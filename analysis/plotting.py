@@ -172,12 +172,14 @@ def _short_data_path(data_path):
 
 def _build_fit_label(fit_result):
     """Build a legend label string from a fit result dict."""
+    if 'fit_label' in fit_result:
+        return fit_result['fit_label']
     if 'center' in fit_result and 'width' in fit_result:
         y0, A, x0, w = fit_result['params']
         model_name = getattr(fit_result.get('model'), '__name__', '')
         sign = '-' if 'dip' in model_name else '+'
         formula = f'y = y₀ {sign} A/(1 + (x - x₀)²/(w/2)²)'
-        param_str = f'y₀={y0:.3g}, A={A:.3g}, x₀={x0:.5g}, w={w:.3g}'
+        param_str = f'y₀={y0:.3g}, A={A:.3g}, x₀={x0:.7g}, w={w:.3g}'
         return f'{formula};<br>{param_str}'
     elif 'tau' in fit_result:
         a, tau, c = fit_result['params']
