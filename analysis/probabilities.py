@@ -139,6 +139,107 @@ def loading_rate_site_resolved(logic1):
     return mean_sr, sem_sr
 
 
+# ---- Paired-site conditional probabilities: P(img2=AB | img1=11) ----
+
+def _pair_binomial(both_loaded, outcome, axis):
+    """Binomial mean and SEM for a paired-site outcome.
+
+    Parameters
+    ----------
+    both_loaded : ndarray, int counts of events where both sites loaded
+    outcome     : ndarray, int counts of the specific img2 outcome
+    axis        : None or tuple, axes to sum over (for pooling)
+
+    Returns
+    -------
+    mean, sem : ndarray (NaN where both_loaded == 0)
+    """
+    if axis is not None:
+        both_loaded = np.sum(both_loaded, axis=axis)
+        outcome = np.sum(outcome, axis=axis)
+    both_loaded = both_loaded.astype(float)
+    mask = both_loaded > 0
+    mean = np.where(mask, outcome / np.maximum(both_loaded, 1), np.nan)
+    sem = np.where(mask,
+                   np.sqrt(mean * (1 - mean) / np.maximum(both_loaded, 1)),
+                   np.nan)
+    return mean, sem
+
+
+def pair_prob_site_resolved(logic1, logic2):
+    """Paired-site conditional probabilities, site-resolved.
+
+    Pairs neighboring sites (0&1, 2&3, ...).  Conditions on both sites
+    loaded in img1 (img1=11 for the pair).
+
+    Parameters
+    ----------
+    logic1, logic2 : ndarray (nSites, nParams, nReps) bool
+        nSites must be even.
+
+    Returns
+    -------
+    p1111_sr, p1111_sem_sr : ndarray (nPairs, nParams)
+    p1100_sr, p1100_sem_sr : ndarray (nPairs, nParams)
+    p1110_sr, p1110_sem_sr : ndarray (nPairs, nParams)
+    p1101_sr, p1101_sem_sr : ndarray (nPairs, nParams)
+    """
+    assert logic1.shape[0] % 2 == 0, "nSites must be even for pairing"
+
+    l1A, l1B = logic1[0::2], logic1[1::2]  # (nPairs, nParams, nReps)
+    l2A, l2B = logic2[0::2], logic2[1::2]
+
+    both_loaded = np.sum(l1A & l1B, axis=2)  # (nPairs, nParams)
+
+    n11 = np.sum(l1A & l1B & l2A & l2B, axis=2)
+    n00 = np.sum(l1A & l1B & ~l2A & ~l2B, axis=2)
+    n10 = np.sum(l1A & l1B & l2A & ~l2B, axis=2)
+    n01 = np.sum(l1A & l1B & ~l2A & l2B, axis=2)
+
+    p1111_sr, p1111_sem_sr = _pair_binomial(both_loaded, n11, axis=None)
+    p1100_sr, p1100_sem_sr = _pair_binomial(both_loaded, n00, axis=None)
+    p1110_sr, p1110_sem_sr = _pair_binomial(both_loaded, n10, axis=None)
+    p1101_sr, p1101_sem_sr = _pair_binomial(both_loaded, n01, axis=None)
+
+    return (p1111_sr, p1111_sem_sr, p1100_sr, p1100_sem_sr,
+            p1110_sr, p1110_sem_sr, p1101_sr, p1101_sem_sr)
+
+
+def pair_prob(logic1, logic2):
+    """Paired-site conditional probabilities, pooled across all pairs.
+
+    Pools both-loaded events across all pairs and reps for each parameter
+    point, then computes binomial mean and SEM.
+
+    Returns
+    -------
+    p1111, p1111_sem : ndarray (nParams,)
+    p1100, p1100_sem : ndarray (nParams,)
+    p1110, p1110_sem : ndarray (nParams,)
+    p1101, p1101_sem : ndarray (nParams,)
+    """
+    assert logic1.shape[0] % 2 == 0, "nSites must be even for pairing"
+
+    l1A, l1B = logic1[0::2], logic1[1::2]
+    l2A, l2B = logic2[0::2], logic2[1::2]
+
+    cond = l1A & l1B  # (nPairs, nParams, nReps)
+
+    both_loaded = np.sum(cond, axis=(0, 2))  # (nParams,)
+    n11 = np.sum(cond & l2A & l2B, axis=(0, 2))
+    n00 = np.sum(cond & ~l2A & ~l2B, axis=(0, 2))
+    n10 = np.sum(cond & l2A & ~l2B, axis=(0, 2))
+    n01 = np.sum(cond & ~l2A & l2B, axis=(0, 2))
+
+    p1111, p1111_sem = _pair_binomial(both_loaded, n11, axis=None)
+    p1100, p1100_sem = _pair_binomial(both_loaded, n00, axis=None)
+    p1110, p1110_sem = _pair_binomial(both_loaded, n10, axis=None)
+    p1101, p1101_sem = _pair_binomial(both_loaded, n01, axis=None)
+
+    return (p1111, p1111_sem, p1100, p1100_sem,
+            p1110, p1110_sem, p1101, p1101_sem)
+
+
 def loading_rate(logic1):
     """Site-averaged loading rate.
 

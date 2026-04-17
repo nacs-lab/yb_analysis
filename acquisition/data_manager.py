@@ -87,6 +87,13 @@ class DataManager:
             if self.is_hc:
                 logger.info('High-coherence mode (isHC=1): no images via ZMQ')
             self._init_empty()
+            # For isInit scans, still create the HDF5 so images get saved
+            if self.is_init and self.frame_size[0] > 0:
+                try:
+                    create_scan_file(self.fname, self.config, self.frame_size, 1)
+                    self._file_created = True
+                except Exception as e:
+                    logger.warning('Failed to create HDF5 for init scan: %s', e)
             return
 
         # --- LOADED state (from disk, read-only during scan) ---
@@ -159,12 +166,15 @@ class DataManager:
                 logger.warning('Failed to create HDF5: %s', e)
 
     def _init_empty(self):
-        """Initialize empty state for isInit scans."""
+        """Initialize empty state for isInit / isHC scans."""
         self.num_sites = 0
         self.loaded_thresholds = np.array([])
         self.loaded_infidelities = np.array([])
         self.loaded_gauss_fits = None
         self.grid_locations = np.zeros((0, 2))
+        self._display_image = None
+        self._display_intensities = None
+        self._display_logicals = None
         self._intensity_accum = []
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
@@ -173,6 +183,13 @@ class DataManager:
         self.loading_rates = np.array([])
         self.grid_shift_history = []
         self.grid_shift_heatmap = None
+        self._scan_logicals = []
+        self._param_indices = None
+        self._scan_params = None
+        self._scan_dims = None
+        self._scan_name = None
+        self._scan_param_path = None
+        self._plot_scale = 1.0
         self._imgs_to_process = []
         self._seq_ids_to_process = []
         self._imgs_to_save = []
@@ -181,7 +198,8 @@ class DataManager:
         self._seq_ids_to_save = []
         self._save_lock = threading.Lock()
         self._file_created = False
-        self._day_dir = ''
+        self._frame_size_fixed = False
+        # NOTE: don't reset self._day_dir — it's set in __init__ before this call
         self.img_buffer = self.log_buffer = None
         self._img_cnt_grid = self._img_cnt_refit = self._img_cnt_loading = 0
 
@@ -293,6 +311,11 @@ class DataManager:
         if self.is_init:
             for img in self._imgs_to_process:
                 self._imgs_to_save.append(img.astype(np.int16))
+            # Show the first image of the latest sequence on the dashboard
+            pSeq = self.num_images_per_seq
+            n_imgs = len(self._imgs_to_process)
+            last_seq_start = (n_imgs - 1) // pSeq * pSeq
+            self._display_image = self._imgs_to_process[last_seq_start].astype(np.int16)
             self._seq_ids_to_save.extend(self._seq_ids_to_process)
             self._imgs_to_process.clear()
             self._seq_ids_to_process.clear()
