@@ -16,4 +16,6 @@ from .fittings import (  # noqa: F401
     gaussian_peak,
     ramsey_efield_model,
     fit_ramsey_efield,
+    dipolar_exchange_model,
+    fit_dipolar_exchange,
 )

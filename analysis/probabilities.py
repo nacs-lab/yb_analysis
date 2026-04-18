@@ -196,6 +196,8 @@ def pair_prob_site_resolved(logic1, logic2):
     n10 = np.sum(l1A & l1B & l2A & ~l2B, axis=2)
     n01 = np.sum(l1A & l1B & ~l2A & l2B, axis=2)
 
+    assert (n11 + n00 + n10 + n01 == both_loaded).all(), "Outcome counts must sum to total loaded"
+    
     p1111_sr, p1111_sem_sr = _pair_binomial(both_loaded, n11, axis=None)
     p1100_sr, p1100_sem_sr = _pair_binomial(both_loaded, n00, axis=None)
     p1110_sr, p1110_sem_sr = _pair_binomial(both_loaded, n10, axis=None)

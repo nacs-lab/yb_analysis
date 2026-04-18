@@ -34,62 +34,59 @@ def _gaussian_mask(box_size, sigma):
     return gaussian_filter(mask, sigma)
 
 
-def _detect_spots(avg_image, spot_sigma=2.0, min_distance=10,
-                  threshold_sigma=5.0):
-    """Detect tweezer spots via Laplacian-of-Gaussian (LoG) filtering.
+def _detect_spots(avg_image, num_tweezers, spot_sigma=2.0, min_distance=10):
+    """Find the top *num_tweezers* brightest spots via LoG filtering.
 
-    The -LoG filter responds strongly to bright spots whose size matches
-    *spot_sigma*, naturally rejecting uniform background and illumination
-    gradients.  Only peaks whose response exceeds *threshold_sigma*
-    robust standard deviations above the median are kept.
+    Computes the -LoG (Laplacian-of-Gaussian) response of the image, finds
+    all local maxima, and returns the *num_tweezers* with the strongest
+    response.  No threshold tuning required — the expected count is the
+    only knob.
 
     Parameters
     ----------
     avg_image : ndarray (H, W)
+    num_tweezers : int
+        Expected number of tweezer spots.
     spot_sigma : float
         Expected spot radius in pixels (LoG kernel sigma).
     min_distance : int
-        Minimum pixel separation between detected peaks.
-    threshold_sigma : float
-        Peaks must exceed  median + threshold_sigma * robust_std.
+        Minimum pixel separation between peaks.
 
     Returns
     -------
-    positions : ndarray (N, 2) — [y, x] pairs.
+    positions : ndarray (N, 2) — [y, x] pairs, N <= num_tweezers.
     """
     img = avg_image.astype(np.float64)
 
     # -LoG: positive at bright blobs matching spot_sigma
     neg_log = -gaussian_laplace(img, sigma=spot_sigma)
 
-    # Robust threshold: median + k * MAD-based std
-    med = np.median(neg_log)
-    mad = np.median(np.abs(neg_log - med))
-    robust_std = 1.4826 * mad
-    abs_threshold = med + threshold_sigma * robust_std
+    # Find many candidate peaks (ask for more than needed, then rank)
+    n_candidates = num_tweezers * 3
 
     try:
         from skimage.feature import peak_local_max
         coords = peak_local_max(neg_log, min_distance=min_distance,
-                                threshold_abs=abs_threshold, num_peaks=200)
-        return coords
+                                num_peaks=n_candidates)
     except ImportError:
-        pass
+        # Fallback: low threshold + connected components
+        med = np.median(neg_log)
+        mad = np.median(np.abs(neg_log - med))
+        thr = med + 3.0 * 1.4826 * mad
+        binary = neg_log >= thr
+        labeled, n_feat = label(binary)
+        if n_feat == 0:
+            return np.zeros((0, 2), dtype=np.float64)
+        centroids = center_of_mass(neg_log, labeled, range(1, n_feat + 1))
+        coords = np.array(centroids, dtype=np.float64).round().astype(int)
 
-    # Fallback: binary threshold + connected components
-    binary = neg_log >= abs_threshold
-    labeled, num_features = label(binary)
-    if num_features == 0:
+    if len(coords) == 0:
         return np.zeros((0, 2), dtype=np.float64)
-    centroids = center_of_mass(neg_log, labeled, range(1, num_features + 1))
-    pts = np.array(centroids, dtype=np.float64)
-    # Greedy min-distance filter
-    keep = []
-    for i in range(len(pts)):
-        if all(np.sum((pts[i] - pts[j]) ** 2) >= min_distance ** 2
-               for j in keep):
-            keep.append(i)
-    return pts[keep] if keep else np.zeros((0, 2), dtype=np.float64)
+
+    # Rank by LoG response strength and keep the top num_tweezers
+    responses = neg_log[coords[:, 0], coords[:, 1]]
+    top_idx = np.argsort(responses)[::-1][:num_tweezers]
+    return coords[top_idx].astype(np.float64)
 
 
 def _sort_grid(positions):
@@ -318,7 +315,7 @@ def _plot_histograms(hist_data, thresholds, gauss_fits, infidelities,
 # Public API
 # ---------------------------------------------------------------------------
 
-def hist_init(scan_dir, box_size=9, sigma=2.0, num_bins=50,
+def hist_init(scan_dir, num_tweezers, box_size=9, sigma=2.0, num_bins=50,
               save_to_day_folder=True):
     """Initialize tweezer grid locations and detection thresholds.
 
@@ -331,6 +328,9 @@ def hist_init(scan_dir, box_size=9, sigma=2.0, num_bins=50,
     scan_dir : str
         Path to scan directory, e.g.
         r'D:\\...\\Data\\20260416\\data_20260416_182630'
+    num_tweezers : int
+        Expected number of tweezer spots.  The detector picks the top N
+        brightest blob-like features from the averaged image.
     box_size : int
         Side length of the Gaussian weighting mask (pixels).
     sigma : float
@@ -380,9 +380,9 @@ def hist_init(scan_dir, box_size=9, sigma=2.0, num_bins=50,
     # 4. Build mask
     mask_mat = _gaussian_mask(box_size, sigma)
 
-    # 5. Detect spots
-    print('Detecting tweezer spots ...')
-    spots = _detect_spots(avg_image)
+    # 5. Detect spots — pick the top num_tweezers by LoG response
+    print(f'Detecting top {num_tweezers} tweezer spots ...')
+    spots = _detect_spots(avg_image, num_tweezers)
     print(f'Found {len(spots)} candidate spots')
     if len(spots) == 0:
         print('No spots auto-detected. The editor will open with an empty grid.')
