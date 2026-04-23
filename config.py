@@ -19,15 +19,22 @@ TEST_SERVER_PORT = 1500
 # "matlab" on PATH; MATLAB_ROOT is the matlab_new/ directory used as the
 # startup path so addpath(genpath(pwd)) finds the full tree.
 def _default_matlab_exe():
+    """Pick a sensible MATLAB path per OS. Override with $YB_MATLAB_EXE."""
     override = os.environ.get('YB_MATLAB_EXE')
     if override:
         return override
     if os.name == 'nt':
-        return r'C:\Program Files\MATLAB\R2025b\bin\matlab.exe'
-    # macOS / Linux
-    mac_default = '/Applications/MATLAB_R2025b.app/bin/matlab'
-    if os.path.exists(mac_default):
-        return mac_default
+        # Production lab PC runs R2023a; try common install roots.
+        for p in (r'C:\Program Files\MATLAB\R2023a\bin\matlab.exe',
+                  r'C:\Program Files\MATLAB\R2025b\bin\matlab.exe'):
+            if os.path.exists(p):
+                return p
+        return r'C:\Program Files\MATLAB\R2023a\bin\matlab.exe'
+    # macOS
+    for p in ('/Applications/MATLAB_R2023a.app/bin/matlab',
+              '/Applications/MATLAB_R2025b.app/bin/matlab'):
+        if os.path.exists(p):
+            return p
     return 'matlab'
 
 
