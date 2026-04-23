@@ -13,16 +13,21 @@ import threading
 import numpy as np
 import zmq
 
-# Add the YbExpServer directory to path so we can import the existing classes.
-# The YbExpServer lives in the main repo, not necessarily relative to this file.
+# Add the YbExpServer directory to sys.path so we can import AnalysisUser /
+# AnalysisClient / ExptClient. yb_analysis/acquisition/ → repo_root →
+# matlab_new/YbExpServer.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# Try relative path first (works when yb_analysis is inside the repo)
-_EXPSERVER_DIR = os.path.normpath(os.path.join(
-    _THIS_DIR, '..', '..', '..', 'YbExpServer'
-))
-if not os.path.isfile(os.path.join(_EXPSERVER_DIR, 'AnalysisUser.py')):
-    # Fall back to the canonical location
-    _EXPSERVER_DIR = r'C:\msys64\home\Ybtweezer-PC2\projects\experiment-control\matlab_new\YbExpServer'
+_CANDIDATES = [
+    os.path.normpath(os.path.join(_THIS_DIR, '..', '..', 'matlab_new', 'YbExpServer')),
+    # Legacy canonical location on the lab PC, kept as a last-resort fallback
+    r'C:\msys64\home\Ybtweezer-PC2\projects\experiment-control\matlab_new\YbExpServer',
+]
+_EXPSERVER_DIR = next(
+    (p for p in _CANDIDATES if os.path.isfile(os.path.join(p, 'AnalysisUser.py'))),
+    None)
+if _EXPSERVER_DIR is None:
+    raise ImportError(
+        "Could not locate AnalysisUser.py. Checked: " + ", ".join(_CANDIDATES))
 if _EXPSERVER_DIR not in sys.path:
     sys.path.insert(0, _EXPSERVER_DIR)
 
