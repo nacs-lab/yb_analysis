@@ -6,8 +6,9 @@ import os
 PATH_PREFIX = os.environ.get('YB_PATH_PREFIX', r'D:\OneDrive - Harvard University\Documents - Yb')
 DATA_DIR = os.path.join(PATH_PREFIX, 'Data')
 
-# ZMQ server URL for AnalysisClient
-MATLAB_URL = 'tcp://127.0.0.1:1400'
+# ZMQ server URL for AnalysisClient — must match consts.MatlabURL in
+# matlab_new/expConfig.m (line 9).
+MATLAB_URL = 'tcp://127.0.0.1:1408'
 
 # Fixed ports
 DASHBOARD_PORT = 8050
