@@ -27,6 +27,7 @@ class QueuePane(ttk.LabelFrame):
         self._refresh_ms = refresh_ms
         self._entries = []      # flat list mirroring listbox rows
         self._running_id = None
+        self._poll_lock = threading.Lock()
         self._poll_busy = False
         self._offline = False
 
@@ -62,9 +63,12 @@ class QueuePane(ttk.LabelFrame):
     def _refresh(self):
         """Kick off a background poll. UI stays responsive; results land via
         self.after(0, ...) on the main thread."""
-        if not self._poll_busy:
+        with self._poll_lock:
+            if self._poll_busy:
+                self._schedule_refresh()
+                return
             self._poll_busy = True
-            threading.Thread(target=self._poll_worker, daemon=True).start()
+        threading.Thread(target=self._poll_worker, daemon=True).start()
         self._schedule_refresh()
 
     def _poll_worker(self):
@@ -75,8 +79,8 @@ class QueuePane(ttk.LabelFrame):
         else:
             self.after(0, self._on_poll_ok, q)
         finally:
-            # the next _refresh tick is free to start another worker
-            self._poll_busy = False
+            with self._poll_lock:
+                self._poll_busy = False
 
     def _on_poll_ok(self, q):
         if self._offline:

@@ -7,6 +7,7 @@ Pause/Abort/Start use the MATLAB MemoryMap file for signaling.
 import mmap
 import os
 import struct
+import tempfile
 import tkinter as tk
 import logging
 import traceback
@@ -22,7 +23,12 @@ logger = logging.getLogger(__name__)
 # MemoryMap layout (matches MemoryMap.m):
 # 12 doubles (96 bytes) + 32 uint8 (32 bytes) + 1 double (8 bytes) + 32 doubles (256 bytes) + 1 double (8 bytes)
 # Key offsets (in bytes, each double = 8 bytes):
-_MMAP_PATH = os.path.join(os.environ.get('TEMP', '/tmp'), 'nacsctl', 'nacs_mem_map.dat')
+#
+# Must match MemoryMap.m's `fullfile(tempdir, 'nacsctl', 'nacs_mem_map.dat')`.
+# Python's tempfile.gettempdir() matches MATLAB's tempdir on both Windows
+# and macOS/Linux, whereas os.environ['TEMP'] was not set on macOS and fell
+# back to /tmp — which MATLAB does NOT use.
+_MMAP_PATH = os.path.join(tempfile.gettempdir(), 'nacsctl', 'nacs_mem_map.dat')
 _OFF_SCAN_COMPLETE = 2 * 8   # ScanComplete
 _OFF_ABORT = 8 * 8           # AbortRunSeq
 _OFF_PAUSE = 9 * 8           # PauseRunSeq

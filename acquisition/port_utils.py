@@ -16,21 +16,34 @@ logger = logging.getLogger(__name__)
 def _stale_pids_windows(port: int):
     try:
         out = subprocess.check_output(
-            ['netstat', '-ano'], text=True, stderr=subprocess.DEVNULL)
+            ['netstat', '-ano', '-p', 'tcp'], text=True, stderr=subprocess.DEVNULL)
     except Exception as e:
         logger.debug('netstat failed: %s', e)
         return []
     pids = []
+    # Look for the port at either end of the local address column. Use a
+    # regex tolerant of variable whitespace / tabs (netstat formatting
+    # differs across Windows versions and locales).
+    import re
+    pat = re.compile(
+        r'^\s*TCP\s+\S*?[.:]' + re.escape(str(port)) + r'\b.*LISTENING\s+(\d+)\s*$',
+        re.IGNORECASE)
     for line in out.splitlines():
-        if f':{port} ' not in line or 'LISTENING' not in line:
-            continue
-        parts = line.strip().split()
-        if not parts:
+        m = pat.match(line)
+        if not m:
             continue
         try:
-            pids.append(int(parts[-1]))
+            pids.append(int(m.group(1)))
         except ValueError:
             pass
+    if not pids:
+        # Only log a short snippet of candidate lines so a missed match is
+        # diagnosable without flooding the log.
+        candidates = [l for l in out.splitlines() if f':{port}' in l][:5]
+        if candidates:
+            logger.debug(
+                'netstat has :%d entries but none parsed as LISTENING. '
+                'Sample: %r', port, candidates)
     return pids
 
 

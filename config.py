@@ -1,6 +1,7 @@
 """Experiment configuration constants — mirrors expConfig.m defaults."""
 
 import os
+import tempfile
 
 # Default data storage path (override via environment or constructor arg)
 PATH_PREFIX = os.environ.get('YB_PATH_PREFIX', r'D:\OneDrive - Harvard University\Documents - Yb')
@@ -35,7 +36,7 @@ MATLAB_ROOT = os.environ.get(
     'YB_MATLAB_ROOT',
     os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'matlab_new')))
 RUNNER_QUEUE_PATH = os.path.join(
-    os.environ.get('TEMP', '/tmp'), 'nacsctl', 'runner_queue.json')
+    tempfile.gettempdir(), 'nacsctl', 'runner_queue.json')
 
 # DataManager update intervals (in number of sequences)
 UPDATE_GRID_INTERVAL = 50

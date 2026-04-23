@@ -143,3 +143,28 @@ def test_port_rebind_after_stop():
         assert True
     finally:
         srv2.stop_worker()
+
+
+def test_exptclient_recovers_after_timeout():
+    """If a queue_list times out, the next call must not hit EFSM. Exercises
+    the recreate_sock-on-timeout path in ExptClient."""
+    from ExptServer import ExptServer
+    from ExptClient import ExptClient
+
+    url = _next_url()
+    # no server yet — every call should time out and recover
+    c = ExptClient(url)
+    with pytest.raises(TimeoutError):
+        c.queue_list(timeout_ms=200)
+    # a second call must not blow up on EFSM — it times out cleanly
+    with pytest.raises(TimeoutError):
+        c.queue_list(timeout_ms=200)
+
+    # now bring a server up and verify the client still works
+    srv = ExptServer(url)
+    try:
+        time.sleep(0.2)
+        q = c.queue_list(timeout_ms=2000)
+        assert q == {'queued': [], 'running': None, 'history': []}
+    finally:
+        srv.stop_worker()

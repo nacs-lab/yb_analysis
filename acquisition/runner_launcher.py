@@ -66,10 +66,15 @@ class RunnerLauncher:
         ]
         if os.name == 'nt':
             cmd.append('-minimize')
-        cmd += [
-            '-sd', self._root,
-            '-r', "addpath(genpath(pwd)); SequenceRunner(); exit",
-        ]
+        # Pass the URL explicitly so Python and MATLAB can never drift —
+        # escape single quotes inside the URL for MATLAB's string literal.
+        url_esc = self._url.replace("'", "''")
+        r_arg = (
+            f"addpath(genpath(pwd)); "
+            f"SequenceRunner('{url_esc}'); "
+            f"exit"
+        )
+        cmd += ['-sd', self._root, '-r', r_arg]
         logger.info('Spawning runner: %s', ' '.join(cmd))
         self._proc = subprocess.Popen(cmd, env=env)
 
