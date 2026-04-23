@@ -203,8 +203,10 @@ class ZmqClient:
     def submit_job(self, payload):
         return self._q_call('submit_job', payload, reply='int')
 
-    def queue_list(self):
-        return self._q_call('queue_list', reply='json')
+    def queue_list(self, timeout_ms=400):
+        # Short timeout: called ~1 Hz from the UI; when the runner is absent
+        # we want to fail fast rather than pile up outstanding REQs.
+        return self._q_call('queue_list', reply='json', timeout_ms=timeout_ms)
 
     def queue_remove(self, job_id):
         return self._q_call(

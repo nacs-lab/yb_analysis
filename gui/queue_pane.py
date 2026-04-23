@@ -6,6 +6,7 @@ never selectable for reorder/remove.
 """
 
 import logging
+import threading
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -26,6 +27,8 @@ class QueuePane(ttk.LabelFrame):
         self._refresh_ms = refresh_ms
         self._entries = []      # flat list mirroring listbox rows
         self._running_id = None
+        self._poll_busy = False
+        self._offline = False
 
         self._build()
         self._schedule_refresh()
@@ -57,15 +60,35 @@ class QueuePane(ttk.LabelFrame):
         self.after(self._refresh_ms, self._refresh)
 
     def _refresh(self):
+        """Kick off a background poll. UI stays responsive; results land via
+        self.after(0, ...) on the main thread."""
+        if not self._poll_busy:
+            self._poll_busy = True
+            threading.Thread(target=self._poll_worker, daemon=True).start()
+        self._schedule_refresh()
+
+    def _poll_worker(self):
         try:
             q = self._client.queue_list()
         except Exception as e:
-            logger.debug('queue_list failed: %s', e)
-            self._status.config(text='runner offline')
-            self._schedule_refresh()
-            return
+            self.after(0, self._on_poll_error, str(e))
+        else:
+            self.after(0, self._on_poll_ok, q)
+        finally:
+            # the next _refresh tick is free to start another worker
+            self._poll_busy = False
+
+    def _on_poll_ok(self, q):
+        if self._offline:
+            logger.info('Runner back online')
+            self._offline = False
         self._render(q)
-        self._schedule_refresh()
+
+    def _on_poll_error(self, msg):
+        if not self._offline:
+            logger.debug('queue_list failed: %s', msg)
+            self._offline = True
+        self._status.config(text='runner offline')
 
     def _render(self, q):
         saved_sel = self._selected_id()
