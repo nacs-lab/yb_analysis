@@ -12,29 +12,9 @@ Usage:
 import argparse
 import atexit
 import logging
-import os
-import signal
-import subprocess
-import sys
 
+from yb_analysis.acquisition.port_utils import kill_port
 from yb_analysis.config import MATLAB_URL, DASHBOARD_PORT
-
-
-def _kill_port(port):
-    """Kill any process listening on the given TCP port (Windows)."""
-    try:
-        out = subprocess.check_output(
-            ['netstat', '-ano'], text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            if f':{port} ' in line and 'LISTENING' in line:
-                pid = int(line.strip().split()[-1])
-                if pid == os.getpid():
-                    continue
-                logging.info('Killing stale process on port %d (pid=%d)', port, pid)
-                subprocess.call(['taskkill', '/PID', str(pid), '/F'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        logging.debug('Port cleanup failed: %s', e)
 
 
 def main():
@@ -56,7 +36,7 @@ def main():
     )
 
     # Kill stale processes on our ports
-    _kill_port(args.port)
+    kill_port(args.port)
 
     from yb_analysis.acquisition.zmq_client import ZmqClient
     from yb_analysis.plotting.dashboard import DashboardRenderer
