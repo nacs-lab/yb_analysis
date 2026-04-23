@@ -5,10 +5,13 @@ The existing Python ZMQ layer returns raw array.array('d', ...) blobs; this
 module converts them into structured numpy arrays.
 """
 
+import json
 import sys
 import os
 import array
+import threading
 import numpy as np
+import zmq
 
 # Add the YbExpServer directory to path so we can import the existing classes.
 # The YbExpServer lives in the main repo, not necessarily relative to this file.
@@ -130,6 +133,7 @@ class ZmqClient:
     """
 
     def __init__(self, url='tcp://127.0.0.1:1312', refresh_rate=2.0):
+        self._url = url
         self._au = AnalysisUser(url)
         self._au.set_refresh_rate(refresh_rate)
         # Patch AnalysisUser's worker to survive decode errors (ZMQ framing race)
@@ -140,6 +144,76 @@ class ZmqClient:
             except (UnicodeDecodeError, Exception):
                 return self._au.SeqStatus.Unknown
         self._au._AnalysisUser__update_status = _safe_update_status
+        # Dedicated queue-ops socket guarded by a lock (GUI reads concurrently)
+        self._q_lock = threading.Lock()
+        self._q_ctx = zmq.Context.instance()
+        self._q_sock = None
+        self._open_queue_sock()
+
+    def _open_queue_sock(self):
+        if self._q_sock is not None:
+            try:
+                self._q_sock.close(linger=0)
+            except Exception:
+                pass
+        self._q_sock = self._q_ctx.socket(zmq.REQ)
+        self._q_sock.setsockopt(zmq.LINGER, 0)
+        self._q_sock.connect(self._url)
+
+    def _q_call(self, *frames, reply='string', timeout_ms=2000):
+        """Send a multi-frame REQ, receive a single reply. On failure the
+        socket is recreated so callers can retry without leaving it in a
+        broken REQ-state."""
+        with self._q_lock:
+            try:
+                for i, f in enumerate(frames):
+                    flags = zmq.SNDMORE if i < len(frames) - 1 else 0
+                    if isinstance(f, str):
+                        self._q_sock.send_string(f, flags)
+                    else:
+                        self._q_sock.send(bytes(f), flags)
+                if self._q_sock.poll(timeout_ms) == 0:
+                    self._open_queue_sock()
+                    raise TimeoutError(f"{frames[0]}: no reply")
+                if reply == 'string':
+                    return self._q_sock.recv_string()
+                elif reply == 'json':
+                    return json.loads(self._q_sock.recv())
+                elif reply == 'int':
+                    return int.from_bytes(self._q_sock.recv(), 'little')
+                else:
+                    return self._q_sock.recv()
+            except TimeoutError:
+                raise
+            except Exception:
+                self._open_queue_sock()
+                raise
+
+    def ping(self, timeout_ms=500):
+        try:
+            return self._q_call('ping', timeout_ms=timeout_ms) == 'pong'
+        except Exception:
+            return False
+
+    def submit_job(self, payload):
+        return self._q_call('submit_job', payload, reply='int')
+
+    def queue_list(self):
+        return self._q_call('queue_list', reply='json')
+
+    def queue_remove(self, job_id):
+        return self._q_call(
+            'queue_remove', int(job_id).to_bytes(8, 'little'))
+
+    def queue_move(self, job_id, direction):
+        return self._q_call(
+            'queue_move', int(job_id).to_bytes(8, 'little'), direction)
+
+    def shutdown_runner(self):
+        try:
+            return self._q_call('shutdown')
+        except Exception:
+            return ''
 
     def grab_imgs(self):
         """Grab all queued images from the server.
@@ -199,3 +273,7 @@ class ZmqClient:
     def cleanup(self):
         """Stop the background worker thread."""
         self._au.stop_worker()
+        try:
+            self._q_sock.close(linger=0)
+        except Exception:
+            pass

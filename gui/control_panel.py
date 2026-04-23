@@ -61,7 +61,7 @@ class ControlPanel(tk.Tk):
     def __init__(self, zmq_client, dashboard=None):
         super().__init__()
         self.title('Yb Experiment Control')
-        self.geometry('540x400')
+        self.geometry('560x640')
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._client = zmq_client
@@ -109,6 +109,11 @@ class ControlPanel(tk.Tk):
         self._rate_entry.insert(0, str(self._refresh_ms // 1000))
         self._rate_entry.pack(side='left', padx=8)
         self._rate_entry.bind('<Return>', self._on_rate)
+
+        # Queue pane for SequenceRunner jobs
+        from yb_analysis.gui.queue_pane import QueuePane
+        self._queue_pane = QueuePane(self, self._client, refresh_ms=1000)
+        self._queue_pane.pack(fill='both', expand=True, padx=10, pady=(4, 10))
 
     def _on_pause(self):
         mm = _mmap_open()
