@@ -15,6 +15,7 @@ Usage:
 import argparse
 import atexit
 import logging
+import signal
 
 from yb_analysis.acquisition.port_utils import kill_port
 from yb_analysis.config import (
@@ -96,6 +97,17 @@ def main():
 
     logging.info('Dashboard at http://localhost:%d', args.port)
     app = ControlPanel(client, dashboard)
+
+    # Ctrl-C in the terminal: route through the UI's normal close path so
+    # the dashboard + runner shut down cleanly.
+    def _on_sigint(signum, frame):
+        logging.info('SIGINT received — closing UI')
+        try:
+            app.after(0, app._on_close)
+        except Exception:
+            app.quit()
+    signal.signal(signal.SIGINT, _on_sigint)
+
     app.mainloop()
 
 

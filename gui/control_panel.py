@@ -80,6 +80,14 @@ class ControlPanel(tk.Tk):
         # Status polling on main thread (lightweight)
         self._poll_status()
 
+        # Tk on macOS blocks Python's signal handlers inside mainloop(); a
+        # periodic no-op tick lets SIGINT propagate so Ctrl-C in the spawning
+        # terminal works.
+        self._tick_alive()
+
+    def _tick_alive(self):
+        self.after(200, self._tick_alive)
+
     def _build_ui(self):
         self._lbl_status = tk.Label(self, text='Status: Unknown', font=('Segoe UI', 16))
         self._lbl_status.pack(fill='x', padx=10, pady=(12, 4))
