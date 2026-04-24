@@ -65,7 +65,7 @@ class RunnerLauncher:
             '-nodesktop', '-nosplash',
         ]
         if os.name == 'nt':
-            cmd.append('-minimize')
+            cmd += ['-wait', '-minimize']
         # Pass the URL explicitly so Python and MATLAB can never drift —
         # escape single quotes inside the URL for MATLAB's string literal.
         url_esc = self._url.replace("'", "''")
@@ -94,7 +94,7 @@ class RunnerLauncher:
         raise TimeoutError(
             f"Runner did not respond to ping within {boot_timeout:.0f}s")
 
-    def stop(self, grace: float = 10.0) -> None:
+    def stop(self, grace: float = 20.0) -> None:
         """Graceful shutdown: ZMQ `shutdown` → wait → force-kill if needed."""
         if not self.is_alive():
             self._proc = None
@@ -113,10 +113,34 @@ class RunnerLauncher:
         try:
             self._proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            logger.warning('Runner did not exit within %.1fs — killing', grace)
-            self._proc.kill()
+            logger.warning('Runner did not exit within %.1fs — force killing', grace)
+            self._force_kill()
             try:
-                self._proc.wait(timeout=3)
+                self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 logger.error('Runner kill timed out')
         self._proc = None
+
+    def _force_kill(self) -> None:
+        """Kill the MATLAB runner process on all platforms.
+
+        On Windows, ``matlab.exe -wait`` spawns the real MATLAB JVM as a
+        **detached** process — it is NOT a child of the launcher.
+        ``taskkill /T`` on the launcher therefore misses the JVM.
+
+        Belt-and-suspenders approach:
+          1. Kill whoever owns port 1408 (= the JVM with the ZMQ socket).
+          2. Kill the launcher process tree.
+        """
+        port = _url_to_port(self._url)
+        if os.name == 'nt':
+            # Kill the JVM directly via its port
+            killed = kill_port(port)
+            if killed:
+                logger.info('Killed %d process(es) on port %d', killed, port)
+            # Also kill the launcher tree in case it's still around
+            subprocess.call(
+                ['taskkill', '/PID', str(self._proc.pid), '/T', '/F'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            self._proc.kill()

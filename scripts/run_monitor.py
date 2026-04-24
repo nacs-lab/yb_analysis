@@ -69,13 +69,26 @@ def main():
     from yb_analysis.plotting.dashboard import DashboardRenderer
     from yb_analysis.gui.control_panel import ControlPanel
     from yb_analysis.io.preload import load_background_data
+    from yb_analysis.config import read_orca_config
 
     logging.info('Connecting to %s', args.url)
     client = ZmqClient(args.url, refresh_rate=args.refresh)
+
+    # Initialize camera via the runner with ROI from expConfig.m
+    orca_cfg = read_orca_config()
+    logging.info('Initializing camera (ROI=%s)...', orca_cfg['roi'])
+    try:
+        client.camera_init(orca_cfg['roi'])
+    except Exception as e:
+        logging.warning('Camera init failed: %s (continue without camera)', e)
     dashboard = DashboardRenderer(port=args.port)
 
     def _cleanup():
         logging.info('Shutting down...')
+        try:
+            client.camera_close()
+        except Exception:
+            pass
         try:
             dashboard.close()
         except Exception:
@@ -85,6 +98,13 @@ def main():
                 runner.stop()
             except Exception as e:
                 logging.warning('Runner stop failed: %s', e)
+        # Final safety net: kill whatever still holds the ZMQ port.
+        # Covers cases where runner.stop() failed or the JVM is orphaned.
+        from yb_analysis.acquisition.port_utils import kill_port
+        try:
+            kill_port(int(args.url.rsplit(':', 1)[-1].split('/')[0]))
+        except Exception:
+            pass
 
     atexit.register(_cleanup)
 
@@ -97,6 +117,7 @@ def main():
 
     logging.info('Dashboard at http://localhost:%d', args.port)
     app = ControlPanel(client, dashboard)
+    app._camera_pane.set_roi(orca_cfg['roi'])
 
     # Ctrl-C in the terminal: route through the UI's normal close path so
     # the dashboard + runner shut down cleanly.

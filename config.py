@@ -45,6 +45,47 @@ MATLAB_ROOT = os.environ.get(
 RUNNER_QUEUE_PATH = os.path.join(
     tempfile.gettempdir(), 'nacsctl', 'runner_queue.json')
 
+# ---- Orca camera config (read from / written to expConfig.m) ----
+
+_EXPCONFIG_PATH = os.path.join(MATLAB_ROOT, 'expConfig.m')
+
+
+def read_orca_config():
+    """Parse consts.Orca.ROI and consts.Orca.ExposureTime from expConfig.m."""
+    import re
+    roi = [0, 0, 4096, 2304]
+    exposure = 0.1
+    try:
+        with open(_EXPCONFIG_PATH, 'r') as f:
+            text = f.read()
+        m = re.search(r'consts\.Orca\.ROI\s*=\s*\[([^\]]+)\]', text)
+        if m:
+            roi = [int(float(x)) for x in m.group(1).split()]
+        m = re.search(r'consts\.Orca\.ExposureTime\s*=\s*([0-9.eE+-]+)', text)
+        if m:
+            exposure = float(m.group(1))
+    except Exception:
+        pass
+    return {'roi': roi, 'exposure_time': exposure}
+
+
+def write_orca_roi(roi):
+    """Update consts.Orca.ROI in expConfig.m in-place."""
+    import re
+    try:
+        with open(_EXPCONFIG_PATH, 'r') as f:
+            text = f.read()
+        roi_str = '%d %d %d %d' % tuple(roi)
+        text = re.sub(
+            r'(consts\.Orca\.ROI\s*=\s*\[)[^\]]+(\])',
+            r'\g<1>' + roi_str + r'\2',
+            text)
+        with open(_EXPCONFIG_PATH, 'w') as f:
+            f.write(text)
+    except Exception as e:
+        raise RuntimeError(f'Failed to update expConfig.m: {e}')
+
+
 # DataManager update intervals (in number of sequences)
 UPDATE_GRID_INTERVAL = 50
 UPDATE_GRID_BATCH_SIZE = 50

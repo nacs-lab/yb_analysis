@@ -222,6 +222,23 @@ class ZmqClient:
         except Exception:
             return ''
 
+    # -------- Camera --------
+
+    def camera_init(self, roi, timeout_ms=10000):
+        return self._q_call('camera_init', json.dumps(roi),
+                            timeout_ms=timeout_ms)
+
+    def camera_set_roi(self, roi, timeout_ms=5000):
+        return self._q_call('camera_set_roi', json.dumps(roi),
+                            timeout_ms=timeout_ms)
+
+    def camera_close(self, timeout_ms=5000):
+        return self._q_call('camera_close', timeout_ms=timeout_ms)
+
+    def camera_status(self, timeout_ms=1000):
+        return self._q_call('camera_status', reply='json',
+                            timeout_ms=timeout_ms)
+
     def grab_imgs(self):
         """Grab all queued images from the server.
 

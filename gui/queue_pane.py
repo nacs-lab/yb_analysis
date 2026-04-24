@@ -26,6 +26,19 @@ def _fmt_time(ts):
     return time.strftime('%H:%M:%S', time.localtime(ts))
 
 
+def _fmt_duration(start_ts, end_ts=None):
+    """Format elapsed time as M:SS or H:MM:SS."""
+    if not start_ts:
+        return ''
+    end = end_ts or time.time()
+    elapsed = max(0, int(end - start_ts))
+    mins, secs = divmod(elapsed, 60)
+    if mins >= 60:
+        hours, mins = divmod(mins, 60)
+        return f'{hours}:{mins:02d}:{secs:02d}'
+    return f'{mins}:{secs:02d}'
+
+
 # SI prefix table — index = power-of-1000, offset by 8 so 0 is "y" / 8 is unity.
 _SI_PREFIXES = {
     -24: 'y', -21: 'z', -18: 'a', -15: 'f', -12: 'p',
@@ -144,13 +157,14 @@ def _format_detail(summary):
 
 _COLUMNS = [
     ('marker', '', 24, 'center'),
-    ('id',     'ID', 44, 'center'),
-    ('seq',    'Seq', 160, 'w'),
-    ('axis',   'Scan axis', 240, 'w'),
-    ('reps',   'Reps', 56, 'center'),
-    ('imgs',   'Imgs', 44, 'center'),
-    ('time',   'Time', 80, 'center'),
-    ('status', 'Status', 68, 'center'),
+    ('id',     'ID', 36, 'center'),
+    ('scan',   'Scan', 120, 'w'),
+    ('seq',    'Seq', 130, 'w'),
+    ('axis',   'Scan axis', 200, 'w'),
+    ('reps',   'Reps', 44, 'center'),
+    ('added',  'Added', 66, 'center'),
+    ('run',    'Run', 52, 'center'),
+    ('status', 'Status', 52, 'center'),
 ]
 
 
@@ -247,9 +261,18 @@ class QueuePane(ttk.LabelFrame):
     @staticmethod
     def _row(entry, is_running=False, is_history=False):
         summary = entry.get('summary') or {}
+
+        # Scan name: prefer scan_name (function name like "LACParamScan"),
+        # fall back to scan_filename (file like "LACScan")
+        scan_name = (summary.get('scan_name') or
+                     summary.get('scan_filename') or '—')
+
+        added_cell = _fmt_time(entry.get('enqueued_ts'))
+
         if is_running:
             marker, tag = '▶', 'running'
-            time_cell = _fmt_time(entry.get('start_ts')) or 'pending'
+            run_cell = _fmt_duration(entry.get('start_ts'))  # live elapsed
+            status_cell = 'running'
         elif is_history:
             status = entry.get('status') or entry.get('state') or ''
             if status == 'ok':
@@ -258,20 +281,24 @@ class QueuePane(ttk.LabelFrame):
                 marker, tag = '✗', 'error'
             else:
                 marker, tag = '·', 'done'
-            time_cell = _fmt_time(entry.get('finish_ts') or entry.get('start_ts'))
+            run_cell = _fmt_duration(entry.get('start_ts'), entry.get('finish_ts'))
+            status_cell = status
         else:
             marker, tag = '·', ''
-            time_cell = 'pending'
+            run_cell = ''
+            status_cell = 'queued'
+
         return (
             (
                 marker,
                 str(entry.get('id', '')),
+                scan_name,
                 entry.get('seqName') or '—',
                 _format_axes(summary.get('axes')),
                 _pretty_value(summary.get('num_per_group')) if summary.get('num_per_group') else '—',
-                _pretty_value(summary.get('num_images'))    if summary.get('num_images')    else '—',
-                time_cell,
-                entry.get('status') or entry.get('state') or '',
+                added_cell,
+                run_cell,
+                status_cell,
             ),
             tag,
         )
@@ -300,7 +327,7 @@ class QueuePane(ttk.LabelFrame):
         hist = q.get('history') or []
         if hist:
             sep_iid = self._tree.insert('', 'end',
-                                        values=('', '', '── history ──', '', '', '', '', ''),
+                                        values=('', '', '── history ──', '', '', '', '', '', ''),
                                         tags=('sep',))
             self._entry_by_iid[sep_iid] = None
             for e in hist[:10]:

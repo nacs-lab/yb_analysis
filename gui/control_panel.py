@@ -67,7 +67,7 @@ class ControlPanel(tk.Tk):
     def __init__(self, zmq_client, dashboard=None):
         super().__init__()
         self.title('Yb Experiment Control')
-        self.geometry('560x640')
+        self.geometry('720x720')
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._client = zmq_client
@@ -124,6 +124,11 @@ class ControlPanel(tk.Tk):
         self._rate_entry.pack(side='left', padx=8)
         self._rate_entry.bind('<Return>', self._on_rate)
 
+        # Camera pane
+        from yb_analysis.gui.camera_pane import CameraPane
+        self._camera_pane = CameraPane(self, self._client, refresh_ms=2000)
+        self._camera_pane.pack(fill='x', padx=10, pady=(4, 4))
+
         # Queue pane for SequenceRunner jobs
         from yb_analysis.gui.queue_pane import QueuePane
         self._queue_pane = QueuePane(self, self._client, refresh_ms=1000)
@@ -179,14 +184,16 @@ class ControlPanel(tk.Tk):
                 dummy = _mmap_read_double(mm, _OFF_DUMMY_RUNNING)
                 mm.close()
 
-                if abort > 0 or scan_complete > 0:
-                    status = 'Stopped'
+                if dummy > 0:
+                    status = 'Idle'
                 elif is_paused > 0:
                     status = 'Paused'
                 elif pause > 0:
                     status = 'Pausing...'
-                elif dummy > 0:
-                    status = 'Dummy Running'
+                elif abort > 0:
+                    status = 'Stopped'
+                elif scan_complete > 0:
+                    status = 'Stopped'
                 else:
                     status = 'Running'
                 self._lbl_status.config(text=f'Status: {status}')
@@ -254,6 +261,11 @@ class ControlPanel(tk.Tk):
 
     def _on_close(self):
         self._running = False
+        # Close camera BEFORE closing ZMQ sockets so the command reaches the runner
+        try:
+            self._client.camera_close()
+        except Exception:
+            pass
         self._client.cleanup()
         if self._dashboard:
             self._dashboard.close()
