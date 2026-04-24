@@ -9,9 +9,18 @@ import threading
 import tkinter as tk
 import tkinter.ttk as ttk
 
-from yb_analysis.config import write_orca_roi
+from yb_analysis.config import write_orca_roi, write_orca_exposure
 
 logger = logging.getLogger(__name__)
+
+
+def _format_exposure(value):
+    """Render exposure_time (seconds) for display. %g drops trailing zeros
+    and switches to scientific notation for very small values."""
+    try:
+        return ('%g' % float(value))
+    except (TypeError, ValueError):
+        return '0'
 
 
 class CameraPane(ttk.LabelFrame):
@@ -25,6 +34,14 @@ class CameraPane(ttk.LabelFrame):
         self._connected = False
         self._cmd_pending = False  # True while waiting for a command to take effect
         self._last_server_roi = None  # track what the server reports
+        self._last_server_exposure = None
+
+        # Deferred expConfig persistence: user-applied values land here in the
+        # main thread before the ZMQ command is queued.  The poll loop writes
+        # expConfig.m only when the server actually reflects them — that way a
+        # failed init never leaves stale values in the persistent config.
+        self._pending_persist_roi = None
+        self._pending_persist_exposure = None
 
         self._build_ui()
         self._schedule_refresh()
@@ -43,6 +60,7 @@ class CameraPane(ttk.LabelFrame):
         rf = ttk.Frame(self)
         rf.pack(fill='x', padx=6, pady=2)
         self._roi_vars = {}
+        self._roi_entries = {}
         for i, label in enumerate(('X', 'Y', 'W', 'H')):
             ttk.Label(rf, text=label + ':').grid(row=0, column=i * 2, padx=(6, 1))
             var = tk.StringVar(value='0')
@@ -50,6 +68,18 @@ class CameraPane(ttk.LabelFrame):
             e.grid(row=0, column=i * 2 + 1, padx=(0, 4))
             e.bind('<Return>', self._on_apply_roi)
             self._roi_vars[label] = var
+            self._roi_entries[label] = e
+
+        # Exposure field (seconds)
+        ef = ttk.Frame(self)
+        ef.pack(fill='x', padx=6, pady=2)
+        ttk.Label(ef, text='Exposure (s):').pack(side='left', padx=(6, 1))
+        self._exposure_var = tk.StringVar(value='0.1')
+        self._exposure_entry = ttk.Entry(ef, textvariable=self._exposure_var, width=10)
+        self._exposure_entry.pack(side='left', padx=(0, 4))
+        self._exposure_entry.bind('<Return>', self._on_apply_exposure)
+        ttk.Button(ef, text='Apply Exposure',
+                   command=self._on_apply_exposure).pack(side='left', padx=2)
 
         # Buttons
         bf = ttk.Frame(self)
@@ -75,6 +105,13 @@ class CameraPane(ttk.LabelFrame):
     def get_roi(self):
         return [int(self._roi_vars[k].get()) for k in ('X', 'Y', 'W', 'H')]
 
+    def set_exposure(self, exposure_time):
+        """Set the exposure entry (called externally on startup)."""
+        self._exposure_var.set(_format_exposure(exposure_time))
+
+    def get_exposure(self):
+        return float(self._exposure_var.get())
+
     # ------------------------------------------------------------ Callbacks
 
     def _on_connect(self):
@@ -83,17 +120,32 @@ class CameraPane(ttk.LabelFrame):
         except ValueError:
             self._lbl_error.config(text='Bad ROI values')
             return
+        try:
+            exposure = self.get_exposure()
+            if not (exposure > 0):
+                raise ValueError
+        except ValueError:
+            self._lbl_error.config(text='Bad exposure value')
+            return
         self._lbl_status.config(text='Connecting...', foreground='orange')
         self._lbl_error.config(text='')
         self._cmd_pending = True
-        threading.Thread(target=self._do_connect, args=(roi,),
+        # Stash pending values in the main thread so the poll callback can
+        # observe them atomically — avoids a race with the worker thread.
+        self._pending_persist_roi = list(roi)
+        self._pending_persist_exposure = float(exposure)
+        threading.Thread(target=self._do_connect, args=(roi, exposure),
                          daemon=True).start()
 
-    def _do_connect(self, roi):
+    def _do_connect(self, roi, exposure):
         try:
-            self._client.camera_init(roi)
+            self._client.camera_init(roi, exposure_time=exposure)
         except Exception as e:
+            # ZMQ call itself failed — command never reached the runner.
+            # Clear pending so a later success doesn't wrongly persist.
             self._cmd_pending = False
+            self._pending_persist_roi = None
+            self._pending_persist_exposure = None
             self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
 
     def _on_disconnect(self):
@@ -117,15 +169,39 @@ class CameraPane(ttk.LabelFrame):
         self._lbl_error.config(text='')
         self._lbl_status.config(text='Updating ROI...', foreground='orange')
         self._cmd_pending = True
+        self._pending_persist_roi = list(roi)
         threading.Thread(target=self._do_set_roi, args=(roi,),
                          daemon=True).start()
 
     def _do_set_roi(self, roi):
         try:
             self._client.camera_set_roi(roi)
-            write_orca_roi(roi)
         except Exception as e:
             self._cmd_pending = False
+            self._pending_persist_roi = None
+            self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
+
+    def _on_apply_exposure(self, _event=None):
+        try:
+            exposure = self.get_exposure()
+            if not (exposure > 0):
+                raise ValueError
+        except ValueError:
+            self._lbl_error.config(text='Bad exposure value')
+            return
+        self._lbl_error.config(text='')
+        self._lbl_status.config(text='Updating exposure...', foreground='orange')
+        self._cmd_pending = True
+        self._pending_persist_exposure = float(exposure)
+        threading.Thread(target=self._do_set_exposure, args=(exposure,),
+                         daemon=True).start()
+
+    def _do_set_exposure(self, exposure):
+        try:
+            self._client.camera_set_exposure(exposure)
+        except Exception as e:
+            self._cmd_pending = False
+            self._pending_persist_exposure = None
             self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
 
     # --------------------------------------------------- Background polling
@@ -155,6 +231,7 @@ class CameraPane(ttk.LabelFrame):
     def _on_poll_ok(self, status):
         connected = status.get('connected', False)
         roi = status.get('roi', [0, 0, 0, 0])
+        exposure = status.get('exposure_time', None)
         err = status.get('error', '')
 
         # Detect when a pending command has taken effect
@@ -163,9 +240,19 @@ class CameraPane(ttk.LabelFrame):
                 self._cmd_pending = False  # state changed — command landed
             elif self._last_server_roi and roi != self._last_server_roi:
                 self._cmd_pending = False  # ROI changed — command landed
+            elif (self._last_server_exposure is not None
+                  and exposure is not None
+                  and exposure != self._last_server_exposure):
+                self._cmd_pending = False
 
         self._last_server_roi = roi
+        self._last_server_exposure = exposure
         self._connected = connected
+
+        # Persist to expConfig.m only once the server reflects what the user
+        # requested. This runs regardless of _cmd_pending so rapid successive
+        # applies still persist correctly when each lands.
+        self._maybe_persist(connected, roi, exposure, err)
 
         # While a command is pending, don't overwrite the UI
         if self._cmd_pending:
@@ -174,14 +261,22 @@ class CameraPane(ttk.LabelFrame):
         if connected:
             self._lbl_status.config(text='Connected', foreground='green')
             self._lbl_error.config(text='')
-            # Only sync ROI fields from server when they actually differ
-            # (avoids clobbering user edits while they're typing)
-            try:
-                ui_roi = self.get_roi()
-            except ValueError:
-                ui_roi = None
-            if ui_roi != roi:
-                self.set_roi(roi)
+            # Only sync ROI fields from server when they actually differ AND
+            # the user isn't currently editing them.
+            if not self._any_roi_focused():
+                try:
+                    ui_roi = self.get_roi()
+                except ValueError:
+                    ui_roi = None
+                if ui_roi != roi:
+                    self.set_roi(roi)
+            if exposure is not None and not self._exposure_focused():
+                try:
+                    ui_exp = self.get_exposure()
+                except ValueError:
+                    ui_exp = None
+                if ui_exp is None or abs(ui_exp - float(exposure)) > 1e-9:
+                    self.set_exposure(exposure)
         else:
             if err:
                 self._lbl_status.config(text='Error', foreground='red')
@@ -189,3 +284,50 @@ class CameraPane(ttk.LabelFrame):
             else:
                 self._lbl_status.config(text='Disconnected', foreground='gray')
                 self._lbl_error.config(text='')
+
+    # ---------------------------------------------------- Focus-aware helpers
+
+    def _focused_widget(self):
+        """Return the currently focused widget, or None on error. Tk can
+        raise KeyError/TclError briefly during teardown or while the mouse
+        is outside the app, so we treat those as 'no focus'."""
+        try:
+            return self.focus_get()
+        except (KeyError, tk.TclError):
+            return None
+
+    def _any_roi_focused(self):
+        focused = self._focused_widget()
+        if focused is None:
+            return False
+        return any(focused is e for e in self._roi_entries.values())
+
+    def _exposure_focused(self):
+        return self._focused_widget() is self._exposure_entry
+
+    # --------------------------------------------- Deferred expConfig persist
+
+    def _maybe_persist(self, connected, roi, exposure, err):
+        """Write expConfig.m when — and only when — the server confirms the
+        value the user applied. A persisted command clears its own pending
+        slot. We deliberately do NOT clear on errors: a stale error from a
+        previous command shouldn't cancel a later successful apply.  Pending
+        slots are overwritten in the main thread on each new Apply, so they
+        can't accumulate."""
+        if self._pending_persist_roi is not None:
+            if (connected and not err
+                    and list(roi) == list(self._pending_persist_roi)):
+                try:
+                    write_orca_roi(roi)
+                except Exception as e:
+                    logger.warning('write_orca_roi failed: %s', e)
+                self._pending_persist_roi = None
+        if self._pending_persist_exposure is not None and exposure is not None:
+            if (connected and not err
+                    and abs(float(exposure)
+                            - float(self._pending_persist_exposure)) < 1e-9):
+                try:
+                    write_orca_exposure(exposure)
+                except Exception as e:
+                    logger.warning('write_orca_exposure failed: %s', e)
+                self._pending_persist_exposure = None

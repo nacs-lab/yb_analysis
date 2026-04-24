@@ -86,6 +86,38 @@ def write_orca_roi(roi):
         raise RuntimeError(f'Failed to update expConfig.m: {e}')
 
 
+def write_orca_exposure(exposure_time):
+    """Update consts.Orca.ExposureTime (seconds) in expConfig.m in-place."""
+    import re
+    try:
+        # Read in binary to preserve the file's original line endings.
+        with open(_EXPCONFIG_PATH, 'rb') as f:
+            raw = f.read()
+        text = raw.decode('utf-8')
+        # Detect the dominant newline style so any insertion matches.
+        newline = '\r\n' if '\r\n' in text else '\n'
+        exp_str = ('%g' % float(exposure_time))
+        new_text, n = re.subn(
+            r'(consts\.Orca\.ExposureTime\s*=\s*)[0-9.eE+-]+',
+            r'\g<1>' + exp_str,
+            text)
+        if n == 0:
+            # Field missing — append after the ROI line using its newline.
+            new_text, m = re.subn(
+                r'(consts\.Orca\.ROI\s*=\s*\[[^\]]+\];[^\r\n]*(?:\r?\n))',
+                r'\1consts.Orca.ExposureTime = ' + exp_str + ';' + newline,
+                text, count=1)
+            if m == 0:
+                # Neither ExposureTime nor ROI found — append at EOF.
+                if not text.endswith(('\n', '\r\n')):
+                    text += newline
+                new_text = text + 'consts.Orca.ExposureTime = ' + exp_str + ';' + newline
+        with open(_EXPCONFIG_PATH, 'wb') as f:
+            f.write(new_text.encode('utf-8'))
+    except Exception as e:
+        raise RuntimeError(f'Failed to update expConfig.m: {e}')
+
+
 # DataManager update intervals (in number of sequences)
 UPDATE_GRID_INTERVAL = 50
 UPDATE_GRID_BATCH_SIZE = 50

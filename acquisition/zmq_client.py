@@ -224,12 +224,24 @@ class ZmqClient:
 
     # -------- Camera --------
 
-    def camera_init(self, roi, timeout_ms=10000):
-        return self._q_call('camera_init', json.dumps(roi),
+    def camera_init(self, roi, exposure_time=None, timeout_ms=10000):
+        """Initialize the camera.
+
+        `roi` is [x, y, w, h]. `exposure_time` (seconds) is optional — when
+        None the runner uses OrcaInit's default. Sent as a JSON dict so the
+        server can pick both out atomically."""
+        payload = {'roi': list(roi)}
+        if exposure_time is not None:
+            payload['exposure_time'] = float(exposure_time)
+        return self._q_call('camera_init', json.dumps(payload),
                             timeout_ms=timeout_ms)
 
     def camera_set_roi(self, roi, timeout_ms=5000):
         return self._q_call('camera_set_roi', json.dumps(roi),
+                            timeout_ms=timeout_ms)
+
+    def camera_set_exposure(self, exposure_time, timeout_ms=5000):
+        return self._q_call('camera_set_exposure', str(float(exposure_time)),
                             timeout_ms=timeout_ms)
 
     def camera_close(self, timeout_ms=5000):
@@ -238,6 +250,20 @@ class ZmqClient:
     def camera_status(self, timeout_ms=1000):
         return self._q_call('camera_status', reply='json',
                             timeout_ms=timeout_ms)
+
+    # -------- Dummy keep-alive toggle --------
+
+    def set_dummy_enabled(self, enabled, timeout_ms=2000):
+        return self._q_call('set_dummy_enabled',
+                            '1' if enabled else '0',
+                            timeout_ms=timeout_ms)
+
+    def get_dummy_enabled(self, timeout_ms=1000):
+        try:
+            return self._q_call('get_dummy_enabled',
+                                timeout_ms=timeout_ms) == '1'
+        except Exception:
+            return True
 
     def grab_imgs(self):
         """Grab all queued images from the server.

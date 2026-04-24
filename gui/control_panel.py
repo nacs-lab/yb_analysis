@@ -58,7 +58,8 @@ def _mmap_read_double(mm, offset):
 
 _STATUS = {0: 'Stopped', 1: 'Running', 2: 'Paused', 3: 'Unknown'}
 _STATUS_COLORS = {
-    'Idle': '#555555', 'Running': '#006600', 'Paused': '#cc6600',
+    'Idle': '#555555', 'Idle (dummy off)': '#888888',
+    'Running': '#006600', 'Paused': '#cc6600',
     'Pausing...': '#cc6600', 'Stopped': '#aa0000',
 }
 
@@ -78,6 +79,7 @@ class ControlPanel(tk.Tk):
         self._cur_seq_id = 0
         self._refresh_ms = 2000
         self._running = True
+        self._dummy_enabled = True  # tracks the server-side keep-alive toggle
 
         style = ttk.Style(self)
         style.configure('Abort.TButton', foreground='red',
@@ -110,6 +112,18 @@ class ControlPanel(tk.Tk):
             side='right', padx=4)
         ttk.Button(top, text='Pause', command=self._on_pause).pack(
             side='right', padx=4)
+
+        # Dummy keep-alive toggle — when off, SequenceRunner stops running
+        # DummySeq between jobs (nothing hits the hardware while idle).
+        self._dummy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text='Run dummy seq',
+                        variable=self._dummy_var,
+                        command=self._on_dummy_toggle).pack(
+            side='right', padx=(12, 8))
+        # Sync the UI from the server on startup so a persistent runner that
+        # was last left disabled doesn't silently flip back to enabled just
+        # because the UI defaults to checked.
+        threading.Thread(target=self._load_dummy_state, daemon=True).start()
 
         ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
 
@@ -195,6 +209,38 @@ class ControlPanel(tk.Tk):
         except ValueError:
             pass
 
+    def _on_dummy_toggle(self):
+        self._push_dummy_state()
+
+    def _push_dummy_state(self):
+        enabled = bool(self._dummy_var.get())
+        self._dummy_enabled = enabled
+        # Run on a background thread: ZMQ REQ/REP is not instant and we don't
+        # want to freeze the UI if the runner is slow to respond.
+        threading.Thread(
+            target=self._do_push_dummy, args=(enabled,), daemon=True).start()
+
+    def _do_push_dummy(self, enabled):
+        try:
+            self._client.set_dummy_enabled(enabled)
+        except Exception as e:
+            logger.warning('set_dummy_enabled failed: %s', e)
+
+    def _load_dummy_state(self):
+        """Read the server-side dummy flag and reflect it in the checkbox.
+        Runs on a worker thread; posts the UI update back to the main loop
+        via after(0) so Tk is only touched from the main thread."""
+        try:
+            enabled = self._client.get_dummy_enabled()
+        except Exception as e:
+            logger.warning('get_dummy_enabled failed: %s', e)
+            return
+        self.after(0, self._apply_dummy_state_from_server, enabled)
+
+    def _apply_dummy_state_from_server(self, enabled):
+        self._dummy_var.set(bool(enabled))
+        self._dummy_enabled = bool(enabled)
+
     # --------------------------------------------------------- Status poll
 
     def _poll_status(self):
@@ -211,7 +257,7 @@ class ControlPanel(tk.Tk):
                 mm.close()
 
                 if dummy > 0:
-                    status = 'Idle'
+                    status = 'Idle (dummy off)' if not self._dummy_enabled else 'Idle'
                 elif is_paused > 0:
                     status = 'Paused'
                 elif pause > 0:
