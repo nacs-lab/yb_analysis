@@ -145,6 +145,68 @@ def test_port_rebind_after_stop():
         srv2.stop_worker()
 
 
+def test_summary_round_trip(server):
+    """ybScanSummary JSON should come back unchanged through queue_list."""
+    import json
+    srv, _ = server
+    summary = {
+        'axes': [{'dim': 1, 'name': 'LAC.FreqDetuning',
+                  'scale': 1e-6, 'units': 'Hz',
+                  'min': 50e3, 'max': 1e6, 'npts': 20}],
+        'num_per_group': 2000, 'num_images': 1,
+        'scramble': False, 'is_init': False, 'is_hc': False,
+        'rearrangement': False, 'scan_filename': 'LACScan',
+        'set_params': {'SLM_VServo': 0.8, 'Imag399_ExposureTime': 0.1},
+        'default_params': {'BlueMOT_LoadingTime': 0.5},
+    }
+    jid = srv.submit_job(b'\x00LACScan\x00payload', summary=summary)
+    e = srv.queue_list()['queued'][0]
+    assert e['id'] == jid
+    assert e['summary'] == summary
+
+    # seqName should prefer scan_filename over the payload sniff
+    assert e['seqName'] == 'LACScan'
+
+
+def test_queue_formatting_helpers():
+    """The pure-Python formatters used by the GUI should handle 1D / parallel /
+    2D axes and dimensionless vs. units correctly."""
+    from yb_analysis.gui.queue_pane import _format_axes, _format_detail, _pretty_value
+
+    assert _format_axes([]) == '—'
+    assert _format_axes([{'dim': 1, 'name': 'X', 'units': 'Hz',
+                          'min': 50e3, 'max': 1e6, 'npts': 20}]) == \
+        'X = 50 kHz..1 MHz (20 pt)'
+    # parallel
+    parallel = _format_axes([
+        {'dim': 1, 'name': 'A', 'units': '', 'min': 1, 'max': 5, 'npts': 51},
+        {'dim': 1, 'name': 'B', 'units': '', 'min': 1, 'max': 5, 'npts': 51},
+    ])
+    assert 'A + B' in parallel and '51 pt' in parallel
+    # 2D
+    two_d = _format_axes([
+        {'dim': 1, 'name': 'A', 'units': '', 'min': 0, 'max': 1, 'npts': 2},
+        {'dim': 2, 'name': 'B', 'units': '', 'min': 0, 'max': 1, 'npts': 2},
+    ])
+    assert '×' in two_d
+
+    # dimensionless numbers should NOT get SI prefixes
+    assert _pretty_value(0.8) == '0.8'
+    assert _pretty_value(2000) == '2000'
+    # but with units, they should
+    assert _pretty_value(50000, 'Hz') == '50 kHz'
+    assert _pretty_value(1e-3, 's') == '1 ms'
+
+    detail = _format_detail({
+        'set_params': {'SLM_VServo': 0.8, 'Pushout_Green_Amp': 0.1},
+        'default_params': {'BlueMOT_LoadingTime': 0.5},
+        'num_per_group': 2000, 'num_images': 1,
+    })
+    assert 'SLM:' in detail and 'VServo=0.8' in detail
+    assert 'LoadingTime=0.5*' in detail  # default suffixed with *
+    assert 'num_per_group=2000' in detail
+
+
 def test_exptclient_recovers_after_timeout():
     """If a queue_list times out, the next call must not hit EFSM. Exercises
     the recreate_sock-on-timeout path in ExptClient."""
