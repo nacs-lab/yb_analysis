@@ -55,12 +55,15 @@ def _pretty_value(val, units=''):
         f = float(val)
     except (TypeError, ValueError):
         return repr(val)
+    import math
+    if not math.isfinite(f):
+        # NaN / inf — don't try log10; just render whatever %.4g gives.
+        return f'{f:.4g}' + (f' {units}' if units else '')
     if not units:
         # Dimensionless / unknown-unit → plain %.4g, no SI prefix
         return f'{f:.4g}'
     if f == 0:
         return f'0 {units}'
-    import math
     exp = int(math.floor(math.log10(abs(f)) / 3) * 3)
     exp = max(-24, min(18, exp))
     mant = f / (10 ** exp)

@@ -196,6 +196,12 @@ def test_queue_formatting_helpers():
     # but with units, they should
     assert _pretty_value(50000, 'Hz') == '50 kHz'
     assert _pretty_value(1e-3, 's') == '1 ms'
+    # NaN / inf must not crash the formatter (regression: int(floor(log10(nan)))
+    # used to raise ValueError and blow up the whole render cycle)
+    import math
+    assert 'nan' in _pretty_value(float('nan'), 'Hz').lower()
+    assert 'inf' in _pretty_value(math.inf, 's').lower()
+    assert _pretty_value(float('nan')) == 'nan'
 
     detail = _format_detail({
         'set_params': {'SLM_VServo': 0.8, 'Pushout_Green_Amp': 0.1},
