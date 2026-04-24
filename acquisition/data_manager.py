@@ -37,6 +37,19 @@ def get_data_manager(scan_id):
     with _cache_lock:
         if scan_id in _cache:
             return _cache[scan_id]
+        # Evict all previous managers — only the active scan needs memory.
+        # Each DataManager can hold hundreds of MB of image data. Save any
+        # pending data before eviction so late-arriving frames from a
+        # previous scan aren't lost.
+        for old_id in list(_cache):
+            if old_id != scan_id:
+                try:
+                    _cache[old_id].save_data()
+                except Exception as e:
+                    logger.warning('Pre-eviction save failed for scan %d: %s',
+                                   old_id, e)
+                logger.debug('Evicting DataManager for scan %d', old_id)
+                del _cache[old_id]
         dm = DataManager(scan_id)
         _cache[scan_id] = dm
         return dm

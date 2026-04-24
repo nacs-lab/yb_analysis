@@ -52,6 +52,7 @@ class RunnerLauncher:
     def start(self, boot_timeout: float = 45.0) -> None:
         """Kill stale port binders, spawn the runner, wait for ping."""
         kill_port(_url_to_port(self._url))
+        self._kill_stale_runners()
 
         env = os.environ.copy()
         if self._mock:
@@ -121,26 +122,63 @@ class RunnerLauncher:
                 logger.error('Runner kill timed out')
         self._proc = None
 
+    @staticmethod
+    def _kill_stale_runners():
+        """Kill leftover MATLAB runners from previous sessions."""
+        if os.name != 'nt':
+            return
+        try:
+            out = subprocess.check_output(
+                ['wmic', 'process', 'where',
+                 "Name='MATLAB.exe' AND CommandLine LIKE '%SequenceRunner%'",
+                 'get', 'ProcessId'],
+                text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    logger.info('Killing stale runner MATLAB pid=%s', line)
+                    subprocess.call(
+                        ['taskkill', '/PID', line, '/F'],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     def _force_kill(self) -> None:
         """Kill the MATLAB runner process on all platforms.
 
-        On Windows, ``matlab.exe -wait`` spawns the real MATLAB JVM as a
-        **detached** process — it is NOT a child of the launcher.
-        ``taskkill /T`` on the launcher therefore misses the JVM.
-
-        Belt-and-suspenders approach:
-          1. Kill whoever owns port 1408 (= the JVM with the ZMQ socket).
-          2. Kill the launcher process tree.
+        On Windows, ``matlab.exe -wait`` spawns the real MATLAB JVM
+        (``bin\\win64\\MATLAB.exe``) as a child.  Three strategies:
+          1. Kill the launcher process tree (``taskkill /T``).
+          2. Find the JVM by ParentProcessId and kill it directly.
+          3. Kill whoever owns port 1408.
         """
-        port = _url_to_port(self._url)
+        launcher_pid = self._proc.pid
         if os.name == 'nt':
-            # Kill the JVM directly via its port
-            killed = kill_port(port)
-            if killed:
-                logger.info('Killed %d process(es) on port %d', killed, port)
-            # Also kill the launcher tree in case it's still around
+            # 1. Kill the launcher tree
             subprocess.call(
-                ['taskkill', '/PID', str(self._proc.pid), '/T', '/F'],
+                ['taskkill', '/PID', str(launcher_pid), '/T', '/F'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 2. Find the JVM child by ParentProcessId (survives launcher death)
+            try:
+                out = subprocess.check_output(
+                    ['wmic', 'process', 'where',
+                     f'ParentProcessId={launcher_pid}',
+                     'get', 'ProcessId'],
+                    text=True, stderr=subprocess.DEVNULL)
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        logger.info('Killing MATLAB JVM child pid=%s', line)
+                        subprocess.call(
+                            ['taskkill', '/PID', line, '/F'],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            # 3. Kill any process still holding the port
+            killed = kill_port(_url_to_port(self._url))
+            if killed:
+                logger.info('Killed %d process(es) on port', killed)
         else:
             self._proc.kill()

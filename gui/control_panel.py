@@ -9,6 +9,7 @@ import os
 import struct
 import tempfile
 import tkinter as tk
+import tkinter.ttk as ttk
 import logging
 import traceback
 import threading
@@ -20,26 +21,21 @@ from yb_analysis.acquisition.data_manager import get_data_manager
 
 logger = logging.getLogger(__name__)
 
-# MemoryMap layout (matches MemoryMap.m):
-# 12 doubles (96 bytes) + 32 uint8 (32 bytes) + 1 double (8 bytes) + 32 doubles (256 bytes) + 1 double (8 bytes)
-# Key offsets (in bytes, each double = 8 bytes):
-#
-# Must match MemoryMap.m's `fullfile(tempdir, 'nacsctl', 'nacs_mem_map.dat')`.
-# Python's tempfile.gettempdir() matches MATLAB's tempdir on both Windows
-# and macOS/Linux, whereas os.environ['TEMP'] was not set on macOS and fell
-# back to /tmp — which MATLAB does NOT use.
+# MemoryMap layout (matches MemoryMap.m)
 _MMAP_PATH = os.path.join(tempfile.gettempdir(), 'nacsctl', 'nacs_mem_map.dat')
-_OFF_SCAN_COMPLETE = 2 * 8   # ScanComplete
-_OFF_ABORT = 8 * 8           # AbortRunSeq
-_OFF_PAUSE = 9 * 8           # PauseRunSeq
-_OFF_ISPAUSED = 10 * 8       # IsPausedRunSeq
-_OFF_CURSEQNUM = 11 * 8      # CurrentSeqNum
-# After 12 doubles (96B) + 32 uint8 (32B) + 1 double (8B) + 32 doubles (256B) = 392
-_OFF_DUMMY_RUNNING = 392     # DummyRunning
+_OFF_SCAN_COMPLETE = 2 * 8
+_OFF_ABORT = 8 * 8
+_OFF_PAUSE = 9 * 8
+_OFF_ISPAUSED = 10 * 8
+_OFF_CURSEQNUM = 11 * 8
+_OFF_DUMMY_RUNNING = 392
+
+_FONT = ('Segoe UI', 10)
+_FONT_SM = ('Segoe UI', 9)
+_FONT_TITLE = ('Segoe UI', 14, 'bold')
 
 
 def _mmap_open():
-    """Open the MATLAB memory map file for read/write."""
     if not os.path.isfile(_MMAP_PATH):
         return None
     try:
@@ -59,7 +55,12 @@ def _mmap_read_double(mm, offset):
     mm.seek(offset)
     return struct.unpack('d', mm.read(8))[0]
 
+
 _STATUS = {0: 'Stopped', 1: 'Running', 2: 'Paused', 3: 'Unknown'}
+_STATUS_COLORS = {
+    'Idle': '#555555', 'Running': '#006600', 'Paused': '#cc6600',
+    'Pausing...': '#cc6600', 'Stopped': '#aa0000',
+}
 
 
 class ControlPanel(tk.Tk):
@@ -67,7 +68,8 @@ class ControlPanel(tk.Tk):
     def __init__(self, zmq_client, dashboard=None):
         super().__init__()
         self.title('Yb Experiment Control')
-        self.geometry('720x720')
+        self.geometry('680x600')
+        self.minsize(560, 480)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._client = zmq_client
@@ -77,69 +79,94 @@ class ControlPanel(tk.Tk):
         self._refresh_ms = 2000
         self._running = True
 
+        style = ttk.Style(self)
+        style.configure('Abort.TButton', foreground='red',
+                        font=('Segoe UI', 10, 'bold'))
+
         self._build_ui()
 
-        # Processing in background thread
         self._worker = threading.Thread(target=self._process_loop, daemon=True)
         self._worker.start()
-
-        # Status polling on main thread (lightweight)
         self._poll_status()
-
-        # Tk on macOS blocks Python's signal handlers inside mainloop(); a
-        # periodic no-op tick lets SIGINT propagate so Ctrl-C in the spawning
-        # terminal works.
         self._tick_alive()
 
     def _tick_alive(self):
         self.after(200, self._tick_alive)
 
+    # ------------------------------------------------------------------ UI
+
     def _build_ui(self):
-        self._lbl_status = tk.Label(self, text='Status: Unknown', font=('Segoe UI', 16))
-        self._lbl_status.pack(fill='x', padx=10, pady=(12, 4))
+        # ---- Top bar: status + buttons ----
+        top = ttk.Frame(self)
+        top.pack(fill='x', padx=10, pady=(8, 4))
 
-        bf = tk.Frame(self)
-        bf.pack(fill='x', padx=10, pady=8)
-        tk.Button(bf, text='Pause', font=('Segoe UI', 11),
-                  command=self._on_pause).pack(side='left', expand=True, fill='x', padx=4)
-        tk.Button(bf, text='Start', font=('Segoe UI', 11),
-                  command=self._on_start).pack(side='left', expand=True, fill='x', padx=4)
-        tk.Button(bf, text='ABORT', font=('Segoe UI', 12, 'bold'), fg='red',
-                  command=self._on_abort).pack(side='left', expand=True, fill='x', padx=4)
+        self._lbl_status = ttk.Label(top, text='Status: Unknown',
+                                     font=_FONT_TITLE)
+        self._lbl_status.pack(side='left')
 
-        inf = tk.Frame(self)
-        inf.pack(fill='x', padx=10, pady=4)
-        self._lbl_scan = tk.Label(inf, text='Scan: —', font=('Segoe UI', 12), anchor='w')
-        self._lbl_scan.pack(fill='x')
-        self._lbl_seq = tk.Label(inf, text='Seq: —', font=('Segoe UI', 12), anchor='w')
-        self._lbl_seq.pack(fill='x')
-        self._lbl_file = tk.Label(inf, text='File: —', font=('Segoe UI', 9), anchor='w', wraplength=500)
-        self._lbl_file.pack(fill='x', pady=(6, 0))
+        ttk.Button(top, text='ABORT', command=self._on_abort,
+                   style='Abort.TButton').pack(side='right', padx=(4, 0))
+        ttk.Button(top, text='Start', command=self._on_start).pack(
+            side='right', padx=4)
+        ttk.Button(top, text='Pause', command=self._on_pause).pack(
+            side='right', padx=4)
 
-        rf = tk.Frame(self)
-        rf.pack(fill='x', padx=10, pady=8)
-        tk.Label(rf, text='Refresh (s):', font=('Segoe UI', 11)).pack(side='left')
-        self._rate_entry = tk.Entry(rf, width=4, font=('Segoe UI', 11))
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
+
+        # ---- Middle: camera (left) + scan info (right) ----
+        mid = ttk.Frame(self)
+        mid.pack(fill='x', padx=10, pady=(2, 4))
+        mid.columnconfigure(1, weight=1)
+
+        from yb_analysis.gui.camera_pane import CameraPane
+        self._camera_pane = CameraPane(mid, self._client, refresh_ms=2000)
+        self._camera_pane.grid(row=0, column=0, sticky='nsew', padx=(0, 4))
+
+        info = ttk.LabelFrame(mid, text='Current scan')
+        info.grid(row=0, column=1, sticky='nsew', padx=(4, 0))
+        gi = ttk.Frame(info)
+        gi.pack(fill='both', expand=True, padx=6, pady=4)
+
+        for r, (label, attr) in enumerate([('Scan:', '_lbl_scan'),
+                                            ('Seq:', '_lbl_seq')]):
+            ttk.Label(gi, text=label, font=_FONT).grid(row=r, column=0,
+                                                        sticky='w', padx=(0, 4))
+            lbl = ttk.Label(gi, text='--', font=_FONT)
+            lbl.grid(row=r, column=1, sticky='w')
+            setattr(self, attr, lbl)
+
+        ttk.Label(gi, text='File:', font=_FONT_SM).grid(
+            row=2, column=0, sticky='nw', padx=(0, 4))
+        self._lbl_file = ttk.Label(gi, text='--', font=_FONT_SM,
+                                   wraplength=260)
+        self._lbl_file.grid(row=2, column=1, sticky='w')
+
+        self._lbl_save_err = ttk.Label(gi, text='', font=_FONT_SM,
+                                        foreground='red', wraplength=260)
+        self._lbl_save_err.grid(row=3, column=0, columnspan=2, sticky='w')
+
+        rf = ttk.Frame(gi)
+        rf.grid(row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Label(rf, text='Refresh (s):', font=_FONT_SM).pack(side='left')
+        self._rate_entry = ttk.Entry(rf, width=3, font=_FONT_SM)
         self._rate_entry.insert(0, str(self._refresh_ms // 1000))
-        self._rate_entry.pack(side='left', padx=8)
+        self._rate_entry.pack(side='left', padx=4)
         self._rate_entry.bind('<Return>', self._on_rate)
 
-        # Camera pane
-        from yb_analysis.gui.camera_pane import CameraPane
-        self._camera_pane = CameraPane(self, self._client, refresh_ms=2000)
-        self._camera_pane.pack(fill='x', padx=10, pady=(4, 4))
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
 
-        # Queue pane for SequenceRunner jobs
+        # ---- Bottom: queue pane ----
         from yb_analysis.gui.queue_pane import QueuePane
         self._queue_pane = QueuePane(self, self._client, refresh_ms=1000)
-        self._queue_pane.pack(fill='both', expand=True, padx=10, pady=(4, 10))
+        self._queue_pane.pack(fill='both', expand=True, padx=10, pady=(2, 8))
+
+    # -------------------------------------------------------------- Actions
 
     def _on_pause(self):
         mm = _mmap_open()
         if mm:
             _mmap_write_double(mm, _OFF_PAUSE, 1.0)
             mm.close()
-            logger.info('MemoryMap: PauseRunSeq = 1')
         else:
             self._client.pause_seq()
 
@@ -148,7 +175,6 @@ class ControlPanel(tk.Tk):
         if mm:
             _mmap_write_double(mm, _OFF_PAUSE, 0.0)
             mm.close()
-            logger.info('MemoryMap: PauseRunSeq = 0 (resume)')
         else:
             self._client.start_seq()
 
@@ -158,7 +184,6 @@ class ControlPanel(tk.Tk):
             _mmap_write_double(mm, _OFF_ABORT, 1.0)
             _mmap_write_double(mm, _OFF_PAUSE, 0.0)
             mm.close()
-            logger.info('MemoryMap: AbortRunSeq = 1')
         else:
             self._client.abort_seq()
 
@@ -170,8 +195,9 @@ class ControlPanel(tk.Tk):
         except ValueError:
             pass
 
+    # --------------------------------------------------------- Status poll
+
     def _poll_status(self):
-        """Poll status from MemoryMap (authoritative), fallback to ZMQ."""
         if not self._running:
             return
         try:
@@ -196,17 +222,19 @@ class ControlPanel(tk.Tk):
                     status = 'Stopped'
                 else:
                     status = 'Running'
-                self._lbl_status.config(text=f'Status: {status}')
+                self._lbl_status.config(
+                    text=f'Status: {status}',
+                    foreground=_STATUS_COLORS.get(status, '#000000'))
             else:
-                # Fallback to ZMQ
                 s = self._client.get_status()
                 self._lbl_status.config(text=f'Status: {_STATUS.get(s, "?")}')
         except Exception:
             pass
         self.after(1000, self._poll_status)
 
+    # ------------------------------------------------ Background processing
+
     def _process_loop(self):
-        """Background thread: grab images, process, update dashboard."""
         while self._running:
             try:
                 self._process_once()
@@ -218,50 +246,56 @@ class ControlPanel(tk.Tk):
         info = self._client.grab_imgs()
         if len(info['scan_ids']) == 0:
             return
-
         valid_mask = info['scan_ids'] != 0
         if not np.any(valid_mask):
             return
-
         valid_idx = np.where(valid_mask)[0]
         imgs = [info['imgs'][i] for i in valid_idx]
         scan_ids = info['scan_ids'][valid_mask]
         seq_ids = info['seq_ids'][valid_mask]
 
-        # Process grouped by scan_id
         start = 0
         while start < len(imgs):
             cur_scan = int(scan_ids[start])
             end = start + 1
             while end < len(imgs) and scan_ids[end] == cur_scan:
                 end += 1
-
             if cur_scan > 0:
                 dm = get_data_manager(cur_scan)
-                dm.store_new_data({'imgs': imgs[start:end], 'seq_ids': seq_ids[start:end]})
+                dm.store_new_data({'imgs': imgs[start:end],
+                                   'seq_ids': seq_ids[start:end]})
                 dm.process_data()
                 dm.update_data()
                 if self._dashboard:
                     self._dashboard.update(dm.get_plot_data())
-                fname = dm.save_data()
-
-                # Update UI from background thread (thread-safe via after())
+                fname = ''
+                save_err = ''
+                try:
+                    fname = dm.save_data()
+                except Exception as e:
+                    save_err = f'Save failed: {e}'
+                    logger.error('save_data() failed for scan %d: %s',
+                                 cur_scan, e)
                 self._cur_scan_id = cur_scan
                 self._cur_seq_id = int(seq_ids[-1])
-                self.after(0, self._update_labels, fname)
-
+                self.after(0, self._update_labels, fname, save_err)
             start = end
 
-    def _update_labels(self, fname=''):
-        """Called on main thread via after()."""
-        self._lbl_scan.config(text=f'Scan: {self._cur_scan_id}')
-        self._lbl_seq.config(text=f'Seq: {self._cur_seq_id}')
+    def _update_labels(self, fname='', save_err=''):
+        self._lbl_scan.config(text=str(self._cur_scan_id))
+        self._lbl_seq.config(text=str(self._cur_seq_id))
         if fname:
-            self._lbl_file.config(text=f'File: {fname}')
+            self._lbl_file.config(text=fname)
+        # Sticky error indicator — clears only when the next save succeeds
+        if save_err:
+            self._lbl_save_err.config(text=save_err)
+        elif fname:
+            self._lbl_save_err.config(text='')
+
+    # ------------------------------------------------------------ Shutdown
 
     def _on_close(self):
         self._running = False
-        # Close camera BEFORE closing ZMQ sockets so the command reaches the runner
         try:
             self._client.camera_close()
         except Exception:
