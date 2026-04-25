@@ -219,17 +219,55 @@ class ZmqClient:
 
     # -------- Camera --------
 
-    def camera_init(self, roi, exposure_time=None, timeout_ms=10000):
-        """Initialize the camera.
+    def camera_init(self, roi, exposure_time=None, timeout_ms=10000,
+                    wait_connected_s=45.0):
+        """Initialize the camera, blocking until the runner reports it
+        connected.
 
-        `roi` is [x, y, w, h]. `exposure_time` (seconds) is optional — when
-        None the runner uses OrcaInit's default. Sent as a JSON dict so the
-        server can pick both out atomically."""
+        Why block: the 'ok' from this ZMQ call is only a queue-ack; MATLAB
+        still spends ~25–30s in imaqreset + OrcaInit before the camera is
+        actually usable. If anything else accesses the shared
+        IMAQ/AslDma/DCAM state during that window — e.g. a separate
+        `matlab.exe -batch` submitter is booting up to call submit_job,
+        which loads its own IMAQ adaptors — OrcaInit can fail silently:
+        the runner never sets `vid` in its base workspace, every
+        subsequent scan goes down the "no camera" branch, and frames
+        never flow. Empirically this caused ~30% of 2-cycle test runs
+        to capture 0 frames on cycle 2; gating callers on
+        `connected=True` eliminated it (31/31 cycles, vs ~70% before).
+
+        Polls camera_status until the runner sets connected=True (only
+        emitted by handleCameraCmd 'init' AFTER OrcaInit returns), or
+        until `error` is set, or until wait_connected_s elapses. Pass
+        wait_connected_s=0 for legacy fire-and-forget behavior.
+
+        `roi` is [x, y, w, h]. `exposure_time` (seconds) is optional —
+        when None the runner uses OrcaInit's default."""
         payload = {'roi': list(roi)}
         if exposure_time is not None:
             payload['exposure_time'] = float(exposure_time)
-        return self._q_call('camera_init', json.dumps(payload),
-                            timeout_ms=timeout_ms)
+        ack = self._q_call('camera_init', json.dumps(payload),
+                           timeout_ms=timeout_ms)
+        if wait_connected_s <= 0:
+            return ack
+        deadline = time.monotonic() + wait_connected_s
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                st = self.camera_status(timeout_ms=500)
+            except Exception:
+                st = None
+            if isinstance(st, dict):
+                last_status = st
+                if st.get('connected'):
+                    return ack
+                err = st.get('error') or ''
+                if err:
+                    raise RuntimeError(f'Camera init failed: {err}')
+            time.sleep(0.5)
+        raise TimeoutError(
+            f'Camera did not report connected within {wait_connected_s:.1f}s '
+            f'(last status: {last_status})')
 
     def camera_set_roi(self, roi, timeout_ms=5000):
         return self._q_call('camera_set_roi', json.dumps(roi),

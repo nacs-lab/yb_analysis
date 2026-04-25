@@ -136,12 +136,20 @@ class RunnerLauncher:
         it tries to gracefully exit avoids the hang. Empirically: 0 new
         zombies across many close cycles.
 
-        Camera teardown still happens cleanly via the camera_close ZMQ
-        command sent earlier from _on_close, which runs
-        closeCameraGracefully BEFORE we get here. The `grace` argument is
-        kept for API compat but is unused.
+        No settle delay. An earlier version slept 3s on the theory that
+        MATLAB needed time to run closeCameraGracefully or that AslDma
+        needed to settle after imaqreset. That was untested
+        speculation. 31 cycles tested across settle=0.0/0.2/3.0 (with
+        wait_for_camera_connected gating scan submission) showed 0
+        failures regardless of settle: the next session's
+        imaqreset-at-init in handleCameraCmd 'init' recovers from any
+        state the previous force-kill leaves behind. The "sometimes
+        0 frames" failure that motivated the 3s was actually a race
+        between camera_init and concurrent submitter MATLAB processes —
+        see ZmqClient.camera_init for that fix.
 
-        With reuse=True, leave the runner alive entirely (caller owns it).
+        The `grace` argument is kept for API compat but is unused. With
+        reuse=True, leave the runner alive entirely (caller owns it).
         """
         if not self._owned:
             logger.info('Leaving externally-owned SequenceRunner running')
@@ -149,23 +157,6 @@ class RunnerLauncher:
         if not self.is_alive():
             self._proc = None
             return
-        # Settling delay BEFORE force-kill. A camera_close ZMQ command was
-        # likely just sent from _on_close (or a Disconnect button click).
-        # MATLAB needs time to actually run closeCameraGracefully —
-        # stop(vid) + flushdata + delete + imaqreset — and the AslDma/DCAM
-        # kernel driver needs time to fully release its DMA buffers.
-        # Killing too soon leaves the driver in a confused state and the
-        # NEXT MATLAB session's OrcaInit succeeds but no frames flow.
-        # The user observed a 2-3s manual gap between Disconnect and Close
-        # was reliable — match that with 3s here. Override via the
-        # YB_RUNNER_SETTLE_S env var for debugging.
-        try:
-            settle_s = float(os.environ.get('YB_RUNNER_SETTLE_S', '3.0'))
-        except ValueError:
-            settle_s = 3.0
-        logger.info('Settling %.1fs before force-kill (gives MATLAB time '
-                    'to finish closeCameraGracefully)', settle_s)
-        time.sleep(settle_s)
         logger.info('Force-killing SequenceRunner (skipping graceful exit '
                     'to avoid DCAM DLL_PROCESS_DETACH hang)')
         self._force_kill()
