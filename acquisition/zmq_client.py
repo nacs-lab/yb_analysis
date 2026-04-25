@@ -10,6 +10,7 @@ import sys
 import os
 import array
 import threading
+import time
 import numpy as np
 import zmq
 
@@ -215,12 +216,6 @@ class ZmqClient:
     def queue_move(self, job_id, direction):
         return self._q_call(
             'queue_move', int(job_id).to_bytes(8, 'little'), direction)
-
-    def shutdown_runner(self):
-        try:
-            return self._q_call('shutdown')
-        except Exception:
-            return ''
 
     # -------- Camera --------
 

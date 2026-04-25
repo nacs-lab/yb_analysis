@@ -1,5 +1,5 @@
 """Tests for RunnerLauncher — uses a small Python stand-in to exercise
-the spawn → ping → shutdown lifecycle without requiring a real MATLAB."""
+the spawn → ping → force-kill lifecycle without requiring a real MATLAB."""
 import itertools
 import os
 import subprocess
@@ -20,8 +20,8 @@ def _next_url():
 
 @pytest.fixture
 def fake_runner_script(tmp_path):
-    """A Python script that mimics SequenceRunner: binds ExptServer, loops
-    until shutdown_requested() is true, then exits."""
+    """A Python script that mimics SequenceRunner: binds ExptServer and
+    loops forever. RunnerLauncher.stop() force-kills it."""
     script = tmp_path / "fake_runner.py"
     expserver_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), '..', '..', 'matlab_new', 'YbExpServer'))
@@ -32,7 +32,7 @@ def fake_runner_script(tmp_path):
         url = sys.argv[1]
         srv = ExptServer(url)
         try:
-            while not srv.shutdown_requested():
+            while True:
                 time.sleep(0.1)
         finally:
             srv.stop_worker()
@@ -45,7 +45,7 @@ def test_spawn_ping_shutdown(fake_runner_script, tmp_path, monkeypatch):
       1. kill-stale-port (no-op since port is free),
       2. spawn the process,
       3. wait for ping to succeed,
-      4. on stop(): send ZMQ `shutdown`, let the process exit within grace.
+      4. on stop(): force-kill the process.
     """
     from yb_analysis.acquisition.runner_launcher import RunnerLauncher
 

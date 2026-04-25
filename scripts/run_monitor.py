@@ -33,6 +33,11 @@ def main():
                         help=f'Dashboard web server port (default: {DASHBOARD_PORT})')
     parser.add_argument('--no-runner', action='store_true',
                         help='Do not spawn the background MATLAB SequenceRunner')
+    parser.add_argument('--reuse-runner', action='store_true',
+                        help='Reuse an already-running SequenceRunner if present, '
+                             'and DO NOT shut it down on exit. Mitigates the '
+                             'DCAM/AslDma zombie issue (one MATLAB stays alive '
+                             'across GUI sessions).')
     parser.add_argument('--mock', action='store_true',
                         help='Launch the runner with NACS_MOCK=1 (stub libnacs)')
     parser.add_argument('--matlab-exe', default=MATLAB_EXE,
@@ -61,6 +66,7 @@ def main():
             matlab_root=args.matlab_root,
             url=args.url,
             mock=args.mock,
+            reuse=args.reuse_runner,
         )
         logging.info('Starting MATLAB SequenceRunner (mock=%s)...', args.mock)
         runner.start()
@@ -126,12 +132,18 @@ def main():
     # Ctrl-C in the terminal: route through the UI's normal close path so
     # the dashboard + runner shut down cleanly.
     def _on_sigint(signum, frame):
-        logging.info('SIGINT received — closing UI')
+        logging.info('Signal %s received — closing UI', signum)
         try:
             app.after(0, app._on_close)
         except Exception:
             app.quit()
     signal.signal(signal.SIGINT, _on_sigint)
+    # Also catch Ctrl-Break on Windows (SIGBREAK). Without this, sending
+    # Ctrl-Break (or CTRL_BREAK_EVENT to a CREATE_NEW_PROCESS_GROUP child)
+    # terminates Python without running atexit, leaving the MATLAB runner
+    # orphaned. Used by the zombie-repro test harness; harmless otherwise.
+    if hasattr(signal, 'SIGBREAK'):
+        signal.signal(signal.SIGBREAK, _on_sigint)
 
     app.mainloop()
 
