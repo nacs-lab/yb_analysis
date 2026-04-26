@@ -150,6 +150,10 @@ class ZmqClient:
             except (UnicodeDecodeError, Exception):
                 return self._au.SeqStatus.Unknown
         self._au._AnalysisUser__update_status = _safe_update_status
+        # Disable AnalysisUser worker's get_imgs path: it uses AnalysisClient
+        # which can't recover from socket timeouts. grab_imgs uses _q_sock
+        # directly (same socket as camera/queue ops, which auto-recreates).
+        self._au.AC.get_imgs = lambda *a, **kw: None
         # Dedicated queue-ops socket guarded by a lock (GUI reads concurrently)
         self._q_lock = threading.Lock()
         self._q_ctx = zmq.Context.instance()
@@ -308,26 +312,22 @@ class ZmqClient:
             scan_ids : ndarray of int64
             seq_ids : ndarray of int64
         """
-        raw_batches = self._au.grab_imgs()
-
-        all_imgs = []
-        all_scan_ids = []
-        all_seq_ids = []
-
-        for raw in raw_batches:
-            if raw is None:
-                continue
-            # raw is an array.array('d', ...) from AnalysisClient.get_imgs()
-            info = _process_imgs(raw)
-            all_imgs.extend(info['imgs'])
-            if len(info['scan_ids']) > 0:
-                all_scan_ids.extend(info['scan_ids'])
-                all_seq_ids.extend(info['seq_ids'])
-
+        empty = {
+            'imgs': [],
+            'scan_ids': np.array([], dtype=np.int64),
+            'seq_ids': np.array([], dtype=np.int64),
+        }
+        try:
+            raw = self._q_call('get_imgs', reply='bytes', timeout_ms=5000)
+        except Exception:
+            return empty
+        if not raw:
+            return empty
+        info = _process_imgs(array.array('d', raw))
         return {
-            'imgs': all_imgs,
-            'scan_ids': np.array(all_scan_ids, dtype=np.int64) if all_scan_ids else np.array([], dtype=np.int64),
-            'seq_ids': np.array(all_seq_ids, dtype=np.int64) if all_seq_ids else np.array([], dtype=np.int64),
+            'imgs': info['imgs'],
+            'scan_ids': np.array(info['scan_ids'], dtype=np.int64) if len(info['scan_ids']) > 0 else np.array([], dtype=np.int64),
+            'seq_ids': np.array(info['seq_ids'], dtype=np.int64) if len(info['seq_ids']) > 0 else np.array([], dtype=np.int64),
         }
 
     def get_status(self):
