@@ -273,6 +273,16 @@ class ZmqClient:
             f'Camera did not report connected within {wait_connected_s:.1f}s '
             f'(last status: {last_status})')
 
+    def camera_apply_settings(self, roi, exposure_time, timeout_ms=5000):
+        """Apply ROI and exposure atomically (single _camera_pending write).
+
+        Use instead of separate camera_set_roi + camera_set_exposure to avoid
+        the overwrite race where the second call clobbers the first before
+        MATLAB's handleCameraCmd can drain the pending slot."""
+        payload = {'roi': list(roi), 'exposure_time': float(exposure_time)}
+        return self._q_call('camera_apply_settings', json.dumps(payload),
+                            timeout_ms=timeout_ms)
+
     def camera_set_roi(self, roi, timeout_ms=5000):
         return self._q_call('camera_set_roi', json.dumps(roi),
                             timeout_ms=timeout_ms)
