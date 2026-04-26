@@ -80,16 +80,7 @@ def main():
     logging.info('Connecting to %s', args.url)
     client = ZmqClient(args.url, refresh_rate=args.refresh)
 
-    # Initialize camera via the runner with ROI + exposure from expConfig.m
-    # (expConfig is canonical — startup always seeds the hardware from it).
     orca_cfg = read_orca_config()
-    logging.info('Initializing camera (ROI=%s, Exposure=%g s)...',
-                 orca_cfg['roi'], orca_cfg['exposure_time'])
-    try:
-        client.camera_init(orca_cfg['roi'],
-                           exposure_time=orca_cfg['exposure_time'])
-    except Exception as e:
-        logging.warning('Camera init failed: %s (continue without camera)', e)
     dashboard = DashboardRenderer(port=args.port)
 
     def _cleanup():
@@ -128,6 +119,11 @@ def main():
     app = ControlPanel(client, dashboard)
     app._camera_pane.set_roi(orca_cfg['roi'])
     app._camera_pane.set_exposure(orca_cfg['exposure_time'])
+    # Kick off camera init in the background so the GUI shows "Connecting..."
+    # from its very first render instead of blocking before the window opens.
+    logging.info('Starting camera init in background (ROI=%s, Exposure=%g s)...',
+                 orca_cfg['roi'], orca_cfg['exposure_time'])
+    app._camera_pane._on_connect()
 
     # Ctrl-C in the terminal: route through the UI's normal close path so
     # the dashboard + runner shut down cleanly.
