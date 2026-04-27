@@ -35,74 +35,88 @@ def _today_day_dir():
 
 
 def load_background_data():
-    """Load background data from day folder or fallback to latest scan config.
+    """Auto-select and load background data from the most recent valid day folder.
 
-    Returns plot-ready dict or None.
+    Walks back up to 30 days from today, then falls back to the latest scan
+    config .mat file.
+
+    Returns (data, source_dir) where source_dir is the Data/YYYYMMDD path used
+    (or None if loaded from a scan config fallback), and data is the plot-ready
+    dict (or None if nothing was found).
     """
-    # Try day folder first
-    data = _load_from_day_folder()
-    if data is not None:
-        return data
-
-    # Fallback: most recent scan config
-    return _load_from_scan_config()
-
-
-def _load_from_day_folder():
-    """Load from today's (or yesterday's) day folder files."""
     data_dir = os.path.join(PATH_PREFIX, 'Data')
-
     for delta in range(30):
         day = (datetime.now() - timedelta(days=delta)).strftime('%Y%m%d')
         day_dir = os.path.join(data_dir, day)
-        if not os.path.isdir(day_dir):
-            continue
+        data, _ = load_from_dir(day_dir)
+        if data is not None:
+            return data, day_dir
 
-        grid_file = os.path.join(day_dir, 'gridLocations.txt')
-        thresh_file = os.path.join(day_dir, 'threshold.mat')
-        hist_file = os.path.join(day_dir, 'histData.mat')
+    data = _load_from_scan_config()
+    return data, None
 
-        # Need at least grid + thresholds
-        if not os.path.isfile(grid_file) or not os.path.isfile(thresh_file):
-            continue
 
-        logger.info('Loading background from day folder: %s', day_dir)
+def load_from_dir(day_dir):
+    """Load grid + thresholds from a specific directory.
 
-        # Grid
+    Returns (data_dict, status_msg).  data_dict is None on failure and
+    status_msg explains what happened or how many sites were loaded.
+    """
+    if not os.path.isdir(day_dir):
+        return None, 'Folder not found'
+
+    grid_file = os.path.join(day_dir, 'gridLocations.txt')
+    thresh_file = os.path.join(day_dir, 'threshold.mat')
+    hist_file = os.path.join(day_dir, 'histData.mat')
+
+    if not os.path.isfile(grid_file):
+        return None, 'Missing gridLocations.txt'
+    if not os.path.isfile(thresh_file):
+        return None, 'Missing threshold.mat'
+
+    logger.info('Loading background from day folder: %s', day_dir)
+
+    try:
+        grid = np.loadtxt(grid_file, skiprows=1)
+        if grid.ndim == 1:
+            grid = grid.reshape(1, -1)
+    except Exception as e:
+        return None, f'Failed to load grid: {e}'
+
+    try:
+        from scipy.io import loadmat
+        td = loadmat(thresh_file, squeeze_me=True)
+        thresholds = np.asarray(td['thresholds'], dtype=np.float64).ravel()
+        infidelities = np.asarray(td['infidelities'], dtype=np.float64).ravel()
+        gauss_fits = _parse_gauss_fits_struct(td.get('gaussFitsStruct'))
+    except Exception as e:
+        return None, f'Failed to load thresholds: {e}'
+
+    num_sites = len(thresholds)
+
+    bg_hist_data = None
+    if os.path.isfile(hist_file):
         try:
-            grid = np.loadtxt(grid_file, skiprows=1)
-            if grid.ndim == 1:
-                grid = grid.reshape(1, -1)
+            from scipy.io import loadmat as lm
+            hd = lm(hist_file, squeeze_me=True)
+            bg_hist_data = _parse_hist_data_struct(hd.get('histData'), num_sites)
         except Exception as e:
-            logger.warning('Failed to load grid: %s', e)
-            continue
+            logger.warning('Failed to load histData: %s', e)
 
-        # Thresholds
-        try:
-            from scipy.io import loadmat
-            td = loadmat(thresh_file, squeeze_me=True)
-            thresholds = np.asarray(td['thresholds'], dtype=np.float64).ravel()
-            infidelities = np.asarray(td['infidelities'], dtype=np.float64).ravel()
-            gauss_fits = _parse_gauss_fits_struct(td.get('gaussFitsStruct'))
-        except Exception as e:
-            logger.warning('Failed to load thresholds: %s', e)
-            continue
+    data = _build_plot_data(grid, thresholds, infidelities, gauss_fits,
+                            bg_hist_data, num_sites)
+    return data, f'{num_sites} sites loaded'
 
-        num_sites = len(thresholds)
 
-        # Histograms (optional)
-        bg_hist_data = None
-        if os.path.isfile(hist_file):
-            try:
-                from scipy.io import loadmat as lm
-                hd = lm(hist_file, squeeze_me=True)
-                bg_hist_data = _parse_hist_data_struct(hd.get('histData'), num_sites)
-            except Exception as e:
-                logger.warning('Failed to load histData: %s', e)
-
-        return _build_plot_data(grid, thresholds, infidelities, gauss_fits,
-                                bg_hist_data, num_sites)
-
+def _load_from_day_folder():
+    """Walk back up to 30 days and return the first valid day folder's data."""
+    data_dir = os.path.join(PATH_PREFIX, 'Data')
+    for delta in range(30):
+        day = (datetime.now() - timedelta(days=delta)).strftime('%Y%m%d')
+        day_dir = os.path.join(data_dir, day)
+        data, _ = load_from_dir(day_dir)
+        if data is not None:
+            return data
     return None
 
 

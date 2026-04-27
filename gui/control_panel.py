@@ -66,15 +66,17 @@ _STATUS_COLORS = {
 
 class ControlPanel(tk.Tk):
 
-    def __init__(self, zmq_client, dashboard=None):
+    def __init__(self, zmq_client, dashboard=None, init_dir=None, init_status=''):
         super().__init__()
         self.title('Yb Experiment Control')
-        self.geometry('680x600')
-        self.minsize(560, 480)
+        self.geometry('600x600')
+        self.minsize(480, 480)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._client = zmq_client
         self._dashboard = dashboard
+        self._init_dir = init_dir
+        self._init_status = init_status
         self._cur_scan_id = 0
         self._cur_seq_id = 0
         self._refresh_ms = 2000
@@ -152,12 +154,13 @@ class ControlPanel(tk.Tk):
         ttk.Label(gi, text='File:', font=_FONT_SM).grid(
             row=2, column=0, sticky='nw', padx=(0, 4))
         self._lbl_file = ttk.Label(gi, text='--', font=_FONT_SM,
-                                   wraplength=260)
+                                   wraplength=0)
         self._lbl_file.grid(row=2, column=1, sticky='w')
 
         self._lbl_save_err = ttk.Label(gi, text='', font=_FONT_SM,
-                                        foreground='red', wraplength=260)
+                                        foreground='red', wraplength=190)
         self._lbl_save_err.grid(row=3, column=0, columnspan=2, sticky='w')
+        self._lbl_save_err.grid_remove()
 
         rf = ttk.Frame(gi)
         rf.grid(row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
@@ -166,6 +169,16 @@ class ControlPanel(tk.Tk):
         self._rate_entry.insert(0, str(self._refresh_ms // 1000))
         self._rate_entry.pack(side='left', padx=4)
         self._rate_entry.bind('<Return>', self._on_rate)
+
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
+
+        # ---- Init folder selector ----
+        from yb_analysis.gui.init_pane import InitPane
+        self._init_pane = InitPane(
+            self, on_change=self._on_init_loaded,
+            init_dir=self._init_dir, init_status=self._init_status,
+        )
+        self._init_pane.pack(fill='x', padx=10, pady=(2, 4))
 
         ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
 
@@ -200,6 +213,10 @@ class ControlPanel(tk.Tk):
             mm.close()
         else:
             self._client.abort_seq()
+
+    def _on_init_loaded(self, data):
+        if self._dashboard and data is not None:
+            self._dashboard.update(data)
 
     def _on_rate(self, _=None):
         try:
@@ -314,6 +331,7 @@ class ControlPanel(tk.Tk):
                 dm.update_data()
                 if self._dashboard:
                     self._dashboard.update(dm.get_plot_data())
+                self.after(0, self._init_pane.set_is_init_scan, dm.is_init)
                 fname = ''
                 save_err = ''
                 try:
@@ -328,15 +346,22 @@ class ControlPanel(tk.Tk):
             start = end
 
     def _update_labels(self, fname='', save_err=''):
+        from yb_analysis.config import PATH_PREFIX
         self._lbl_scan.config(text=str(self._cur_scan_id))
         self._lbl_seq.config(text=str(self._cur_seq_id))
         if fname:
-            self._lbl_file.config(text=fname)
+            try:
+                display = os.path.relpath(os.path.dirname(fname), PATH_PREFIX)
+            except ValueError:
+                display = os.path.dirname(fname)
+            self._lbl_file.config(text=display)
         # Sticky error indicator — clears only when the next save succeeds
         if save_err:
             self._lbl_save_err.config(text=save_err)
+            self._lbl_save_err.grid()
         elif fname:
             self._lbl_save_err.config(text='')
+            self._lbl_save_err.grid_remove()
 
     # ------------------------------------------------------------ Shutdown
 

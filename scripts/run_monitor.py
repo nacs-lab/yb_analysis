@@ -108,15 +108,18 @@ def main():
 
     atexit.register(_cleanup)
 
-    bg_data = load_background_data()
+    bg_data, init_dir = load_background_data()
     if bg_data is not None:
         logging.info('Loaded background: %d sites, thresholds + grid', bg_data['num_sites'])
+        init_status = f'{bg_data["num_sites"]} sites loaded'
         dashboard.update(bg_data)
     else:
+        init_dir = None
+        init_status = 'No data found'
         dashboard.start()
 
     logging.info('Dashboard at http://localhost:%d', args.port)
-    app = ControlPanel(client, dashboard)
+    app = ControlPanel(client, dashboard, init_dir=init_dir, init_status=init_status)
     app._camera_pane.set_roi(orca_cfg['roi'])
     app._camera_pane.set_exposure(orca_cfg['exposure_time'])
     # Kick off camera init in the background so the GUI shows "Connecting..."
