@@ -69,8 +69,8 @@ class ControlPanel(tk.Tk):
     def __init__(self, zmq_client, dashboard=None, init_dir=None, init_status=''):
         super().__init__()
         self.title('Yb Experiment Control')
-        self.geometry('600x600')
-        self.minsize(480, 480)
+        self.geometry('640x720')
+        self.minsize(520, 560)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
         self._client = zmq_client

@@ -126,3 +126,6 @@ UPDATE_THRES_BATCH_SIZE = 200
 UPDATE_LOADING_INTERVAL = 50  # update loading rates every 50 shots (like grid)
 UPDATE_HIST_BATCH_SIZE = 2000  # accumulate this many shots for histogram
 UPDATE_HIST_INTERVAL = 200     # recompute histograms every N shots
+
+# Number of completed scans shown in the queue history panel
+QUEUE_HISTORY_DISPLAY = 30

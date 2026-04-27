@@ -9,6 +9,8 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
+from yb_analysis import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -256,19 +258,33 @@ class QueuePane(ttk.LabelFrame):
         self._schedule_refresh()
 
     def _build(self):
-        top = ttk.Frame(self)
-        top.pack(fill='both', expand=True, padx=4, pady=(4, 2))
+        # Style scoped to this pane: taller rows, padded headings.
+        style = ttk.Style(self)
+        style.configure('Queue.Treeview', rowheight=22)
+        style.configure('Queue.Treeview.Heading', padding=(4, 4))
+
+        # Vertical split: queue list (top) and selection detail (bottom).
+        paned = ttk.PanedWindow(self, orient='vertical')
+        paned.pack(fill='both', expand=True, padx=6, pady=(4, 6))
+
+        # ---- Top: tree + buttons ----
+        tree_section = ttk.Frame(paned)
+        paned.add(tree_section, weight=3)
+
+        tree_wrap = ttk.Frame(tree_section)
+        tree_wrap.pack(fill='both', expand=True, padx=2, pady=(2, 4))
 
         self._tree = ttk.Treeview(
-            top, columns=[c[0] for c in _COLUMNS], show='headings',
-            height=8, selectmode='browse')
+            tree_wrap, columns=[c[0] for c in _COLUMNS], show='headings',
+            height=8, selectmode='browse', style='Queue.Treeview')
         for cid, title, width, anchor, stretch in _COLUMNS:
             self._tree.heading(cid, text=title)
             self._tree.column(cid, width=width, minwidth=width,
                               anchor=anchor, stretch=stretch)
         self._tree.pack(side='left', fill='both', expand=True)
 
-        sb = ttk.Scrollbar(top, orient='vertical', command=self._tree.yview)
+        sb = ttk.Scrollbar(tree_wrap, orient='vertical',
+                           command=self._tree.yview)
         sb.pack(side='right', fill='y')
         self._tree.configure(yscrollcommand=sb.set)
 
@@ -284,8 +300,8 @@ class QueuePane(ttk.LabelFrame):
         # Click to show detail in bottom pane
         self._tree.bind('<<TreeviewSelect>>', self._on_select)
 
-        btn_row = ttk.Frame(self)
-        btn_row.pack(fill='x', padx=4, pady=(0, 2))
+        btn_row = ttk.Frame(tree_section)
+        btn_row.pack(fill='x', padx=2, pady=(2, 2))
         ttk.Button(btn_row, text='Up', command=lambda: self._move('up')).pack(
             side='left', padx=2)
         ttk.Button(btn_row, text='Down', command=lambda: self._move('down')).pack(
@@ -295,11 +311,22 @@ class QueuePane(ttk.LabelFrame):
         self._status = ttk.Label(btn_row, text='')
         self._status.pack(side='right')
 
-        self._detail = tk.Label(
-            self, text='', anchor='nw', justify='left', wraplength=640,
-            font=('Consolas', 9), fg='#333333', bg='#f5f5f5',
-            relief='solid', bd=1, padx=6, pady=4)
-        self._detail.pack(fill='x', padx=4, pady=(0, 4))
+        # ---- Bottom: scrollable detail ----
+        detail_section = ttk.Frame(paned, relief='solid', borderwidth=1)
+        paned.add(detail_section, weight=1)
+
+        self._detail = tk.Text(
+            detail_section, height=6, wrap='word',
+            font=('Consolas', 9), fg='#333333', bg='#fafafa',
+            relief='flat', borderwidth=0, padx=8, pady=6,
+            state='disabled', cursor='arrow',
+            highlightthickness=0)
+        self._detail.pack(side='left', fill='both', expand=True)
+
+        detail_sb = ttk.Scrollbar(detail_section, orient='vertical',
+                                  command=self._detail.yview)
+        detail_sb.pack(side='right', fill='y')
+        self._detail.configure(yscrollcommand=detail_sb.set)
 
     # --- Tooltip ---
 
@@ -350,12 +377,17 @@ class QueuePane(ttk.LabelFrame):
             return '\n'.join(parts)
 
         if col_id == 'reps':
-            flags = []
+            lines = []
+            total = summary.get('total_per_group')
+            nseqs = summary.get('nseqs')
+            if total and nseqs:
+                rep = total // nseqs if nseqs else total
+                lines.append(f'total = {total}  ({rep} rep x {nseqs} pt)')
             for k in ('num_per_group', 'num_images', 'scramble',
                       'is_init', 'is_hc', 'rearrangement'):
                 if k in summary:
-                    flags.append(f'{k}={_pretty_value(summary[k])}')
-            return '\n'.join(flags) if flags else ''
+                    lines.append(f'{k}={_pretty_value(summary[k])}')
+            return '\n'.join(lines) if lines else ''
 
         return ''
 
@@ -426,6 +458,11 @@ class QueuePane(ttk.LabelFrame):
 
         file_id = entry.get('file_id') or ''
 
+        # Reps is the actual sequence count after ybBuildScanJob's StackNum
+        # stacking (each scan point repeats >=2x). Fall back to the user's
+        # NumPerGroup if total_per_group isn't in the summary (older runner).
+        reps = summary.get('total_per_group') or summary.get('num_per_group')
+
         return (
             (
                 marker,
@@ -433,7 +470,7 @@ class QueuePane(ttk.LabelFrame):
                 scan_name,
                 entry.get('seqName') or '--',
                 _format_axes_short(summary.get('axes')),
-                _pretty_value(summary.get('num_per_group')) if summary.get('num_per_group') else '--',
+                _pretty_value(reps) if reps else '--',
                 file_id,
                 added_cell,
                 status_cell,
@@ -443,6 +480,7 @@ class QueuePane(ttk.LabelFrame):
 
     def _render(self, q):
         saved_id = self._selected_job_id()
+        saved_yview = self._tree.yview()
 
         for iid in self._tree.get_children():
             self._tree.delete(iid)
@@ -468,7 +506,7 @@ class QueuePane(ttk.LabelFrame):
                 values=('', '', '-- history --', '', '', '', '', '', ''),
                 tags=('sep',))
             self._entry_by_iid[sep_iid] = None
-            for e in hist[:10]:
+            for e in hist[:config.QUEUE_HISTORY_DISPLAY]:
                 values, tag = self._row(e, is_history=True)
                 iid = self._tree.insert('', 'end', values=values,
                                         tags=(tag,) if tag else ())
@@ -478,8 +516,9 @@ class QueuePane(ttk.LabelFrame):
             for iid, entry in self._entry_by_iid.items():
                 if entry and entry.get('id') == saved_id:
                     self._tree.selection_set(iid)
-                    self._tree.see(iid)
                     break
+
+        self._tree.yview_moveto(saved_yview[0])
 
         total = len(q.get('queued', []))
         if running:
@@ -506,11 +545,14 @@ class QueuePane(ttk.LabelFrame):
 
     def _on_select(self, _event=None):
         e = self._selected_entry()
-        if not e or not e.get('summary'):
-            self._detail.config(text='')
-            return
-        text = _format_detail(e['summary']) or ''
-        self._detail.config(text=text)
+        text = ''
+        if e and e.get('summary'):
+            text = _format_detail(e['summary']) or ''
+        self._detail.configure(state='normal')
+        self._detail.delete('1.0', 'end')
+        if text:
+            self._detail.insert('1.0', text)
+        self._detail.configure(state='disabled')
 
     def _move(self, direction):
         jid, _ = self._selected_queued()
