@@ -253,6 +253,11 @@ class QueuePane(ttk.LabelFrame):
         self._poll_busy = False
         self._offline = False
         self._entry_by_iid = {}
+        # Stable-key -> Treeview iid. Lets _render diff against the existing
+        # tree (insert/move/update/delete) instead of clearing and rebuilding
+        # every poll, which would drop selection, scroll position, and the
+        # hover tooltip's iid reference.
+        self._iid_by_key = {}
 
         self._build()
         self._schedule_refresh()
@@ -479,51 +484,62 @@ class QueuePane(ttk.LabelFrame):
         )
 
     def _render(self, q):
-        saved_id = self._selected_job_id()
-        saved_yview = self._tree.yview()
+        desired = self._compute_desired(q)
+        desired_keys = {key for key, _, _, _ in desired}
 
-        for iid in self._tree.get_children():
-            self._tree.delete(iid)
-        self._entry_by_iid.clear()
+        # Drop rows that are no longer present.
+        for key in list(self._iid_by_key):
+            if key not in desired_keys:
+                iid = self._iid_by_key.pop(key)
+                self._entry_by_iid.pop(iid, None)
+                self._tree.delete(iid)
 
-        running = q.get('running')
-        if running:
-            values, tag = self._row(running, is_running=True)
-            iid = self._tree.insert('', 'end', values=values,
-                                    tags=(tag,) if tag else ())
-            self._entry_by_iid[iid] = running
-
-        for e in q.get('queued', []):
-            values, tag = self._row(e)
-            iid = self._tree.insert('', 'end', values=values,
-                                    tags=(tag,) if tag else ())
-            self._entry_by_iid[iid] = e
-
-        hist = q.get('history') or []
-        if hist:
-            sep_iid = self._tree.insert(
-                '', 'end',
-                values=('', '', '-- history --', '', '', '', '', '', ''),
-                tags=('sep',))
-            self._entry_by_iid[sep_iid] = None
-            for e in hist[:config.QUEUE_HISTORY_DISPLAY]:
-                values, tag = self._row(e, is_history=True)
-                iid = self._tree.insert('', 'end', values=values,
-                                        tags=(tag,) if tag else ())
-                self._entry_by_iid[iid] = e
-
-        if saved_id is not None:
-            for iid, entry in self._entry_by_iid.items():
-                if entry and entry.get('id') == saved_id:
-                    self._tree.selection_set(iid)
-                    break
-
-        self._tree.yview_moveto(saved_yview[0])
+        # Insert / move / update each row in the desired position.
+        for index, (key, values, tag, entry) in enumerate(desired):
+            tags = (tag,) if tag else ()
+            iid = self._iid_by_key.get(key)
+            if iid is None:
+                iid = self._tree.insert('', index, values=values, tags=tags)
+                self._iid_by_key[key] = iid
+            else:
+                if self._tree.index(iid) != index:
+                    self._tree.move(iid, '', index)
+                if tuple(self._tree.item(iid, 'values')) != tuple(values):
+                    self._tree.item(iid, values=values)
+                if tuple(self._tree.item(iid, 'tags')) != tags:
+                    self._tree.item(iid, tags=tags)
+            self._entry_by_iid[iid] = entry
 
         total = len(q.get('queued', []))
-        if running:
+        if q.get('running'):
             total += 1
         self._status.config(text=f'{total} in queue', foreground='black')
+
+    def _compute_desired(self, q):
+        """Build the (key, values, tag, entry) list for the next render, in
+        display order. Stable keys: ('job', id) for jobs, ('sep',) for the
+        history separator. Entries without an id are skipped (shouldn't
+        happen — server always assigns ids)."""
+        out = []
+        running = q.get('running')
+        if running and running.get('id') is not None:
+            values, tag = self._row(running, is_running=True)
+            out.append((('job', running['id']), values, tag, running))
+        for e in q.get('queued', []):
+            if e.get('id') is None:
+                continue
+            values, tag = self._row(e)
+            out.append((('job', e['id']), values, tag, e))
+        hist = q.get('history') or []
+        if hist:
+            sep_values = ('', '', '-- history --', '', '', '', '', '', '')
+            out.append((('sep',), sep_values, 'sep', None))
+            for e in hist[:config.QUEUE_HISTORY_DISPLAY]:
+                if e.get('id') is None:
+                    continue
+                values, tag = self._row(e, is_history=True)
+                out.append((('job', e['id']), values, tag, e))
+        return out
 
     # --- Selection / actions ---
 
@@ -532,10 +548,6 @@ class QueuePane(ttk.LabelFrame):
         if not sel:
             return None
         return self._entry_by_iid.get(sel[0])
-
-    def _selected_job_id(self):
-        e = self._selected_entry()
-        return e.get('id') if e else None
 
     def _selected_queued(self):
         e = self._selected_entry()
