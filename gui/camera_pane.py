@@ -66,7 +66,6 @@ class CameraPane(ttk.LabelFrame):
             var = tk.StringVar(value='0')
             e = ttk.Entry(rf, textvariable=var, width=6)
             e.grid(row=0, column=i * 2 + 1, padx=(0, 4))
-            e.bind('<Return>', self._on_apply_roi)
             self._roi_vars[label] = var
             self._roi_entries[label] = e
 
@@ -77,7 +76,6 @@ class CameraPane(ttk.LabelFrame):
         self._exposure_var = tk.StringVar(value='0.1')
         self._exposure_entry = ttk.Entry(ef, textvariable=self._exposure_var, width=10)
         self._exposure_entry.pack(side='left', padx=(0, 4))
-        self._exposure_entry.bind('<Return>', self._on_apply_exposure)
 
         # Buttons
         bf = ttk.Frame(self)
@@ -161,50 +159,6 @@ class CameraPane(ttk.LabelFrame):
             self._cmd_pending = False
             self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
 
-    def _on_apply_roi(self, _event=None):
-        try:
-            roi = self.get_roi()
-        except ValueError:
-            self._lbl_error.config(text='Bad ROI values')
-            return
-        self._lbl_error.config(text='')
-        self._lbl_status.config(text='Updating ROI...', foreground='orange')
-        self._cmd_pending = True
-        self._pending_persist_roi = list(roi)
-        threading.Thread(target=self._do_set_roi, args=(roi,),
-                         daemon=True).start()
-
-    def _do_set_roi(self, roi):
-        try:
-            self._client.camera_set_roi(roi)
-        except Exception as e:
-            self._pending_persist_roi = None
-            self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
-        self.after(0, self._clear_cmd_pending)
-
-    def _on_apply_exposure(self, _event=None):
-        try:
-            exposure = self.get_exposure()
-            if not (exposure > 0):
-                raise ValueError
-        except ValueError:
-            self._lbl_error.config(text='Bad exposure value')
-            return
-        self._lbl_error.config(text='')
-        self._lbl_status.config(text='Updating exposure...', foreground='orange')
-        self._cmd_pending = True
-        self._pending_persist_exposure = float(exposure)
-        threading.Thread(target=self._do_set_exposure, args=(exposure,),
-                         daemon=True).start()
-
-    def _do_set_exposure(self, exposure):
-        try:
-            self._client.camera_set_exposure(exposure)
-        except Exception as e:
-            self._pending_persist_exposure = None
-            self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
-        self.after(0, self._clear_cmd_pending)
-
     def _on_apply_all(self, _event=None):
         # Read and validate all values first, before any poll callback can
         # overwrite fields (poll runs in main thread via after(), so it cannot
@@ -237,7 +191,18 @@ class CameraPane(ttk.LabelFrame):
             self._pending_persist_roi = None
             self._pending_persist_exposure = None
             self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
-        self.after(0, self._clear_cmd_pending)
+            self.after(0, self._clear_cmd_pending)
+            return
+        # The ZMQ ack is a queue-ack only — the runner applies asynchronously,
+        # so we must NOT clear _cmd_pending here or the next poll would flip
+        # status to "Connected" before the camera has actually reconfigured.
+        # _maybe_persist clears _cmd_pending once the server reports the new
+        # values. The watchdog below covers two cases _maybe_persist can't:
+        # (a) MATLAB reports a server-side error (err set, persist condition
+        # rejects), and (b) the camera snaps ROI/exposure to a hardware grid
+        # so the exact-match check never succeeds. Without it, the UI would
+        # stay on "Applying settings..." until the user clicked Connect.
+        self.after(8000, self._clear_cmd_pending)
 
     def _clear_cmd_pending(self):
         self._cmd_pending = False
@@ -279,8 +244,8 @@ class CameraPane(ttk.LabelFrame):
         prev_server_exposure = self._last_server_exposure
 
         # connect/disconnect: detect completion via connection-state change.
-        # Setting commands (set_roi/set_exposure) clear _cmd_pending directly
-        # from the worker thread after the synchronous ZMQ call returns.
+        # apply_settings completion is signaled by _maybe_persist clearing
+        # both persist slots once the server reports the requested values.
         if self._cmd_pending and connected != self._connected:
             self._cmd_pending = False
 
@@ -361,6 +326,7 @@ class CameraPane(ttk.LabelFrame):
         previous command shouldn't cancel a later successful apply.  Pending
         slots are overwritten in the main thread on each new Apply, so they
         can't accumulate."""
+        cleared = False
         if self._pending_persist_roi is not None:
             if (connected and not err
                     and list(roi) == list(self._pending_persist_roi)):
@@ -369,6 +335,7 @@ class CameraPane(ttk.LabelFrame):
                 except Exception as e:
                     logger.warning('write_orca_roi failed: %s', e)
                 self._pending_persist_roi = None
+                cleared = True
         if self._pending_persist_exposure is not None and exposure is not None:
             requested = float(self._pending_persist_exposure)
             actual = float(exposure)
@@ -383,3 +350,13 @@ class CameraPane(ttk.LabelFrame):
                 except Exception as e:
                     logger.warning('write_orca_exposure failed: %s', e)
                 self._pending_persist_exposure = None
+                cleared = True
+        # Drop _cmd_pending once the server has confirmed every requested
+        # change. Gated on `cleared` so a stale poll (slots already None
+        # from before) doesn't prematurely clear an in-flight Disconnect,
+        # which never sets persist slots and relies on the connection-
+        # state-change check above to clear _cmd_pending.
+        if (cleared and self._cmd_pending
+                and self._pending_persist_roi is None
+                and self._pending_persist_exposure is None):
+            self._cmd_pending = False

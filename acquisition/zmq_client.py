@@ -247,14 +247,6 @@ class ZmqClient:
         with self._lock:
             return self._client.camera_apply_settings(roi, exposure_time, timeout_ms)
 
-    def camera_set_roi(self, roi, timeout_ms=5000):
-        with self._lock:
-            return self._client.camera_set_roi(roi, timeout_ms)
-
-    def camera_set_exposure(self, exposure_time, timeout_ms=5000):
-        with self._lock:
-            return self._client.camera_set_exposure(exposure_time, timeout_ms)
-
     def camera_close(self, timeout_ms=5000):
         with self._lock:
             return self._client.camera_close(timeout_ms)
