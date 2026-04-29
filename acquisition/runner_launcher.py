@@ -86,13 +86,27 @@ class RunnerLauncher:
         ]
         if os.name == 'nt':
             cmd += ['-wait', '-minimize']
-        # Optional MATLAB stdout capture for debugging shutdown hangs.
-        # Set YB_MATLAB_LOGFILE to a path to enable. NOTE: -logfile causes
-        # MATLAB to flush stdout to the file synchronously, which is what
-        # makes shutdown hangs visible.
-        log_path = os.environ.get('YB_MATLAB_LOGFILE')
-        if log_path:
-            cmd += ['-logfile', log_path]
+        # MATLAB stdout capture. Defaults to
+        #   <project_root>/log/matlab_log/runner_<timestamp>.log
+        # so each runner session leaves a record on disk; previous sessions'
+        # logs are preserved (MATLAB's -logfile truncates per session, so we
+        # use a per-launch filename). Override with the env var
+        # YB_MATLAB_LOGFILE — '%t' in that path is substituted with the
+        # launch timestamp.
+        # NOTE: -logfile flushes synchronously, which is what makes shutdown
+        # hangs visible. Cost is negligible on a local SSD; avoid network paths.
+        log_path = os.environ.get('YB_MATLAB_LOGFILE') or os.path.join(
+            os.path.dirname(self._root),
+            'log', 'matlab_log', 'runner_%t.log')
+        log_path = log_path.replace('%t', time.strftime('%Y%m%d_%H%M%S'))
+        log_dir = os.path.dirname(log_path)
+        if log_dir and not os.path.isdir(log_dir):
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+            except OSError:
+                pass
+        cmd += ['-logfile', log_path]
+        logger.info('MATLAB logfile: %s', log_path)
         # Pass the URL explicitly so Python and MATLAB can never drift —
         # escape single quotes inside the URL for MATLAB's string literal.
         url_esc = self._url.replace("'", "''")
