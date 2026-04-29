@@ -1,22 +1,19 @@
 """ZMQ client wrapper with numpy conversion.
 
-Wraps existing AnalysisUser.py / AnalysisClient.py with numpy-aware interfaces.
-The existing Python ZMQ layer returns raw array.array('d', ...) blobs; this
-module converts them into structured numpy arrays.
+Thin GUI-side wrapper around ExptClient (matlab_new/YbExpServer/ExptClient.py).
+Adds numpy conversion for the image stream, the camera_init wait-for-connected
+wrapper, status string-to-int translation, and a single lock to serialize REQ
+access from multiple GUI threads.
 """
 
-import json
 import sys
 import os
-import array
 import threading
 import time
 import numpy as np
-import zmq
 
-# Add the YbExpServer directory to sys.path so we can import AnalysisUser /
-# AnalysisClient / ExptClient. yb_analysis/acquisition/ → repo_root →
-# matlab_new/YbExpServer.
+# Add the YbExpServer directory to sys.path so we can import ExptClient.
+# yb_analysis/acquisition/ -> repo_root -> matlab_new/YbExpServer.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CANDIDATES = [
     os.path.normpath(os.path.join(_THIS_DIR, '..', '..', 'matlab_new', 'YbExpServer')),
@@ -24,19 +21,28 @@ _CANDIDATES = [
     r'C:\msys64\home\Ybtweezer-PC2\projects\experiment-control\matlab_new\YbExpServer',
 ]
 _EXPSERVER_DIR = next(
-    (p for p in _CANDIDATES if os.path.isfile(os.path.join(p, 'AnalysisUser.py'))),
+    (p for p in _CANDIDATES if os.path.isfile(os.path.join(p, 'ExptClient.py'))),
     None)
 if _EXPSERVER_DIR is None:
     raise ImportError(
-        "Could not locate AnalysisUser.py. Checked: " + ", ".join(_CANDIDATES))
+        "Could not locate ExptClient.py. Checked: " + ", ".join(_CANDIDATES))
 if _EXPSERVER_DIR not in sys.path:
     sys.path.insert(0, _EXPSERVER_DIR)
 
-from AnalysisUser import AnalysisUser  # noqa: E402
+from ExptClient import ExptClient  # noqa: E402
+
+
+# ExptServer returns one of these strings; ZmqClient.get_status returns the
+# int code so callers (control_panel._STATUS) can dispatch.
+_STATUS_STR_TO_INT = {
+    'Sequence is stopped': 0,
+    'Sequence is running': 1,
+    'Sequence is paused': 2,
+}
 
 
 def _process_imgs(raw_data):
-    """Parse the flat double array returned by AnalysisClient.get_imgs().
+    """Parse the flat double array returned by ExptClient.get_imgs().
 
     Wire format (from ExptServer.py):
         [num_seqs, <per-sequence blocks>]
@@ -54,10 +60,7 @@ def _process_imgs(raw_data):
     if raw_data is None or len(raw_data) == 0:
         return {'imgs': [], 'scan_ids': [], 'seq_ids': []}
 
-    if isinstance(raw_data, array.array):
-        res = np.array(raw_data, dtype=np.float64)
-    else:
-        res = np.asarray(raw_data, dtype=np.float64)
+    res = np.asarray(raw_data, dtype=np.float64)
 
     if res.size == 0:
         return {'imgs': [], 'scan_ids': [], 'seq_ids': []}
@@ -128,98 +131,50 @@ def _process_imgs(raw_data):
 class ZmqClient:
     """High-level ZMQ client for experiment control.
 
-    Wraps AnalysisUser with numpy conversions and a clean API.
+    Wraps ExptClient with numpy conversions, status string-to-int translation,
+    a serialization lock, and the camera_init wait-for-connected wrapper.
 
     Parameters
     ----------
     url : str
-        ZMQ server URL (default: tcp://127.0.0.1:8889).
-    refresh_rate : float
-        How often the background worker polls for new images (seconds).
+        ZMQ server URL (default: tcp://127.0.0.1:1312).
+    refresh_rate : optional
+        Accepted for backwards compatibility (run_monitor.py CLI). Ignored;
+        polling cadence is now owned by individual GUI panes.
     """
 
-    def __init__(self, url='tcp://127.0.0.1:1312', refresh_rate=2.0):
+    def __init__(self, url='tcp://127.0.0.1:1312', refresh_rate=None):
         self._url = url
-        self._au = AnalysisUser(url)
-        self._au.set_refresh_rate(refresh_rate)
-        # Patch AnalysisUser's worker to survive decode errors (ZMQ framing race)
-        _orig_update_status = self._au._AnalysisUser__update_status
-        def _safe_update_status():
-            try:
-                return _orig_update_status()
-            except (UnicodeDecodeError, Exception):
-                return self._au.SeqStatus.Unknown
-        self._au._AnalysisUser__update_status = _safe_update_status
-        # Disable AnalysisUser worker's get_imgs path: it uses AnalysisClient
-        # which can't recover from socket timeouts. grab_imgs uses _q_sock
-        # directly (same socket as camera/queue ops, which auto-recreates).
-        self._au.AC.get_imgs = lambda *a, **kw: None
-        # Dedicated queue-ops socket guarded by a lock (GUI reads concurrently)
-        self._q_lock = threading.Lock()
-        self._q_ctx = zmq.Context.instance()
-        self._q_sock = None
-        self._open_queue_sock()
+        self._client = ExptClient(url)
+        # Multiple GUI threads call into ZmqClient (queue_pane._poll_worker,
+        # camera_pane workers, control_panel._process_loop). REQ has a strict
+        # SEND -> RECV state machine, so all wire access must serialize.
+        self._lock = threading.Lock()
 
-    def _open_queue_sock(self):
-        if self._q_sock is not None:
-            try:
-                self._q_sock.close(linger=0)
-            except Exception:
-                pass
-        self._q_sock = self._q_ctx.socket(zmq.REQ)
-        self._q_sock.setsockopt(zmq.LINGER, 0)
-        self._q_sock.connect(self._url)
-
-    def _q_call(self, *frames, reply='string', timeout_ms=2000):
-        """Send a multi-frame REQ, receive a single reply. On failure the
-        socket is recreated so callers can retry without leaving it in a
-        broken REQ-state."""
-        with self._q_lock:
-            try:
-                for i, f in enumerate(frames):
-                    flags = zmq.SNDMORE if i < len(frames) - 1 else 0
-                    if isinstance(f, str):
-                        self._q_sock.send_string(f, flags)
-                    else:
-                        self._q_sock.send(bytes(f), flags)
-                if self._q_sock.poll(timeout_ms) == 0:
-                    self._open_queue_sock()
-                    raise TimeoutError(f"{frames[0]}: no reply")
-                if reply == 'string':
-                    return self._q_sock.recv_string()
-                elif reply == 'json':
-                    return json.loads(self._q_sock.recv())
-                elif reply == 'int':
-                    return int.from_bytes(self._q_sock.recv(), 'little')
-                else:
-                    return self._q_sock.recv()
-            except TimeoutError:
-                raise
-            except Exception:
-                self._open_queue_sock()
-                raise
+    # -------- Liveness / queue --------
 
     def ping(self, timeout_ms=500):
-        try:
-            return self._q_call('ping', timeout_ms=timeout_ms) == 'pong'
-        except Exception:
-            return False
+        with self._lock:
+            try:
+                return self._client.ping(timeout_ms)
+            except Exception:
+                return False
 
     def submit_job(self, payload):
-        return self._q_call('submit_job', payload, reply='int')
+        with self._lock:
+            return self._client.submit_job(payload)
 
     def queue_list(self, timeout_ms=400):
-        # Short timeout: called ~1 Hz from the UI; when the runner is absent
-        # we want to fail fast rather than pile up outstanding REQs.
-        return self._q_call('queue_list', reply='json', timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.queue_list(timeout_ms)
 
     def queue_remove(self, job_id):
-        return self._q_call(
-            'queue_remove', int(job_id).to_bytes(8, 'little'))
+        with self._lock:
+            return self._client.queue_remove(job_id)
 
     def queue_move(self, job_id, direction):
-        return self._q_call(
-            'queue_move', int(job_id).to_bytes(8, 'little'), direction)
+        with self._lock:
+            return self._client.queue_move(job_id, direction)
 
     # -------- Camera --------
 
@@ -229,11 +184,11 @@ class ZmqClient:
         connected.
 
         Why block: the 'ok' from this ZMQ call is only a queue-ack; MATLAB
-        still spends ~25–30s in imaqreset + OrcaInit before the camera is
+        still spends ~25-30s in imaqreset + OrcaInit before the camera is
         actually usable. If anything else accesses the shared
-        IMAQ/AslDma/DCAM state during that window — e.g. a separate
+        IMAQ/AslDma/DCAM state during that window - e.g. a separate
         `matlab.exe -batch` submitter is booting up to call submit_job,
-        which loads its own IMAQ adaptors — OrcaInit can fail silently:
+        which loads its own IMAQ adaptors - OrcaInit can fail silently:
         the runner never sets `vid` in its base workspace, every
         subsequent scan goes down the "no camera" branch, and frames
         never flow. Empirically this caused ~30% of 2-cycle test runs
@@ -245,13 +200,10 @@ class ZmqClient:
         until `error` is set, or until wait_connected_s elapses. Pass
         wait_connected_s=0 for legacy fire-and-forget behavior.
 
-        `roi` is [x, y, w, h]. `exposure_time` (seconds) is optional —
+        `roi` is [x, y, w, h]. `exposure_time` (seconds) is optional -
         when None the runner uses OrcaInit's default."""
-        payload = {'roi': list(roi)}
-        if exposure_time is not None:
-            payload['exposure_time'] = float(exposure_time)
-        ack = self._q_call('camera_init', json.dumps(payload),
-                           timeout_ms=timeout_ms)
+        with self._lock:
+            ack = self._client.camera_init(roi, exposure_time, timeout_ms)
         if wait_connected_s <= 0:
             return ack
         deadline = time.monotonic() + wait_connected_s
@@ -274,43 +226,39 @@ class ZmqClient:
             f'(last status: {last_status})')
 
     def camera_apply_settings(self, roi, exposure_time, timeout_ms=5000):
-        """Apply ROI and exposure atomically (single _camera_pending write).
-
-        Use instead of separate camera_set_roi + camera_set_exposure to avoid
-        the overwrite race where the second call clobbers the first before
-        MATLAB's handleCameraCmd can drain the pending slot."""
-        payload = {'roi': list(roi), 'exposure_time': float(exposure_time)}
-        return self._q_call('camera_apply_settings', json.dumps(payload),
-                            timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.camera_apply_settings(roi, exposure_time, timeout_ms)
 
     def camera_set_roi(self, roi, timeout_ms=5000):
-        return self._q_call('camera_set_roi', json.dumps(roi),
-                            timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.camera_set_roi(roi, timeout_ms)
 
     def camera_set_exposure(self, exposure_time, timeout_ms=5000):
-        return self._q_call('camera_set_exposure', str(float(exposure_time)),
-                            timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.camera_set_exposure(exposure_time, timeout_ms)
 
     def camera_close(self, timeout_ms=5000):
-        return self._q_call('camera_close', timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.camera_close(timeout_ms)
 
     def camera_status(self, timeout_ms=1000):
-        return self._q_call('camera_status', reply='json',
-                            timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.camera_status(timeout_ms)
 
-    # -------- Dummy keep-alive toggle --------
+    # -------- Dummy keep-alive --------
 
     def set_dummy_enabled(self, enabled, timeout_ms=2000):
-        return self._q_call('set_dummy_enabled',
-                            '1' if enabled else '0',
-                            timeout_ms=timeout_ms)
+        with self._lock:
+            return self._client.set_dummy_enabled(enabled, timeout_ms)
 
     def get_dummy_enabled(self, timeout_ms=1000):
-        try:
-            return self._q_call('get_dummy_enabled',
-                                timeout_ms=timeout_ms) == '1'
-        except Exception:
-            return True
+        with self._lock:
+            try:
+                return self._client.get_dummy_enabled(timeout_ms)
+            except Exception:
+                return True
+
+    # -------- Images / status / sequence control --------
 
     def grab_imgs(self):
         """Grab all queued images from the server.
@@ -328,12 +276,13 @@ class ZmqClient:
             'seq_ids': np.array([], dtype=np.int64),
         }
         try:
-            raw = self._q_call('get_imgs', reply='bytes', timeout_ms=5000)
+            with self._lock:
+                raw = self._client.get_imgs(timeout_ms=5000)
         except Exception:
             return empty
-        if not raw:
+        if raw is None or len(raw) == 0:
             return empty
-        info = _process_imgs(array.array('d', raw))
+        info = _process_imgs(raw)
         return {
             'imgs': info['imgs'],
             'scan_ids': np.array(info['scan_ids'], dtype=np.int64) if len(info['scan_ids']) > 0 else np.array([], dtype=np.int64),
@@ -342,31 +291,42 @@ class ZmqClient:
 
     def get_status(self):
         """Get experiment status: 0=Stopped, 1=Running, 2=Paused, 3=Unknown."""
-        return self._au.get_status()
+        with self._lock:
+            try:
+                s = self._client.get_status()
+            except Exception:
+                return 3
+        return _STATUS_STR_TO_INT.get(s, 3)
 
     def abort_seq(self):
-        """Send abort signal."""
-        self._au.abort_seq()
+        with self._lock:
+            try:
+                self._client.abort_seq()
+            except Exception:
+                pass
 
     def pause_seq(self):
-        """Send pause signal."""
-        self._au.pause_seq()
+        with self._lock:
+            try:
+                self._client.pause_seq()
+            except Exception:
+                pass
 
     def start_seq(self):
-        """Send start/continue signal."""
-        self._au.start_seq()
+        with self._lock:
+            try:
+                self._client.start_seq()
+            except Exception:
+                pass
 
     def set_refresh_rate(self, val):
-        """Set background polling rate in seconds."""
-        self._au.set_refresh_rate(val)
-
-    def get_refresh_rate(self):
-        return self._au.get_refresh_rate()
+        # No-op: kept for backwards compatibility with control_panel._on_rate.
+        # The polling cadence is owned by individual GUI panes now.
+        pass
 
     def cleanup(self):
-        """Stop the background worker thread."""
-        self._au.stop_worker()
+        """Drop the wire client. Safe to call multiple times."""
         try:
-            self._q_sock.close(linger=0)
+            self._client = None
         except Exception:
             pass
