@@ -70,8 +70,14 @@ class RunnerLauncher:
                 return
             logger.info('No existing runner — spawning one (reuse mode: '
                         'will leave it alive on stop())')
-        kill_port(_url_to_port(self._url))
+        # Kill stale MATLAB runners first — _kill_stale_runners calls
+        # _kill_dcam_tray() before taskkill, which unblocks any DCAM kernel
+        # wait so the kill actually lands. Running kill_port first risks
+        # taskkilling a stuck MATLAB without dcamtray cleanup, which leaks
+        # the DCAM handle and makes the next OrcaInit fail with 0 frames.
+        # Mirrors the order used in _force_kill().
         self._kill_stale_runners()
+        kill_port(_url_to_port(self._url))
 
         env = os.environ.copy()
         if self._mock:
