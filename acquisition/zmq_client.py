@@ -6,11 +6,14 @@ wrapper, status string-to-int translation, and a single lock to serialize REQ
 access from multiple GUI threads.
 """
 
+import logging
 import sys
 import os
 import threading
 import time
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Add the YbExpServer directory to sys.path so we can import ExptClient.
 # yb_analysis/acquisition/ -> repo_root -> matlab_new/YbExpServer.
@@ -39,6 +42,13 @@ _STATUS_STR_TO_INT = {
     'Sequence is running': 1,
     'Sequence is paused': 2,
 }
+
+# After a grab_imgs failure, wait this long before trying again. The next
+# call inside the cooldown window returns empty without acquiring the lock.
+_GRAB_IMGS_COOLDOWN_S = 1.0
+
+# Suppress duplicate get_status warnings within this window (seconds).
+_STATUS_WARN_THROTTLE_S = 30.0
 
 
 def _process_imgs(raw_data):
@@ -150,6 +160,14 @@ class ZmqClient:
         # camera_pane workers, control_panel._process_loop). REQ has a strict
         # SEND -> RECV state machine, so all wire access must serialize.
         self._lock = threading.Lock()
+        # Circuit breaker for grab_imgs: when the runner doesn't reply,
+        # cool down before trying again so a dead runner doesn't hog the
+        # shared lock and starve queue/camera polls.
+        self._grab_imgs_cooldown_until = 0.0
+        # Throttle for get_status warnings: log at most once per
+        # _STATUS_WARN_THROTTLE_S, otherwise a dead runner spams the log
+        # at the GUI's 1 Hz status-poll cadence.
+        self._last_get_status_warn = 0.0
 
     # -------- Liveness / queue --------
 
@@ -275,10 +293,14 @@ class ZmqClient:
             'scan_ids': np.array([], dtype=np.int64),
             'seq_ids': np.array([], dtype=np.int64),
         }
+        if time.monotonic() < self._grab_imgs_cooldown_until:
+            return empty
         try:
             with self._lock:
-                raw = self._client.get_imgs(timeout_ms=5000)
+                raw = self._client.get_imgs(timeout_ms=2000)
         except Exception:
+            self._grab_imgs_cooldown_until = (
+                time.monotonic() + _GRAB_IMGS_COOLDOWN_S)
             return empty
         if raw is None or len(raw) == 0:
             return empty
@@ -294,7 +316,11 @@ class ZmqClient:
         with self._lock:
             try:
                 s = self._client.get_status()
-            except Exception:
+            except Exception as e:
+                now = time.monotonic()
+                if now - self._last_get_status_warn > _STATUS_WARN_THROTTLE_S:
+                    logger.warning('get_status failed: %s', e)
+                    self._last_get_status_warn = now
                 return 3
         return _STATUS_STR_TO_INT.get(s, 3)
 
@@ -318,11 +344,6 @@ class ZmqClient:
                 self._client.start_seq()
             except Exception:
                 pass
-
-    def set_refresh_rate(self, val):
-        # No-op: kept for backwards compatibility with control_panel._on_rate.
-        # The polling cadence is owned by individual GUI panes now.
-        pass
 
     def cleanup(self):
         """Drop the wire client. Safe to call multiple times."""

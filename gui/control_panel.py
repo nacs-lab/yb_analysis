@@ -222,7 +222,6 @@ class ControlPanel(tk.Tk):
         try:
             v = int(self._rate_entry.get())
             self._refresh_ms = max(500, v * 1000)
-            self._client.set_refresh_rate(v)
         except ValueError:
             pass
 

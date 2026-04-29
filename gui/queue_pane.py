@@ -426,7 +426,7 @@ class QueuePane(ttk.LabelFrame):
         if not self._offline:
             logger.debug('queue_list failed: %s', msg)
             self._offline = True
-        self._status.config(text='runner offline')
+        self._status.config(text='runner offline', foreground='red')
 
     # --- Rendering ---
 
@@ -523,7 +523,7 @@ class QueuePane(ttk.LabelFrame):
         total = len(q.get('queued', []))
         if running:
             total += 1
-        self._status.config(text=f'{total} in queue')
+        self._status.config(text=f'{total} in queue', foreground='black')
 
     # --- Selection / actions ---
 
