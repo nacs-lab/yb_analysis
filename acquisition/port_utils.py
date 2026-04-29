@@ -14,36 +14,27 @@ logger = logging.getLogger(__name__)
 
 
 def _stale_pids_windows(port: int):
+    # Use Get-NetTCPConnection rather than parsing `netstat -ano` because
+    # netstat localizes the State column ("LISTENING" → "ABHÖREN" on
+    # German, "ÉCOUTE" on French, etc.), so a regex match on "LISTENING"
+    # silently fails on any non-English Windows.  Get-NetTCPConnection
+    # filters on the State enum, which is locale-independent.
+    ps_cmd = (
+        f"Get-NetTCPConnection -LocalPort {port} -State Listen "
+        f"-ErrorAction SilentlyContinue | ForEach-Object {{ $_.OwningProcess }}"
+    )
     try:
         out = subprocess.check_output(
-            ['netstat', '-ano', '-p', 'tcp'], text=True, stderr=subprocess.DEVNULL)
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_cmd],
+            text=True, stderr=subprocess.DEVNULL, timeout=10)
     except Exception as e:
-        logger.debug('netstat failed: %s', e)
+        logger.debug('Get-NetTCPConnection failed: %s', e)
         return []
     pids = []
-    # Look for the port at either end of the local address column. Use a
-    # regex tolerant of variable whitespace / tabs (netstat formatting
-    # differs across Windows versions and locales).
-    import re
-    pat = re.compile(
-        r'^\s*TCP\s+\S*?[.:]' + re.escape(str(port)) + r'\b.*LISTENING\s+(\d+)\s*$',
-        re.IGNORECASE)
     for line in out.splitlines():
-        m = pat.match(line)
-        if not m:
-            continue
-        try:
-            pids.append(int(m.group(1)))
-        except ValueError:
-            pass
-    if not pids:
-        # Only log a short snippet of candidate lines so a missed match is
-        # diagnosable without flooding the log.
-        candidates = [l for l in out.splitlines() if f':{port}' in l][:5]
-        if candidates:
-            logger.debug(
-                'netstat has :%d entries but none parsed as LISTENING. '
-                'Sample: %r', port, candidates)
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
     return pids
 
 

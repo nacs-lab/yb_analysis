@@ -158,6 +158,13 @@ class CameraPane(ttk.LabelFrame):
         except Exception as e:
             self._cmd_pending = False
             self.after(0, self._lbl_error.config, {'text': str(e)[:60]})
+            return
+        # The connection-state-change check in _on_poll_ok clears _cmd_pending
+        # only when `connected` flips True→False. If a prior Connect already
+        # failed (server reports connected=False), Disconnect never produces a
+        # transition and the UI would stay on "Disconnecting...". Watchdog so
+        # the UI recovers regardless.
+        self.after(3000, self._clear_cmd_pending)
 
     def _on_apply_all(self, _event=None):
         # Read and validate all values first, before any poll callback can
