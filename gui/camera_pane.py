@@ -81,7 +81,7 @@ class CameraPane(ttk.LabelFrame):
 
         # Buttons
         bf = ttk.Frame(self)
-        bf.pack(fill='x', padx=6, pady=(2, 6))
+        bf.pack(fill='x', padx=6, pady=(2, 2))
         self._btn_connect = ttk.Button(bf, text='Connect',
                                        command=self._on_connect)
         self._btn_connect.pack(side='left', padx=2)
@@ -90,8 +90,13 @@ class CameraPane(ttk.LabelFrame):
         self._btn_disconnect.pack(side='left', padx=2)
         ttk.Button(bf, text='Apply Settings',
                    command=self._on_apply_all).pack(side='left', padx=2)
-        self._lbl_error = ttk.Label(bf, text='', foreground='red')
-        self._lbl_error.pack(side='right', padx=4)
+
+        # Error label — placed below the button row so long messages
+        # (e.g. ROIPosition validation errors) wrap inside the pane
+        # instead of overflowing past Apply Settings.
+        self._lbl_error = ttk.Label(self, text='', foreground='red',
+                                    wraplength=320, justify='left')
+        self._lbl_error.pack(fill='x', padx=6, pady=(0, 6))
 
     # ---------------------------------------------------------- ROI helpers
 
