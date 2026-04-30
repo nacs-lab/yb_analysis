@@ -1,6 +1,6 @@
 """Circular buffer for fixed-size N-D arrays.
 
-Port of YbExpServer/data_processing/ArrayQueue.m
+Port of YbExptCtrl/data_processing/ArrayQueue.m
 """
 
 import numpy as np

@@ -24,7 +24,7 @@ def fake_runner_script(tmp_path):
     loops forever. RunnerLauncher.stop() force-kills it."""
     script = tmp_path / "fake_runner.py"
     expserver_dir = os.path.abspath(os.path.join(
-        os.path.dirname(__file__), '..', '..', 'matlab_new', 'YbExpServer'))
+        os.path.dirname(__file__), '..', '..', 'matlab_new', 'YbExptCtrl'))
     script.write_text(textwrap.dedent(f"""
         import sys, time
         sys.path.insert(0, {expserver_dir!r})
