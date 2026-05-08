@@ -242,8 +242,8 @@ class DataManager:
                 g = np.loadtxt(grid_file, skiprows=1)
                 if g.ndim == 1:
                     g = g.reshape(1, -1)
-                if g.shape[1] == 2 and g.shape[0] > 0:
-                    self.grid_locations = g
+                if g.shape[1] >= 2 and g.shape[0] > 0:
+                    self.grid_locations = g[:, :2]   # Y, X — ignore extra columns (e.g. Site_Index)
                     self.num_sites = len(g)
                     logger.info('Loaded grid from day folder (%d sites)', self.num_sites)
             except Exception as e:
