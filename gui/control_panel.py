@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # MemoryMap layout (matches MemoryMap.m)
 _MMAP_PATH = os.path.join(tempfile.gettempdir(), 'nacsctl', 'nacs_mem_map.dat')
 _OFF_SCAN_COMPLETE = 2 * 8
+_OFF_NUM_PER_GROUP = 5 * 8     # set positive by runJob, zeroed at runJob exit
 _OFF_ABORT = 8 * 8
 _OFF_PAUSE = 9 * 8
 _OFF_ISPAUSED = 10 * 8
@@ -59,9 +60,14 @@ def _mmap_read_double(mm, offset):
 _STATUS = {0: 'Stopped', 1: 'Running', 2: 'Paused', 3: 'Unknown'}
 _STATUS_COLORS = {
     'Idle': '#555555', 'Idle (dummy off)': '#888888',
+    'Idle (default)': '#555555', 'Idle (last seq)': '#0a5d8a',
+    'Idle (last fallback)': '#cc6600',
     'Running': '#006600', 'Paused': '#cc6600',
     'Pausing...': '#cc6600', 'Stopped': '#aa0000',
 }
+
+# Dummy-mode radio values must match the strings ExptServer.dummy_mode accepts.
+_DUMMY_MODES = ('off', 'default', 'last')
 
 
 class ControlPanel(tk.Tk):
@@ -81,7 +87,19 @@ class ControlPanel(tk.Tk):
         self._cur_seq_id = 0
         self._refresh_ms = 2000
         self._running = True
-        self._dummy_enabled = True  # tracks the server-side keep-alive toggle
+        # Mirrors the server's __dummy_mode. Used by the status-label rendering
+        # to distinguish 'Idle (default)' from 'Idle (last seq)' etc.
+        self._dummy_mode = 'last'
+        # Last value of last_seq_status the GUI has seen — drives the cached-
+        # seq label and the enable state of the "Last seq" radio button.
+        self._last_seq_meta = {
+            'available': False, 'name': '', 'file_id': '',
+            'fallback_active': False,
+        }
+        # Reference to the last real-scan DataManager. Dummy frames borrow
+        # its plot-data dict so the dashboard can show the live frame without
+        # mutating the real DM's internal state or its save buffers.
+        self._last_real_dm = None
 
         style = ttk.Style(self)
         style.configure('Abort.TButton', foreground='red',
@@ -115,16 +133,35 @@ class ControlPanel(tk.Tk):
         ttk.Button(top, text='Pause', command=self._on_pause).pack(
             side='right', padx=4)
 
-        # Dummy keep-alive toggle — when off, SequenceRunner stops running
-        # DummySeq between jobs (nothing hits the hardware while idle).
-        self._dummy_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text='Run dummy seq',
-                        variable=self._dummy_var,
-                        command=self._on_dummy_toggle).pack(
-            side='right', padx=(12, 8))
-        # Sync the UI from the server on startup so a persistent runner that
-        # was last left disabled doesn't silently flip back to enabled just
-        # because the UI defaults to checked.
+        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
+
+        # Dummy keep-alive mode selector — three radios:
+        #   off     -> runner pauses between jobs
+        #   default -> runner runs DummySeq (the canonical no-imaging filler)
+        #   last    -> runner replays the last successful real seq; frames
+        #              flow to the dashboard but scan_id<0 routes them around
+        #              the disk-save path (see _process_once).
+        # The "Last seq" radio shows what's cached and an amber fallback
+        # indicator when the runner had to drop back to default.
+        dummy_frame = ttk.LabelFrame(self, text='Dummy')
+        dummy_frame.pack(fill='x', padx=10, pady=(2, 4))
+        radios = ttk.Frame(dummy_frame)
+        radios.pack(fill='x', padx=6, pady=(4, 0))
+        self._dummy_mode_var = tk.StringVar(value='last')
+        for mode, label in (('off', 'Off'),
+                             ('default', 'Default dummy'),
+                             ('last', 'Last seq')):
+            rb = ttk.Radiobutton(
+                radios, text=label, variable=self._dummy_mode_var,
+                value=mode, command=self._on_dummy_mode_changed)
+            rb.pack(side='left', padx=(0, 12))
+            if mode == 'last':
+                self._rb_last = rb
+        self._lbl_last_seq = ttk.Label(
+            dummy_frame, text='Last: --', font=_FONT_SM, foreground='#555555')
+        self._lbl_last_seq.pack(anchor='w', padx=6, pady=(2, 4))
+        # Sync UI from the server on startup so a persistent runner that
+        # was last left in a particular mode is reflected in the UI.
         threading.Thread(target=self._load_dummy_state, daemon=True).start()
 
         ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
@@ -225,37 +262,83 @@ class ControlPanel(tk.Tk):
         except ValueError:
             pass
 
-    def _on_dummy_toggle(self):
-        self._push_dummy_state()
-
-    def _push_dummy_state(self):
-        enabled = bool(self._dummy_var.get())
-        self._dummy_enabled = enabled
-        # Run on a background thread: ZMQ REQ/REP is not instant and we don't
-        # want to freeze the UI if the runner is slow to respond.
+    def _on_dummy_mode_changed(self):
+        mode = self._dummy_mode_var.get()
+        if mode not in _DUMMY_MODES:
+            mode = 'default'
+            self._dummy_mode_var.set(mode)
+        self._dummy_mode = mode
+        # ZMQ REQ/REP off the UI thread to avoid freezing the radio click.
         threading.Thread(
-            target=self._do_push_dummy, args=(enabled,), daemon=True).start()
+            target=self._do_push_dummy_mode, args=(mode,), daemon=True).start()
 
-    def _do_push_dummy(self, enabled):
+    def _do_push_dummy_mode(self, mode):
         try:
-            self._client.set_dummy_enabled(enabled)
+            self._client.set_dummy_mode(mode)
         except Exception as e:
-            logger.warning('set_dummy_enabled failed: %s', e)
+            logger.warning('set_dummy_mode(%r) failed: %s', mode, e)
 
     def _load_dummy_state(self):
-        """Read the server-side dummy flag and reflect it in the checkbox.
-        Runs on a worker thread; posts the UI update back to the main loop
-        via after(0) so Tk is only touched from the main thread."""
+        """Read mode + last-seq metadata from the server on startup so the
+        UI reflects whatever the persistent runner already had. Runs on a
+        worker; main-thread Tk update via after(0)."""
+        mode = None
         try:
-            enabled = self._client.get_dummy_enabled()
+            mode = self._client.get_dummy_mode()
         except Exception as e:
-            logger.warning('get_dummy_enabled failed: %s', e)
-            return
-        self.after(0, self._apply_dummy_state_from_server, enabled)
+            logger.warning('get_dummy_mode failed: %s', e)
+        meta = None
+        try:
+            meta = self._client.last_seq_status()
+        except Exception as e:
+            logger.warning('last_seq_status failed: %s', e)
+        self.after(0, self._apply_dummy_state_from_server, mode, meta)
 
-    def _apply_dummy_state_from_server(self, enabled):
-        self._dummy_var.set(bool(enabled))
-        self._dummy_enabled = bool(enabled)
+    def _apply_dummy_state_from_server(self, mode, meta):
+        if mode in _DUMMY_MODES:
+            self._dummy_mode_var.set(mode)
+            self._dummy_mode = mode
+        self._update_last_seq_label(meta)
+
+    def _update_last_seq_label(self, meta):
+        """Refresh the cached-seq label. The label answers two questions:
+        what is currently being replayed, and what's in the cache.
+
+        Layout (depends on (mode, available)):
+            mode='last',  cache empty   -> "Running default (no last seq cached)"  amber
+            mode='last',  cache present -> "Replaying: name (fid)"                 blue
+            mode!='last', cache empty   -> "Cached: --"                            gray
+            mode!='last', cache present -> "Cached: name (fid)"                    gray
+        """
+        if not isinstance(meta, dict):
+            return
+        self._last_seq_meta = {
+            'available': bool(meta.get('available')),
+            'name': str(meta.get('name', '') or ''),
+            'file_id': str(meta.get('file_id', '') or ''),
+            'fallback_active': bool(meta.get('fallback_active')),
+        }
+        available = self._last_seq_meta['available']
+        name = self._last_seq_meta['name'] or '(unnamed)'
+        fid = self._last_seq_meta['file_id']
+        suffix = f' ({fid})' if fid else ''
+        if self._dummy_mode == 'last':
+            if available:
+                txt = f'Replaying: {name}{suffix}'
+                color = '#0a5d8a'
+            else:
+                txt = 'Running default (no last seq cached)'
+                color = '#cc6600'
+        else:
+            if available:
+                txt = f'Cached: {name}{suffix}'
+            else:
+                txt = 'Cached: --'
+            color = '#888888'
+        try:
+            self._lbl_last_seq.config(text=txt, foreground=color)
+        except tk.TclError:
+            pass
 
     # --------------------------------------------------------- Status poll
 
@@ -270,10 +353,24 @@ class ControlPanel(tk.Tk):
                 is_paused = _mmap_read_double(mm, _OFF_ISPAUSED)
                 scan_complete = _mmap_read_double(mm, _OFF_SCAN_COMPLETE)
                 dummy = _mmap_read_double(mm, _OFF_DUMMY_RUNNING)
+                num_per_group = _mmap_read_double(mm, _OFF_NUM_PER_GROUP)
                 mm.close()
 
-                if dummy > 0:
-                    status = 'Idle (dummy off)' if not self._dummy_enabled else 'Idle'
+                # NumPerGroup is positive iff runJob is currently in flight
+                # (set at line 275 of SequenceRunner.m, zeroed at line 364).
+                # We use it as a tie-breaker so an Idle badge can never paper
+                # over a real job — DummyRunning can lag a poll if the
+                # MATLAB write hasn't been picked up yet.
+                if dummy > 0 and num_per_group <= 0:
+                    if self._dummy_mode == 'off':
+                        status = 'Idle (dummy off)'
+                    elif self._dummy_mode == 'last':
+                        if self._last_seq_meta.get('available'):
+                            status = 'Idle (last seq)'
+                        else:
+                            status = 'Idle (last fallback)'
+                    else:
+                        status = 'Idle (default)'
                 elif is_paused > 0:
                     status = 'Paused'
                 elif pause > 0:
@@ -292,7 +389,22 @@ class ControlPanel(tk.Tk):
                 self._lbl_status.config(text=f'Status: {_STATUS.get(s, "?")}')
         except Exception:
             pass
+        # Refresh the cached-last-seq label in the background. Throttled to
+        # every other tick (~2 s) so the runner isn't hammered with REQ
+        # round-trips when the cache is stable.
+        self._last_seq_poll_tick = getattr(self, '_last_seq_poll_tick', 0) + 1
+        if self._last_seq_poll_tick % 2 == 0:
+            threading.Thread(target=self._refresh_last_seq_async,
+                             daemon=True).start()
         self.after(1000, self._poll_status)
+
+    def _refresh_last_seq_async(self):
+        try:
+            meta = self._client.last_seq_status()
+        except Exception:
+            return
+        if meta is not None:
+            self.after(0, self._update_last_seq_label, meta)
 
     # ------------------------------------------------ Background processing
 
@@ -341,8 +453,70 @@ class ControlPanel(tk.Tk):
                                  cur_scan, e)
                 self._cur_scan_id = cur_scan
                 self._cur_seq_id = int(seq_ids[-1])
+                # Track this DM so dummy frames (cur_scan < 0) can borrow its
+                # plot context. Updated only on real saves.
+                self._last_real_dm = dm
                 self.after(0, self._update_labels, fname, save_err)
+            elif cur_scan < 0:
+                # Dummy-mode frames: scan_id was set to -1 by SequenceRunner
+                # before replaying the cached last seq. Suppress disk save and
+                # in-memory accumulation, but push the latest raw frame to
+                # the dashboard so the user can see camera activity.
+                self._dispatch_dummy_batch(imgs[start:end], seq_ids[start:end])
             start = end
+
+    def _dispatch_dummy_batch(self, batch_imgs, batch_seq_ids):
+        """Display a dummy-mode image batch without persisting anything.
+
+        Per-frame: run detect_atom on the live image using the last real
+        DM's grid + thresholds, then push (cur_image, cur_intensities,
+        logicals) so the Tweezer Array view shows green/red boxes and the
+        Atom Intensities scatter updates.
+
+        Per-batch: do NOT touch the cumulative state — the histograms,
+        scan curve, grid shift, loading rates, gaussian fits, and discrim
+        infidelities are inherited verbatim from the last real DM's
+        get_plot_data() snapshot, so those panels freeze at the last real
+        scan's values. Nothing is appended to save buffers, no HDF5 write,
+        no _intensity_accum growth, no img_buffer push.
+
+        If no real DM has been seen yet this session, drop the batch —
+        the dashboard has nothing meaningful to render. Bytes still leave
+        the ZMQ deque so memory is bounded by get_imgs draining."""
+        if not self._dashboard or self._last_real_dm is None:
+            return
+        if not batch_imgs:
+            return
+        try:
+            latest = batch_imgs[-1]
+            # batch_imgs entries are (H, W, n_imgs_per_seq); pick the first
+            # frame so the single-image panel has the right shape.
+            if latest.ndim == 3 and latest.shape[2] >= 1:
+                cur_img = latest[:, :, 0]
+            else:
+                cur_img = latest
+            cur_img_f = cur_img.astype(np.float64)
+
+            dm = self._last_real_dm
+            data = dict(dm.get_plot_data())
+            data['cur_image'] = cur_img_f
+            if dm.num_sites > 0 and len(dm.grid_locations) > 0:
+                # Local import: detect_atom is in a sibling module that
+                # data_manager.py already pulls in, so no extra startup cost.
+                from yb_analysis.detection.detect_atom import detect_atom
+                logicals, intensities = detect_atom(
+                    cur_img_f, dm.grid_locations,
+                    dm.thresholds, dm.mask_mat,
+                )
+                data['cur_intensities'] = intensities
+                data['logicals'] = logicals
+            else:
+                # Grid not yet established — show bare frame, no boxes.
+                data['cur_intensities'] = None
+                data['logicals'] = None
+            self._dashboard.update(data)
+        except Exception:
+            logger.error('dummy dispatch error:\n%s', traceback.format_exc())
 
     def _update_labels(self, fname='', save_err=''):
         from yb_analysis.config import PATH_PREFIX

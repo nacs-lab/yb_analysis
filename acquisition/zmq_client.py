@@ -268,6 +268,33 @@ class ZmqClient:
             except Exception:
                 return True
 
+    def set_dummy_mode(self, mode, timeout_ms=2000):
+        with self._lock:
+            return self._client.set_dummy_mode(mode, timeout_ms)
+
+    def get_dummy_mode(self, timeout_ms=1000):
+        with self._lock:
+            try:
+                return self._client.get_dummy_mode(timeout_ms)
+            except Exception:
+                return 'default'
+
+    def last_seq_status(self, timeout_ms=1000):
+        """Returns {available, name, file_id, captured_at, fallback_active, mode}.
+        Returns None on wire failure so callers can decide whether to retry."""
+        with self._lock:
+            try:
+                return self._client.last_seq_status(timeout_ms)
+            except Exception:
+                return None
+
+    def clear_last_seq_meta(self, timeout_ms=2000):
+        with self._lock:
+            try:
+                return self._client.clear_last_seq_meta(timeout_ms)
+            except Exception:
+                return None
+
     # -------- Images / status / sequence control --------
 
     def grab_imgs(self):
