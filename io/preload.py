@@ -10,6 +10,7 @@ Fallback: most recent scan config .mat file's initThresholds, initGridLocations,
 
 import os
 import glob
+import shutil
 import logging
 from datetime import datetime, timedelta
 
@@ -18,6 +19,8 @@ import numpy as np
 from yb_analysis.config import PATH_PREFIX
 
 logger = logging.getLogger(__name__)
+
+_DAY_FOLDER_FILES = ('gridLocations.txt', 'threshold.mat', 'histData.mat')
 
 
 def _mat_scalar(val, default=0):
@@ -32,6 +35,46 @@ def _mat_vector(val):
 
 def _today_day_dir():
     return os.path.join(PATH_PREFIX, 'Data', datetime.now().strftime('%Y%m%d'))
+
+
+def bootstrap_today_from(src_dir):
+    """Copy gridLocations.txt / threshold.mat / histData.mat from src_dir into
+    today's day folder so MATLAB's ybStartScan picks them up at submit
+    (instead of falling back to arrayConfig.ActiveConfiguration).
+
+    Returns (today_name, copied_files) on success, or (None, []) when src is
+    already today's folder or no source files were present.
+    """
+    if not src_dir:
+        return None, []
+    today_dir = _today_day_dir()
+    if os.path.normcase(os.path.normpath(src_dir)) == \
+       os.path.normcase(os.path.normpath(today_dir)):
+        return None, []
+
+    copied = []
+    try:
+        os.makedirs(today_dir, exist_ok=True)
+    except Exception as e:
+        logger.warning('Could not create today folder %s: %s', today_dir, e)
+        return None, []
+
+    for name in _DAY_FOLDER_FILES:
+        src = os.path.join(src_dir, name)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(today_dir, name)
+        try:
+            shutil.copy2(src, dst)
+            copied.append(name)
+        except Exception as e:
+            logger.warning('Failed to copy %s -> %s: %s', src, dst, e)
+
+    if not copied:
+        return None, []
+    logger.info('Bootstrapped %s with %d files from %s',
+                today_dir, len(copied), src_dir)
+    return os.path.basename(today_dir), copied
 
 
 def load_background_data():

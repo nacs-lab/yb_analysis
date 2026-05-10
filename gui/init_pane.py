@@ -116,6 +116,14 @@ class InitPane(ttk.LabelFrame):
             data, status = load_from_dir(path_or_none)
             path = path_or_none if data is not None else self._current_dir
 
+        # Bootstrap today's day folder so MATLAB's ybStartScan picks up the
+        # selected init data instead of falling back to arrayConfig.
+        if data is not None and path:
+            from yb_analysis.io.preload import bootstrap_today_from
+            today_name, copied = bootstrap_today_from(path)
+            if today_name and copied:
+                status = f'{status} → copied to {today_name}'
+
         self.after(0, self._apply_result, data, path, status)
 
     def _apply_result(self, data, path, status_msg):

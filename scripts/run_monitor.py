@@ -74,7 +74,7 @@ def main():
     from yb_analysis.acquisition.zmq_client import ZmqClient
     from yb_analysis.plotting.dashboard import DashboardRenderer
     from yb_analysis.gui.control_panel import ControlPanel
-    from yb_analysis.io.preload import load_background_data
+    from yb_analysis.io.preload import load_background_data, bootstrap_today_from
     from yb_analysis.config import read_orca_config
 
     logging.info('Connecting to %s', args.url)
@@ -112,6 +112,12 @@ def main():
     if bg_data is not None:
         logging.info('Loaded background: %d sites, thresholds + grid', bg_data['num_sites'])
         init_status = f'{bg_data["num_sites"]} sites loaded'
+        if init_dir:
+            today_name, copied = bootstrap_today_from(init_dir)
+            if today_name and copied:
+                logging.info('Bootstrapped today (%s) with %d files from %s',
+                             today_name, len(copied), init_dir)
+                init_status = f'{init_status} → copied to {today_name}'
         dashboard.update(bg_data)
     else:
         init_dir = None
