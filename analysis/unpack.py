@@ -11,37 +11,38 @@ from yb_analysis.detection.scan_analysis import (
 )
 
 
-def unpack_scan_logicals(scan, logicals, seq_ids=None, mat_path=None):
+def unpack_scan_logicals(scan, logicals=None, seq_ids=None, mat_path=None,
+                         logicals_img1=None, logicals_img2=None):
     """Unpack scanned parameter values and logical results.
 
-    Supports 1D scans with 1 or 2 images per sequence.
-    Handles scrambled sequence order via seq_ids + Scan.Params.
+    Two input modes:
 
-    Parameters
-    ----------
-    scan : dict
-        Scan configuration with Params, ScanGroup, NumImages.
-    logicals : ndarray (nFrames, nSites)
-        All detection logicals (bool). nFrames = NumImages * nCapturedSequences.
-    seq_ids : ndarray (nCapturedSequences,), optional
-        1-indexed sequence IDs. If None, assumes sequential order.
-    mat_path : str, optional
-        Path to .mat file for HDF5-direct fallback when dict-based extraction
-        fails (e.g. N-D scans with h5py object references).
+    * **Single-array (legacy):** pass ``logicals`` of shape ``(nFrames, nSites)``
+      where ``nFrames = NumImages * nCapturedSequences`` (image-1 and image-2
+      interleaved). ``logic1`` and ``logic2`` come back with the same
+      ``nSites``. ``logic2`` is ``None`` when NumImages=1.
+
+    * **Two-array (isGrid2=1):** pass ``logicals_img1`` of shape
+      ``(NSeqs, M1)`` and ``logicals_img2`` of shape ``(NSeqs, M2)`` (one row
+      per captured sequence per image, already de-interleaved). ``logic1``
+      has shape ``(M1, nParams, maxReps)`` and ``logic2`` has shape
+      ``(M2, nParams, maxReps)`` — different first dimension.
+
+    Handles scrambled sequence order via seq_ids + ``Scan.Params``.
 
     Returns
     -------
-    scan_params : ndarray (nParams,)
-        Unique parameter values (sorted).
-    logic1 : ndarray (nSites, nParams, minReps) bool
-        Image-1 logicals grouped by parameter.
-    logic2 : ndarray (nSites, nParams, minReps) bool or None
-        Image-2 logicals (None if NumImages=1).
+    scan_params : ndarray (nParams,) or (nParams, 2)
+        Unique parameter values (sorted) — flat for 1-D scans, paired for 2-D.
+    logic1 : ndarray (nSites_img1, nParams, maxReps) bool
+    logic2 : ndarray (nSites_img2, nParams, maxReps) bool or None
     """
-    if logicals is None:
+    two_array = logicals_img1 is not None and logicals_img2 is not None
+    if not two_array and logicals is None:
         raise ValueError(
-            'logicals is None — scan may still be running or data not yet saved. '
-            'Try loading a completed scan or wait for the current scan to finish.')
+            'logicals is None — scan may still be running or data not yet '
+            'saved. Pass `logicals` (single-array) or `logicals_img1` + '
+            '`logicals_img2` (two-array).')
 
     num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0])
     params_arr = np.asarray(scan.get('Params', [])).ravel().astype(int)
@@ -73,9 +74,15 @@ def unpack_scan_logicals(scan, logicals, seq_ids=None, mat_path=None):
             scan_params = np.arange(1, n_unique + 1, dtype=float)
 
     n_params = len(scan_params)
-    n_frames = logicals.shape[0]
-    n_sites = logicals.shape[1]
-    n_seqs = n_frames // num_images
+
+    if two_array:
+        n_seqs = logicals_img1.shape[0]
+        n_sites_1 = logicals_img1.shape[1]
+        n_sites_2 = logicals_img2.shape[1]
+    else:
+        n_frames = logicals.shape[0]
+        n_sites_1 = n_sites_2 = logicals.shape[1]
+        n_seqs = n_frames // num_images
 
     if seq_ids is None:
         seq_ids = np.arange(1, n_seqs + 1)
@@ -92,14 +99,21 @@ def unpack_scan_logicals(scan, logicals, seq_ids=None, mat_path=None):
     max_reps = int(reps_per_param.max()) if np.any(reps_per_param > 0) else 0
 
     if max_reps == 0:
-        return scan_params, np.zeros((n_sites, n_params, 0), dtype=bool), None
+        empty_l1 = np.zeros((n_sites_1, n_params, 0), dtype=bool)
+        empty_l2 = (np.zeros((n_sites_2, n_params, 0), dtype=bool)
+                    if two_array or num_images >= 2 else None)
+        return scan_params, empty_l1, empty_l2
 
     # Fill logic arrays — sized to max_reps so every parameter uses all its
     # available repetitions.  Parameters with fewer reps leave trailing slots
-    # as False; prob11_site_resolved's loaded>0 mask handles this correctly,
+    # as False; downstream loaded>0 / reps masks handle this correctly,
     # giving each parameter its own SEM based on its actual repetition count.
-    logic1 = np.zeros((n_sites, n_params, max_reps), dtype=bool)
-    logic2 = np.zeros((n_sites, n_params, max_reps), dtype=bool) if num_images >= 2 else None
+    logic1 = np.zeros((n_sites_1, n_params, max_reps), dtype=bool)
+    if two_array:
+        logic2 = np.zeros((n_sites_2, n_params, max_reps), dtype=bool)
+    else:
+        logic2 = (np.zeros((n_sites_1, n_params, max_reps), dtype=bool)
+                  if num_images >= 2 else None)
     fill_count = np.zeros(n_params, dtype=int)
 
     for k in range(min(len(seq_ids), n_seqs)):
@@ -113,11 +127,15 @@ def unpack_scan_logicals(scan, logicals, seq_ids=None, mat_path=None):
             continue
 
         r = fill_count[p]
-        base_row = k * num_images
-        if base_row < n_frames:
-            logic1[:, p, r] = logicals[base_row, :]
-        if num_images >= 2 and base_row + 1 < n_frames:
-            logic2[:, p, r] = logicals[base_row + 1, :]
+        if two_array:
+            logic1[:, p, r] = logicals_img1[k, :]
+            logic2[:, p, r] = logicals_img2[k, :]
+        else:
+            base_row = k * num_images
+            if base_row < n_frames:
+                logic1[:, p, r] = logicals[base_row, :]
+            if num_images >= 2 and base_row + 1 < n_frames:
+                logic2[:, p, r] = logicals[base_row + 1, :]
         fill_count[p] += 1
 
     return scan_params, logic1, logic2

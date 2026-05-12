@@ -253,3 +253,19 @@ def loading_rate(logic1):
     mean = np.nanmean(mean_sr, axis=0)
     sem = _inter_site_sem(mean_sr)
     return mean, sem
+
+
+def rearrangement_success_rate(logic2):
+    """Per-parameter average of ``logic2`` over array-2 sites and reps.
+
+    In two-array mode (isGrid2=1), image-2 captures atoms after a
+    rearrangement step targeting a defect-free array. The fraction of
+    occupied array-2 sites is the rearrangement success rate. Mathematically
+    identical to ``loading_rate(logic2)`` — provided as a more discoverable
+    name for the two-array use case.
+
+    Returns
+    -------
+    mean, sem : ndarray (nParams,)
+    """
+    return loading_rate(logic2)

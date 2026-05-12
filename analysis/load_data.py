@@ -78,15 +78,33 @@ def load_scan_from_path(scan_dir):
 
 
 def _load_from_h5(h5_path, scan_dir, base):
-    """Load from Python-generated HDF5 file."""
+    """Load from Python-generated HDF5 file.
+
+    Detects two-array layout (``two_array=True`` file attr) and returns per-
+    image logicals/intensities; legacy single-array files still produce the
+    flat ``logicals`` / ``intensities`` arrays as before.
+    """
     import h5py
 
     mat_path = os.path.join(scan_dir, base + '.mat')
     scan = load_scan_config_from_mat(mat_path) if os.path.isfile(mat_path) else {}
 
+    logicals = intensities = None
+    logicals_img1 = logicals_img2 = None
+    intensities_img1 = intensities_img2 = None
+
     with h5py.File(h5_path, 'r') as f:
-        logicals = f['logicals'][:] if 'logicals' in f else None
-        intensities = f['intensities'][:] if 'intensities' in f else None
+        two_array = bool(f.attrs.get('two_array', False))
+        if two_array:
+            logicals_img1 = f['logicals_img1'][:] if 'logicals_img1' in f else None
+            logicals_img2 = f['logicals_img2'][:] if 'logicals_img2' in f else None
+            if 'intensities_img1' in f:
+                intensities_img1 = f['intensities_img1'][:]
+            if 'intensities_img2' in f:
+                intensities_img2 = f['intensities_img2'][:]
+        else:
+            logicals = f['logicals'][:] if 'logicals' in f else None
+            intensities = f['intensities'][:] if 'intensities' in f else None
         seq_ids = f['seq_ids'][:] if 'seq_ids' in f else None
         # Don't load imgs by default (can be huge)
         imgs_shape = f['imgs'].shape if 'imgs' in f else None
@@ -99,8 +117,13 @@ def _load_from_h5(h5_path, scan_dir, base):
 
     return {
         'Scan': scan,
+        'two_array': two_array,
         'logicals': logicals,
         'intensities': intensities,
+        'logicals_img1': logicals_img1,
+        'logicals_img2': logicals_img2,
+        'intensities_img1': intensities_img1,
+        'intensities_img2': intensities_img2,
         'seq_ids': seq_ids.ravel() if seq_ids is not None else None,
         'imgs_shape': imgs_shape,
         'path': h5_path,
@@ -121,8 +144,13 @@ def _load_from_mat(mat_path):
 
     return {
         'Scan': scan,
+        'two_array': False,
         'logicals': logicals,
         'intensities': None,  # MATLAB doesn't save intensities
+        'logicals_img1': None,
+        'logicals_img2': None,
+        'intensities_img1': None,
+        'intensities_img2': None,
         'seq_ids': seq_ids,
         'imgs_shape': imgs_shape,
         'path': mat_path,

@@ -212,8 +212,9 @@ def extract_scan_params_h5(mat_path):
 # ---------------------------------------------------------------------------
 
 def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
-                       scan_dims=None):
-    """Compute survival or loading curve from accumulated logicals.
+                       scan_dims=None, is_two_array=False):
+    """Compute survival, loading, or rearrangement curve from accumulated
+    logicals.
 
     For 1-D scans (scan_dims is None or has 1 entry) returns the classic
     scatter-with-errorbars dict.
@@ -229,6 +230,14 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     num_images : int
     scan_dims : list of dict or None
         From extract_scan_dims(); if len >= 2, produce a 2-D heatmap.
+    is_two_array : bool
+        Two-array mode (isGrid2=1). When True AND the two grids have
+        **different** site counts, compute mean of ``logic2`` (rearrangement
+        success rate). When the two grids have the **same** site count we
+        assume grid-2 is just a translation of grid-1 (matched site indices)
+        and fall back to the standard conditioned-survival calc. When
+        False, behaves exactly as before (survival when NumImages=2,
+        loading when NumImages=1).
 
     Returns
     -------
@@ -237,16 +246,24 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     is_2d = scan_dims is not None and len(scan_dims) >= 2
 
     if is_2d:
-        return _compute_2d(scan_logicals, param_indices, scan_dims, num_images)
+        return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
+                           is_two_array=is_two_array)
 
-    # --- 1-D path (unchanged) ---
+    # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
         return None
     if num_images > 2:
         return {'mode': 'undefined'}
 
     n_params = len(scan_params)
-    n_sites = len(scan_logicals[0][1])
+    n_sites_1 = len(scan_logicals[0][1])
+    has_logic2 = scan_logicals[0][2] is not None
+    n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
+    # In two-array mode with different-sized grids, the per-param metric is
+    # the mean of logic2 over array-2 sites. With same-sized grids, treat as
+    # matched-index survival like the legacy single-array case.
+    different_arrays = is_two_array and has_logic2 and n_sites_1 != n_sites_2
+    n_sites = n_sites_2 if different_arrays else n_sites_1
 
     buckets = [[] for _ in range(n_params)]
     for seq_id, logic1, logic2 in scan_logicals:
@@ -258,7 +275,11 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
             continue
         buckets[p].append((logic1, logic2))
 
-    if num_images == 2:
+    if different_arrays and num_images == 2:
+        mode = 'rearrangement'
+        y_mean_sr, y_sem_sr, n_reps = _rearrangement_buckets(
+            buckets, n_sites, n_params)
+    elif num_images == 2:
         mode = 'survival'
         y_mean_sr, y_sem_sr, n_reps = _survival_buckets(buckets, n_sites, n_params)
     else:
@@ -281,7 +302,8 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     }
 
 
-def _compute_2d(scan_logicals, param_indices, scan_dims, num_images):
+def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
+                is_two_array=False):
     """Compute 2-D heatmap for multi-dimensional scans.
 
     The flat param_index decomposes column-major (dim-0 varies fastest):
@@ -296,7 +318,11 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images):
     d0, d1 = scan_dims[0], scan_dims[1]
     s0, s1 = d0['size'], d1['size']
     n_total = s0 * s1
-    n_sites = len(scan_logicals[0][1])
+    n_sites_1 = len(scan_logicals[0][1])
+    has_logic2 = scan_logicals[0][2] is not None
+    n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
+    different_arrays = is_two_array and has_logic2 and n_sites_1 != n_sites_2
+    n_sites = n_sites_2 if different_arrays else n_sites_1
 
     # Bucket by flat param index (0-based)
     buckets = [[] for _ in range(n_total)]
@@ -309,7 +335,11 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images):
             continue
         buckets[p].append((logic1, logic2))
 
-    if num_images == 2:
+    if different_arrays and num_images == 2:
+        mode = 'rearrangement'
+        y_mean_sr, y_sem_sr, n_reps = _rearrangement_buckets(
+            buckets, n_sites, n_total)
+    elif num_images == 2:
         mode = 'survival'
         y_mean_sr, y_sem_sr, n_reps = _survival_buckets(buckets, n_sites, n_total)
     else:
@@ -381,6 +411,34 @@ def _loading_buckets(buckets, n_sites, n_params):
         n_reps[p] = reps
         l1 = np.array([b[0] for b in buckets[p]])
         prob = l1.mean(axis=0)
+        se = np.sqrt(prob * (1 - prob) / reps)
+        y_mean_sr[:, p] = prob
+        y_sem_sr[:, p] = se
+
+    return y_mean_sr, y_sem_sr, n_reps
+
+
+def _rearrangement_buckets(buckets, n_sites, n_params):
+    """Compute mean of logic2 (rearrangement success rate) per param bucket.
+
+    Used in two-array mode (isGrid2=1) where image-2 captures a defect-free
+    target array. n_sites is the img2 grid size.
+    """
+    y_mean_sr = np.full((n_sites, n_params), np.nan)
+    y_sem_sr = np.full((n_sites, n_params), np.nan)
+    n_reps = np.zeros(n_params, dtype=int)
+
+    for p in range(n_params):
+        if not buckets[p]:
+            continue
+        # Skip reps that don't have an image-2 logical (single-image seqs)
+        l2_list = [b[1] for b in buckets[p] if b[1] is not None]
+        if not l2_list:
+            continue
+        reps = len(l2_list)
+        n_reps[p] = reps
+        l2 = np.array(l2_list)
+        prob = l2.mean(axis=0)
         se = np.sqrt(prob * (1 - prob) / reps)
         y_mean_sr[:, p] = prob
         y_sem_sr[:, p] = se

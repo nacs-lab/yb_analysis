@@ -75,6 +75,14 @@ class DashboardRenderer:
             d['_img_vlo'] = vlo
             d['_img_vhi'] = vhi
             d.pop('cur_image', None)  # don't pickle the raw image (18MB)
+        img2 = d.get('cur_image2')
+        if img2 is not None:
+            uri2, vlo2, vhi2 = _img_to_data_uri(np.asarray(img2, dtype=np.int16))
+            d['_img2_data_uri'] = uri2
+            d['_img2_shape'] = img2.shape
+            d['_img2_vlo'] = vlo2
+            d['_img2_vhi'] = vhi2
+            d.pop('cur_image2', None)
         # Write to alternating files to avoid read/write conflicts on Windows
         idx = getattr(self, '_write_idx', 0)
         target = _DATA_FILE + f'.{idx}'
@@ -184,21 +192,19 @@ new MutationObserver(function(mutations) {
         'fontFamily': '"Segoe UI", sans-serif', 'color': TEXT, 'padding': '10px'}, children=[
         html.H1('Yb Tweezer Dashboard', style={'textAlign': 'center', 'color': '#e94560',
             'margin': '5px 0 10px 0', 'fontSize': '24px'}),
-        # Row 1+2: Tweezer Array (spans both rows) | right column stacked
-        html.Div(style={'display': 'flex', 'gap': '10px', 'marginBottom': '10px'}, children=[
-            # Left: Tweezer Array (tall, spanning 2 rows)
+        # Row 1: image1 | image2 | scan curve — three equal-width 670px panels
+        # (per-shot live data: gets the most vertical real estate)
+        _row([
             _graph('array', 670),
-            # Right: stacked panels
-            html.Div(style={'flex': '1', 'display': 'flex', 'flexDirection': 'column', 'gap': '10px'}, children=[
-                _graph('intens', 330),
-                html.Div(style={'display': 'flex', 'gap': '10px'}, children=[
-                    _graph('shift', 330), _graph('scan', 330),
-                ]),
-            ]),
+            _graph('array2', 670),
+            _graph('scan', 670),
         ]),
-        # Row 3: Avg Histogram + Rep site histograms
+        # Row 2: Atom Intensities — full width, slightly taller than rows 3-4
+        # (also per-shot data)
+        _row([_graph('intens', 320)]),
+        # Row 3: Avg Histogram + Rep site histograms (refit every 200 shots)
         _row([_graph('avghist', 240)] + [_graph(f'rep{i}', 240) for i in range(4)]),
-        # Row 4: Loading Rates | Infidelities | Site selector (equal thirds)
+        # Row 4: Loading | Infidelities | Site selector + Site Hist | Grid Shift
         _row([
             _graph('load', 280),
             _graph('infid', 280),
@@ -214,6 +220,7 @@ new MutationObserver(function(mutations) {
                 # Right: histogram
                 _graph('site', 270),
             ]),
+            _graph('shift', 280),
         ]),
         # Debug
         html.Details([
@@ -225,7 +232,8 @@ new MutationObserver(function(mutations) {
     ])
 
     # --- Single callback for all panels ---
-    outputs = ([Output('array', 'figure'), Output('intens', 'figure'),
+    outputs = ([Output('array', 'figure'), Output('array2', 'figure'),
+                 Output('intens', 'figure'),
                  Output('load', 'figure'), Output('infid', 'figure'),
                  Output('shift', 'figure'), Output('scan', 'figure'),
                  Output('avghist', 'figure')]
@@ -239,18 +247,30 @@ new MutationObserver(function(mutations) {
 
         if d is None:
             debug_lines.append('No data yet (pickle file not found)')
-            empty = [_waiting(t) for t in ['Tweezer Array', 'Intensities',
-                     'Loading', 'Infidelities', 'Grid Shift', 'Scan Curve', 'Avg Histogram']]
+            empty = [_waiting(t) for t in ['Tweezer Array (img 1)', 'Tweezer Array (img 2)',
+                     'Intensities', 'Loading', 'Infidelities', 'Grid Shift', 'Scan Curve',
+                     'Avg Histogram']]
             return empty + [_waiting('Site Hist')]*4 + [[], '\n'.join(debug_lines)]
 
         try:
             has_img = d.get('_img_data_uri') is not None
+            has_img2 = d.get('_img2_data_uri') is not None
             n = d.get('num_sites', 0)
             v = d.get('hist_version', 0)
             n_acc = d.get('n_accum_shots', 0)
 
+            num_images = int(d.get('num_images', 1) or 1)
+            img2_no_data_msg = ('No image 2 (NumImages = 1)' if num_images < 2
+                                else 'Waiting for data...')
+            img2_grid_key = ('grid_locations_img2' if d.get('is_two_array')
+                             else 'grid_locations')
             figs = [
-                _fig_array(d) if has_img else _waiting('Tweezer Array'),
+                _fig_array(d) if has_img else _waiting('Tweezer Array (img 1)'),
+                _fig_array(d, img_key='_img2_data_uri', shape_key='_img2_shape',
+                           vlo_key='_img2_vlo', vhi_key='_img2_vhi',
+                           logicals_key='logicals2', grid_key=img2_grid_key,
+                           title='Tweezer Array (img 2)')
+                    if has_img2 else _waiting('Tweezer Array (img 2)', img2_no_data_msg),
                 _fig_intens(d),
                 _fig_loading(d),
                 _fig_infid(d),
@@ -269,14 +289,14 @@ new MutationObserver(function(mutations) {
             debug_lines.append(f'live_hist: {"list["+str(len(lh))+"]" if isinstance(lh, list) else type(lh).__name__}')
             debug_lines.append(f'live_fits: {"list["+str(len(lf))+"]" if isinstance(lf, list) else type(lf).__name__}')
             debug_lines.append(f'loaded_fits: {"list["+str(len(ldf))+"]" if isinstance(ldf, list) else type(ldf).__name__}')
-            debug_lines.append(f'img={has_img} rep_sites={d.get("hist_rep_sites")}')
+            debug_lines.append(f'img={has_img} img2={has_img2} rep_sites={d.get("hist_rep_sites")}')
 
             return figs + reps + [opts, '\n'.join(debug_lines)]
 
         except Exception:
             tb = traceback.format_exc()
             logging.error('Dashboard render error:\n%s', tb)
-            return [no_update] * 13
+            return [no_update] * 14
 
     @app.callback([Output('site', 'figure'), Output('site-info', 'children')],
                   [Input('site-dd', 'value'), Input('tick', 'n_intervals')])
@@ -306,9 +326,9 @@ def _graph(id, h):
     return dcc.Graph(id=id, figure=_waiting(''), style={'flex': '1', 'height': f'{h}px'},
                      config={'displayModeBar': False})
 
-def _waiting(title):
+def _waiting(title, message='Waiting for data...'):
     fig = go.Figure()
-    fig.add_annotation(text='Waiting for data...', x=0.5, y=0.5, xref='paper', yref='paper',
+    fig.add_annotation(text=message, x=0.5, y=0.5, xref='paper', yref='paper',
                        showarrow=False, font=dict(size=14, color='#666'))
     fig.update_layout(paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, size=10),
                       margin=dict(l=40, r=15, t=35, b=30), uirevision='waiting',
@@ -332,11 +352,14 @@ def _img_to_data_uri(img):
     return f'data:image/png;base64,{b64}', vlo, vhi
 
 
-def _fig_array(d):
-    data_uri = d.get('_img_data_uri')
-    shape = d.get('_img_shape')
+def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
+               vlo_key='_img_vlo', vhi_key='_img_vhi',
+               logicals_key='logicals', grid_key='grid_locations',
+               title='Tweezer Array (img 1)'):
+    data_uri = d.get(img_key)
+    shape = d.get(shape_key)
     if data_uri is None or shape is None:
-        return _waiting('Tweezer Array')
+        return _waiting(title)
     H, W = shape
     fig = go.Figure()
     fig.add_layout_image(
@@ -345,8 +368,8 @@ def _fig_array(d):
         sizing='stretch', layer='below',
     )
     # Colorbar via invisible scatter + autorange anchor at image corners
-    vlo = d.get('_img_vlo', 0)
-    vhi = d.get('_img_vhi', 255)
+    vlo = d.get(vlo_key, 0)
+    vhi = d.get(vhi_key, 255)
     fig.add_trace(go.Scatter(
         x=[0, W, 0, W], y=[0, 0, H, H], mode='markers',
         marker=dict(size=0.1, opacity=0, color=[vlo, vhi, vlo, vhi],
@@ -355,8 +378,8 @@ def _fig_array(d):
         hoverinfo='skip', showlegend=False))
 
     # Site markers as lightweight scatter overlay
-    grid = d.get('grid_locations')
-    logicals = d.get('logicals')
+    grid = d.get(grid_key)
+    logicals = d.get(logicals_key)
     box = d.get('box_size', 11)
     n = len(grid) if grid is not None else 0
     if grid is not None:
@@ -377,7 +400,7 @@ def _fig_array(d):
                 textfont=dict(color='#ffdd44', size=7),
                 hoverinfo='skip', showlegend=False))
 
-    fig.update_layout(**_L, title='Tweezer Array',
+    fig.update_layout(**_L, title=title,
                       xaxis=dict(range=[0, W], showgrid=False, zeroline=False, **_A),
                       yaxis=dict(range=[H, 0], scaleanchor='x', scaleratio=1,
                                  showgrid=False, zeroline=False, **_A))
@@ -544,7 +567,12 @@ def _fig_scan_curve(d):
 
     scan_name = d.get('scan_name', 'Scan')
     x_label = d.get('scan_param_path') or scan_name
-    y_label = 'Survival' if mode == 'survival' else 'Loading Rate'
+    if mode == 'survival':
+        y_label = 'Survival'
+    elif mode == 'rearrangement':
+        y_label = 'Rearrangement Success (mean of logic2)'
+    else:
+        y_label = 'Loading Rate'
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(

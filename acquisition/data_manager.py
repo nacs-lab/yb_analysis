@@ -92,6 +92,19 @@ class DataManager:
         self.num_images_per_seq = int(_scalar(self.config.get('NumImages', 1)))
         self.is_init = bool(_scalar(self.config.get('isInit', 0)))
         self.is_hc = bool(_scalar(self.config.get('isHC', 0)))
+        # Two-array mode (isGrid2=1): image-2 uses its own grid/thresholds
+        # loaded from gridLocations_img2.txt / threshold_img2.mat in the day
+        # folder. Drift correction is inherited from image-1; image-2
+        # thresholds are never refit. See plan: two-array mode.
+        self.is_two_array = bool(_scalar(self.config.get('isGrid2', 0)))
+        self.grid_locations_img2 = None
+        self.num_sites_img2 = 0
+        self.loaded_thresholds_img2 = None
+        self.loaded_infidelities_img2 = None
+        self.loaded_gauss_fits_img2 = None
+        self.loaded_hist_data_img2 = None
+        self.loading_rates_img2 = None
+        self.log_buffer_img2 = None
         box_size = int(_scalar(self.config.get('boxSize', 11)))
         mask_sigma = float(_scalar(self.config.get('maskSigma', 2.0)))
         self.mask_mat = _gaussian_mask(box_size, mask_sigma)
@@ -131,6 +144,10 @@ class DataManager:
         buf_size = max(UPDATE_THRES_BATCH_SIZE, UPDATE_GRID_BATCH_SIZE)
         self.img_buffer = RingBuffer(buf_size, self.frame_size, dtype='int16')
         self.log_buffer = RingBuffer(buf_size, (self.num_sites,), dtype='float64')
+        if self.is_two_array and self.num_sites_img2 > 0:
+            self.log_buffer_img2 = RingBuffer(buf_size, (self.num_sites_img2,),
+                                              dtype='float64')
+            self.loading_rates_img2 = np.zeros(self.num_sites_img2)
 
         # --- Scan curve ---
         raw_params = self.config.get('Params')
@@ -154,10 +171,13 @@ class DataManager:
         self.grid_shift_history = []
         self.grid_shift_heatmap = None
 
-        # --- Display state: always image-1 of the latest sequence ---
+        # --- Display state: image-1 and image-2 of the latest sequence ---
         self._display_image = None
         self._display_intensities = None
         self._display_logicals = None
+        self._display_image2 = None
+        self._display_intensities2 = None
+        self._display_logicals2 = None
 
         # --- Processing buffers ---
         self._frame_size_fixed = False
@@ -171,9 +191,18 @@ class DataManager:
         # --- File I/O ---
         self._save_lock = threading.Lock()
         self._file_created = False
+        # Two-array HDF5 layout only when we'll actually capture img2 frames.
+        # With isGrid2=1 but NumImages=1, fall back to single-array layout.
+        self._save_two_array = (self.is_two_array
+                                and self.num_images_per_seq >= 2
+                                and self.num_sites_img2 > 0)
         if self.num_sites > 0:
             try:
-                create_scan_file(self.fname, self.config, self.frame_size, self.num_sites)
+                create_scan_file(
+                    self.fname, self.config, self.frame_size, self.num_sites,
+                    two_array=self._save_two_array,
+                    num_sites_img2=self.num_sites_img2,
+                )
                 self._file_created = True
             except Exception as e:
                 logger.warning('Failed to create HDF5: %s', e)
@@ -185,9 +214,23 @@ class DataManager:
         self.loaded_infidelities = np.array([])
         self.loaded_gauss_fits = None
         self.grid_locations = np.zeros((0, 2))
+        # Two-array state stays empty in isInit/isHC paths
+        self.is_two_array = False
+        self.grid_locations_img2 = None
+        self.num_sites_img2 = 0
+        self.loaded_thresholds_img2 = None
+        self.loaded_infidelities_img2 = None
+        self.loaded_gauss_fits_img2 = None
+        self.loaded_hist_data_img2 = None
+        self.loading_rates_img2 = None
+        self.log_buffer_img2 = None
+        self._save_two_array = False
         self._display_image = None
         self._display_intensities = None
         self._display_logicals = None
+        self._display_image2 = None
+        self._display_intensities2 = None
+        self._display_logicals2 = None
         self._intensity_accum = []
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
@@ -273,6 +316,90 @@ class DataManager:
             if raw_gf is not None:
                 self.loaded_gauss_fits = _parse_gauss_fits_struct(raw_gf)
 
+        # Two-array mode (isGrid2=1): load image-2 calibration from day folder.
+        # Offline analysis (load_data, unpack) handles this layout; see plan.
+        if self.is_two_array:
+            self._load_img2_calibration()
+
+    def _load_img2_calibration(self):
+        """Load image-2 grid/thresholds/histData from the day folder.
+
+        Falls back to single-array mode (self.is_two_array = False) on any
+        missing or invalid file, rather than crashing the scan.
+        """
+        from yb_analysis.io.preload import (
+            _parse_hist_data_struct, _parse_gauss_fits_struct
+        )
+        from scipy.io import loadmat
+
+        grid_path = os.path.join(self._day_dir, 'gridLocations_img2.txt')
+        if not os.path.isfile(grid_path):
+            logger.warning('isGrid2=1 but %s not found; falling back to '
+                           'single-array mode', grid_path)
+            self.is_two_array = False
+            return
+
+        try:
+            g = np.loadtxt(grid_path, skiprows=1)
+            if g.ndim == 1:
+                g = g.reshape(1, -1)
+            if g.shape[1] < 2 or g.shape[0] == 0:
+                raise ValueError('grid file has no usable rows')
+            self.grid_locations_img2 = g[:, :2]
+            self.num_sites_img2 = len(g)
+            logger.info('Loaded img2 grid (%d sites)', self.num_sites_img2)
+        except Exception as e:
+            logger.warning('Failed to load %s (%s); single-array fallback',
+                           grid_path, e)
+            self.is_two_array = False
+            self.grid_locations_img2 = None
+            self.num_sites_img2 = 0
+            return
+
+        thresh_path = os.path.join(self._day_dir, 'threshold_img2.mat')
+        if not os.path.isfile(thresh_path):
+            logger.warning('isGrid2=1 but %s not found; single-array fallback',
+                           thresh_path)
+            self.is_two_array = False
+            self.grid_locations_img2 = None
+            self.num_sites_img2 = 0
+            return
+        try:
+            td = loadmat(thresh_path, squeeze_me=True)
+            t = np.asarray(td['thresholds'], dtype=np.float64).ravel()
+            if len(t) != self.num_sites_img2:
+                raise ValueError(f'thresholds_img2 length {len(t)} != '
+                                 f'num_sites_img2 {self.num_sites_img2}')
+            self.loaded_thresholds_img2 = t
+            self.loaded_infidelities_img2 = np.asarray(
+                td.get('infidelities', np.full(self.num_sites_img2, np.nan)),
+                dtype=np.float64).ravel()
+            self.loaded_gauss_fits_img2 = _parse_gauss_fits_struct(
+                td.get('gaussFitsStruct'))
+        except Exception as e:
+            logger.warning('Failed to load %s (%s); single-array fallback',
+                           thresh_path, e)
+            self.is_two_array = False
+            self.grid_locations_img2 = None
+            self.num_sites_img2 = 0
+            self.loaded_thresholds_img2 = None
+            self.loaded_infidelities_img2 = None
+            self.loaded_gauss_fits_img2 = None
+            return
+
+        # histData_img2 is optional — missing/invalid is non-fatal
+        hist_path = os.path.join(self._day_dir, 'histData_img2.mat')
+        if os.path.isfile(hist_path):
+            try:
+                hd = loadmat(hist_path, squeeze_me=True)
+                self.loaded_hist_data_img2 = _parse_hist_data_struct(
+                    hd.get('histData'), self.num_sites_img2)
+            except Exception as e:
+                logger.debug('Could not load %s: %s', hist_path, e)
+
+        logger.info('Two-array mode active: img1=%d sites, img2=%d sites',
+                    self.num_sites, self.num_sites_img2)
+
     # --- EFFECTIVE properties ---
 
     @property
@@ -338,9 +465,15 @@ class DataManager:
         pSeq = self.num_images_per_seq
         seq_logic_buf = []  # collect logicals within one sequence
         for idx, img in enumerate(self._imgs_to_process):
+            # In two-array mode, image-2 uses its own grid + thresholds
+            if self.is_two_array and pSeq >= 2 and idx % pSeq == 1:
+                grid_i = self.grid_locations_img2
+                thr_i = self.loaded_thresholds_img2
+            else:
+                grid_i = self.grid_locations
+                thr_i = self.thresholds
             logicals, intensities = detect_atom(
-                img.astype(np.float64), self.grid_locations,
-                self.thresholds, self.mask_mat
+                img.astype(np.float64), grid_i, thr_i, self.mask_mat
             )
             self._logicals_to_save.append(logicals)
             self._intensities_to_save.append(intensities)
@@ -355,6 +488,13 @@ class DataManager:
                 self._display_image = img.astype(np.int16)
                 self._display_intensities = intensities.copy()
                 self._display_logicals = logicals.copy()
+            # On second image of each sequence: capture for image-2 display
+            elif pSeq >= 2 and idx % pSeq == 1:
+                self._display_image2 = img.astype(np.int16)
+                self._display_intensities2 = intensities.copy()
+                self._display_logicals2 = logicals.copy()
+                if self.is_two_array and self.log_buffer_img2 is not None:
+                    self.log_buffer_img2.push(logicals.astype(np.float64))
 
             # On last image of each sequence: accumulate for scan curve
             if idx % pSeq == pSeq - 1:
@@ -411,6 +551,10 @@ class DataManager:
                 self.grid_locations = grid
                 self.grid_shift_history.append((dy, dx))
                 self.grid_shift_heatmap = heatmap
+                # Two-array: inherit the same camera-frame shift on img2 grid
+                if self.is_two_array and self.grid_locations_img2 is not None:
+                    self.grid_locations_img2 = (
+                        self.grid_locations_img2 + np.array([dy, dx]))
                 self._save_grid()
                 logger.info('Grid updated (dy=%d, dx=%d)', dy, dx)
 
@@ -434,6 +578,12 @@ class DataManager:
             if self.log_buffer and self.log_buffer.size() >= UPDATE_LOADING_INTERVAL:
                 n = min(self.log_buffer.size(), 200)
                 self.loading_rates = self.log_buffer.get_last_n(n).mean(axis=0)
+                if (self.is_two_array
+                        and self.log_buffer_img2 is not None
+                        and self.log_buffer_img2.size() >= UPDATE_LOADING_INTERVAL):
+                    n2 = min(self.log_buffer_img2.size(), 200)
+                    self.loading_rates_img2 = (
+                        self.log_buffer_img2.get_last_n(n2).mean(axis=0))
                 self._img_cnt_loading = 0
 
     def _fit_gaussians(self, all_intensities):
@@ -540,14 +690,48 @@ class DataManager:
         if not self._imgs_to_save or not self._file_created:
             return self.fname
         imgs = np.array(self._imgs_to_save, dtype=np.int16)
-        logs = np.array(self._logicals_to_save, dtype=bool) if self._logicals_to_save else np.zeros((len(imgs), max(self.num_sites, 1)), dtype=bool)
-        ints = np.array(self._intensities_to_save, dtype=np.float64) if self._intensities_to_save else np.zeros_like(logs, dtype=np.float64)
         sids = np.array(self._seq_ids_to_save, dtype=np.int64)
 
-        def _do():
-            with self._save_lock:
-                append_block(self.fname, imgs, logs, ints, sids)
-                logger.info('Saved %d frames', len(imgs))
+        if self._save_two_array:
+            # Demux the interleaved per-frame lists into per-image-per-sequence
+            # arrays. Frame indices 0,2,4,... are img1; 1,3,5,... are img2.
+            # See plan: HDF5 two-array layout.
+            logs1 = (np.array(self._logicals_to_save[0::2], dtype=bool)
+                     if self._logicals_to_save
+                     else np.zeros((len(imgs) // 2, max(self.num_sites, 1)),
+                                   dtype=bool))
+            logs2 = (np.array(self._logicals_to_save[1::2], dtype=bool)
+                     if self._logicals_to_save
+                     else np.zeros((len(imgs) // 2,
+                                    max(self.num_sites_img2, 1)), dtype=bool))
+            ints1 = (np.array(self._intensities_to_save[0::2], dtype=np.float64)
+                     if self._intensities_to_save
+                     else np.zeros_like(logs1, dtype=np.float64))
+            ints2 = (np.array(self._intensities_to_save[1::2], dtype=np.float64)
+                     if self._intensities_to_save
+                     else np.zeros_like(logs2, dtype=np.float64))
+
+            def _do():
+                with self._save_lock:
+                    append_block(
+                        self.fname, imgs, logs1, ints1, sids,
+                        logicals_img2_block=logs2,
+                        intensities_img2_block=ints2,
+                    )
+                    logger.info('Saved %d frames (two-array)', len(imgs))
+        else:
+            logs = (np.array(self._logicals_to_save, dtype=bool)
+                    if self._logicals_to_save
+                    else np.zeros((len(imgs), max(self.num_sites, 1)),
+                                  dtype=bool))
+            ints = (np.array(self._intensities_to_save, dtype=np.float64)
+                    if self._intensities_to_save
+                    else np.zeros_like(logs, dtype=np.float64))
+
+            def _do():
+                with self._save_lock:
+                    append_block(self.fname, imgs, logs, ints, sids)
+                    logger.info('Saved %d frames', len(imgs))
 
         threading.Thread(target=_do, daemon=True).start()
         self._imgs_to_save.clear()
@@ -562,6 +746,13 @@ class DataManager:
                        self.grid_locations, header='Y\tX', delimiter='\t', comments='')
         except Exception as e:
             logger.warning('Grid save failed: %s', e)
+        if self.is_two_array and self.grid_locations_img2 is not None:
+            try:
+                np.savetxt(os.path.join(self._day_dir, 'gridLocations_img2.txt'),
+                           self.grid_locations_img2, header='Y\tX',
+                           delimiter='\t', comments='')
+            except Exception as e:
+                logger.warning('Grid img2 save failed: %s', e)
 
     def _save_threshold(self):
         try:
@@ -601,6 +792,20 @@ class DataManager:
             'cur_image': self._display_image.astype(np.float64) if self._display_image is not None else None,
             'cur_intensities': self._display_intensities,
             'logicals': self._display_logicals,
+            'cur_image2': self._display_image2.astype(np.float64) if self._display_image2 is not None else None,
+            'cur_intensities2': self._display_intensities2,
+            'logicals2': self._display_logicals2,
+            'num_images': self.num_images_per_seq,
+            'is_two_array': self.is_two_array,
+            'grid_locations_img2': self.grid_locations_img2.copy()
+                if self.grid_locations_img2 is not None else None,
+            'num_sites_img2': self.num_sites_img2,
+            'thresholds_img2': self.loaded_thresholds_img2,
+            'infidelities_img2': self.loaded_infidelities_img2,
+            'loaded_gauss_fits_img2': self.loaded_gauss_fits_img2,
+            'loaded_hist_data_img2': self.loaded_hist_data_img2,
+            'loading_rates_img2': self.loading_rates_img2.copy()
+                if self.loading_rates_img2 is not None else None,
             'grid_locations': self.grid_locations.copy() if len(self.grid_locations) > 0 else None,
             'box_size': self.mask_mat.shape[0],
             'num_sites': self.num_sites,
@@ -618,7 +823,8 @@ class DataManager:
             'scan_curve': compute_scan_curve(
                 self._scan_logicals, self._param_indices,
                 self._scan_params, self.num_images_per_seq,
-                scan_dims=self._scan_dims),
+                scan_dims=self._scan_dims,
+                is_two_array=self.is_two_array),
             'scan_name': self._scan_name,
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,
