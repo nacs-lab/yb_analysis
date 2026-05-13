@@ -479,7 +479,8 @@ def plot_scan_site_resolved(scan_params, prob_sr, sem_sr=None, fits=None,
 
 
 def plot_site_data(data, grid_locations, data_sem=None, site_idx=None,
-                   title='', cmap='RdYlGn', clim=None, marker_size=80):
+                   title='', cmap='RdYlGn', clim=None, marker_size=80,
+                   bins=None, clip_percentile=(1, 99)):
     """3-panel spatial visualization: 1D line, 2D scatter, histogram.
 
     Port of MATLAB's plotSiteData_anyGeometry.m.
@@ -506,6 +507,12 @@ def plot_site_data(data, grid_locations, data_sem=None, site_idx=None,
 
     n = len(data)
     valid = np.isfinite(data)
+    valid_data = data[valid]
+
+    if clip_percentile is not None and len(valid_data) > 0:
+        lo, hi = np.nanpercentile(valid_data, clip_percentile)
+    else:
+        lo, hi = (np.nanmin(valid_data), np.nanmax(valid_data)) if len(valid_data) else (0, 1)
 
     fig, (ax_line, ax_spatial, ax_hist) = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(title, fontsize=14)
@@ -518,10 +525,13 @@ def plot_site_data(data, grid_locations, data_sem=None, site_idx=None,
     ax_line.set_xlabel('Site')
     ax_line.set_ylabel('Value')
     ax_line.grid(True, alpha=0.3)
+    if clip_percentile is not None:
+        pad = 0.05 * (hi - lo) if hi > lo else 0
+        ax_line.set_ylim(lo - pad, hi + pad)
 
     # Panel 2: 2D spatial scatter
     if clim is None:
-        vmin, vmax = np.nanmin(data), np.nanmax(data)
+        vmin, vmax = lo, hi
     else:
         vmin, vmax = clim
     norm = Normalize(vmin=vmin, vmax=vmax)
@@ -535,10 +545,15 @@ def plot_site_data(data, grid_locations, data_sem=None, site_idx=None,
     plt.colorbar(sc, ax=ax_spatial)
 
     # Panel 3: histogram + Gaussian fit
-    valid_data = data[valid]
-    ax_hist.hist(valid_data, bins=min(30, max(5, n // 3)), edgecolor='black', alpha=0.7)
-    if len(valid_data) > 3:
-        mu, std = valid_data.mean(), valid_data.std()
+    if clip_percentile is not None:
+        hist_data = valid_data[(valid_data >= lo) & (valid_data <= hi)]
+    else:
+        hist_data = valid_data
+    if bins is None:
+        bins = max(30, int(np.sqrt(len(hist_data)) * 3))
+    ax_hist.hist(hist_data, bins=bins, edgecolor='black', alpha=0.7)
+    if len(hist_data) > 3:
+        mu, std = hist_data.mean(), hist_data.std()
         ax_hist.axvline(mu, color='red', linestyle='--', label=f'μ={mu:.3g}')
         ax_hist.set_title(f'μ={mu:.3g}, σ={std:.3g}')
     ax_hist.set_xlabel('Value')
