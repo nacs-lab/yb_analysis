@@ -580,7 +580,11 @@ def _fig_scan_curve(d):
         mode='markers', marker=dict(size=6, color='#44aaff'),
         hoverinfo='text', hovertext=[f'{x_label}={xi:.4g}, {y_label}={yi:.3f}+/-{ei:.3f} (n={ni})'
                                       for xi, yi, ei, ni in zip(x_disp, y, err, n_reps)]))
-    fig.update_layout(**_L, title=f'{scan_name} ({int(n_reps.mean())} reps/pt)',
+    title_text = f'{scan_name} ({int(n_reps.mean())} reps/pt)'
+    fname = d.get('scan_filename')
+    if fname:
+        title_text += f'<br><sub style="font-size:10px;color:#888">{fname}</sub>'
+    fig.update_layout(**_L, title=title_text,
                       xaxis=dict(title=x_label, **_A),
                       yaxis=dict(title=y_label, range=[-0.05, 1.05], **_A))
     return fig
@@ -621,7 +625,11 @@ def _fig_scan_2d(d, sc):
         colorbar=dict(title=y_label, len=0.9),
         hovertemplate=f'{x_name}=%{{x:.4g}}<br>{y_name}=%{{y:.4g}}<br>{y_label}=%{{z:.3f}}<extra></extra>',
     ))
-    fig.update_layout(**_L, title=f'{scan_name} ({avg_reps} reps/pt)',
+    title_text = f'{scan_name} ({avg_reps} reps/pt)'
+    fname = d.get('scan_filename')
+    if fname:
+        title_text += f'<br><sub style="font-size:10px;color:#888">{fname}</sub>'
+    fig.update_layout(**_L, title=title_text,
                       xaxis=dict(title=x_name, **_A),
                       yaxis=dict(title=y_name, **_A))
     return fig

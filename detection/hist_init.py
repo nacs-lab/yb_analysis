@@ -382,6 +382,100 @@ def sort_grid(positions):
     return np.vstack(result)
 
 
+def sort_grid_rotated(positions, rotation_deg=None, spacing=None,
+                      return_info=False, verbose=False):
+    """Column-major, bottom-up sort for a (possibly rotated) lattice.
+
+    Order: index 0 is the bottom-left site (smallest column, largest image
+    y within that column), then up the leftmost column (decreasing image y),
+    then step right to the next column, repeat.
+
+    Algorithm:
+      1. Estimate lattice rotation θ from nearest-neighbor bearings (folded
+         by 4× angle doubling so the four orthogonal lattice directions
+         collapse to one circular mean).
+      2. Estimate lattice spacing as the median NN distance.
+      3. Project sites into the rotated frame (x_r along the more-horizontal
+         lattice axis, y_r along the more-vertical one).
+      4. Snap each site's x_r to an integer column index by rounding
+         ``(x_r - x_r.min()) / spacing``. Robust to missing columns.
+      5. Sort by (column index asc, y_r desc).
+
+    Parameters
+    ----------
+    positions : ndarray (N, 2)
+        Sites in image coords [y, x] (image y increases downward).
+    rotation_deg : float or None
+        Lattice rotation, CCW from image +x, in degrees. If None, auto-
+        estimated. For grids close to 45° tilt the auto-pick can flip row
+        vs column by 90° — pass manually in that case.
+    spacing : float or None
+        Lattice pitch in px. If None, taken as the median NN distance.
+    return_info : bool
+        If True, return (sorted_pos, info_dict) with keys
+        ``rotation_deg``, ``spacing``, ``n_columns``, ``column_sizes``.
+    verbose : bool
+        Print the diagnostics.
+    """
+    from scipy.spatial import cKDTree
+    pos = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+    if len(pos) <= 1:
+        info = {'rotation_deg': 0.0, 'spacing': 0.0,
+                'n_columns': len(pos), 'column_sizes': np.array([len(pos)])}
+        return (pos.copy(), info) if return_info else pos.copy()
+
+    xy = pos[:, [1, 0]]
+    tree = cKDTree(xy)
+    kq = min(5, len(pos))
+    nn_d, nn_i = tree.query(xy, k=kq)
+
+    if rotation_deg is None:
+        src = np.repeat(np.arange(len(pos)), kq - 1)
+        dst = nn_i[:, 1:].ravel()
+        v = xy[dst] - xy[src]
+        norms = np.hypot(v[:, 0], v[:, 1])
+        keep = norms > 0
+        ang = np.arctan2(v[keep, 1], v[keep, 0])
+        mean4 = np.arctan2(np.sin(4 * ang).mean(), np.cos(4 * ang).mean())
+        rotation_deg = float(np.degrees(mean4 / 4.0))
+
+    if spacing is None:
+        # NN distance (column 1 of nn_d, since column 0 is self → 0)
+        spacing = float(np.median(nn_d[:, 1]))
+
+    theta = np.radians(rotation_deg)
+    c, s = np.cos(theta), np.sin(theta)
+    y_im, x_im = pos[:, 0], pos[:, 1]
+    x_r =  x_im * c + y_im * s
+    y_r = -x_im * s + y_im * c
+
+    col_idx = np.round((x_r - x_r.min()) / spacing).astype(np.int64)
+    # Lexsort: primary key (last) = column index ascending,
+    # secondary key (first) = -y_r ascending (== y_r descending → image-bottom first)
+    order = np.lexsort((-y_r, col_idx))
+    sorted_pos = pos[order]
+
+    uniq, counts = np.unique(col_idx, return_counts=True)
+    info = {
+        'rotation_deg': float(rotation_deg),
+        'spacing': float(spacing),
+        'n_columns': int(len(uniq)),
+        'column_sizes': counts,
+        'order': order,
+    }
+    if verbose:
+        logger.info(
+            'sort_grid_rotated: rotation=%+.2f°, spacing=%.2f px, '
+            'columns=%d (sizes min/median/max = %d/%d/%d)',
+            info['rotation_deg'], info['spacing'], info['n_columns'],
+            int(counts.min()), int(np.median(counts)), int(counts.max()),
+        )
+
+    if return_info:
+        return sorted_pos, info
+    return sorted_pos
+
+
 # ---------------------------------------------------------------------------
 # Step 4 — Interactive grid editor
 # ---------------------------------------------------------------------------

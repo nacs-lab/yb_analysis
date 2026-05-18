@@ -828,6 +828,7 @@ class DataManager:
             'scan_name': self._scan_name,
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,
+            'scan_filename': os.path.basename(self.fname) if self.fname else None,
         }
 
 
