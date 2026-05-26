@@ -36,6 +36,12 @@ def unpack_scan_logicals(scan, logicals=None, seq_ids=None, mat_path=None,
         Unique parameter values (sorted) — flat for 1-D scans, paired for 2-D.
     logic1 : ndarray (nSites_img1, nParams, maxReps) bool
     logic2 : ndarray (nSites_img2, nParams, maxReps) bool or None
+    reps_per_param : ndarray (nParams,) int
+        Actual number of repetitions recorded for each parameter point. With
+        non-uniform reps (e.g. mid-scan abort, scrambled scans), trailing
+        slots in the logic arrays are padded with ``False``; downstream code
+        that computes loading rate per-param MUST divide by this rather than
+        by ``logic1.shape[2] = max_reps``.
     """
     two_array = logicals_img1 is not None and logicals_img2 is not None
     if not two_array and logicals is None:
@@ -102,7 +108,7 @@ def unpack_scan_logicals(scan, logicals=None, seq_ids=None, mat_path=None,
         empty_l1 = np.zeros((n_sites_1, n_params, 0), dtype=bool)
         empty_l2 = (np.zeros((n_sites_2, n_params, 0), dtype=bool)
                     if two_array or num_images >= 2 else None)
-        return scan_params, empty_l1, empty_l2
+        return scan_params, empty_l1, empty_l2, reps_per_param
 
     # Fill logic arrays — sized to max_reps so every parameter uses all its
     # available repetitions.  Parameters with fewer reps leave trailing slots
@@ -138,4 +144,4 @@ def unpack_scan_logicals(scan, logicals=None, seq_ids=None, mat_path=None,
                 logic2[:, p, r] = logicals[base_row + 1, :]
         fill_count[p] += 1
 
-    return scan_params, logic1, logic2
+    return scan_params, logic1, logic2, reps_per_param

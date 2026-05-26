@@ -205,9 +205,10 @@ new MutationObserver(function(mutations) {
         # Row 3: Avg Histogram + Rep site histograms (refit every 200 shots)
         _row([_graph('avghist', 240)] + [_graph(f'rep{i}', 240) for i in range(4)]),
         # Row 4: Loading | Infidelities | Site selector + Site Hist | Grid Shift
+        # Tall enough for the 2-D site maps to read as roughly square on large arrays.
         _row([
-            _graph('load', 280),
-            _graph('infid', 280),
+            _graph('load', 600),
+            _graph('infid', 600),
             html.Div(style={'flex': '1', 'minWidth': '0', 'display': 'flex', 'gap': '8px'}, children=[
                 # Left: dropdown + parameters
                 html.Div(style={'width': '140px', 'flexShrink': '0'}, children=[
@@ -216,11 +217,23 @@ new MutationObserver(function(mutations) {
                                  style={'backgroundColor': '#2b2b4a', 'color': '#222', 'marginBottom': '8px'}),
                     html.Div(id='site-info', style={'fontSize': '11px', 'color': '#bbb',
                         'lineHeight': '1.6'}),
+                    # Slider controls marker size for the site-resolved
+                    # scatter plots (load / infid) so they read well at
+                    # any array spacing.
+                    html.Div(style={'marginTop': '14px', 'paddingTop': '10px',
+                        'borderTop': '1px solid #333'}, children=[
+                        html.Label('Marker size:', style={'fontSize': '11px', 'color': '#bbb'}),
+                        dcc.Slider(id='marker-size', min=2, max=40, step=1, value=12,
+                            marks={2: {'label': '2', 'style': {'fontSize': '9px', 'color': '#888'}},
+                                   20: {'label': '20', 'style': {'fontSize': '9px', 'color': '#888'}},
+                                   40: {'label': '40', 'style': {'fontSize': '9px', 'color': '#888'}}},
+                            tooltip={'placement': 'top', 'always_visible': False}),
+                    ]),
                 ]),
                 # Right: histogram
-                _graph('site', 270),
+                _graph('site', 590),
             ]),
-            _graph('shift', 280),
+            _graph('shift', 600),
         ]),
         # Debug
         html.Details([
@@ -240,8 +253,11 @@ new MutationObserver(function(mutations) {
                + [Output(f'rep{i}', 'figure') for i in range(4)]
                + [Output('site-dd', 'options'), Output('debug-pre', 'children')])
 
-    @app.callback(outputs, Input('tick', 'n_intervals'))
-    def refresh(_n):
+    @app.callback(outputs, [Input('tick', 'n_intervals'),
+                            Input('marker-size', 'value')])
+    def refresh(_n, marker_size):
+        # Guard against the slider returning None during first render.
+        marker_size = int(marker_size) if marker_size else 12
         d = _read_data()
         debug_lines = []
 
@@ -272,8 +288,8 @@ new MutationObserver(function(mutations) {
                            title='Tweezer Array (img 2)')
                     if has_img2 else _waiting('Tweezer Array (img 2)', img2_no_data_msg),
                 _fig_intens(d),
-                _fig_loading(d),
-                _fig_infid(d),
+                _fig_loading(d, marker_size=marker_size),
+                _fig_infid(d, marker_size=marker_size),
                 _fig_shift(d),
                 _fig_scan_curve(d),
                 _fig_avghist(d),
@@ -460,18 +476,17 @@ def _fig_intens(d):
     return fig
 
 
-def _fig_loading(d):
+def _fig_loading(d, marker_size=12):
     grid, rates = d.get('grid_locations'), d.get('loading_rates')
     if grid is None or rates is None or len(grid) == 0:
         return _waiting('Loading Rates')
     n = len(grid)
+    sz = marker_size
     if n < 100:
-        sz = 20
         mode = 'markers+text'
         text = [f'{r:.0%}' for r in rates]
         tfont = dict(size=7, color='black')
     else:
-        sz = max(4, min(12, 800 // int(np.sqrt(n))))
         mode = 'markers'
         text = None
         tfont = None
@@ -489,19 +504,18 @@ def _fig_loading(d):
     return fig
 
 
-def _fig_infid(d):
+def _fig_infid(d, marker_size=12):
     grid, inf = d.get('grid_locations'), d.get('infidelities')
     if grid is None or inf is None or len(grid) == 0:
         return _waiting('Infidelities')
     n = len(grid)
     log_inf = np.log10(np.clip(inf, 1e-6, 1.0))
+    sz = marker_size
     if n < 100:
-        sz = 20
         mode = 'markers+text'
         text = [f'{v:.0e}' for v in inf]
         tfont = dict(size=6, color='white')
     else:
-        sz = max(4, min(12, 800 // int(np.sqrt(n))))
         mode = 'markers'
         text = None
         tfont = None

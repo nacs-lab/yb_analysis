@@ -65,7 +65,8 @@ def _compute_site_intensities(images, positions, mask_mat):
     return intensities
 
 
-def dynamical_threshold(images, positions, mask_mat, num_bins=50):
+def dynamical_threshold(images, positions, mask_mat, num_bins=50,
+                        outlier_clip_mad=5.0):
     """Compute per-site detection thresholds from a stack of recent images.
 
     Fits a two-Gaussian mixture to each site's intensity histogram and finds
@@ -81,6 +82,12 @@ def dynamical_threshold(images, positions, mask_mat, num_bins=50):
         Gaussian weighting mask.
     num_bins : int
         Number of histogram bins.
+    outlier_clip_mad : float or None
+        Per-site, drop intensities above ``median + outlier_clip_mad * 1.4826
+        * MAD`` before histogramming and fitting. Rejects bad-frame artifacts
+        (e.g. cosmic rays / readout glitches) whose huge values otherwise
+        blow out the histogram range and squash the bimodal no-atom/atom
+        structure into what looks like a single peak. Set to None to disable.
 
     Returns
     -------
@@ -107,6 +114,12 @@ def dynamical_threshold(images, positions, mask_mat, num_bins=50):
 
     for s in range(num_sites):
         site_data = intensities[:, s]
+        if outlier_clip_mad is not None and outlier_clip_mad > 0:
+            med = np.median(site_data)
+            mad = np.median(np.abs(site_data - med))
+            if mad > 0:
+                upper = med + outlier_clip_mad * 1.4826 * mad
+                site_data = site_data[site_data <= upper]
         counts, edges = np.histogram(site_data, bins=num_bins, density=True)
         bin_centers = 0.5 * (edges[:-1] + edges[1:])
 

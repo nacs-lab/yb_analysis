@@ -122,20 +122,35 @@ def prob10(logic1, logic2):
 
 # ---- Loading rate: P(img1=1) ----
 
-def loading_rate_site_resolved(logic1):
+def loading_rate_site_resolved(logic1, reps_per_param=None):
     """Site-resolved loading rate.
 
     Parameters
     ----------
     logic1 : ndarray (nSites, nParams, nReps) bool
+    reps_per_param : ndarray (nParams,) int, optional
+        Actual reps per param (from ``unpack_scan_logicals``).  When omitted,
+        ``logic1.shape[2]`` is assumed uniform across params — correct only
+        when every param has exactly the same number of reps.  Pass it in for
+        scans with non-uniform reps (mid-scan aborts, scrambled scans where
+        the run ended before all combinations got equal coverage).
 
     Returns
     -------
     mean_sr, sem_sr : ndarray (nSites, nParams)
     """
-    n_reps = logic1.shape[2]
-    mean_sr = logic1.mean(axis=2).astype(float)
-    sem_sr = np.sqrt(mean_sr * (1 - mean_sr) / max(n_reps, 1))
+    if reps_per_param is None:
+        n_per_param = np.full(logic1.shape[1], logic1.shape[2], dtype=int)
+    else:
+        n_per_param = np.asarray(reps_per_param).astype(int)
+    # Padded slots are False, so summing gives the true loaded-event count per
+    # site-param.  Divide each column by that param's actual rep count.
+    loaded = logic1.sum(axis=2).astype(float)            # (nSites, nParams)
+    denom = np.maximum(n_per_param, 1).astype(float)     # (nParams,)
+    mean_sr = np.where(n_per_param > 0, loaded / denom, np.nan)
+    sem_sr = np.where(n_per_param > 0,
+                      np.sqrt(mean_sr * (1 - mean_sr) / denom),
+                      np.nan)
     return mean_sr, sem_sr
 
 
@@ -242,20 +257,27 @@ def pair_prob(logic1, logic2):
             p1110, p1110_sem, p1101, p1101_sem)
 
 
-def loading_rate(logic1):
+def loading_rate(logic1, reps_per_param=None):
     """Site-averaged loading rate.
+
+    Parameters
+    ----------
+    logic1 : ndarray (nSites, nParams, nReps) bool
+    reps_per_param : ndarray (nParams,) int, optional
+        Actual reps per param.  See ``loading_rate_site_resolved`` — required
+        for correct results when reps are non-uniform.
 
     Returns
     -------
     mean, sem : ndarray (nParams,)
     """
-    mean_sr, _ = loading_rate_site_resolved(logic1)
+    mean_sr, _ = loading_rate_site_resolved(logic1, reps_per_param)
     mean = np.nanmean(mean_sr, axis=0)
     sem = _inter_site_sem(mean_sr)
     return mean, sem
 
 
-def rearrangement_success_rate(logic2):
+def rearrangement_success_rate(logic2, reps_per_param=None):
     """Per-parameter average of ``logic2`` over array-2 sites and reps.
 
     In two-array mode (isGrid2=1), image-2 captures atoms after a
@@ -268,4 +290,4 @@ def rearrangement_success_rate(logic2):
     -------
     mean, sem : ndarray (nParams,)
     """
-    return loading_rate(logic2)
+    return loading_rate(logic2, reps_per_param)

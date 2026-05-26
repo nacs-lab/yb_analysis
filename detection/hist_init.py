@@ -1312,13 +1312,17 @@ def register_csv_grid(avg_image, scan_dir, *, detected_spots=None,
 # Step 5 — Threshold computation
 # ---------------------------------------------------------------------------
 
-def compute_thresholds(images, grid, mask_mat, num_bins=50, is_alive=None):
+def compute_thresholds(images, grid, mask_mat, num_bins=50, is_alive=None,
+                       outlier_clip_mad=5.0):
     """Fit double-Gaussian histograms and compute per-site thresholds.
 
     Thin wrapper around ``dynamical_threshold``. If ``is_alive`` is given,
     only alive rows are fit; dead rows get NaN thresholds, NaN infidelities,
     None Gaussian-fit params, and empty histogram bins. The output arrays
     keep the full length of ``grid`` so identity is preserved.
+
+    ``outlier_clip_mad`` is passed through to drop bad-frame artifacts per
+    site before fitting; see ``dynamical_threshold`` for details.
 
     Returns
     -------
@@ -1327,7 +1331,8 @@ def compute_thresholds(images, grid, mask_mat, num_bins=50, is_alive=None):
     grid = np.asarray(grid, dtype=np.float64)
     M = len(grid)
     if is_alive is None:
-        return dynamical_threshold(images, grid, mask_mat, num_bins=num_bins)
+        return dynamical_threshold(images, grid, mask_mat, num_bins=num_bins,
+                                   outlier_clip_mad=outlier_clip_mad)
 
     is_alive = np.asarray(is_alive, dtype=bool)
     alive_idx = np.where(is_alive)[0]
@@ -1340,7 +1345,8 @@ def compute_thresholds(images, grid, mask_mat, num_bins=50, is_alive=None):
 
     alive_grid = grid[alive_idx]
     hd_a, thr_a, gf_a, inf_a = dynamical_threshold(
-        images, alive_grid, mask_mat, num_bins=num_bins
+        images, alive_grid, mask_mat, num_bins=num_bins,
+        outlier_clip_mad=outlier_clip_mad,
     )
 
     # Expand back to full length M.
