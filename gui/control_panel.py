@@ -17,7 +17,9 @@ import time
 
 import numpy as np
 
-from yb_analysis.acquisition.data_manager import get_data_manager
+from yb_analysis.acquisition.data_manager import (
+    get_data_manager, record_loading, get_loading_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,8 @@ class ControlPanel(tk.Tk):
         ttk.Button(top, text='Start', command=self._on_start).pack(
             side='right', padx=4)
         ttk.Button(top, text='Pause', command=self._on_pause).pack(
+            side='right', padx=4)
+        ttk.Button(top, text='Restart Dash', command=self._on_restart_dash).pack(
             side='right', padx=4)
 
         ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
@@ -250,6 +254,20 @@ class ControlPanel(tk.Tk):
             mm.close()
         else:
             self._client.abort_seq()
+
+    def _on_restart_dash(self):
+        """Kill and immediately respawn the Dash subprocess.
+
+        Picks up code changes in dashboard.py without restarting the main GUI
+        (so the camera connection stays up).
+        """
+        if not self._dashboard:
+            return
+        try:
+            self._dashboard.restart()
+            logger.info('Dashboard subprocess restarted')
+        except Exception:
+            logger.error('Dashboard restart failed:\n%s', traceback.format_exc())
 
     def _on_init_loaded(self, data):
         if self._dashboard and data is not None:
@@ -510,10 +528,16 @@ class ControlPanel(tk.Tk):
                 )
                 data['cur_intensities'] = intensities
                 data['logicals'] = logicals
+                record_loading(logicals)
             else:
                 # Grid not yet established — show bare frame, no boxes.
                 data['cur_intensities'] = None
                 data['logicals'] = None
+            data['loading_history'] = get_loading_history()
+            # Flag so the dashboard blanks out panels frozen at the last real
+            # scan's values (histograms, scan curve, loading rates, etc.)
+            # and labels them as Dummy mode.
+            data['_dummy_mode'] = True
             self._dashboard.update(data)
         except Exception:
             logger.error('dummy dispatch error:\n%s', traceback.format_exc())

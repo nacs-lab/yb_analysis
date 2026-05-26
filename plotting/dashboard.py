@@ -2,7 +2,7 @@
 
 Layout:
   Row 1: [Tweezer Array]  [Atom Intensities]
-  Row 2: [Loading 2D] [Infidelities 2D] [Grid Shift] [Avg Histogram]
+  Row 2: [Atom Intensities (wide)]  [Loading Rate (live)]
   Row 3: [4 rep site histograms — stable between refits]
   Row 4: [Interactive site selector + histogram]
   /debug endpoint for state inspection
@@ -94,19 +94,36 @@ class DashboardRenderer:
         self._write_idx = 1 - idx  # toggle 0 ↔ 1
         self.start()
 
-    def close(self):
+    def _terminate_proc(self, tag=''):
         if self._proc and self._proc.is_alive():
             self._proc.terminate()
             self._proc.join(timeout=3)
             if self._proc.is_alive():
                 self._proc.kill()
                 self._proc.join(timeout=1)
-            logger.info('Dashboard process stopped')
+            logger.info('Dashboard process stopped%s', f' ({tag})' if tag else '')
+        self._proc = None
+
+    def close(self):
+        self._terminate_proc()
         for p in (_DATA_FILE, _DATA_FILE + '.0', _DATA_FILE + '.1'):
             try:
                 os.remove(p)
             except OSError:
                 pass
+
+    def restart(self):
+        """Kill and immediately respawn the Dash subprocess.
+
+        Keeps the shared data files in place so the new subprocess renders
+        the current frame straight away (no 'waiting for data' gap).
+        """
+        self._terminate_proc(tag='restart')
+        # Brief pause to let the OS release port 8050 before the new
+        # subprocess tries to bind it. Without this the child can die
+        # silently with WinError 10048.
+        time.sleep(0.5)
+        self.start()
 
 
 def _read_data():
@@ -199,9 +216,9 @@ new MutationObserver(function(mutations) {
             _graph('array2', 670),
             _graph('scan', 670),
         ]),
-        # Row 2: Atom Intensities — full width, slightly taller than rows 3-4
-        # (also per-shot data)
-        _row([_graph('intens', 320)]),
+        # Row 2: Atom Intensities (wide) + live Loading Rate panel
+        # (per-shot data; intens gets 3x the width since it scales with #sites)
+        _row([_graph('intens', 320, flex=3), _graph('loadlive', 320, flex=1)]),
         # Row 3: Avg Histogram + Rep site histograms (refit every 200 shots)
         _row([_graph('avghist', 240)] + [_graph(f'rep{i}', 240) for i in range(4)]),
         # Row 4: Loading | Infidelities | Site selector + Site Hist | Grid Shift
@@ -246,7 +263,7 @@ new MutationObserver(function(mutations) {
 
     # --- Single callback for all panels ---
     outputs = ([Output('array', 'figure'), Output('array2', 'figure'),
-                 Output('intens', 'figure'),
+                 Output('intens', 'figure'), Output('loadlive', 'figure'),
                  Output('load', 'figure'), Output('infid', 'figure'),
                  Output('shift', 'figure'), Output('scan', 'figure'),
                  Output('avghist', 'figure')]
@@ -264,8 +281,8 @@ new MutationObserver(function(mutations) {
         if d is None:
             debug_lines.append('No data yet (pickle file not found)')
             empty = [_waiting(t) for t in ['Tweezer Array (img 1)', 'Tweezer Array (img 2)',
-                     'Intensities', 'Loading', 'Infidelities', 'Grid Shift', 'Scan Curve',
-                     'Avg Histogram']]
+                     'Intensities', 'Loading Rate', 'Loading', 'Infidelities', 'Grid Shift',
+                     'Scan Curve', 'Avg Histogram']]
             return empty + [_waiting('Site Hist')]*4 + [[], '\n'.join(debug_lines)]
 
         try:
@@ -280,6 +297,16 @@ new MutationObserver(function(mutations) {
                                 else 'Waiting for data...')
             img2_grid_key = ('grid_locations_img2' if d.get('is_two_array')
                              else 'grid_locations')
+            # Dummy mode: live panels (image, intensities, loading-rate trace)
+            # still reflect the current frame, but cumulative panels carry
+            # over stale values from the last real scan. Blank those out and
+            # label them so the user isn't misled by frozen data.
+            is_dummy = bool(d.get('_dummy_mode'))
+            dummy_msg = 'Dummy mode'
+
+            def _stale(title, builder):
+                return _waiting(title, dummy_msg) if is_dummy else builder()
+
             figs = [
                 _fig_array(d) if has_img else _waiting('Tweezer Array (img 1)'),
                 _fig_array(d, img_key='_img2_data_uri', shape_key='_img2_shape',
@@ -288,14 +315,16 @@ new MutationObserver(function(mutations) {
                            title='Tweezer Array (img 2)')
                     if has_img2 else _waiting('Tweezer Array (img 2)', img2_no_data_msg),
                 _fig_intens(d),
-                _fig_loading(d, marker_size=marker_size),
-                _fig_infid(d, marker_size=marker_size),
-                _fig_shift(d),
-                _fig_scan_curve(d),
-                _fig_avghist(d),
+                _fig_loading_live(d),
+                _stale('Loading Rates', lambda: _fig_loading(d, marker_size=marker_size)),
+                _stale('Infidelities', lambda: _fig_infid(d, marker_size=marker_size)),
+                _stale('Grid Shift', lambda: _fig_shift(d)),
+                _stale('Scan Curve', lambda: _fig_scan_curve(d)),
+                _stale('Avg Histogram', lambda: _fig_avghist(d)),
             ]
 
-            reps = _figs_reps(d)
+            reps = ([_waiting('Site Hist', dummy_msg)] * 4
+                    if is_dummy else _figs_reps(d))
             opts = [{'label': f'Site {i+1}', 'value': i+1} for i in range(n)]
 
             lh = d.get('live_hist_data')
@@ -312,7 +341,7 @@ new MutationObserver(function(mutations) {
         except Exception:
             tb = traceback.format_exc()
             logging.error('Dashboard render error:\n%s', tb)
-            return [no_update] * 14
+            return [no_update] * 15
 
     @app.callback([Output('site', 'figure'), Output('site-info', 'children')],
                   [Input('site-dd', 'value'), Input('tick', 'n_intervals')])
@@ -320,6 +349,8 @@ new MutationObserver(function(mutations) {
         d = _read_data()
         if d is None or val is None:
             return _waiting('Site Histogram'), ''
+        if d.get('_dummy_mode'):
+            return _waiting('Site Histogram', 'Dummy mode'), ''
         return _fig_site(d, int(val) - 1)
 
     # Click on loading-rate or infidelity 2D plot → select site in dropdown
@@ -335,11 +366,12 @@ new MutationObserver(function(mutations) {
 def _row(children):
     return html.Div(style={'display': 'flex', 'gap': '10px', 'marginBottom': '10px'}, children=children)
 
-def _graph(id, h):
+def _graph(id, h, flex=1):
     # Set initial "waiting" figure so Plotly has a uirevision baseline.
     # Without this, Plotly may not re-render when the callback first returns
     # a figure with uirevision='live' (no prior value to compare against).
-    return dcc.Graph(id=id, figure=_waiting(''), style={'flex': '1', 'height': f'{h}px'},
+    return dcc.Graph(id=id, figure=_waiting(''),
+                     style={'flex': f'{flex}', 'minWidth': '0', 'height': f'{h}px'},
                      config={'displayModeBar': False})
 
 def _waiting(title, message='Waiting for data...'):
@@ -473,6 +505,42 @@ def _fig_intens(d):
     fig.update_layout(**_L, title='Atom Intensities', xaxis=dict(title='Site', dtick=max(1, n//20), **_A),
                       yaxis=dict(title='Intensity', range=[ymin-pad, ymax+pad], **_A),
                       legend=dict(x=0.01, y=0.99, bgcolor='rgba(0,0,0,0.3)'))
+    return fig
+
+
+def _fig_loading_live(d):
+    hist = d.get('loading_history')
+    if hist is None or len(hist) == 0:
+        return _waiting('Loading Rate')
+    hist = np.asarray(hist, dtype=float)
+    logicals = d.get('logicals')
+    cur = float(np.asarray(logicals).mean()) if logicals is not None and len(logicals) > 0 else None
+    # Average over the displayed history window (always populated, unlike
+    # loading_rates which only refreshes every UPDATE_LOADING_INTERVAL shots).
+    avg = float(hist.mean())
+
+    n = len(hist)
+    x = list(range(1, n + 1))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=hist.tolist(), mode='lines+markers',
+                              line=dict(color='#0c6', width=1.5),
+                              marker=dict(size=4, color='#0c6'),
+                              name='Per-shot', hoverinfo='y'))
+    fig.add_shape(type='line', x0=0, x1=1, xref='paper', y0=avg, y1=avg,
+                  line=dict(color='#ffdd44', width=1.5, dash='dash'))
+    fig.add_annotation(text=f'Avg: {avg:.1%}', xref='paper', y=avg,
+                       x=0.99, showarrow=False, xanchor='right', yanchor='bottom',
+                       font=dict(color='#ffdd44', size=10))
+    if cur is not None:
+        fig.add_annotation(text=f'Current: {cur:.1%}', xref='paper', yref='paper',
+                           x=0.5, y=1.0, showarrow=False,
+                           font=dict(size=18, color='#0c6', family='monospace'),
+                           bgcolor='rgba(20,20,40,0.8)')
+    fig.update_layout(**_L, title='Loading Rate (last 100)',
+                      xaxis=dict(title='Shot # (oldest → latest)', **_A),
+                      yaxis=dict(title='Fraction loaded', autorange=True,
+                                 tickformat='.0%', **_A),
+                      showlegend=False)
     return fig
 
 

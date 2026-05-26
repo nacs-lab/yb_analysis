@@ -9,6 +9,7 @@ State model (3 layers):
 import os
 import logging
 import threading
+import collections
 import numpy as np
 
 from yb_analysis.config import (
@@ -31,6 +32,31 @@ logger = logging.getLogger(__name__)
 
 _cache = {}
 _cache_lock = threading.Lock()
+
+# Per-shot mean loading rate (img1), held at module scope so it survives
+# scan transitions — the DataManager (and its log_buffer) is recreated on
+# each new scan, but this deque persists for the camera-connection lifetime.
+# Also fed from dummy-mode frames in control_panel so the live trace keeps
+# updating while no real scan is running.
+_loading_history = collections.deque(maxlen=100)
+_loading_history_lock = threading.Lock()
+
+
+def record_loading(logicals):
+    """Append the per-shot mean loading rate to the persistent history."""
+    if logicals is None:
+        return
+    arr = np.asarray(logicals)
+    if arr.size == 0:
+        return
+    with _loading_history_lock:
+        _loading_history.append(float(arr.mean()))
+
+
+def get_loading_history():
+    """Snapshot of the persistent loading-rate history as a 1-D array."""
+    with _loading_history_lock:
+        return np.array(_loading_history, dtype=float) if _loading_history else None
 
 
 def get_data_manager(scan_id):
@@ -484,6 +510,7 @@ class DataManager:
             if idx % pSeq == 0:
                 self._intensity_accum.append(intensities.copy())
                 self.log_buffer.push(logicals.astype(np.float64))
+                record_loading(logicals)
                 # Always display image-1 (loading image, not pushout)
                 self._display_image = img.astype(np.int16)
                 self._display_intensities = intensities.copy()
@@ -812,6 +839,7 @@ class DataManager:
             'thresholds': self.thresholds.copy(),
             'infidelities': self.infidelities.copy(),
             'loading_rates': self.loading_rates.copy(),
+            'loading_history': get_loading_history(),
             'loaded_gauss_fits': self.loaded_gauss_fits,
             'live_hist_data': self.live_hist_data,
             'live_gauss_fits': self.live_gauss_fits,
