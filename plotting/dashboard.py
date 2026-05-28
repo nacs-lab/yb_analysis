@@ -160,6 +160,22 @@ def _build_app():
     # re-applies the style whenever a new <image> element appears.
     app.index_string = '''<!DOCTYPE html>
 <html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}
+<style>
+/* Sleek iOS-style toggle switch (used for the colorbar autoscale control). */
+input.yb-switch {
+    -webkit-appearance: none; appearance: none; margin: 0 6px 0 0;
+    position: relative; width: 30px; height: 16px; flex: none;
+    background: #3a3a52; border-radius: 8px; cursor: pointer;
+    transition: background .15s ease; outline: none;
+}
+input.yb-switch::before {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #d8d8e0; transition: transform .15s ease;
+}
+input.yb-switch:checked { background: #2a7fff; }
+input.yb-switch:checked::before { transform: translateX(14px); background: #fff; }
+</style>
 </head><body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer>
 <script>
 new MutationObserver(function(mutations) {
@@ -214,7 +230,22 @@ new MutationObserver(function(mutations) {
         _row([
             _graph('array', 670),
             _graph('array2', 670),
-            _graph('scan', 670),
+            # Scan panel; colorbar-scale toggle overlaid INSIDE the panel (top-right).
+            html.Div(style={'flex': '1', 'minWidth': '0', 'position': 'relative'}, children=[
+                dcc.Graph(id='scan', figure=_waiting(''), style={'height': '670px'},
+                          config={'displayModeBar': False}),
+                # Toggle switch: on → autoscale colorbar to data; off → fixed 0–1.
+                html.Div(style={'position': 'absolute', 'top': '9px', 'right': '70px',
+                                'zIndex': '5', 'display': 'flex', 'alignItems': 'center'},
+                    children=[
+                        dcc.Checklist(id='cbar-scale',
+                            options=[{'label': 'Autoscale', 'value': 'auto'}],
+                            value=[], inline=True, inputClassName='yb-switch',
+                            style={'fontSize': '11px', 'color': '#ffffff'},
+                            labelStyle={'display': 'flex', 'alignItems': 'center',
+                                        'cursor': 'pointer', 'margin': '0', 'color': '#ffffff'}),
+                    ]),
+            ]),
         ]),
         # Row 2: Atom Intensities (wide) + live Loading Rate panel
         # (per-shot data; intens gets 3x the width since it scales with #sites)
@@ -271,10 +302,13 @@ new MutationObserver(function(mutations) {
                + [Output('site-dd', 'options'), Output('debug-pre', 'children')])
 
     @app.callback(outputs, [Input('tick', 'n_intervals'),
-                            Input('marker-size', 'value')])
-    def refresh(_n, marker_size):
+                            Input('marker-size', 'value'),
+                            Input('cbar-scale', 'value')])
+    def refresh(_n, marker_size, cbar_toggle):
         # Guard against the slider returning None during first render.
         marker_size = int(marker_size) if marker_size else 12
+        # Checklist returns a list; 'auto' present → autoscale, else fixed 0–1.
+        cbar_scale = 'auto' if (cbar_toggle and 'auto' in cbar_toggle) else '01'
         d = _read_data()
         debug_lines = []
 
@@ -319,7 +353,7 @@ new MutationObserver(function(mutations) {
                 _stale('Loading Rates', lambda: _fig_loading(d, marker_size=marker_size)),
                 _stale('Infidelities', lambda: _fig_infid(d, marker_size=marker_size)),
                 _stale('Grid Shift', lambda: _fig_shift(d)),
-                _stale('Scan Curve', lambda: _fig_scan_curve(d)),
+                _stale('Scan Curve', lambda: _fig_scan_curve(d, cbar_scale=cbar_scale)),
                 _stale('Avg Histogram', lambda: _fig_avghist(d)),
             ]
 
@@ -461,37 +495,49 @@ def _fig_intens(d):
         return _waiting('Intensities')
     n = len(t)
     sites = list(range(1, n+1))
+    # Marker size shrinks as the array grows so dots don't overlap on dense
+    # arrays but stay readable for small ones (~13px @ n<=140, ~8px @ n=225).
+    cur_size = float(np.clip(1800.0 / n, 6, 13))
+    thr_size = max(4.0, cur_size - 2)
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=sites, y=t.tolist(), mode='markers', name='Threshold',
-                              marker=dict(size=10, color='#777', symbol='circle', line=dict(width=1, color='#999'))))
+                              marker=dict(size=thr_size, color='#777', symbol='circle', line=dict(width=1, color='#999'))))
     ymin, ymax = float(t.min()), float(t.max())
     ci = d.get('cur_intensities')
     if ci is not None:
         logicals = d.get('logicals')
         colors = ['#0c6' if (logicals is not None and i < len(logicals) and logicals[i]) else '#e44' for i in range(n)]
         fig.add_trace(go.Scatter(x=sites, y=ci.tolist(), mode='markers', name='Current',
-                                  marker=dict(size=12, color=colors, symbol='circle', line=dict(width=1, color='white'))))
+                                  marker=dict(size=cur_size, color=colors, symbol='circle', line=dict(width=1, color='white'))))
         ymin = min(ymin, float(ci.min()))
         ymax = max(ymax, float(ci.max()))
-    # Mean lines for loaded / empty sites + distance annotation
+    # Mean line + 68% (±1σ) band for loaded / empty sites + distance annotation
     if ci is not None and logicals is not None:
         mask = np.array(logicals[:n], dtype=bool) if len(logicals) >= n else np.zeros(n, dtype=bool)
+
+        def _band(values, color, fill, label, yanchor):
+            mu = float(values.mean())
+            sd = float(values.std())
+            # ±1σ band ≈ central 68% of a normal distribution
+            fig.add_shape(type='rect', xref='paper', x0=0, x1=1, y0=mu-sd, y1=mu+sd,
+                          fillcolor=fill, line=dict(width=0), layer='below')
+            fig.add_shape(type='line', x0=0, x1=1, xref='paper', y0=mu, y1=mu,
+                          line=dict(color=color, width=1.5, dash='dash'))
+            fig.add_annotation(text=f'{label}: {mu:.1f} ± {sd:.1f}', xref='paper', y=mu,
+                               x=0.99, showarrow=False, xanchor='right', yanchor=yanchor,
+                               font=dict(color=color, size=10), bgcolor='rgba(20,20,40,0.6)')
+            return mu, sd
+
         if mask.any():
-            mu_loaded = float(ci[mask].mean())
-            fig.add_shape(type='line', x0=0, x1=1, xref='paper', y0=mu_loaded, y1=mu_loaded,
-                          line=dict(color='#0c6', width=1.5, dash='dash'))
-            fig.add_annotation(text=f'Loaded: {mu_loaded:.1f}', xref='paper', y=mu_loaded,
-                               x=1.0, showarrow=False, xanchor='left',
-                               font=dict(color='#0c6', size=10))
+            mu_loaded, sd_loaded = _band(ci[mask], '#0c6', 'rgba(0,204,102,0.12)', 'Loaded', 'bottom')
+            ymin = min(ymin, mu_loaded - sd_loaded)
+            ymax = max(ymax, mu_loaded + sd_loaded)
         else:
             mu_loaded = None
         if (~mask).any():
-            mu_empty = float(ci[~mask].mean())
-            fig.add_shape(type='line', x0=0, x1=1, xref='paper', y0=mu_empty, y1=mu_empty,
-                          line=dict(color='#e44', width=1.5, dash='dash'))
-            fig.add_annotation(text=f'Empty: {mu_empty:.1f}', xref='paper', y=mu_empty,
-                               x=1.0, showarrow=False, xanchor='left',
-                               font=dict(color='#e44', size=10))
+            mu_empty, sd_empty = _band(ci[~mask], '#e44', 'rgba(238,68,68,0.12)', 'Empty', 'top')
+            ymin = min(ymin, mu_empty - sd_empty)
+            ymax = max(ymax, mu_empty + sd_empty)
         else:
             mu_empty = None
         if mu_loaded is not None and mu_empty is not None:
@@ -621,14 +667,14 @@ def _fig_shift(d):
     return fig
 
 
-def _fig_scan_curve(d):
+def _fig_scan_curve(d, cbar_scale='01'):
     sc = d.get('scan_curve')
     if sc is None or sc.get('mode') == 'undefined':
         return _waiting('Scan Curve')
 
     # --- 2-D heatmap ---
     if sc.get('ndim', 1) >= 2:
-        return _fig_scan_2d(d, sc)
+        return _fig_scan_2d(d, sc, cbar_scale=cbar_scale)
 
     # --- 1-D scatter with error bars ---
     x = sc['scan_x']
@@ -662,17 +708,45 @@ def _fig_scan_curve(d):
         mode='markers', marker=dict(size=6, color='#44aaff'),
         hoverinfo='text', hovertext=[f'{x_label}={xi:.4g}, {y_label}={yi:.3f}+/-{ei:.3f} (n={ni})'
                                       for xi, yi, ei, ni in zip(x_disp, y, err, n_reps)]))
-    title_text = f'{scan_name} ({int(n_reps.mean())} reps/pt)'
-    fname = d.get('scan_filename')
-    if fname:
-        title_text += f'<br><sub style="font-size:10px;color:#888">{fname}</sub>'
+    title_text = _scan_title(f'{scan_name} ({int(n_reps.mean())} reps/pt)',
+                             d.get('scan_filename'))
     fig.update_layout(**_L, title=title_text,
                       xaxis=dict(title=x_label, **_A),
                       yaxis=dict(title=y_label, range=[-0.05, 1.05], **_A))
     return fig
 
 
-def _fig_scan_2d(d, sc):
+def _scan_title(main, fname):
+    """Scan-panel title with the run/folder name shown inline and clearly
+    (bright, larger) next to the main title rather than as a faint subtitle."""
+    if not fname:
+        return main
+    run = fname[:-3] if fname.endswith('.h5') else fname  # strip .h5 → run folder
+    return f'{main}  <span style="font-size:14px;color:#7cc4ff">— {run}</span>'
+
+
+def _fmt_tick(v):
+    """Compact axis label: SI suffix for big magnitudes, else general format."""
+    av = abs(float(v))
+    if av >= 1e9:
+        return f'{v/1e9:g}G'
+    if av >= 1e6:
+        return f'{v/1e6:g}M'
+    if av >= 1e3:
+        return f'{v/1e3:g}k'
+    return f'{v:g}'
+
+
+def _tickset(vals):
+    """Tick indices + labels for an equal-step (index) axis, thinned to ~12
+    ticks max so labels don't crowd on long scans."""
+    n = len(vals)
+    step = max(1, int(np.ceil(n / 12)))
+    idx = list(range(0, n, step))
+    return idx, [_fmt_tick(vals[i]) for i in idx]
+
+
+def _fig_scan_2d(d, sc, cbar_scale='01'):
     """Render a 2-D scan as a survival/loading heatmap."""
     heatmap = sc.get('heatmap')
     n_reps = sc.get('n_reps')
@@ -701,19 +775,68 @@ def _fig_scan_2d(d, sc):
     y_label = 'Survival' if mode == 'survival' else 'Loading'
     avg_reps = int(n_reps[n_reps > 0].mean()) if np.any(n_reps > 0) else 0
 
+    # Colorbar z-range: 'auto' lets Plotly autoscale to the data, '01' pins 0–1.
+    if cbar_scale == 'auto':
+        zmin = zmax = None
+    else:
+        zmin, zmax = 0, 1
+
+    # Plot against equal-step indices so EVERY cell is the same size even when
+    # the scan values are unevenly spaced; the real values are restored as tick
+    # labels and ride in customdata for the hover (along with reps + error).
+    nx, ny = len(x_disp), len(y_vals)
+    x_idx = np.arange(nx)
+    y_idx = np.arange(ny)
+    xv = np.asarray(x_disp, dtype=float)
+    yv = np.asarray(y_vals, dtype=float)
+    Xv = np.broadcast_to(xv.reshape(1, nx), (ny, nx))   # actual x per cell
+    Yv = np.broadcast_to(yv.reshape(ny, 1), (ny, nx))   # actual y per cell
+
+    sem = sc.get('sem')
+    if sem is not None:
+        # customdata: [x_val, y_val, reps, error] per cell
+        customdata = np.dstack([Xv, Yv, n_reps, sem])
+        hovertemplate = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
+                         f'{y_name}=%{{customdata[1]:.4g}}<br>'
+                         f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}<br>'
+                         f'reps=%{{customdata[2]:d}}<extra></extra>')
+    else:
+        customdata = np.dstack([Xv, Yv, n_reps])
+        hovertemplate = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
+                         f'{y_name}=%{{customdata[1]:.4g}}<br>'
+                         f'{y_label}=%{{z:.3f}}<br>reps=%{{customdata[2]:d}}<extra></extra>')
+
     fig = go.Figure(go.Heatmap(
-        z=z, x=x_disp, y=y_vals,
-        colorscale='Viridis', zmin=0, zmax=1,
+        z=z, x=x_idx, y=y_idx,
+        colorscale='Viridis', zmin=zmin, zmax=zmax,
         colorbar=dict(title=y_label, len=0.9),
-        hovertemplate=f'{x_name}=%{{x:.4g}}<br>{y_name}=%{{y:.4g}}<br>{y_label}=%{{z:.3f}}<extra></extra>',
+        customdata=customdata,
+        hovertemplate=hovertemplate,
     ))
-    title_text = f'{scan_name} ({avg_reps} reps/pt)'
-    fname = d.get('scan_filename')
-    if fname:
-        title_text += f'<br><sub style="font-size:10px;color:#888">{fname}</sub>'
+
+    # Red box around every cell updated in the latest batch (the cells
+    # currently being scanned). On the index grid every cell is unit-sized.
+    cur = sc.get('current') or []
+    if isinstance(cur, dict):       # backward-compat: old single-cell format
+        cur = [cur]
+    for cell in cur:
+        xi, yi = cell.get('x_idx'), cell.get('y_idx')
+        if (xi is None or yi is None
+                or not (0 <= xi < nx) or not (0 <= yi < ny)):
+            continue
+        fig.add_shape(type='rect', xref='x', yref='y',
+                      x0=xi-0.5, x1=xi+0.5, y0=yi-0.5, y1=yi+0.5,
+                      line=dict(color='#ff0000', width=3), fillcolor='rgba(0,0,0,0)',
+                      layer='above')
+
+    xtv, xtt = _tickset(xv)
+    ytv, ytt = _tickset(yv)
+    title_text = _scan_title(f'{scan_name} ({avg_reps} reps/pt)', d.get('scan_filename'))
     fig.update_layout(**_L, title=title_text,
-                      xaxis=dict(title=x_name, **_A),
-                      yaxis=dict(title=y_name, **_A))
+                      xaxis=dict(title=x_name, tickmode='array',
+                                 tickvals=xtv, ticktext=xtt, **_A),
+                      yaxis=dict(title=y_name, tickmode='array',
+                                 tickvals=ytv, ticktext=ytt, **_A))
     return fig
 
 

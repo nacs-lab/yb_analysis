@@ -3,6 +3,8 @@
 Port of MATLAB's get_prob11.m, get_prob10.m, get_loadingRate_siteResolved.m.
 """
 
+import warnings
+
 import numpy as np
 
 
@@ -58,25 +60,27 @@ def prob11_site_resolved(logic1, logic2):
 def prob11(logic1, logic2):
     """Site-averaged survival probability.
 
-    The SEM for each parameter point is a pooled binomial SEM computed from
-    the total loaded-atom events across all sites and reps for that point:
-        sem[p] = sqrt(p̄ * (1 - p̄) / total_loaded[p])
-    This gives each point its own error bar that scales with its actual
-    repetition count — parameters with fewer reps receive larger error bars.
+    Grand mean of the per-site survival ratios across sites (each site weighted
+    equally), with the per-site binomial SEMs propagated. This matches the
+    MATLAB reference ``get_prob11.m``:
+        mean[p] = mean_s prob11_sr[s, p]          (omitnan)
+        sem[p]  = sqrt(Σ_s sem_sr[s, p]²) / nSites
+    and keeps this consistent with the live dashboard and with ``prob10`` /
+    ``loading_rate`` here (which also average over sites). NOTE: this is *not*
+    the pooled Σjoint/Σloaded — that load-weights sites unequally and diverges
+    from MATLAB when sites load at different rates.
 
     Returns
     -------
     mean : ndarray (nParams,)
     sem  : ndarray (nParams,)
     """
-    # Pool loaded and joint events across all sites and reps
-    joint_total = np.sum(logic1 & logic2, axis=(0, 2)).astype(float)  # (nParams,)
-    loaded_total = np.sum(logic1, axis=(0, 2)).astype(float)           # (nParams,)
-
-    mean = np.where(loaded_total > 0, joint_total / loaded_total, np.nan)
-    sem = np.where(loaded_total > 0,
-                   np.sqrt(mean * (1 - mean) / np.maximum(loaded_total, 1)),
-                   np.nan)
+    mean_sr, sem_sr = prob11_site_resolved(logic1, logic2)
+    n_sites = mean_sr.shape[0]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN columns → NaN
+        mean = np.nanmean(mean_sr, axis=0)
+    sem = np.sqrt(np.nansum(sem_sr**2, axis=0)) / max(n_sites, 1)
     return mean, sem
 
 

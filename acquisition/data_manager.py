@@ -191,6 +191,7 @@ class DataManager:
         self._scan_name = self._scan_title or self._scan_param_path
         self._plot_scale = float(_scalar(self.config.get('PlotScale', 1)))
         self._scan_logicals = []  # list of (seq_id, logic1, logic2_or_None)
+        self._last_batch_seq_ids = []  # seq_ids added in the most recent batch
 
         # --- Other state ---
         self.loading_rates = np.zeros(self.num_sites)
@@ -266,6 +267,7 @@ class DataManager:
         self.grid_shift_history = []
         self.grid_shift_heatmap = None
         self._scan_logicals = []
+        self._last_batch_seq_ids = []
         self._param_indices = None
         self._scan_params = None
         self._scan_dims = None
@@ -490,6 +492,7 @@ class DataManager:
         n_new_seqs = 0
         pSeq = self.num_images_per_seq
         seq_logic_buf = []  # collect logicals within one sequence
+        batch_sids = []  # seq_ids completed in THIS batch (for "current" highlight)
         for idx, img in enumerate(self._imgs_to_process):
             # In two-array mode, image-2 uses its own grid + thresholds
             if self.is_two_array and pSeq >= 2 and idx % pSeq == 1:
@@ -530,8 +533,10 @@ class DataManager:
                 logic1 = seq_logic_buf[0]
                 logic2 = seq_logic_buf[1] if len(seq_logic_buf) >= 2 else None
                 self._scan_logicals.append((sid, logic1.copy(), logic2.copy() if logic2 is not None else None))
+                batch_sids.append(sid)
                 seq_logic_buf.clear()
                 n_new_seqs += 1
+        self._last_batch_seq_ids = batch_sids
 
         # Rebin histograms from accumulated intensities (cheap: ~0.5ms)
         if len(self._intensity_accum) >= 1:
@@ -852,7 +857,8 @@ class DataManager:
                 self._scan_logicals, self._param_indices,
                 self._scan_params, self.num_images_per_seq,
                 scan_dims=self._scan_dims,
-                is_two_array=self.is_two_array),
+                is_two_array=self.is_two_array,
+                recent_seq_ids=self._last_batch_seq_ids),
             'scan_name': self._scan_name,
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,

@@ -212,7 +212,7 @@ def extract_scan_params_h5(mat_path):
 # ---------------------------------------------------------------------------
 
 def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
-                       scan_dims=None, is_two_array=False):
+                       scan_dims=None, is_two_array=False, recent_seq_ids=None):
     """Compute survival, loading, or rearrangement curve from accumulated
     logicals.
 
@@ -247,7 +247,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
     if is_2d:
         return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
-                           is_two_array=is_two_array)
+                           is_two_array=is_two_array, recent_seq_ids=recent_seq_ids)
 
     # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
@@ -303,7 +303,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
 
 def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
-                is_two_array=False):
+                is_two_array=False, recent_seq_ids=None):
     """Compute 2-D heatmap for multi-dimensional scans.
 
     The flat param_index decomposes column-major (dim-0 varies fastest):
@@ -351,15 +351,44 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         warnings.simplefilter('ignore', RuntimeWarning)  # nanmean on empty slices
         y_mean_flat = np.nanmean(y_mean_sr, axis=0)  # (n_total,)
 
+    # Per-cell error of the site-averaged value, propagated from the per-site
+    # binomial standard errors exactly like the 1-D curve's error bars:
+    #   value_cell = mean_s p_s,   SE_cell = sqrt(Σ_s SE_s²) / n_sites
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_sites, 1)
+
     # Reshape into (s1, s0) grid → heatmap[dim1_idx, dim0_idx]
     # Column-major: dim0 varies fastest in the flat array
     heatmap = y_mean_flat.reshape(s1, s0)
     n_grid = n_reps.reshape(s1, s0)
+    sem_grid = sem_flat.reshape(s1, s0)
+
+    # Cells currently being scanned = every sequence completed in the most
+    # recent batch (one dashboard update can carry several sequences). Map each
+    # seq_id's flat param index back to (dim0, dim1) grid coords. Fall back to
+    # the last measured sequence so a box still shows on a quiet refresh.
+    sids = list(recent_seq_ids) if recent_seq_ids else (
+        [int(scan_logicals[-1][0])] if scan_logicals else [])
+    current = []
+    seen = set()
+    for sid in sids:
+        li = int(sid) - 1
+        if not (0 <= li < len(param_indices)):
+            continue
+        p = int(param_indices[li]) - 1
+        if not (0 <= p < n_total):
+            continue
+        cell = (p % s0, p // s0)
+        if cell not in seen:
+            seen.add(cell)
+            current.append({'x_idx': cell[0], 'y_idx': cell[1]})
 
     return {
         'mode': mode,
         'ndim': 2,
         'heatmap': heatmap,
+        'sem': sem_grid,  # per-cell standard error of the site-averaged value
         'n_reps': n_grid,
         'x_values': d0['values'],  # dim0 → x-axis
         'y_values': d1['values'],  # dim1 → y-axis
@@ -367,6 +396,7 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         'y_name': d1['name'],
         'x_size': s0,
         'y_size': s1,
+        'current': current,  # list of {x_idx, y_idx} cells to highlight
     }
 
 
