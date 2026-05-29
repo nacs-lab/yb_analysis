@@ -245,9 +245,14 @@ _COLUMNS = [
 
 
 class QueuePane(ttk.LabelFrame):
-    def __init__(self, parent, zmq_client, refresh_ms=1000):
+    def __init__(self, parent, zmq_client, dashboard=None, refresh_ms=1000):
         super().__init__(parent, text='Scan queue')
         self._client = zmq_client
+        # Reference (or None) to the DashboardRenderer; after each successful
+        # poll we push the queue snapshot into its shared pickle so the
+        # in-browser Queue panel and /api/queue stay in sync without opening
+        # a second ZMQ socket.
+        self._dashboard = dashboard
         self._refresh_ms = refresh_ms
         self._poll_lock = threading.Lock()
         self._poll_busy = False
@@ -426,6 +431,11 @@ class QueuePane(ttk.LabelFrame):
             logger.info('Runner back online')
             self._offline = False
         self._render(q)
+        if self._dashboard is not None:
+            try:
+                self._dashboard.update_queue(q)
+            except Exception as e:
+                logger.debug('dashboard.update_queue failed: %s', e)
 
     def _on_poll_error(self, msg):
         if not self._offline:

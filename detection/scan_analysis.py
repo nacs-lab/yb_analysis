@@ -252,8 +252,6 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
         return None
-    if num_images > 2:
-        return {'mode': 'undefined'}
 
     n_params = len(scan_params)
     n_sites_1 = len(scan_logicals[0][1])
@@ -275,11 +273,15 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
             continue
         buckets[p].append((logic1, logic2))
 
-    if different_arrays and num_images == 2:
+    # For num_images >= 2 the seq_logicals tuple stores (logic1, last_frame),
+    # so "survival" here is the conditional probability of being loaded in
+    # the FINAL frame given loaded in img1 — regardless of how many
+    # intermediate captures (e.g. two-round SLM rearrangement) sat between.
+    if different_arrays and num_images >= 2:
         mode = 'rearrangement'
         y_mean_sr, y_sem_sr, n_reps = _rearrangement_buckets(
             buckets, n_sites, n_params)
-    elif num_images == 2:
+    elif num_images >= 2:
         mode = 'survival'
         y_mean_sr, y_sem_sr, n_reps = _survival_buckets(buckets, n_sites, n_params)
     else:
@@ -312,8 +314,6 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
     """
     if not scan_logicals or param_indices is None:
         return None
-    if num_images > 2:
-        return {'mode': 'undefined', 'ndim': 2}
 
     d0, d1 = scan_dims[0], scan_dims[1]
     s0, s1 = d0['size'], d1['size']
@@ -335,11 +335,11 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
             continue
         buckets[p].append((logic1, logic2))
 
-    if different_arrays and num_images == 2:
+    if different_arrays and num_images >= 2:
         mode = 'rearrangement'
         y_mean_sr, y_sem_sr, n_reps = _rearrangement_buckets(
             buckets, n_sites, n_total)
-    elif num_images == 2:
+    elif num_images >= 2:
         mode = 'survival'
         y_mean_sr, y_sem_sr, n_reps = _survival_buckets(buckets, n_sites, n_total)
     else:

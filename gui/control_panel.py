@@ -225,7 +225,8 @@ class ControlPanel(tk.Tk):
 
         # ---- Bottom: queue pane ----
         from yb_analysis.gui.queue_pane import QueuePane
-        self._queue_pane = QueuePane(self, self._client, refresh_ms=1000)
+        self._queue_pane = QueuePane(self, self._client,
+                                     dashboard=self._dashboard, refresh_ms=1000)
         self._queue_pane.pack(fill='both', expand=True, padx=10, pady=(2, 8))
 
     # -------------------------------------------------------------- Actions

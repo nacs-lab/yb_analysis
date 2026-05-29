@@ -140,8 +140,14 @@ def unpack_scan_logicals(scan, logicals=None, seq_ids=None, mat_path=None,
             base_row = k * num_images
             if base_row < n_frames:
                 logic1[:, p, r] = logicals[base_row, :]
-            if num_images >= 2 and base_row + 1 < n_frames:
-                logic2[:, p, r] = logicals[base_row + 1, :]
+            # logic2 = FINAL frame of the seq (== row + 1 for pSeq=2, ==
+            # row + 2 for pSeq=3, etc). This keeps "survival" defined as
+            # initial -> final regardless of how many intermediate
+            # captures the seq took (e.g. multi-round rearrangement, where
+            # the middle frame is just a diagnostic).
+            last_row = base_row + num_images - 1
+            if num_images >= 2 and last_row < n_frames:
+                logic2[:, p, r] = logicals[last_row, :]
         fill_count[p] += 1
 
     return scan_params, logic1, logic2, reps_per_param

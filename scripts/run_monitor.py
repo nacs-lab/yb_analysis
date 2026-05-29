@@ -31,6 +31,11 @@ def main():
                         help='Refresh rate in seconds (default: 2)')
     parser.add_argument('--port', type=int, default=DASHBOARD_PORT,
                         help=f'Dashboard web server port (default: {DASHBOARD_PORT})')
+    parser.add_argument('--lan', action='store_true',
+                        help='Bind the dashboard (and /api/* endpoints) to '
+                             '0.0.0.0 so other machines on the LAN can connect. '
+                             'All endpoints are read-only; default is loopback '
+                             'only (127.0.0.1).')
     parser.add_argument('--no-runner', action='store_true',
                         help='Do not spawn the background MATLAB SequenceRunner')
     parser.add_argument('--reuse-runner', action='store_true',
@@ -81,7 +86,8 @@ def main():
     client = ZmqClient(args.url, refresh_rate=args.refresh)
 
     orca_cfg = read_orca_config()
-    dashboard = DashboardRenderer(port=args.port)
+    dash_host = '0.0.0.0' if args.lan else '127.0.0.1'
+    dashboard = DashboardRenderer(port=args.port, host=dash_host)
 
     def _cleanup():
         logging.info('Shutting down...')
@@ -124,7 +130,19 @@ def main():
         init_status = 'No data found'
         dashboard.start()
 
-    logging.info('Dashboard at http://localhost:%d', args.port)
+    if args.lan:
+        import socket
+        try:
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            lan_ip = '<host-ip>'
+        logging.info('Dashboard + API on LAN: http://%s:%d  (also localhost). '
+                     'API endpoints at /api/{status,grid,loading,queue,scan,'
+                     'infidelities,snapshot}', lan_ip, args.port)
+    else:
+        logging.info('Dashboard at http://localhost:%d  '
+                     '(API endpoints at /api/*; pass --lan to expose on LAN)',
+                     args.port)
     app = ControlPanel(client, dashboard, init_dir=init_dir, init_status=init_status)
     app._camera_pane.set_roi(orca_cfg['roi'])
     app._camera_pane.set_exposure(orca_cfg['exposure_time'])

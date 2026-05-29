@@ -198,13 +198,19 @@ class DataManager:
         self.grid_shift_history = []
         self.grid_shift_heatmap = None
 
-        # --- Display state: image-1 and image-2 of the latest sequence ---
+        # --- Display state: image-1, image-2 (final), image-mid of latest seq ---
+        # For NumImages == 3 (two-round SLM rearrangement), image-mid holds the
+        # middle frame; the dashboard can toggle between displaying the final
+        # frame and the middle frame in the second image panel.
         self._display_image = None
         self._display_intensities = None
         self._display_logicals = None
         self._display_image2 = None
         self._display_intensities2 = None
         self._display_logicals2 = None
+        self._display_image_mid = None
+        self._display_intensities_mid = None
+        self._display_logicals_mid = None
 
         # --- Processing buffers ---
         self._frame_size_fixed = False
@@ -258,6 +264,9 @@ class DataManager:
         self._display_image2 = None
         self._display_intensities2 = None
         self._display_logicals2 = None
+        self._display_image_mid = None
+        self._display_intensities_mid = None
+        self._display_logicals_mid = None
         self._intensity_accum = []
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
@@ -494,8 +503,15 @@ class DataManager:
         seq_logic_buf = []  # collect logicals within one sequence
         batch_sids = []  # seq_ids completed in THIS batch (for "current" highlight)
         for idx, img in enumerate(self._imgs_to_process):
-            # In two-array mode, image-2 uses its own grid + thresholds
-            if self.is_two_array and pSeq >= 2 and idx % pSeq == 1:
+            frame_idx = idx % pSeq            # 0 = initial, pSeq-1 = final
+            is_first = frame_idx == 0
+            is_last  = pSeq >= 2 and frame_idx == pSeq - 1
+            is_mid   = (not is_first) and (not is_last)   # only when pSeq >= 3
+            # Two-array mode: the second array layout applies to the FINAL
+            # frame (post-rearrangement / post-pushout). Middle frames are
+            # still in the same configuration as the initial image, so they
+            # use grid_locations.
+            if self.is_two_array and is_last:
                 grid_i = self.grid_locations_img2
                 thr_i = self.loaded_thresholds_img2
             else:
@@ -510,7 +526,7 @@ class DataManager:
             seq_logic_buf.append(logicals)
 
             # On first image of each sequence: accumulate for histograms + display
-            if idx % pSeq == 0:
+            if is_first:
                 self._intensity_accum.append(intensities.copy())
                 self.log_buffer.push(logicals.astype(np.float64))
                 record_loading(logicals)
@@ -518,20 +534,30 @@ class DataManager:
                 self._display_image = img.astype(np.int16)
                 self._display_intensities = intensities.copy()
                 self._display_logicals = logicals.copy()
-            # On second image of each sequence: capture for image-2 display
-            elif pSeq >= 2 and idx % pSeq == 1:
+            # Middle frame(s): only meaningful when pSeq >= 3 (e.g. the
+            # two-round SLM rearrangement after round 1 but before round
+            # 2). Only the most recent middle frame is kept for display.
+            if is_mid:
+                self._display_image_mid = img.astype(np.int16)
+                self._display_intensities_mid = intensities.copy()
+                self._display_logicals_mid = logicals.copy()
+            # Final image of each sequence: feeds the "image 2" display
+            # slot and (for is_two_array) the second log buffer.
+            if is_last:
                 self._display_image2 = img.astype(np.int16)
                 self._display_intensities2 = intensities.copy()
                 self._display_logicals2 = logicals.copy()
                 if self.is_two_array and self.log_buffer_img2 is not None:
                     self.log_buffer_img2.push(logicals.astype(np.float64))
 
-            # On last image of each sequence: accumulate for scan curve
-            if idx % pSeq == pSeq - 1:
+            # On last image of each sequence: accumulate for scan curve.
+            # logic2 always refers to the FINAL frame's logicals so the
+            # survival curve compares initial vs final regardless of pSeq.
+            if frame_idx == pSeq - 1:
                 seq_idx = idx // pSeq
                 sid = int(self._seq_ids_to_process[seq_idx]) if seq_idx < len(self._seq_ids_to_process) else 0
                 logic1 = seq_logic_buf[0]
-                logic2 = seq_logic_buf[1] if len(seq_logic_buf) >= 2 else None
+                logic2 = seq_logic_buf[-1] if len(seq_logic_buf) >= 2 else None
                 self._scan_logicals.append((sid, logic1.copy(), logic2.copy() if logic2 is not None else None))
                 batch_sids.append(sid)
                 seq_logic_buf.clear()
@@ -821,12 +847,16 @@ class DataManager:
 
     def get_plot_data(self):
         return {
+            'scan_id': self.scan_id,
             'cur_image': self._display_image.astype(np.float64) if self._display_image is not None else None,
             'cur_intensities': self._display_intensities,
             'logicals': self._display_logicals,
             'cur_image2': self._display_image2.astype(np.float64) if self._display_image2 is not None else None,
             'cur_intensities2': self._display_intensities2,
             'logicals2': self._display_logicals2,
+            'cur_image_mid': self._display_image_mid.astype(np.float64) if self._display_image_mid is not None else None,
+            'cur_intensities_mid': self._display_intensities_mid,
+            'logicals_mid': self._display_logicals_mid,
             'num_images': self.num_images_per_seq,
             'is_two_array': self.is_two_array,
             'grid_locations_img2': self.grid_locations_img2.copy()
