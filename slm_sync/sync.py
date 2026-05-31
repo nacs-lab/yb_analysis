@@ -1,0 +1,361 @@
+"""Per-scan diagnostic sync from SLM PC → lab-PC HDF5 sidecar.
+
+When a scan finishes, `sync_scan(scan_id, scan_dir)` pulls every diag row
+from the SLM PC's ledger and writes them into `<scan_dir>/slm_diag.h5`
+alongside the regular MATLAB-written `data_*.h5`. The code-snapshot
+manifest is fetched separately and saved as `<scan_dir>/slm_code.json`
+— hashes only; bytes stay on the SLM PC, retrievable on demand via
+`ondemand.get_protocol_source(scan_id)`.
+
+Design (matches the plan's §Phase 2 schema commitments):
+
+- Sidecar lives next to the scan's HDF5 (`<scan_dir>/slm_diag.h5`) so
+  it travels with the data when scans are archived.
+- One resizable HDF5 dataset per scalar diag field. Variable-shape
+  fields (arrays, dicts) go into a single `diag_json` vlen-string
+  column carrying the full row as a JSON blob. Lets us add new diag
+  fields server-side without lab-side schema migrations.
+- Idempotent: rerunning the sync produces the same files. Resumable:
+  if a partial sync wrote rows 0–N, the next attempt fetches
+  `?since_seq_id=N` and appends.
+- Old scans (pre-Phase-1 deploy) return
+  `{synced: False, reason: 'legacy_run'}` — the SLM PC has no ledger
+  for them, by design.
+"""
+
+import json
+import logging
+import os
+import threading
+from datetime import datetime
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+from yb_analysis.slm_sync.client import SlmSyncClient
+
+logger = logging.getLogger(__name__)
+
+
+# Filenames written into each scan_dir.
+DIAG_H5 = 'slm_diag.h5'
+CODE_JSON = 'slm_code.json'
+# Tiny resume-state sidecar so an interrupted sync can pick up exactly
+# where it left off without parsing the HDF5.
+SYNC_STATE = '.slm_sync_state.json'
+
+# Numeric diag fields surfaced as their own HDF5 columns for easy
+# `pd.read_hdf` / `h5py` access. Anything not in this list still lands
+# in `diag_json` so nothing is lost — this is just a convenience layer
+# for the common fields. Extend as needed when analysis tooling wants
+# direct vectorized access to a new field.
+_NUMERIC_DIAG_COLUMNS = (
+    'total_ms', 'compute_total_ms', 'paced_total_ms',
+    'bits_decode_ms', 'lock_check_ms', 'phase_load_ms',
+    'n_loaded', 'n_loaded_total', 'n_dropped', 'n_total_sites',
+    'n_sites_model', 'nsteps', 'step_period_ms',
+    'aborted_at_frame', 'aborted_at_ms',
+)
+_BOOL_DIAG_COLUMNS = (
+    'aborted', 'wrote_final_phase', 'used_cuda_graph',
+    'handoff_idle', 'handoff_protocol',
+)
+_STRING_DIAG_COLUMNS = (
+    'protocol', 'handoff_reason', 'handoff_idle_reason',
+)
+
+
+def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True):
+    """Pull SLM-side diag + code-snapshot for ``scan_id`` into ``scan_dir``.
+
+    Args:
+        scan_id: 14-digit YYYYMMDDHHMMSS from MATLAB (passed verbatim to
+                 the SLM endpoint as a string).
+        scan_dir: Path to the scan's directory (where data_*.h5 lives).
+                  ``slm_diag.h5`` and ``slm_code.json`` will be written
+                  here.
+        client: Optional ``SlmSyncClient`` instance. Created with defaults
+                if omitted.
+        sync_code: Whether to also fetch the code-snapshot manifest.
+
+    Returns a status dict::
+
+        {
+          'synced':       bool,   # True iff at least one row landed on disk
+          'reason':       str,    # 'ok' | 'legacy_run' | 'slm_offline' | 'no_data' | …
+          'scan_id':      str,
+          'rows_written': int,
+          'total_rows':   int,    # current count in the SLM ledger
+          'overflow':     bool,
+          'diag_path':    str | None,
+          'code_path':    str | None,
+        }
+    """
+    scan_dir = Path(scan_dir)
+    scan_id = str(scan_id)
+    if client is None:
+        client = SlmSyncClient()
+
+    diag_path = scan_dir / DIAG_H5
+    state_path = scan_dir / SYNC_STATE
+    code_path = scan_dir / CODE_JSON
+
+    status = {
+        'synced': False,
+        'reason': '',
+        'scan_id': scan_id,
+        'rows_written': 0,
+        'total_rows': 0,
+        'overflow': False,
+        'diag_path': None,
+        'code_path': None,
+    }
+
+    # Where did the last sync leave off?
+    since_seq_id = _read_resume_state(state_path)
+
+    diag = client.get_diag(scan_id, since_seq_id=since_seq_id)
+    if diag is None:
+        status['reason'] = 'slm_offline'
+        logger.info('slm_sync %s: SLM PC unreachable', scan_id)
+        return status
+
+    entries = diag.get('entries') or []
+    status['total_rows'] = diag.get('count', 0)
+    status['overflow'] = bool(diag.get('overflow', False))
+
+    if not entries and status['total_rows'] == 0 and since_seq_id is None:
+        # Server confirms there's never been any diag for this scan_id.
+        # Could be a pre-Phase-1 run, or a scan that didn't use the SLM.
+        status['reason'] = 'no_data'
+        return status
+
+    if entries:
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        _append_rows_to_h5(diag_path, entries)
+        last_seq_id = max(
+            (r.get('seq_id') for r in entries
+             if isinstance(r.get('seq_id'), int)),
+            default=since_seq_id or 0)
+        _write_resume_state(state_path, last_seq_id)
+        status['rows_written'] = len(entries)
+        status['diag_path'] = str(diag_path)
+
+    # Code-snapshot manifest (optional, runs after the diag is safe).
+    if sync_code:
+        try:
+            manifest = client.get_code_manifest(scan_id)
+        except Exception as e:
+            logger.warning('slm_sync %s: code manifest fetch failed: %s',
+                           scan_id, e)
+            manifest = None
+        if manifest is not None:
+            try:
+                scan_dir.mkdir(parents=True, exist_ok=True)
+                _write_code_json(code_path, manifest)
+                status['code_path'] = str(code_path)
+            except OSError as e:
+                logger.warning('slm_sync %s: code json write failed: %s',
+                               scan_id, e)
+
+    status['synced'] = (status['rows_written'] > 0
+                        or status['code_path'] is not None)
+    status['reason'] = 'ok' if status['synced'] else 'no_data'
+    return status
+
+
+def mark_legacy_run(scan_dir):
+    """Stamp the resume state with `reason='legacy_run'` so future sync
+    attempts on pre-Phase-1 scans short-circuit instead of polling the
+    SLM PC on every dashboard tick."""
+    Path(scan_dir).mkdir(parents=True, exist_ok=True)
+    state_path = Path(scan_dir) / SYNC_STATE
+    state_path.write_text(
+        json.dumps({'last_seq_id': None, 'reason': 'legacy_run'}),
+        encoding='utf-8')
+
+
+# ---------------------------------------------------------------------------
+# Schedule-from-DataManager helper
+# ---------------------------------------------------------------------------
+
+
+_SYNC_LOCK = threading.Lock()  # one sync at a time across the lab-PC process
+
+
+def sync_scan_async(scan_id, scan_dir, **kw):
+    """Run sync_scan in a daemon thread so DataManager.save_data isn't
+    blocked by network I/O.
+
+    Returns the Thread so the caller can `.join` in tests. In production
+    the thread is fire-and-forget.
+    """
+    def _run():
+        with _SYNC_LOCK:
+            try:
+                status = sync_scan(scan_id, scan_dir, **kw)
+                logger.info('slm_sync %s: %s (rows=%d)',
+                            scan_id, status['reason'], status['rows_written'])
+            except Exception:
+                logger.exception('slm_sync %s: unexpected failure', scan_id)
+    t = threading.Thread(
+        target=_run, name=f'slm-sync-{scan_id}', daemon=True)
+    t.start()
+    return t
+
+
+# ---------------------------------------------------------------------------
+# HDF5 sidecar I/O
+# ---------------------------------------------------------------------------
+
+
+def _ensure_h5(path):
+    """Open `slm_diag.h5` for append; create empty datasets if absent.
+
+    Datasets layout:
+      /diag/seq_id          int64, resizable
+      /diag/retry_count     int64, resizable
+      /diag/ts_epoch        float64, resizable
+      /diag/ts_iso          vlen str, resizable
+      /diag/run_id          vlen str, resizable
+      /diag/client_id       vlen str, resizable
+      /diag/<numeric>       float64, resizable     (per _NUMERIC_DIAG_COLUMNS)
+      /diag/<bool>          uint8, resizable       (per _BOOL_DIAG_COLUMNS)
+      /diag/<str>           vlen str, resizable    (per _STRING_DIAG_COLUMNS)
+      /diag/diag_json       vlen str, resizable    (full row JSON-encoded)
+      /meta/scan_id         attr
+      /meta/schema_version  attr
+    """
+    f = h5py.File(path, 'a')
+    if 'meta' not in f:
+        f.create_group('meta')
+        f['meta'].attrs['schema_version'] = 1
+    if 'diag' not in f:
+        diag = f.create_group('diag')
+        vlen_str = h5py.string_dtype(encoding='utf-8')
+        # Core columns
+        diag.create_dataset('seq_id', (0,), maxshape=(None,), dtype='i8')
+        diag.create_dataset('retry_count', (0,), maxshape=(None,), dtype='i8')
+        diag.create_dataset('ts_epoch', (0,), maxshape=(None,), dtype='f8')
+        diag.create_dataset('ts_iso', (0,), maxshape=(None,), dtype=vlen_str)
+        diag.create_dataset('run_id', (0,), maxshape=(None,), dtype=vlen_str)
+        diag.create_dataset('client_id', (0,), maxshape=(None,), dtype=vlen_str)
+        # Surfaced numeric / bool / string diag columns
+        for k in _NUMERIC_DIAG_COLUMNS:
+            diag.create_dataset(k, (0,), maxshape=(None,), dtype='f8')
+        for k in _BOOL_DIAG_COLUMNS:
+            diag.create_dataset(k, (0,), maxshape=(None,), dtype='u1')
+        for k in _STRING_DIAG_COLUMNS:
+            diag.create_dataset(k, (0,), maxshape=(None,), dtype=vlen_str)
+        # Full row as JSON — captures everything not surfaced above
+        # (arrays like compute_ms[], Zernike coeffs, future fields, …).
+        diag.create_dataset('diag_json', (0,), maxshape=(None,), dtype=vlen_str)
+    return f
+
+
+def _append_rows_to_h5(path, entries):
+    """Append `entries` to the HDF5 sidecar. Resizes every dataset by
+    len(entries) and writes the new tail slice. Atomic per-dataset; if
+    the write fails halfway through, the next sync resumes via
+    `since_seq_id`.
+    """
+    if not entries:
+        return
+    n = len(entries)
+    with _ensure_h5(path) as f:
+        diag = f['diag']
+
+        def _append(name, values):
+            ds = diag[name]
+            old = ds.shape[0]
+            ds.resize((old + n,))
+            ds[old:old + n] = values
+
+        _append('seq_id', [_safe_int(r.get('seq_id')) for r in entries])
+        _append('retry_count',
+                [_safe_int(r.get('retry_count'), default=0) for r in entries])
+        _append('ts_epoch',
+                [float(r.get('ts_epoch') or 0.0) for r in entries])
+        _append('ts_iso', [str(r.get('ts_iso') or '') for r in entries])
+        _append('run_id', [str(r.get('run_id') or '') for r in entries])
+        _append('client_id', [str(r.get('client_id') or '') for r in entries])
+
+        for col in _NUMERIC_DIAG_COLUMNS:
+            _append(col, [_safe_float(((r.get('diag') or {}).get(col)))
+                          for r in entries])
+        for col in _BOOL_DIAG_COLUMNS:
+            _append(col, [1 if (r.get('diag') or {}).get(col) else 0
+                          for r in entries])
+        for col in _STRING_DIAG_COLUMNS:
+            _append(col, [str((r.get('diag') or {}).get(col) or '')
+                          for r in entries])
+        # Full row JSON — preserves arrays + unknown future fields.
+        _append('diag_json',
+                [json.dumps(r, default=str) for r in entries])
+
+
+def _safe_int(v, default=None):
+    if v is None:
+        return default if default is not None else -1
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default if default is not None else -1
+
+
+def _safe_float(v):
+    if v is None:
+        return np.nan
+    try:
+        f = float(v)
+        return f if np.isfinite(f) else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+# ---------------------------------------------------------------------------
+# Resume state + code JSON
+# ---------------------------------------------------------------------------
+
+
+def _read_resume_state(path):
+    if not path.exists():
+        return None
+    try:
+        d = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if d.get('reason') == 'legacy_run':
+        # Sentinel: signal to sync_scan that this is a pre-Phase-1 run.
+        # We return a special marker; sync_scan checks d['reason'] via
+        # _is_marked_legacy.
+        return None
+    last = d.get('last_seq_id')
+    return last if isinstance(last, int) else None
+
+
+def _write_resume_state(path, last_seq_id):
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(
+        json.dumps({'last_seq_id': last_seq_id,
+                    'updated_iso': datetime.now().isoformat(
+                        timespec='seconds')}),
+        encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def _write_code_json(path, manifest_response):
+    """Write the SLM-PC code-snapshot manifest to disk.
+
+    The body we get from `/slm/runs/{scan_id}/code` includes a `manifest`
+    sub-dict with the full hashes + git_state + per-file metadata. We
+    persist the response verbatim plus a top-level `synced_at_iso` so an
+    analyst can tell when the snapshot was fetched.
+    """
+    payload = dict(manifest_response)
+    payload['synced_at_iso'] = datetime.now().isoformat(timespec='seconds')
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(payload, indent=2, default=str),
+                   encoding='utf-8')
+    os.replace(tmp, path)

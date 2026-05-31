@@ -15,6 +15,21 @@ MATLAB_URL = 'tcp://127.0.0.1:1408'
 DASHBOARD_PORT = 8050
 TEST_SERVER_PORT = 1500
 
+# ---- Dashboard live-image rendering -------------------------------------
+# The live "Tweezer Array" panels render at ~670 px, so a full-sensor camera
+# frame (e.g. 4096x2304) is needlessly huge: the old encoder shipped a ~12 MB
+# base64 PNG *per image, per update*, and with two-array + middle frame that's
+# ~38 MB the browser must base64- + PNG-decode + raster every tick — the
+# freeze seen under heavy imaging. Downsample the displayed frame to at most
+# this many pixels on the long edge before encoding; overlays stay aligned
+# because the raster is stretched back to the original extent. None disables.
+# Kept generous (1400) so the ON state still has zoom headroom; toggle the
+# dashboard's Downsample switch OFF for full native resolution when zooming in.
+DASH_IMAGE_MAX_DIM = 1400
+# PNG compression level (0-9) for the displayed frame. 0 = none (old behavior:
+# fast but large); 1 is nearly free and shrinks real (sparse) frames a lot.
+DASH_IMAGE_PNG_COMPRESSION = 1
+
 # Background MATLAB runner (SequenceRunner.m). MATLAB_EXE defaults to
 # "matlab" on PATH; MATLAB_ROOT is the matlab_new/ directory used as the
 # startup path so addpath(genpath(pwd)) finds the full tree.
@@ -129,3 +144,32 @@ UPDATE_HIST_INTERVAL = 200     # recompute histograms every N shots
 
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
+
+# ---- SLM server (separate machine, reached over Tailscale) ----
+#
+# The SLM PC runs SLMnet's FastAPI server. By default we connect to its plaintext
+# HTTP loopback companion port (8551) over Tailscale. No basic-auth inside the
+# tailnet; outside it the SLM PC is unreachable.
+#
+# Defaults reflect the current lab Tailscale assignments. Override with env
+# vars if those change or for a different deployment.
+SLM_URL = os.environ.get('YB_SLM_URL', 'http://100.114.207.118:8551')
+SLM_VERIFY_TLS = os.environ.get('YB_SLM_VERIFY_TLS', '0') == '1'
+SLM_PASSWORD_PATH = os.environ.get('YB_SLM_PASSWORD_PATH', None)
+LAB_PC_TAILSCALE_IP = os.environ.get('YB_LAB_TAILSCALE_IP', '100.86.15.43')
+
+# Per-endpoint poll cadence (ms) — different panels tolerate different
+# staleness. Mapped to a background thread per endpoint in slm_proxy.py.
+SLM_POLL_INTERVALS_MS = {
+    'health':         2000,
+    'devices':       10000,
+    'lock_status':    2000,
+    'camera_png':     2000,
+    'phase_png':      2000,
+    'rearrange_diag': 5000,
+}
+
+# HTTP timeouts for SLM proxy / sync calls. Tuple is (connect, read).
+# Connect is tight: Tailscale handshake is fast or it's not happening at all.
+# Read is more generous: PNG / JSON responses may be 50–500ms.
+SLM_HTTP_TIMEOUT_S = (2.0, 5.0)

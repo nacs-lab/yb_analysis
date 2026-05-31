@@ -11,6 +11,7 @@ Layout:
 import base64
 import io
 import json
+import math
 import os
 import pickle
 import time
@@ -21,7 +22,9 @@ import traceback
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
-from dash import Dash, html, dcc, Input, Output, State, no_update
+from dash import Dash, html, dcc, Input, Output, State, no_update, Patch
+
+from yb_analysis.config import DASH_IMAGE_MAX_DIM, DASH_IMAGE_PNG_COMPRESSION
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,18 @@ _DATA_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_data.pkl')
 # read by both the Queue panel callback and the /api/queue endpoint, so the
 # Dash subprocess doesn't need its own ZMQ socket to the runner.
 _QUEUE_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_queue.pkl')
+# SLM-proxy snapshot — written by yb_analysis.slm_proxy.SlmProxy on the main
+# process, read here by the dashboard subprocess + the /api/slm/* routes.
+_SLM_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_slm.pkl')
+# Reverse-channel control file: written by the Dash subprocess (browser
+# toggles) and read by the MAIN process. Carries the live-image downsample
+# toggle. Tiny + atomic, like the other shared pickles.
+_CONTROL_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_control.pkl')
+
+# Opt-in performance logging. Set env YB_DASH_PROFILE=1 before launching
+# run_monitor; the write path (update) and render path (refresh) then each
+# emit one concise timing/size line per call, tagged DASHPROF.
+_PROFILE = bool(os.environ.get('YB_DASH_PROFILE'))
 
 
 class DashboardRenderer:
@@ -67,15 +82,28 @@ class DashboardRenderer:
     def update(self, data):
         """Write plot data to the shared file.
 
-        Downsample large images to keep pickle small (~1MB vs 32MB).
-        Uses double-buffer strategy to avoid Windows file locking.
+        Pre-encodes each live frame to a downsampled PNG data URI (see
+        ``_img_to_data_uri``) so the pickle stays small and the Dash callback
+        (separate process) pays no image cost. Uses a double-buffer strategy
+        to avoid Windows file-locking on the shared pickle.
         """
+        t0 = time.perf_counter() if _PROFILE else 0.0
         d = dict(data)
-        # Pre-encode image to JPEG data URI in the main process so the
-        # Dash callback (separate process) doesn't pay the ~130ms PIL cost.
+        # Monotonic write counter: lets the Dash callback skip rebuilding all
+        # figures on ticks where no new frame arrived (see _last_state gate).
+        self._seq = getattr(self, '_seq', 0) + 1
+        d['_write_seq'] = self._seq
+        # Pre-encode image to a PNG data URI in the main process so the Dash
+        # callback (separate process) doesn't pay the encode cost. Live-image
+        # downsampling is toggleable from the dashboard (browser writes
+        # _CONTROL_FILE; we read it here). Default ON — a full-sensor frame is
+        # ~12 MB of base64 and freezes the browser; downsampling cuts it ~10x.
+        ctrl = _read_control() or {}
+        max_dim = DASH_IMAGE_MAX_DIM if ctrl.get('downsample', True) else None
         img = d.get('cur_image')
         if img is not None:
-            uri, vlo, vhi = _img_to_data_uri(np.asarray(img, dtype=np.int16))
+            uri, vlo, vhi = _img_to_data_uri(np.asarray(img, dtype=np.int16),
+                                             max_dim=max_dim)
             d['_img_data_uri'] = uri
             d['_img_shape'] = img.shape
             d['_img_vlo'] = vlo
@@ -83,7 +111,8 @@ class DashboardRenderer:
             d.pop('cur_image', None)  # don't pickle the raw image (18MB)
         img2 = d.get('cur_image2')
         if img2 is not None:
-            uri2, vlo2, vhi2 = _img_to_data_uri(np.asarray(img2, dtype=np.int16))
+            uri2, vlo2, vhi2 = _img_to_data_uri(np.asarray(img2, dtype=np.int16),
+                                                max_dim=max_dim)
             d['_img2_data_uri'] = uri2
             d['_img2_shape'] = img2.shape
             d['_img2_vlo'] = vlo2
@@ -92,12 +121,13 @@ class DashboardRenderer:
         img_mid = d.get('cur_image_mid')
         if img_mid is not None:
             uri_mid, vlo_mid, vhi_mid = _img_to_data_uri(
-                np.asarray(img_mid, dtype=np.int16))
+                np.asarray(img_mid, dtype=np.int16), max_dim=max_dim)
             d['_img_mid_data_uri'] = uri_mid
             d['_img_mid_shape'] = img_mid.shape
             d['_img_mid_vlo'] = vlo_mid
             d['_img_mid_vhi'] = vhi_mid
             d.pop('cur_image_mid', None)
+        t_enc = time.perf_counter() if _PROFILE else 0.0
         # Write to alternating files to avoid read/write conflicts on Windows
         idx = getattr(self, '_write_idx', 0)
         target = _DATA_FILE + f'.{idx}'
@@ -107,6 +137,8 @@ class DashboardRenderer:
         with open(_DATA_FILE, 'w') as f:
             f.write(str(idx))
         self._write_idx = 1 - idx  # toggle 0 ↔ 1
+        if _PROFILE:
+            _log_update_profile(t0, t_enc, target, d, ctrl, max_dim)
         self.start()
 
     def update_queue(self, q):
@@ -178,6 +210,92 @@ def _read_queue_data():
         return None
 
 
+def _read_slm_data():
+    """Read the latest SLM-proxy snapshot written by yb_analysis.slm_proxy.
+
+    Returns None if the proxy was never started or the file is missing. The
+    dashboard treats absence as "SLM panels disabled" and renders an offline
+    badge.
+    """
+    try:
+        with open(_SLM_FILE, 'rb') as f:
+            return pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
+        return None
+
+
+def _read_control():
+    """Read the dashboard control file (browser -> main reverse channel).
+
+    Returns None when never written; callers treat absence as defaults.
+    """
+    try:
+        with open(_CONTROL_FILE, 'rb') as f:
+            return pickle.load(f)
+    except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
+        return None
+
+
+def _write_control(state):
+    """Atomically write the dashboard control file (called in Dash subprocess)."""
+    tmp = _CONTROL_FILE + '.tmp'
+    with open(tmp, 'wb') as f:
+        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, _CONTROL_FILE)
+
+
+# ---- Opt-in performance logging (env YB_DASH_PROFILE=1) --------------------
+
+def _json_default(x):
+    return _to_jsonable(x)
+
+
+def _approx_json_size(obj):
+    """Serialized byte size of a figure/patch payload (profiling only)."""
+    try:
+        return len(json.dumps(obj, default=_json_default))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _log_update_profile(t0, t_enc, target, d, ctrl, max_dim):
+    """One line per write: image count/shapes, encode ms, pickle MB, total ms."""
+    t_end = time.perf_counter()
+    shapes = [d.get(k) for k in ('_img_shape', '_img2_shape', '_img_mid_shape')
+              if d.get(k) is not None]
+    try:
+        sz = os.path.getsize(target) / 1e6
+    except OSError:
+        sz = -1.0
+    logger.info('DASHPROF update: imgs=%d shapes=%s downsample=%s(max_dim=%s) '
+                'encode=%.1fms pickle=%.2fMB total=%.1fms',
+                len(shapes), shapes, ctrl.get('downsample', True), max_dim,
+                (t_enc - t0) * 1e3, sz, (t_end - t0) * 1e3)
+
+
+def _log_refresh_profile(n, t0, t_read, t_build, emitted):
+    """One line per tick: read/build/emit ms, full/patch/no_update split,
+    approximate payload MB (what the browser must parse), total ms."""
+    t_emit = time.perf_counter()
+    full = patch = noupd = 0
+    payload = 0
+    for o in emitted:
+        if o is no_update:
+            noupd += 1
+        elif isinstance(o, Patch):
+            patch += 1
+            payload += max(0, _approx_json_size(o.to_plotly_json()))
+        else:
+            obj = o.to_plotly_json() if hasattr(o, 'to_plotly_json') else o
+            full += 1
+            payload += max(0, _approx_json_size(obj))
+    logging.info('DASHPROF refresh n=%s: read=%.1fms build=%.1fms emit=%.1fms '
+                 'kinds[full=%d patch=%d noupd=%d] payload=%.2fMB total=%.1fms',
+                 n, (t_read - t0) * 1e3, (t_build - t_read) * 1e3,
+                 (t_emit - t_build) * 1e3, full, patch, noupd,
+                 payload / 1e6, (t_emit - t0) * 1e3)
+
+
 def _to_jsonable(x):
     """Recursively convert numpy / bytes payloads to JSON-safe Python types.
 
@@ -225,6 +343,108 @@ _HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri',
                '_img_mid_vlo', '_img_mid_vhi')
 
 
+def _resolve_scan_dir(scan_id):
+    """Map a 14-digit scan_id to its data directory on disk.
+
+    Mirrors `DataManager.__init__`'s path construction so the dashboard
+    finds the same directory MATLAB writes into.
+    """
+    from yb_analysis.io.scan_directory import (
+        make_scan_dir, make_scan_fname, scan_id_to_stamps)
+    try:
+        date_stamp, time_stamp = scan_id_to_stamps(int(scan_id))
+        dname, _, _ = make_scan_dir(date_stamp, time_stamp)
+        return dname
+    except Exception:
+        return None
+
+
+def _runs_diag_response(scan_id):
+    """Phase 2 helper: return per-scan diag rows.
+
+    Strategy:
+      1. If `<scan_dir>/slm_diag.h5` exists, read + return rows from it
+         (fast, no network).
+      2. Else passthrough to SLM PC's `/slm/runs/{scan_id}/diag` (live).
+      3. Else 503.
+    """
+    from flask import jsonify
+    scan_dir = _resolve_scan_dir(scan_id)
+    if scan_dir:
+        sidecar = os.path.join(scan_dir, 'slm_diag.h5')
+        if os.path.exists(sidecar):
+            try:
+                return jsonify(_read_slm_diag_h5(sidecar, scan_id))
+            except Exception as e:
+                logger.warning('slm_diag.h5 read failed (%s): %s',
+                               sidecar, e)
+    # Live passthrough.
+    try:
+        from yb_analysis.slm_sync import SlmSyncClient
+        client = SlmSyncClient()
+        data = client.get_diag(scan_id)
+        if data is None:
+            return jsonify({'error': 'slm offline and no local sidecar'}), 503
+        return jsonify(data)
+    except Exception as e:
+        logger.warning('runs_diag passthrough failed: %s', e)
+        return jsonify({'error': str(e)}), 503
+
+
+def _runs_code_response(scan_id):
+    """Phase 2 helper: return code-snapshot manifest for a scan."""
+    from flask import jsonify
+    scan_dir = _resolve_scan_dir(scan_id)
+    if scan_dir:
+        sidecar = os.path.join(scan_dir, 'slm_code.json')
+        if os.path.exists(sidecar):
+            try:
+                with open(sidecar, 'r', encoding='utf-8') as f:
+                    return jsonify(json.load(f))
+            except Exception as e:
+                logger.warning('slm_code.json read failed (%s): %s',
+                               sidecar, e)
+    # Live passthrough.
+    try:
+        from yb_analysis.slm_sync import SlmSyncClient
+        client = SlmSyncClient()
+        data = client.get_code_manifest(scan_id)
+        if data is None:
+            return jsonify({'error': 'no code snapshot for this scan_id'}), 404
+        return jsonify(data)
+    except Exception as e:
+        logger.warning('runs_code passthrough failed: %s', e)
+        return jsonify({'error': str(e)}), 503
+
+
+def _read_slm_diag_h5(path, scan_id):
+    """Read all rows from a synced slm_diag.h5 sidecar.
+
+    Returns the same shape the SLM PC's `/slm/runs/{id}/diag` returns,
+    so the dashboard renderer treats local + remote responses identically.
+    """
+    import h5py
+    with h5py.File(path, 'r') as f:
+        diag = f['diag']
+        n = diag['seq_id'].shape[0]
+        if n == 0:
+            return {'scan_id': str(scan_id), 'count': 0,
+                    'overflow': False, 'entries': []}
+        # Pull the per-row JSON column — it carries the full original row.
+        json_col = diag['diag_json'][:]
+        entries = []
+        for raw in json_col:
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='replace')
+            try:
+                entries.append(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                # Bad row — skip, but keep going.
+                continue
+    return {'scan_id': str(scan_id), 'count': n,
+            'overflow': False, 'entries': entries}
+
+
 def _register_api_routes(server):
     """Attach read-only JSON endpoints to the Flask app underlying Dash."""
     from flask import jsonify
@@ -244,6 +464,15 @@ def _register_api_routes(server):
         '/api/infidelities':'per-site discrimination infidelity',
         '/api/queue':       'runner queue {running, queued, history} (~1s stale)',
         '/api/snapshot':    'full plot-data dict minus heavy image blobs',
+        '/api/slm':         'SLM-proxy passthrough index (health, lock, camera/png, ...)',
+        '/api/slm/health':  'SLM PC /health passthrough (cached, ~2s stale)',
+        '/api/slm/devices': 'SLM PC /devices passthrough (cached, ~10s stale)',
+        '/api/slm/lock/status':     'SLM PC /lock/status passthrough (cached, ~2s stale)',
+        '/api/slm/rearrange/diag':  'SLM PC /slm/rearrange_diag passthrough (cached, ~5s stale)',
+        '/api/slm/camera/png':      'SLM PC /camera/capture_png passthrough (cached, ~2s stale)',
+        '/api/slm/phase/png':       'SLM PC /slm/phase_png passthrough (cached, ~2s stale)',
+        '/api/runs/<scan_id>/diag': 'per-scan SLM diag rows: synced sidecar first, then live SLM passthrough',
+        '/api/runs/<scan_id>/code': 'per-scan code-snapshot manifest: synced sidecar first, then live SLM passthrough',
     }
 
     def _list_endpoints():
@@ -307,6 +536,94 @@ def _register_api_routes(server):
         return jsonify(_to_jsonable(
             {k: v for k, v in d.items() if k not in _HEAVY_KEYS}))
 
+    # ---- SLM passthrough routes (read from yb_dash_slm.pkl) ----
+    # All return cached SLM-PC data, polled by yb_analysis.slm_proxy on the
+    # main process. Stale by up to the configured poll interval (typically
+    # 2–10 s). When the proxy is disabled or the SLM PC is offline, returns
+    # 503 with a JSON error body (no exception, no hang).
+
+    from flask import Response
+
+    def _slm_field(field, mime_type=None, default_status=503):
+        """Helper: return field from yb_dash_slm.pkl as JSON, or 503."""
+        slm = _read_slm_data()
+        if slm is None:
+            return jsonify({'error': 'slm proxy disabled or not started'}), 503
+        if slm.get('slm_offline'):
+            return jsonify({
+                'error': 'slm offline',
+                'last_error_msg': slm.get('last_error_msg', {}),
+                'last_error_ts': slm.get('last_error_ts', {}),
+            }), 503
+        val = slm.get(field)
+        if val is None:
+            return jsonify({'error': f'no data for {field} yet'}), 503
+        if mime_type:
+            # PNG byte payload — return as raw response, not JSON.
+            return Response(val, mimetype=mime_type)
+        return jsonify(_to_jsonable(val))
+
+    @server.route('/api/slm')
+    @server.route('/api/slm/')
+    def _api_slm_index():
+        slm = _read_slm_data() or {}
+        return jsonify({
+            'service': 'yb-slm-proxy',
+            'slm_url': slm.get('slm_url'),
+            'slm_offline': slm.get('slm_offline', True),
+            'last_poll_ts': slm.get('last_poll_ts', {}),
+            'endpoints': [p for p in _DESCRIPTIONS if p.startswith('/api/slm/')],
+        })
+
+    @server.route('/api/slm/health')
+    def _api_slm_health():
+        return _slm_field('health')
+
+    @server.route('/api/slm/devices')
+    def _api_slm_devices():
+        return _slm_field('devices')
+
+    @server.route('/api/slm/lock/status')
+    def _api_slm_lock():
+        return _slm_field('lock_status')
+
+    @server.route('/api/slm/rearrange/diag')
+    def _api_slm_rearrange_diag():
+        return _slm_field('rearrange_diag')
+
+    @server.route('/api/slm/camera/png')
+    def _api_slm_camera_png():
+        return _slm_field('camera_png', mime_type='image/png')
+
+    @server.route('/api/slm/phase/png')
+    def _api_slm_phase_png():
+        return _slm_field('phase_png', mime_type='image/png')
+
+    # ---- Phase 2: per-scan diag / code retrieval (synced sidecar first,
+    #      then SLM passthrough). These are used by the dashboard's
+    #      Analysis tab and by ad-hoc curl/notebook clients.
+
+    @server.route('/api/runs/<scan_id>/diag')
+    def _api_runs_diag(scan_id):
+        """Return the per-scan SLM diag rows.
+
+        Prefers the locally-synced HDF5 sidecar (if Phase 2 sync has
+        already run for this scan_id and `slm_diag.h5` exists).
+        Otherwise passes through to the SLM PC's
+        `/slm/runs/{scan_id}/diag` endpoint (~live data, ~5s stale).
+        """
+        return _runs_diag_response(scan_id)
+
+    @server.route('/api/runs/<scan_id>/code')
+    def _api_runs_code(scan_id):
+        """Return the code-snapshot manifest for `scan_id`.
+
+        Prefers `<scan_dir>/slm_code.json` if Phase 2 sync persisted
+        it; otherwise passes through to the SLM PC's
+        `/slm/runs/{scan_id}/code`.
+        """
+        return _runs_code_response(scan_id)
+
 
 def _dash_main(host, port, data_file):
     """Entry point for the Dash subprocess."""
@@ -318,6 +635,216 @@ def _dash_main(host, port, data_file):
     )
     app = _build_app()
     app.run(host=host, port=port, debug=False, use_reloader=False)
+
+
+# ---- Partial-update (Patch) machinery --------------------------------------
+# The single refresh callback used to return ~16 brand-new figures every tick,
+# forcing the browser to run Plotly.react() on all of them at once — a
+# multi-hundred-ms main-thread freeze that blocked hover. Instead we now build
+# the full figure (reusing every _fig_* builder unchanged) and emit a Dash
+# Patch carrying ONLY the leaf values that changed since the previous tick, so
+# Plotly mutates traces/shapes in place. Panels whose data didn't change emit
+# no_update and cost the browser nothing.
+#
+# Correctness model: `_last_figs` caches, per panel, the exact figure the
+# connected browser is currently showing. A Patch is a diff applied on the
+# client against that base, so the cache MUST track every emit:
+#   * full figure -> cache = new      (client now shows new)
+#   * patch        -> cache = new      (client applied the diff -> shows new)
+#   * no_update    -> cache unchanged  (client still shows old)
+# The initial callback (n_intervals == 0, fired once per page load) and a
+# periodic keyframe always send the full figure, so a freshly (re)loaded tab
+# resyncs. This assumes ONE active dashboard tab (the lab's single screen);
+# multiple tabs loading at the same instant could briefly desync until the
+# next keyframe — acceptable here, and a reload always fixes it.
+
+_PANEL_IDS = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
+              'load', 'infid', 'shift', 'scan', 'avghist',
+              'rep0', 'rep1', 'rep2', 'rep3')
+
+# Send a full (un-patched) figure every this-many ticks as a resync keyframe.
+# At the 3 s tick that's ~one full re-render every 10 min — imperceptible.
+_KEYFRAME_EVERY = 200
+
+# Per-panel snapshot of the figure the browser currently shows. Lives only in
+# the Dash subprocess (single process). Keyed by _PANEL_IDS + 'site'.
+_last_figs = {}
+
+_MISSING = object()
+
+
+class _Structural(Exception):
+    """Raised mid-diff when a change can't be safely expressed as an in-place
+    patch (a trace ``type`` flip, or a dropped key); the caller then falls back
+    to sending the whole figure, which resyncs the client."""
+
+
+def _vals_equal(a, b):
+    """Leaf equality tolerant of numpy arrays/scalars, nested lists, and NaN."""
+    if a is b:
+        return True
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        try:
+            aa, bb = np.asarray(a), np.asarray(b)
+            if aa.shape != bb.shape:
+                return False
+            if aa.dtype.kind == 'f' or bb.dtype.kind == 'f':
+                return bool(np.array_equal(aa, bb, equal_nan=True))
+            return bool(np.array_equal(aa, bb))
+        except (TypeError, ValueError):
+            return False
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_vals_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, (np.integer, np.floating)):
+        a = a.item()
+    if isinstance(b, (np.integer, np.floating)):
+        b = b.item()
+    if (isinstance(a, float) and isinstance(b, float)
+            and math.isnan(a) and math.isnan(b)):
+        return True
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def _is_dict_list(x):
+    return isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict)
+
+
+def _diff_into(node, old, new):
+    """Record old->new changes into the Patch proxy ``node``.
+
+    Returns True if anything changed. Raises ``_Structural`` when the change
+    needs a full-figure replacement instead of an in-place patch.
+    """
+    if not (isinstance(old, dict) and isinstance(new, dict)):
+        raise _Structural()           # only ever called on dict nodes
+    if set(old) - set(new):           # a key disappeared -> can't patch safely
+        raise _Structural()
+    changed = False
+    for k, nv in new.items():
+        ov = old.get(k, _MISSING)
+        if ov is _MISSING:            # brand-new key -> assign it
+            node[k] = _to_jsonable(nv)
+            changed = True
+            continue
+        if k == 'type' and ov != nv:  # trace type flip (scatter<->heatmap)
+            raise _Structural()
+        if isinstance(ov, dict) and isinstance(nv, dict):
+            changed = _diff_into(node[k], ov, nv) or changed
+        elif _is_dict_list(ov) or _is_dict_list(nv):
+            # list of dicts: traces / shapes / annotations / images
+            if (not isinstance(ov, list) or not isinstance(nv, list)
+                    or len(ov) != len(nv)):
+                node[k] = _to_jsonable(nv)         # length change -> replace
+                changed = True
+            else:
+                for i in range(len(nv)):
+                    if isinstance(ov[i], dict) and isinstance(nv[i], dict):
+                        changed = _diff_into(node[k][i], ov[i], nv[i]) or changed
+                    elif not _vals_equal(ov[i], nv[i]):
+                        node[k][i] = _to_jsonable(nv[i])
+                        changed = True
+        else:
+            if not _vals_equal(ov, nv):
+                node[k] = _to_jsonable(nv)
+                changed = True
+    return changed
+
+
+def _emit(pid, fig, force_full):
+    """Return ``fig`` as a full object, a minimal Patch, or no_update.
+
+    Keeps ``_last_figs[pid]`` equal to whatever the browser now shows.
+    """
+    if fig is _SKIP:                 # gated panel whose inputs didn't change
+        return no_update
+    new = fig.to_plotly_json() if hasattr(fig, 'to_plotly_json') else fig
+    old = _last_figs.get(pid)
+    if force_full or old is None:
+        _last_figs[pid] = new
+        return fig
+    try:
+        patch = Patch()
+        changed = _diff_into(patch, old, new)
+    except _Structural:
+        _last_figs[pid] = new
+        return fig                    # whole figure resyncs the client
+    except Exception:
+        logging.exception('patch diff failed for panel %s; sending full figure',
+                          pid)
+        _last_figs[pid] = new
+        return fig
+    _last_figs[pid] = new
+    return patch if changed else no_update
+
+
+def _force_full(n):
+    """First call after a page load (n==0) and periodic keyframes go full."""
+    return n == 0 or (_KEYFRAME_EVERY and n % _KEYFRAME_EVERY == 0)
+
+
+# ---- Build gating ----------------------------------------------------------
+# At large site counts (thousands of tweezers) the dominant cost is *building*
+# the figures every tick — Plotly validates thousands-element arrays per trace
+# (profiling showed ~0.7-0.9 s/tick even when nothing changed). Two gates avoid
+# that work:
+#   * Global: the main process stamps each write with a monotonic _write_seq.
+#     If the seq (and slider/colorbar inputs) is unchanged since last tick, no
+#     panel can have changed -> skip building entirely and return no_update.
+#   * Per-panel: the cumulative 2-D maps (loading / infidelity / grid-shift)
+#     only refit every 50-200 shots, so even on a fresh frame their data is
+#     usually identical -> skip rebuilding just those.
+# Page-load and keyframe ticks (force_full) bypass both gates so a client
+# always resyncs.
+
+_SKIP = object()                 # sentinel: gated panel unchanged -> no_update
+_last_sig = {}                   # per-panel input signature (gated panels)
+_last_state = {'key': None}      # global (write_seq, marker_size, cbar_scale)
+
+# Above this site count, render the per-site overlays with WebGL (scattergl)
+# instead of SVG. SVG creates one DOM node per site — fine for a few hundred,
+# catastrophic at thousands; WebGL draws them all in one cheap pass.
+_GL_SITES = 400
+
+
+def _h(x):
+    """Cheap, collision-safe-enough hash of an array/list/scalar for change
+    detection. Hashes the raw bytes of numpy arrays (microseconds even at a
+    few thousand elements)."""
+    if x is None:
+        return None
+    if isinstance(x, np.ndarray):
+        return (x.shape, x.dtype.str, hash(x.tobytes()))
+    if isinstance(x, (list, tuple)):
+        return tuple(_h(v) for v in x)
+    return x
+
+
+def _sig_load(d, marker_size):
+    return ('load', marker_size, bool(d.get('_dummy_mode')),
+            _h(d.get('loading_rates')), _h(d.get('grid_locations')))
+
+
+def _sig_infid(d, marker_size):
+    return ('infid', marker_size, bool(d.get('_dummy_mode')),
+            _h(d.get('infidelities')), _h(d.get('grid_locations')))
+
+
+def _sig_shift(d):
+    return ('shift', bool(d.get('_dummy_mode')),
+            _h(d.get('grid_shift_heatmap')),
+            tuple(map(tuple, d.get('grid_shift_history') or [])))
+
+
+def _gated(pid, sig, builder, force_full):
+    """Build the panel only if its signature changed (or force_full); else
+    return _SKIP so _emit yields no_update without building."""
+    if not force_full and _last_sig.get(pid) == sig:
+        return _SKIP
+    _last_sig[pid] = sig
+    return builder()
 
 
 def _build_app():
@@ -366,7 +893,11 @@ new MutationObserver(function(mutations) {
             el.on('plotly_click', function(evtData) {
                 if (!evtData || !evtData.points || !evtData.points.length) return;
                 var pt = evtData.points[0];
-                var site = (pt.customdata != null) ? pt.customdata
+                /* customdata is [site, value] on the 2-D maps (scalar on older
+                   figures); take element 0 when it's an array. */
+                var cd = pt.customdata;
+                var site = Array.isArray(cd) ? cd[0]
+                         : (cd != null) ? cd
                          : (pt.pointIndex != null) ? pt.pointIndex + 1 : null;
                 if (site == null) return;
                 /* Dash stores component props on the React fiber. We can update
@@ -405,7 +936,24 @@ new MutationObserver(function(mutations) {
         # overlaid on the array2 panel; when hidden, the remaining three
         # panels expand to fill the row.
         _row([
-            _graph('array', 670),
+            # Image-1 panel + live-image downsample toggle overlaid top-right.
+            # When ON (default) the main process ships a downsampled frame so
+            # the browser doesn't choke on full-sensor images; turn OFF to see
+            # full resolution (heavier — only for momentary inspection).
+            html.Div(style={'flex': '1', 'minWidth': '0', 'position': 'relative'}, children=[
+                dcc.Graph(id='array', figure=_waiting(''), style={'height': '670px'},
+                          config={'displayModeBar': False}),
+                html.Div(style={'position': 'absolute', 'top': '9px', 'right': '70px',
+                                'zIndex': '5', 'display': 'flex', 'alignItems': 'center'},
+                    children=[
+                        dcc.Checklist(id='downsample',
+                            options=[{'label': 'Downsample', 'value': 'ds'}],
+                            value=['ds'], inline=True, inputClassName='yb-switch',
+                            style={'fontSize': '11px', 'color': '#ffffff'},
+                            labelStyle={'display': 'flex', 'alignItems': 'center',
+                                        'cursor': 'pointer', 'margin': '0', 'color': '#ffffff'}),
+                    ]),
+            ]),
             html.Div(id='array-mid-wrapper',
                      style={'flex': '1', 'minWidth': '0', 'display': 'flex'},
                      children=[_graph('array_mid', 670)]),
@@ -478,7 +1026,14 @@ new MutationObserver(function(mutations) {
             ]),
             _graph('shift', 600),
         ]),
-        # Row 5: Scan queue (filled by the queue callback below)
+        # Row 5: SLM hardware (filled by the slm callback below). Phase 0 lands
+        # these as a row; Phase 4 moves them into a dedicated tab.
+        html.Div(id='slm-panel', style={
+            'backgroundColor': PANEL, 'padding': '10px 14px',
+            'marginTop': '10px', 'borderRadius': '4px',
+            'fontFamily': '"Segoe UI", sans-serif', 'fontSize': '12px',
+            'color': TEXT}),
+        # Row 6: Scan queue (filled by the queue callback below)
         html.Div(id='queue-panel', style={
             'backgroundColor': PANEL, 'padding': '10px 14px',
             'marginTop': '10px', 'borderRadius': '4px',
@@ -491,6 +1046,9 @@ new MutationObserver(function(mutations) {
                 'maxHeight': '300px', 'overflow': 'auto', 'whiteSpace': 'pre-wrap'}),
         ], style={'marginTop': '10px'}),
         dcc.Interval(id='tick', interval=3000, n_intervals=0),
+        # Holds the downsample-toggle state; the callback's real job is the
+        # side effect of writing _CONTROL_FILE for the main process to read.
+        dcc.Store(id='downsample-state'),
     ])
 
     # --- Single callback for all panels ---
@@ -511,17 +1069,39 @@ new MutationObserver(function(mutations) {
         marker_size = int(marker_size) if marker_size else 12
         # Checklist returns a list; 'auto' present → autoscale, else fixed 0–1.
         cbar_scale = 'auto' if (cbar_toggle and 'auto' in cbar_toggle) else '01'
+        t0 = time.perf_counter() if _PROFILE else 0.0
         d = _read_data()
+        t_read = time.perf_counter() if _PROFILE else 0.0
         debug_lines = []
 
         if d is None:
+            # No data: send full placeholders and drop the cache so the next
+            # real tick re-establishes a full figure for every panel.
+            for pid in _PANEL_IDS:
+                _last_figs.pop(pid, None)
             debug_lines.append('No data yet (pickle file not found)')
             empty = [_waiting(t) for t in [
                 'Tweezer Array (img 1)', 'Tweezer Array (middle)',
                 'Tweezer Array (img 2)', 'Intensities', 'Loading Rate',
                 'Loading', 'Infidelities', 'Grid Shift', 'Scan Curve',
                 'Avg Histogram']]
+            _last_sig.clear()
+            _last_state['key'] = None
             return empty + [_waiting('Site Hist')]*4 + [[], '\n'.join(debug_lines)]
+
+        # Global gate: if no new frame was written since the last tick (and the
+        # slider/colorbar inputs are unchanged), nothing can have changed — skip
+        # the whole rebuild. force_full (page load / keyframe) bypasses this.
+        full = _force_full(_n)
+        seq = d.get('_write_seq')
+        state_key = (seq, marker_size, cbar_scale)
+        if not full and seq is not None and _last_state.get('key') == state_key:
+            if _PROFILE:
+                logging.info('DASHPROF refresh n=%s: no new frame -> all '
+                             'no_update (read=%.1fms)', _n,
+                             (t_read - t0) * 1e3)
+            return [no_update] * 16
+        _last_state['key'] = state_key
 
         try:
             has_img = d.get('_img_data_uri') is not None
@@ -568,9 +1148,19 @@ new MutationObserver(function(mutations) {
                                               img2_no_data_msg),
                 _fig_intens(d),
                 _fig_loading_live(d),
-                _stale('Loading Rates', lambda: _fig_loading(d, marker_size=marker_size)),
-                _stale('Infidelities', lambda: _fig_infid(d, marker_size=marker_size)),
-                _stale('Grid Shift', lambda: _fig_shift(d)),
+                # Cumulative 2-D maps: gated — rebuilt only when their own data
+                # changed (they refit every 50-200 shots, not every frame).
+                _gated('load', _sig_load(d, marker_size),
+                       lambda: _stale('Loading Rates',
+                                      lambda: _fig_loading(d, marker_size=marker_size)),
+                       full),
+                _gated('infid', _sig_infid(d, marker_size),
+                       lambda: _stale('Infidelities',
+                                      lambda: _fig_infid(d, marker_size=marker_size)),
+                       full),
+                _gated('shift', _sig_shift(d),
+                       lambda: _stale('Grid Shift', lambda: _fig_shift(d)),
+                       full),
                 _stale('Scan Curve', lambda: _fig_scan_curve(d, cbar_scale=cbar_scale)),
                 _stale('Avg Histogram', lambda: _fig_avghist(d)),
             ]
@@ -599,7 +1189,16 @@ new MutationObserver(function(mutations) {
                 n_reps_total = int(np.asarray(n_reps_arr).sum()) if n_reps_arr is not None else 0
                 debug_lines.append(f'scan_curve: mode={sc_mode} ndim={sc_ndim} reps_total={n_reps_total} num_images={d.get("num_images")}')
 
-            return figs + reps + [opts, '\n'.join(debug_lines)]
+            # Emit minimal Patches (or no_update) instead of replacing every
+            # figure wholesale — this is what keeps hover responsive. Building
+            # the full figures above is cheap (separate Dash process); the
+            # browser only pays for the panels that actually changed.
+            t_build = time.perf_counter() if _PROFILE else 0.0
+            emitted = [_emit(pid, f, full)
+                       for pid, f in zip(_PANEL_IDS, figs + reps)]
+            if _PROFILE:
+                _log_refresh_profile(_n, t0, t_read, t_build, emitted)
+            return emitted + [opts, '\n'.join(debug_lines)]
 
         except Exception:
             tb = traceback.format_exc()
@@ -611,15 +1210,32 @@ new MutationObserver(function(mutations) {
     def site_hist(val, _n):
         d = _read_data()
         if d is None or val is None:
+            _last_figs.pop('site', None)
             return _waiting('Site Histogram'), ''
         if d.get('_dummy_mode'):
+            _last_figs.pop('site', None)
             return _waiting('Site Histogram', 'Dummy mode'), ''
-        return _fig_site(d, int(val) - 1)
+        fig, info = _fig_site(d, int(val) - 1)
+        # Patch the figure in place (the site-info text is tiny — sent whole).
+        return _emit('site', fig, _force_full(_n)), info
 
     # Click on loading-rate or infidelity 2D plot → select site in dropdown
     # is handled entirely in JavaScript (index_string) via plotly_click +
     # React fiber setProps. This bypasses Dash's callback system which can
     # lose clickData when the refresh callback replaces figures every 3s.
+
+    @app.callback(Output('downsample-state', 'data'),
+                  Input('downsample', 'value'))
+    def set_downsample(val):
+        # Browser -> main-process reverse channel. The main process reads
+        # _CONTROL_FILE in DashboardRenderer.update() to decide max_dim.
+        # Fires on page load too, so the control file always reflects the UI.
+        ds = bool(val and 'ds' in val)
+        try:
+            _write_control({'downsample': ds})
+        except OSError:
+            logging.exception('failed to write dashboard control file')
+        return ds
 
     @app.callback(Output('array-mid-wrapper', 'style'),
                   Input('show-mid', 'value'))
@@ -635,6 +1251,11 @@ new MutationObserver(function(mutations) {
                   Input('tick', 'n_intervals'))
     def refresh_queue(_n):
         return _render_queue_panel(_read_queue_data())
+
+    @app.callback(Output('slm-panel', 'children'),
+                  Input('tick', 'n_intervals'))
+    def refresh_slm(_n):
+        return _render_slm_panel(_read_slm_data())
 
     return app
 
@@ -664,16 +1285,30 @@ def _waiting(title, message='Waiting for data...'):
 
 # ---- Figure builders ----
 
-def _img_to_data_uri(img):
-    """Convert int16 image to a lossless PNG data URI for Plotly background.
+def _img_to_data_uri(img, max_dim=DASH_IMAGE_MAX_DIM,
+                     compression=DASH_IMAGE_PNG_COMPRESSION):
+    """Convert an int16 image to a PNG data URI for the Plotly background.
 
-    Uses cv2 with PNG compression=0 (no compression, just framing) for speed.
-    83ms for 4000x2300 — fully lossless, no artifacts.
+    Downsamples to ``max_dim`` px on the long edge before encoding: the array
+    panel is only ~670 px wide, so shipping a full-sensor frame is wasteful and
+    freezes the browser on decode (~12 MB base64 for a 4096x2304 frame). The
+    caller keeps the ORIGINAL shape for the figure extent, so the smaller
+    raster is stretched back and the site-box overlays (in original pixel
+    coords) stay aligned. ``vlo``/``vhi`` are the full-image 2/98 percentiles,
+    returned for the colorbar and computed before downsampling.
     """
     import cv2
     vlo, vhi = float(np.percentile(img, 2)), float(np.percentile(img, 98))
-    gray = np.clip((img.astype(np.float32) - vlo) / max(vhi - vlo, 1) * 255, 0, 255).astype(np.uint8)
-    _, enc = cv2.imencode('.png', gray, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    gray = np.clip((img.astype(np.float32) - vlo) / max(vhi - vlo, 1) * 255,
+                   0, 255).astype(np.uint8)
+    if max_dim:
+        h, w = gray.shape
+        scale = max(h, w) / float(max_dim)
+        if scale > 1.0:
+            gray = cv2.resize(
+                gray, (max(1, round(w / scale)), max(1, round(h / scale))),
+                interpolation=cv2.INTER_AREA)
+    _, enc = cv2.imencode('.png', gray, [cv2.IMWRITE_PNG_COMPRESSION, compression])
     b64 = base64.b64encode(enc.tobytes()).decode()
     return f'data:image/png;base64,{b64}', vlo, vhi
 
@@ -703,25 +1338,51 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
                     colorbar=dict(title='Counts', len=0.9)),
         hoverinfo='skip', showlegend=False))
 
-    # Site markers as lightweight scatter overlay
+    # Site occupancy overlay (green = loaded, red = empty).
     grid = d.get(grid_key)
     logicals = d.get(logicals_key)
     box = d.get('box_size', 11)
     n = len(grid) if grid is not None else 0
-    if grid is not None:
-        half = box / 2
-        # Batch layout shapes — rectangles in data coordinates that scale with zoom
-        shapes = []
-        for i in range(n):
-            y0, x0 = grid[i]
-            c = '#00ff88' if (logicals is not None and i < n and logicals[i]) else '#ff4444'
-            shapes.append(dict(type='rect', x0=x0-half, y0=y0-half, x1=x0+half, y1=y0+half,
-                                line=dict(color=c, width=2)))
-        fig.update_layout(shapes=shapes)
+    if grid is not None and n > 0:
+        if logicals is not None and len(logicals) >= n:
+            occ = np.asarray(logicals[:n], dtype=float)
+        else:
+            occ = np.zeros(n)
+        if n > _GL_SITES:
+            # WebGL boxes drawn as DATA-coordinate line outlines (not markers):
+            # markers are a fixed pixel size that smears into a blob when zoomed
+            # out, whereas these rectangles scale with zoom exactly like the old
+            # SVG shapes — but render in two cheap WebGL traces (loaded / empty)
+            # instead of thousands of SVG nodes. Each site contributes a closed
+            # 5-corner loop plus a NaN to break the line between boxes.
+            half = box / 2.0
+            ys = grid[:, 0].astype(float)
+            xs = grid[:, 1].astype(float)
+            ox = np.array([-half, half, half, -half, -half, np.nan])
+            oy = np.array([-half, -half, half, half, -half, np.nan])
+            bx = xs[:, None] + ox[None, :]          # (n, 6)
+            by = ys[:, None] + oy[None, :]
+            loaded = occ.astype(bool)
+            for sel, color in ((loaded, '#00ff88'), (~loaded, '#ff4444')):
+                fig.add_trace(go.Scattergl(
+                    x=bx[sel].ravel(), y=by[sel].ravel(), mode='lines',
+                    line=dict(color=color, width=1.5),
+                    hoverinfo='skip', showlegend=False))
+        else:
+            # Small arrays: data-coord rectangles (scale with zoom, crisper).
+            half = box / 2
+            shapes = []
+            for i in range(n):
+                y0, x0 = grid[i]
+                c = '#00ff88' if occ[i] else '#ff4444'
+                shapes.append(dict(type='rect', x0=x0-half, y0=y0-half,
+                                   x1=x0+half, y1=y0+half,
+                                   line=dict(color=c, width=2)))
+            fig.update_layout(shapes=shapes)
         if n <= 200:
             # Text labels only for small arrays
             fig.add_trace(go.Scatter(
-                x=grid[:, 1], y=grid[:, 0] - half - 3, mode='text',
+                x=grid[:, 1], y=grid[:, 0] - box / 2 - 3, mode='text',
                 text=[str(i+1) for i in range(n)],
                 textfont=dict(color='#ffdd44', size=7),
                 hoverinfo='skip', showlegend=False))
@@ -744,15 +1405,23 @@ def _fig_intens(d):
     cur_size = float(np.clip(1800.0 / n, 6, 13))
     thr_size = max(4.0, cur_size - 2)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=sites, y=t.tolist(), mode='markers', name='Threshold',
+    # WebGL scatter — at thousands of sites SVG markers are a major render cost.
+    fig.add_trace(go.Scattergl(x=sites, y=t.tolist(), mode='markers', name='Threshold',
                               marker=dict(size=thr_size, color='#777', symbol='circle', line=dict(width=1, color='#999'))))
     ymin, ymax = float(t.min()), float(t.max())
     ci = d.get('cur_intensities')
     if ci is not None:
         logicals = d.get('logicals')
-        colors = ['#0c6' if (logicals is not None and i < len(logicals) and logicals[i]) else '#e44' for i in range(n)]
-        fig.add_trace(go.Scatter(x=sites, y=ci.tolist(), mode='markers', name='Current',
-                                  marker=dict(size=cur_size, color=colors, symbol='circle', line=dict(width=1, color='white'))))
+        # Numeric occupancy + 2-stop colorscale (green/red) instead of a list of
+        # thousands of hex strings — smaller payload, faster to build.
+        if logicals is not None and len(logicals) >= n:
+            occ = np.asarray(logicals[:n], dtype=float)
+        else:
+            occ = np.zeros(n)
+        fig.add_trace(go.Scattergl(x=sites, y=ci.tolist(), mode='markers', name='Current',
+                                  marker=dict(size=cur_size, symbol='circle',
+                                              color=occ, colorscale=[[0, '#e44'], [1, '#0c6']],
+                                              cmin=0, cmax=1, line=dict(width=1, color='white'))))
         ymin = min(ymin, float(ci.min()))
         ymax = max(ymax, float(ci.max()))
     # Mean line + 68% (±1σ) band for loaded / empty sites + distance annotation
@@ -848,13 +1517,17 @@ def _fig_loading(d, marker_size=12):
         mode = 'markers'
         text = None
         tfont = None
-    fig = go.Figure(go.Scatter(
+    # WebGL + hovertemplate: at thousands of sites, SVG markers and a per-point
+    # hovertext string list are both heavy. customdata = [site, rate] feeds both
+    # the hover and the click-to-select JS (which reads customdata[0]).
+    customdata = np.column_stack([np.arange(1, n + 1), np.asarray(rates)])
+    fig = go.Figure(go.Scattergl(
         x=grid[:,1], y=grid[:,0], mode=mode,
         marker=dict(size=sz, color=rates.tolist(), colorscale='RdYlGn', cmin=0, cmax=1,
                     colorbar=dict(title='Rate', len=0.9), line=dict(width=0.5, color='white')),
         text=text, textfont=tfont, textposition='middle center',
-        customdata=[i+1 for i in range(n)],
-        hoverinfo='text', hovertext=[f'Site {i+1}: {r:.1%}' for i, r in enumerate(rates)]))
+        customdata=customdata,
+        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.1%}<extra></extra>'))
     fig.update_layout(**_L, title=f'Loading Rates ({n} sites)', clickmode='event',
                       yaxis=dict(autorange='reversed', scaleanchor='x', scaleratio=1,
                                  visible=False, **_A),
@@ -877,13 +1550,16 @@ def _fig_infid(d, marker_size=12):
         mode = 'markers'
         text = None
         tfont = None
-    fig = go.Figure(go.Scatter(
+    # WebGL + hovertemplate; customdata = [site, infidelity] (the marker colour
+    # is log10, so the real value rides in customdata for a readable hover).
+    customdata = np.column_stack([np.arange(1, n + 1), np.asarray(inf)])
+    fig = go.Figure(go.Scattergl(
         x=grid[:,1], y=grid[:,0], mode=mode,
         marker=dict(size=sz, color=log_inf.tolist(), colorscale='Magma_r', cmin=-4, cmax=-0.3,
                     colorbar=dict(title='log10', len=0.9), line=dict(width=0.5, color='white')),
         text=text, textfont=tfont, textposition='middle center',
-        customdata=[i+1 for i in range(n)],
-        hoverinfo='text', hovertext=[f'Site {i+1}: {v:.2e}' for i, v in enumerate(inf)]))
+        customdata=customdata,
+        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.2e}<extra></extra>'))
     fig.update_layout(**_L, title=f'Discrimination Infidelities ({n} sites)', clickmode='event',
                       yaxis=dict(autorange='reversed', scaleanchor='x', scaleratio=1,
                                  visible=False, **_A),
@@ -1394,3 +2070,125 @@ def _render_queue_panel(q):
             'color': '#888', 'fontSize': '11px', 'fontWeight': 'normal'}),
     ], style=title_style)
     return [title, body]
+
+
+# ---- SLM panel ----
+
+def _render_slm_panel(slm):
+    """Render the SLM hardware row from the proxy's pickle snapshot.
+
+    Layout (single row):
+      [SLM phase PNG] [SLM camera PNG] [lock + health + rearrange-diag readout]
+
+    When the proxy isn't running or the SLM PC is offline, the whole row
+    greys out with a clear banner and a "last poll" timestamp.
+    """
+    title_style = {'fontSize': '14px', 'color': '#e94560', 'fontWeight': 'bold',
+                   'marginBottom': '6px'}
+    title = html.Span('SLM Hardware', style=title_style)
+
+    if slm is None:
+        return [
+            html.Div([title, html.Span('  (proxy disabled)', style={
+                'color': '#888', 'fontSize': '11px', 'fontWeight': 'normal'})]),
+            html.Div('No data yet — proxy not running, or --no-slm was passed.',
+                     style={'color': '#666', 'fontStyle': 'italic'}),
+        ]
+
+    offline = bool(slm.get('slm_offline'))
+    slm_url = slm.get('slm_url', '')
+    status_color = '#888' if offline else '#0c6'
+    status_text = 'OFFLINE' if offline else 'online'
+    header = html.Div([
+        title,
+        html.Span(f'  {status_text}', style={
+            'color': status_color, 'fontSize': '11px', 'fontWeight': 'bold'}),
+        html.Span(f'  {slm_url}', style={
+            'color': '#888', 'fontSize': '11px', 'fontWeight': 'normal'}),
+    ], style={'marginBottom': '8px'})
+
+    if offline:
+        last_err = slm.get('last_error_msg', {})
+        err_lines = [html.Div(f'{k}: {v}', style={'fontSize': '10px', 'color': '#c44'})
+                     for k, v in (last_err or {}).items()]
+        return [header,
+                html.Div('SLM PC unreachable. Last errors:' if err_lines
+                         else 'SLM PC unreachable.',
+                         style={'color': '#888', 'fontStyle': 'italic',
+                                'marginBottom': '6px'}),
+                *err_lines]
+
+    # Online: build the three sub-panels.
+    phase_uri = _png_bytes_to_data_uri(slm.get('phase_png'))
+    cam_uri = _png_bytes_to_data_uri(slm.get('camera_png'))
+    lock = slm.get('lock_status') or {}
+    health = slm.get('health') or {}
+    diag = slm.get('rearrange_diag') or {}
+
+    def _png_block(uri, label):
+        if uri is None:
+            return html.Div(label + ' — waiting…',
+                            style={'color': '#666', 'fontStyle': 'italic',
+                                   'width': '300px', 'height': '300px',
+                                   'border': '1px solid #1a1a30',
+                                   'display': 'flex', 'alignItems': 'center',
+                                   'justifyContent': 'center'})
+        return html.Div([
+            html.Div(label, style={'fontSize': '11px', 'color': '#bbb',
+                                   'marginBottom': '3px'}),
+            html.Img(src=uri, style={
+                'width': '300px', 'maxHeight': '300px', 'objectFit': 'contain',
+                'imageRendering': 'pixelated',
+                'border': '1px solid #1a1a30'}),
+        ], style={'flex': '0 0 auto'})
+
+    # Lock + health text block (rightmost panel).
+    info_rows = []
+    if isinstance(lock, dict):
+        for dev, st in (lock or {}).items():
+            if isinstance(st, dict):
+                holder = st.get('holder') or st.get('client_id') or '—'
+                age_s = st.get('age_s')
+                age_txt = f'{age_s:.0f}s' if isinstance(age_s, (int, float)) else ''
+                info_rows.append(html.Div(
+                    f'lock[{dev}]: held by {holder} {age_txt}',
+                    style={'fontSize': '11px', 'color': '#bbb'}))
+    uptime = health.get('uptime_s') if isinstance(health, dict) else None
+    if isinstance(uptime, (int, float)):
+        info_rows.append(html.Div(
+            f'health: uptime={int(uptime)}s',
+            style={'fontSize': '11px', 'color': '#bbb'}))
+    # Most recent rearrange entry, if any.
+    entries = diag.get('entries') if isinstance(diag, dict) else None
+    if entries:
+        latest = entries[-1]
+        d = latest.get('diag') or {}
+        total_ms = d.get('total_ms')
+        nsteps = d.get('nsteps')
+        n_loaded = d.get('n_loaded')
+        info_rows.append(html.Div('latest rearrange:', style={
+            'fontSize': '11px', 'color': '#ffdd44', 'marginTop': '6px',
+            'fontWeight': 'bold'}))
+        info_rows.append(html.Div(
+            f'  total={total_ms}ms nsteps={nsteps} n_loaded={n_loaded}',
+            style={'fontSize': '10px', 'color': '#bbb',
+                   'fontFamily': 'Consolas, monospace'}))
+    if not info_rows:
+        info_rows.append(html.Div('(no lock / health / diag data yet)',
+                                  style={'fontStyle': 'italic', 'color': '#666',
+                                         'fontSize': '11px'}))
+
+    body = html.Div(style={'display': 'flex', 'gap': '12px',
+                           'alignItems': 'flex-start'}, children=[
+        _png_block(phase_uri, 'phase (SLM)'),
+        _png_block(cam_uri, 'camera (SLM)'),
+        html.Div(info_rows, style={'flex': '1', 'minWidth': '0'}),
+    ])
+    return [header, body]
+
+
+def _png_bytes_to_data_uri(png_bytes):
+    """Wrap raw PNG bytes from the SLM proxy as a data URI for <img src=…>."""
+    if not png_bytes or not isinstance(png_bytes, (bytes, bytearray)):
+        return None
+    return 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()

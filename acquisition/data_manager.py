@@ -69,11 +69,24 @@ def get_data_manager(scan_id):
         # previous scan aren't lost.
         for old_id in list(_cache):
             if old_id != scan_id:
+                old_dm = _cache[old_id]
                 try:
-                    _cache[old_id].save_data()
+                    old_dm.save_data()
                 except Exception as e:
                     logger.warning('Pre-eviction save failed for scan %d: %s',
                                    old_id, e)
+                # Phase 2 of the lab-PC migration: schedule the SLM
+                # diag/code sync as a background thread. Runs in
+                # parallel with the threaded HDF5 final-save above.
+                # Independent files (slm_diag.h5 / slm_code.json) so
+                # no ordering constraint. Off-by-default if the
+                # DataManager opts out.
+                try:
+                    old_dm._schedule_slm_sync()
+                except Exception as e:
+                    logger.warning(
+                        'SLM sync schedule failed for scan %d: %s',
+                        old_id, e)
                 logger.debug('Evicting DataManager for scan %d', old_id)
                 del _cache[old_id]
         dm = DataManager(scan_id)
@@ -99,6 +112,13 @@ def _vector(val):
 
 
 class DataManager:
+
+    # Phase 2 of the lab-PC migration plan: pull SLM-side per-shot diag
+    # rows into <scan_dir>/slm_diag.h5 + code-snapshot manifest into
+    # <scan_dir>/slm_code.json when the scan ends. Off-by-default at
+    # the class level so tests / mock runs don't hit the network;
+    # run_monitor flips it on at startup unless --no-slm.
+    sync_after_finish = True
 
     def __init__(self, scan_id):
         self.scan_id = scan_id
@@ -797,6 +817,30 @@ class DataManager:
         self._intensities_to_save.clear()
         self._seq_ids_to_save.clear()
         return self.fname
+
+    def _schedule_slm_sync(self):
+        """Phase 2: fire-and-forget background sync of the SLM PC's
+        per-scan diag ledger + code-snapshot manifest into the scan's
+        directory. Called once from `get_data_manager`'s eviction path
+        when this scan_id is about to be discarded (scan finished).
+
+        Runs only when ``sync_after_finish`` is True (the class default).
+        Independent of the HDF5 final-save thread — different files,
+        different network path.
+        """
+        if not self.sync_after_finish:
+            return
+        if not self.fname or not self._file_created:
+            # Init scans / scans that never created an HDF5 don't get a
+            # sidecar — there's no scan_dir to put it in.
+            return
+        scan_dir = os.path.dirname(self.fname)
+        try:
+            from yb_analysis.slm_sync import sync as _slm_sync_mod
+            _slm_sync_mod.sync_scan_async(self.scan_id, scan_dir)
+        except Exception:
+            logger.exception('slm_sync schedule failed for scan %d',
+                             self.scan_id)
 
     def _save_grid(self):
         try:

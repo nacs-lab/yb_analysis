@@ -15,11 +15,14 @@ Usage:
 import argparse
 import atexit
 import logging
+import os
 import signal
 
 from yb_analysis.acquisition.port_utils import kill_port
 from yb_analysis.config import (
     MATLAB_URL, DASHBOARD_PORT, MATLAB_EXE, MATLAB_ROOT,
+    SLM_URL, SLM_VERIFY_TLS, SLM_PASSWORD_PATH, SLM_POLL_INTERVALS_MS,
+    SLM_HTTP_TIMEOUT_S, LAB_PC_TAILSCALE_IP,
 )
 
 
@@ -36,6 +39,19 @@ def main():
                              '0.0.0.0 so other machines on the LAN can connect. '
                              'All endpoints are read-only; default is loopback '
                              'only (127.0.0.1).')
+    parser.add_argument('--bind-tailscale', action='store_true',
+                        help=f'Bind the dashboard to this machine\'s Tailscale '
+                             f'IP ({LAB_PC_TAILSCALE_IP}) instead of '
+                             f'0.0.0.0 / loopback. Mutually exclusive with '
+                             f'--lan; useful when you want tailnet-only access.')
+    parser.add_argument('--slm-url', default=SLM_URL,
+                        help=f'SLM PC HTTP URL (default: {SLM_URL}). '
+                             f'Read-only proxy polls health/lock/camera/phase '
+                             f'and exposes them under /api/slm/*.')
+    parser.add_argument('--no-slm', action='store_true',
+                        help='Disable the SLM proxy entirely. /api/slm/* '
+                             'endpoints will return 503 and the dashboard '
+                             'SLM panel will show "proxy disabled".')
     parser.add_argument('--no-runner', action='store_true',
                         help='Do not spawn the background MATLAB SequenceRunner')
     parser.add_argument('--reuse-runner', action='store_true',
@@ -86,8 +102,40 @@ def main():
     client = ZmqClient(args.url, refresh_rate=args.refresh)
 
     orca_cfg = read_orca_config()
-    dash_host = '0.0.0.0' if args.lan else '127.0.0.1'
+    if args.lan and args.bind_tailscale:
+        parser.error('--lan and --bind-tailscale are mutually exclusive.')
+    if args.bind_tailscale:
+        dash_host = LAB_PC_TAILSCALE_IP
+    elif args.lan:
+        dash_host = '0.0.0.0'
+    else:
+        dash_host = '127.0.0.1'
     dashboard = DashboardRenderer(port=args.port, host=dash_host)
+
+    # Start the SLM proxy (background daemon threads). On --no-slm, skip
+    # entirely — dashboard SLM panels will render their "proxy disabled" state.
+    slm_proxy = None
+    if not args.no_slm:
+        from yb_analysis.slm_proxy import SlmProxy
+        slm_password = None
+        if SLM_PASSWORD_PATH and os.path.exists(SLM_PASSWORD_PATH):
+            try:
+                with open(SLM_PASSWORD_PATH, 'r') as f:
+                    slm_password = f.read().strip()
+            except OSError as e:
+                logging.warning('SLM password file %s unreadable: %s',
+                                SLM_PASSWORD_PATH, e)
+        slm_proxy = SlmProxy(
+            slm_url=args.slm_url,
+            intervals_ms=SLM_POLL_INTERVALS_MS,
+            timeout_s=SLM_HTTP_TIMEOUT_S,
+            verify_tls=SLM_VERIFY_TLS,
+            password=slm_password,
+        )
+        slm_proxy.start()
+        logging.info('SLM proxy active: %s', args.slm_url)
+    else:
+        logging.info('SLM proxy disabled (--no-slm)')
 
     def _cleanup():
         logging.info('Shutting down...')
@@ -99,6 +147,11 @@ def main():
             dashboard.close()
         except Exception:
             pass
+        if slm_proxy is not None:
+            try:
+                slm_proxy.stop()
+            except Exception as e:
+                logging.warning('SLM proxy stop failed: %s', e)
         if runner is not None:
             try:
                 runner.stop()
