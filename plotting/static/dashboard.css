@@ -529,6 +529,71 @@ label.switch input:checked + .track::before { transform: translateX(14px); backg
   letter-spacing: 0.4px;
   font-weight: 600;
 }
+/* Source badge inside a stat-tile label — distinguishes lab-computed
+   vs SLM-cache-passthrough values (Phase 5a). */
+.src-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
+  letter-spacing: 0.3px;
+  font-weight: 700;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.src-badge.src-lab {
+  background: rgba(46, 160, 67, 0.18);
+  color: #4cc762;
+  border: 1px solid rgba(46, 160, 67, 0.4);
+}
+.src-badge.src-slm {
+  background: rgba(210, 153, 34, 0.15);
+  color: #d29922;
+  border: 1px solid rgba(210, 153, 34, 0.4);
+}
+/* Click-to-copy scan_id tile: subtle hover, brief flash on copy. */
+.scan-id-copy {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 2px;
+  transition: background 120ms ease;
+}
+.scan-id-copy:hover {
+  background: rgba(88, 166, 255, 0.10);
+}
+.scan-id-copy.just-copied {
+  background: rgba(46, 160, 67, 0.25);
+}
+/* Paths overlay control row inside the per-site survival card. */
+.paths-overlay-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+}
+.paths-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.paths-shot-select {
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 4px;
+}
+.paths-shot-select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .stat-value {
   font-size: 20px;
   font-weight: 600;

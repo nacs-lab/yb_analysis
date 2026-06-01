@@ -1455,6 +1455,42 @@
   $("runs-date-filter").addEventListener("change", renderRunsTable);
   $("runs-refresh").addEventListener("click", loadRunsList);
 
+  // Click-to-copy on scan_id tiles (Analysis tab + anywhere else
+  // the .scan-id-copy class is dropped). Delegated so it picks up
+  // tiles rendered after page load.
+  document.addEventListener("click", (e) => {
+    const el = e.target.closest && e.target.closest(".scan-id-copy");
+    if (!el) return;
+    const sid = el.dataset.scanId || el.textContent.trim();
+    if (!sid) return;
+    const announce = () => {
+      toast(`Copied scan_id ${sid}`, "ok");
+      el.classList.add("just-copied");
+      setTimeout(() => el.classList.remove("just-copied"), 600);
+    };
+    // Modern path; falls back to a hidden textarea for browsers / iframes
+    // where clipboard.writeText is unavailable.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sid).then(announce, () => {
+        toast("Copy failed — clipboard permission denied", "warn");
+      });
+    } else {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = sid;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        announce();
+      } catch {
+        toast("Copy not supported in this browser", "warn");
+      }
+    }
+  });
+
   // Active analysis state lives module-level so the filter card and the
   // per-iteration metric toggles can refetch + re-render against the
   // currently-loaded run without re-asking the user to pick.
@@ -1503,7 +1539,7 @@
     const body = $("analysis-detail-body");
     body.innerHTML = '<div class="hint">loading…</div>';
     ["plot-analysis-scan", "plot-site-loading", "plot-site-survival",
-     "plot-site-fp", "plot-per-iter"].forEach(safePurge);
+     "plot-site-fp", "plot-per-iter", "plot-per-iter-hist"].forEach(safePurge);
     try {
       let url = `/api/runs/${scanId}/analysis`;
       if (Object.keys(activeFilters).length) {
@@ -1554,6 +1590,14 @@
     const diag = r.diag_aggregate;
     const code = r.code || {};
     const grid = r.grid || {};
+    // Phase 5a: when target_aware is populated (rearrangement scans
+    // either from cached SLM analysis or, eventually, lab-computed
+    // from paths_per_shot), the "survival" curve is actually the TP
+    // (target-aware) survival, not per-site survival. Surface that
+    // distinction in labels + extra TP/FP stat tiles.
+    const ta = r.target_aware || null;
+    const targetAware = !!(summary.survival_source
+                            || (ta && ta.overall_mean != null));
     // Surface unpack errors prominently so empty charts have a reason.
     let warnHtml = "";
     if (r.unpack_error) {
@@ -1592,7 +1636,9 @@
       <div class="stat-grid">
         <div class="stat-tile">
           <span class="stat-label">scan_id</span>
-          <span class="stat-value mono" style="font-size:14px;">${r.scan_id}</span>
+          <span class="stat-value mono scan-id-copy" style="font-size:14px;"
+                data-scan-id="${r.scan_id}"
+                title="Click to copy">${r.scan_id}</span>
         </div>
         <div class="stat-tile">
           <span class="stat-label">params</span>
@@ -1603,13 +1649,32 @@
           <span class="stat-value">${r.n_shots}</span>
         </div>
         <div class="stat-tile">
-          <span class="stat-label">avg survival</span>
-          <span class="stat-value">${fmtPct(avg(summary.survival_mean))}</span>
+          <span class="stat-label">${targetAware ? "TP (target)" : "survival"}${
+            targetAware && summary.survival_source
+              ? ` <span class="src-badge src-${
+                  summary.survival_source.startsWith("lab") ? "lab" : "slm"
+                }">${
+                  summary.survival_source.startsWith("lab")
+                    ? "lab"
+                    : "SLM cache"
+                }</span>`
+              : ""
+          }</span>
+          <span class="stat-value" title="${targetAware ? "eligibility-weighted across all shots in the current filter" : "arithmetic mean over scan points"}">${
+            targetAware && ta && ta.overall_mean != null
+              ? fmtPct(ta.overall_mean)
+              : fmtPct(avg(summary.survival_mean))
+          }</span>
         </div>
         <div class="stat-tile">
-          <span class="stat-label">avg loading</span>
+          <span class="stat-label">loading</span>
           <span class="stat-value">${fmtPct(avg(summary.loading_rate))}</span>
         </div>
+        ${targetAware && ta && ta.fp_overall != null ? `
+        <div class="stat-tile">
+          <span class="stat-label">FP</span>
+          <span class="stat-value">${fmtPct(ta.fp_overall)}</span>
+        </div>` : ""}
         ${diag ? `
         <div class="stat-tile">
           <span class="stat-label">mean total_ms</span>
@@ -1644,7 +1709,12 @@
     const useY = sm.length ? sm : lr;
     const useE = sm.length ? (summary.survival_sem || [])
                            : (summary.loading_rate_sem || []);
-    const yLabel = sm.length ? "survival" : "loading rate";
+    // Phase 5a: relabel as "TP" (target-aware) when the survival
+    // curve was overridden by the SLM cache / lab paths join.
+    const targetAware = !!summary.survival_source;
+    const yLabel = sm.length
+        ? (targetAware ? "TP (target survival)" : "survival")
+        : "loading rate";
     // Inset margins so plots breathe inside their card without
     // touching the borders (user asked for side padding).
     const baseMargin = {l: 70, r: 50, t: 14, b: 56};
@@ -1918,6 +1988,14 @@
   // =====================================================================
   let siteDotSize = 4;     // user-controlled marker size
 
+  // Phase 5a paths-overlay state (kept module-level so handlers can
+  // re-render without a full analysis refetch).
+  let pathsOverlayState = {
+    payload: null,    // r.paths_overlay
+    enabled: false,
+    shotIdx: 0,       // index into payload.shot_indices
+  };
+
   function renderPerSiteMaps(r) {
     const ps = r.per_site;
     if (!ps) {
@@ -1925,17 +2003,123 @@
         const el = $(id);
         if (el) Plotly.purge(el);
       });
+      setupPathsOverlay(null);
       return;
     }
+    // Phase 5a paths-overlay: surface the picker on runs that have
+    // paths data (lab-paths source). Hidden otherwise.
+    setupPathsOverlay(r.paths_overlay);
+    // Phase 5a: when the per_site source is lab-only filtered (legacy
+    // run + filter active), surface a small hint so the operator
+    // knows TP/FP markers were intentionally suppressed for this view.
+    const infoSuffix = ps.note ? ` <span class="muted">(${ps.note})</span>` : "";
+    // Phase 5a: when per_site has TP/FP markers (from
+    // slm_analysis.json or, eventually, lab-paths-derived), pass them
+    // so the survival map only colors TARGET sites and the FP map
+    // only colors NON-TARGET sites. Non-applicable sites render as
+    // small grey background dots so the operator can SEE the target
+    // pattern without losing the array context.
+    const tgtMask = ps.is_target_site || null;
+    const ntgtMask = ps.is_nontarget_site || null;
     plotSiteMap("plot-site-loading", "site-loading-info",
-      ps.x, ps.y, ps.loading_rate, "Cividis", "loading");
+      ps.x, ps.y, ps.loading_rate, "Cividis", "loading", {infoSuffix});
     plotSiteMap("plot-site-survival", "site-survival-info",
-      ps.x, ps.y, ps.survival_mean, "Viridis", "survival");
+      ps.x, ps.y, ps.survival_mean, "Viridis",
+      tgtMask ? "TP (target survival)" : "survival",
+      {mask: tgtMask, maskLabel: "target site", infoSuffix,
+       pathsOverlay: currentPathsOverlaySegments()});
     plotSiteMap("plot-site-fp", "site-fp-info",
-      ps.x, ps.y, ps.fp_rate, "Plasma", "FP");
+      ps.x, ps.y, ps.fp_rate, "Plasma", "FP",
+      {mask: ntgtMask, maskLabel: "non-target site", infoSuffix});
   }
 
-  function plotSiteMap(divId, infoId, x, y, values, colorscale, label) {
+  // Returns the trace index that holds the colored per-site markers
+  // (the one whose marker.size should track the dot-size slider / zoom).
+  // The other traces are: [bg dots]?, [paths polyline]?, [target endpoints]?.
+  // Convention: layout always orders traces as
+  //   [bg-greyed]? -> [colored data] -> [paths line]? -> [endpoint markers]?
+  function _siteMapDataTraceIndex(el) {
+    if (!el || !el.data) return 0;
+    // The colored data trace is the first scattergl 'markers' trace
+    // whose marker.colorscale is set (the others lack one).
+    for (let i = 0; i < el.data.length; i++) {
+      const tr = el.data[i];
+      if (tr.mode === "markers" && tr.marker && tr.marker.colorscale) {
+        return i;
+      }
+    }
+    return el.data.length >= 2 ? 1 : 0;
+  }
+
+  function currentPathsOverlaySegments() {
+    const s = pathsOverlayState;
+    if (!s.enabled || !s.payload || !s.payload.all_segments) return null;
+    const seg = s.payload.all_segments[s.shotIdx];
+    if (!seg) return null;
+    return {
+      x: seg.x, y: seg.y,
+      shot_index: seg.shot_index,
+      seq_id: seg.seq_id,
+      n_paths: seg.n_paths,
+    };
+  }
+
+  function setupPathsOverlay(payload) {
+    const ctl = $("paths-overlay-ctl");
+    const toggle = $("paths-overlay-toggle");
+    const sel = $("paths-overlay-shot");
+    if (!ctl || !toggle || !sel) return;
+    if (!payload || !payload.shot_indices || !payload.shot_indices.length) {
+      ctl.hidden = true;
+      pathsOverlayState = {payload: null, enabled: false, shotIdx: 0};
+      return;
+    }
+    ctl.hidden = false;
+    pathsOverlayState.payload = payload;
+    // Reset shotIdx to default if out of bounds.
+    if (pathsOverlayState.shotIdx >= payload.shot_indices.length) {
+      pathsOverlayState.shotIdx = payload.default_idx || 0;
+    }
+    // Repopulate the shot picker.
+    sel.innerHTML = payload.shot_indices.map((sh, i) => {
+      const sid = payload.seq_ids[i];
+      const seg = (payload.all_segments && payload.all_segments[i]) || {};
+      const np = seg.n_paths != null ? ` · ${seg.n_paths} paths` : "";
+      return `<option value="${i}">shot ${sh} (seq ${sid}${np})</option>`;
+    }).join("");
+    sel.value = String(pathsOverlayState.shotIdx);
+    sel.disabled = !pathsOverlayState.enabled;
+    toggle.checked = pathsOverlayState.enabled;
+  }
+
+  // Toggle / shot-picker handlers — re-render only the survival map.
+  (function wirePathsOverlayHandlers() {
+    const toggle = document.getElementById("paths-overlay-toggle");
+    const sel    = document.getElementById("paths-overlay-shot");
+    if (!toggle || !sel) return;
+    const rerenderSurvival = () => {
+      if (!activeAnalysis || !activeAnalysis.per_site) return;
+      const ps = activeAnalysis.per_site;
+      const tgtMask = ps.is_target_site || null;
+      const infoSuffix = ps.note ? ` <span class="muted">(${ps.note})</span>` : "";
+      plotSiteMap("plot-site-survival", "site-survival-info",
+        ps.x, ps.y, ps.survival_mean, "Viridis",
+        tgtMask ? "TP (target survival)" : "survival",
+        {mask: tgtMask, maskLabel: "target site", infoSuffix,
+         pathsOverlay: currentPathsOverlaySegments()});
+    };
+    toggle.addEventListener("change", () => {
+      pathsOverlayState.enabled = toggle.checked;
+      sel.disabled = !pathsOverlayState.enabled;
+      rerenderSurvival();
+    });
+    sel.addEventListener("change", () => {
+      pathsOverlayState.shotIdx = parseInt(sel.value, 10) || 0;
+      rerenderSurvival();
+    });
+  })();
+
+  function plotSiteMap(divId, infoId, x, y, values, colorscale, label, opts) {
     if (!window.Plotly) return;
     const el = $(divId);
     if (!el) return;
@@ -1946,34 +2130,110 @@
       setText(infoId, "");
       return;
     }
-    const finite = values.filter((v) => v != null && isFinite(v));
+    // When a mask is supplied, split into in-mask and out-of-mask
+    // arrays. In-mask points carry the colormap (TP at target sites,
+    // FP at non-target sites). Out-of-mask points render as small
+    // grey background dots so the array geometry is still visible.
+    const mask = opts && opts.mask;
+    const maskLabel = opts && opts.maskLabel;
+    const n = x.length;
+    const xIn = [], yIn = [], vIn = [], iIn = [];
+    const xOut = [], yOut = [], iOut = [];
+    if (mask && mask.length === n) {
+      for (let k = 0; k < n; k++) {
+        if (mask[k]) {
+          xIn.push(x[k]); yIn.push(y[k]); vIn.push(values[k]); iIn.push(k);
+        } else {
+          xOut.push(x[k]); yOut.push(y[k]); iOut.push(k);
+        }
+      }
+    } else {
+      for (let k = 0; k < n; k++) {
+        xIn.push(x[k]); yIn.push(y[k]); vIn.push(values[k]); iIn.push(k);
+      }
+    }
+    const finite = vIn.filter((v) => v != null && isFinite(v));
     const vmin = 0;
     const vmax = 1;
     const mean = finite.length ? finite.reduce((a, b) => a + b, 0) / finite.length : null;
-    setText(infoId, mean != null ? `mean ${fmtNum(mean, 3)}` : "");
-    // Remember the original x-axis span so we can scale marker size on
-    // zoom. Default Plotly scattergl markers are sized in pixels, so as
-    // you zoom in the dots stay the same pixel size and appear shrunken
-    // relative to the data they represent. We rescale on every relayout
-    // event so dots grow with zoom.
+    let infoTxt = mean != null ? `mean ${fmtNum(mean, 3)}` : "";
+    if (mask && mask.length === n) {
+      infoTxt += ` · ${xIn.length}/${n} ${maskLabel || "marked"}`;
+    }
+    const infoSuffix = opts && opts.infoSuffix;
+    const el2 = $(infoId);
+    if (el2) {
+      el2.innerHTML = `${infoTxt}${infoSuffix || ""}`;
+    } else {
+      setText(infoId, infoTxt);
+    }
     const xMin = Math.min(...x), xMax = Math.max(...x);
     const baseXSpan = Math.max(1, xMax - xMin);
     el._sitemapBaseXSpan = baseXSpan;
     el._sitemapBaseSize = siteDotSize;
-    Plotly.react(el, [{
-      x: x, y: y, type: "scattergl", mode: "markers",
+    const traces = [];
+    // Background (out-of-mask) trace first so colored points sit on top.
+    if (xOut.length) {
+      traces.push({
+        x: xOut, y: yOut, type: "scattergl", mode: "markers",
+        marker: {
+          size: Math.max(1, siteDotSize - 1),
+          color: "#3a3a3a", line: {width: 0},
+          opacity: 0.4,
+        },
+        hoverinfo: "skip",
+        showlegend: false,
+        name: "non-marked",
+      });
+    }
+    traces.push({
+      x: xIn, y: yIn, type: "scattergl", mode: "markers",
       marker: {
-        size: siteDotSize, color: values, colorscale,
+        size: siteDotSize, color: vIn, colorscale,
         cmin: vmin, cmax: vmax,
         line: {width: 0},
         colorbar: {title: {text: label}, len: 0.9, tickformat: ".2f"},
       },
       hovertemplate: "site %{pointNumber}: %{marker.color:.3f}<extra></extra>",
-    }], plotLayoutFlush({
+      name: maskLabel || label,
+    });
+    // Phase 5a: paths overlay — NaN-separated polyline drawn on top
+    // of the markers. Light cyan with low opacity so the underlying
+    // colormap stays legible.
+    const po = opts && opts.pathsOverlay;
+    if (po && Array.isArray(po.x) && Array.isArray(po.y) && po.x.length) {
+      traces.push({
+        x: po.x, y: po.y,
+        type: "scattergl", mode: "lines",
+        line: {color: "rgba(120, 220, 255, 0.55)", width: 1.2},
+        hoverinfo: "skip",
+        showlegend: false,
+        name: `paths shot ${po.shot_index}`,
+      });
+      // Bonus: tiny end-cap markers at every target endpoint of the
+      // segments so the user can see exactly where the atoms LANDED.
+      // Pull endpoints out of the polyline (every 3rd entry pair = the
+      // segment's end before the NaN separator).
+      const xEnds = [], yEnds = [];
+      for (let i = 1; i < po.x.length; i += 3) {
+        xEnds.push(po.x[i]); yEnds.push(po.y[i]);
+      }
+      traces.push({
+        x: xEnds, y: yEnds,
+        type: "scattergl", mode: "markers",
+        marker: {size: 3, color: "rgba(120, 220, 255, 0.9)",
+                 symbol: "circle-open"},
+        hovertemplate: "target endpoint<extra></extra>",
+        showlegend: false,
+        name: "target endpoints",
+      });
+    }
+    Plotly.react(el, traces, plotLayoutFlush({
       xaxis: {visible: false},
       yaxis: {visible: false, autorange: "reversed",
               scaleanchor: "x", scaleratio: 1},
       margin: {l: 10, r: 60, t: 10, b: 10},
+      showlegend: false,
     }), plotConfig());
     // (Re)wire the relayout handler -- Plotly fires this on zoom / pan
     // / dblclick reset. We scale the marker size proportional to the
@@ -1989,7 +2249,13 @@
         if (!curSpan) return;
         const zoom = el._sitemapBaseXSpan / curSpan;
         const newSize = Math.max(1, el._sitemapBaseSize * zoom);
-        try { Plotly.restyle(el, {"marker.size": newSize}); } catch {}
+        // Resize ONLY the colored-data trace (skip background bg dots
+        // at index 0 if present, and skip the paths-overlay lines /
+        // endpoint markers which use their own fixed size).
+        try {
+          const idx = _siteMapDataTraceIndex(el);
+          Plotly.restyle(el, {"marker.size": newSize}, [idx]);
+        } catch {}
       });
     }
   }
@@ -2018,7 +2284,10 @@
                 scaled = Math.max(1, siteDotSize * (el._sitemapBaseXSpan / curSpan));
               }
             }
-            try { Plotly.restyle(el, {"marker.size": scaled}); } catch {}
+            try {
+              const idx = _siteMapDataTraceIndex(el);
+              Plotly.restyle(el, {"marker.size": scaled}, [idx]);
+            } catch {}
           }
         });
     });
@@ -2047,7 +2316,15 @@
     // Available metrics.
     const metrics = [];
     if (pi.loaded_frac)    metrics.push({key: "loaded_frac",   label: "loaded frac",  isFrac: true});
-    if (pi.survival_frac)  metrics.push({key: "survival_frac", label: "survival",     isFrac: true});
+    if (pi.survival_frac)  metrics.push({
+      key: "survival_frac",
+      // Phase 5a: when target-aware, the per-iteration curve is per-shot TP
+      // (not per-site survival). Label changes accordingly so the legend
+      // doesn't lie. `survival_source` is set by run_analysis when the
+      // override applied (lab_paths or slm_server_cached).
+      label: pi.survival_label || "survival",
+      isFrac: true,
+    });
     if (pi.fp_frac)        metrics.push({key: "fp_frac",       label: "FP rate",      isFrac: true});
     const paramVals = pi.param_values || {};
     Object.keys(paramVals).forEach((name) => {
@@ -2072,10 +2349,54 @@
         perIterToggles[chip.dataset.metric] = !perIterToggles[chip.dataset.metric];
         chip.classList.toggle("on", perIterToggles[chip.dataset.metric]);
         renderPerIterPlot(pi, metrics);
+        renderPerIterHist(pi, metrics);
       });
     });
     setText("per-iter-info", `${pi.shot_index.length} shots`);
     renderPerIterPlot(pi, metrics);
+    renderPerIterHist(pi, metrics);
+  }
+
+  function renderPerIterHist(pi, metrics) {
+    if (!window.Plotly) return;
+    const el = $("plot-per-iter-hist");
+    if (!el) return;
+    const traces = [];
+    metrics.forEach((m) => {
+      if (!perIterToggles[m.key]) return;
+      // Histogram fractions only (skip swept-param-value metrics since
+      // they're a different scale than 0..1).
+      if (!m.isFrac) return;
+      const y = pi[m.key] || [];
+      const vals = y.filter(
+        (v) => v != null && typeof v === "number" && isFinite(v));
+      if (!vals.length) return;
+      traces.push({
+        x: vals,
+        type: "histogram",
+        // 0.5% bins from 0 to 1.
+        xbins: {start: 0, end: 1.005, size: 0.005},
+        marker: {color: METRIC_COLORS[m.key] || "#ffdd44", opacity: 0.6},
+        name: m.label,
+        autobinx: false,
+      });
+    });
+    if (!traces.length) {
+      Plotly.purge(el);
+      el.innerHTML =
+        '<div class="hint" style="padding:14px;text-align:center;">enable a fraction metric to histogram</div>';
+      return;
+    }
+    Plotly.react(el, traces, plotLayoutFlush({
+      margin: {l: 70, r: 90, t: 10, b: 40},
+      xaxis: {title: {text: "value (0.5% bins)"}, range: [0, 1.005],
+              tickformat: ".2f"},
+      yaxis: {title: {text: "shots"}, rangemode: "nonnegative"},
+      barmode: "overlay",
+      showlegend: true,
+      legend: {x: 0.99, y: 0.99, xanchor: "right",
+               bgcolor: "rgba(0,0,0,0.3)"},
+    }), plotConfig());
   }
 
   function renderPerIterPlot(pi, metrics) {
@@ -2154,11 +2475,56 @@
     setText("seq-specific-name", r.scan_name || "(unknown)");
     const body = $("seq-specific-body");
     if (!body) return;
-    body.innerHTML = `
-      <div style="padding:8px 0;font-family:var(--mono);font-size:12px;color:var(--text-dim);">
-        scan_name = ${escHtml(r.scan_name || "(none)")}<br>
-        (placeholder — per-Seq custom analyses will plug in here)
+
+    // Phase 5a: single-image scans (NumImages=1) get an averaged
+    // camera image card. The per-site survival + paths panels are
+    // empty for these scans (no second image), but the averaged
+    // loading frame IS what the experimenter wants to see.
+    const ai = r.avg_image;
+    let html = '';
+    if (ai && (ai.available || ai.computable)) {
+      const sh = ai.image_shape || [];
+      const dims = sh.length === 2 ? `${sh[0]}×${sh[1]}` : '';
+      // Append the scan_id query so the browser refreshes when the
+      // operator switches scans (and bypasses cache on the new run).
+      const src = `/api/runs/${encodeURIComponent(r.scan_id || '')}`
+                  + `/avg_image?v=${encodeURIComponent(r.scan_id || '')}`;
+      const hint = ai.available
+        ? `cached · ${ai.n_shots} shots averaged · ${dims}`
+        : `will compute on first load (~${Math.round(0.03 * (ai.n_shots || 1))} s) ·`
+          + ` ${ai.n_shots} shots · ${dims}`;
+      html += `
+        <div class="avg-image-card" style="padding:8px 0;">
+          <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-dim);
+                     text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">
+            Averaged loading image
+            <span class="muted mono" style="text-transform:none;margin-left:8px;
+                                              letter-spacing:0;font-weight:400;">
+              ${hint}
+            </span>
+          </h3>
+          <div style="position:relative;background:#000;border-radius:4px;
+                       overflow:hidden;max-width:780px;">
+            <img src="${src}" alt="averaged loading image"
+                 style="display:block;width:100%;height:auto;image-rendering:pixelated;"
+                 onerror="this.style.display='none';this.nextElementSibling.style.display='block';">
+            <div class="hint" style="display:none;padding:24px;text-align:center;">
+              avg image fetch failed
+            </div>
+          </div>
+        </div>`;
+    }
+
+    // Always include the placeholder text so future per-Seq panels
+    // have a home. When avg_image renders above, this is just a tiny
+    // muted footer.
+    html += `
+      <div style="padding:8px 0;font-family:var(--mono);font-size:11px;
+                  color:var(--text-dim);">
+        scan_name = ${escHtml(r.scan_name || "(none)")}
+        ${ai ? '' : '· (no Seq-specific panel for this scan type yet)'}
       </div>`;
+    body.innerHTML = html;
   }
 
   function avg(arr) {

@@ -57,6 +57,9 @@ _NUMERIC_DIAG_COLUMNS = (
     'n_loaded', 'n_loaded_total', 'n_dropped', 'n_total_sites',
     'n_sites_model', 'nsteps', 'step_period_ms',
     'aborted_at_frame', 'aborted_at_ms',
+    # Phase 5a — two_round disambiguation. -1 sentinel when absent so
+    # the column is always finite-int (h5py-friendly).
+    'two_round_idx',
 )
 _BOOL_DIAG_COLUMNS = (
     'aborted', 'wrote_final_phase', 'used_cuda_graph',
@@ -64,7 +67,26 @@ _BOOL_DIAG_COLUMNS = (
 )
 _STRING_DIAG_COLUMNS = (
     'protocol', 'handoff_reason', 'handoff_idle_reason',
+    # Phase 5a — "initial" / "final" / "" for non-two-round shots.
+    'two_round_phase',
 )
+
+# Phase 5a — per-shot rearrangement PATHS, stamped by SLMnet via
+# `pairing_extra(loaded_paired, target_paired)` and surfaced here as
+# parallel vlen-int64 columns. Their entries index into the SAME row's
+# slm_grid.json::init_grid / target_grid arrays respectively (both in
+# MATLAB bit order; see plan §Bit-order invariant). Empty arrays for
+# rows that didn't carry pairing (legacy / fast-path abort).
+_VLEN_INT_PATH_COLUMNS = (
+    'loaded_paired',   # idx into init_grid; loaded_paired[i] -> bit-k source site
+    'target_paired',   # idx into target_grid; target_paired[i] -> bit-k target site
+)
+
+# Schema version: bumped 1 -> 2 in Phase 5a when the path vlen columns
+# and two_round disambiguation columns landed. Readers MUST consult
+# /meta/schema_version (or fall back to `'two_round_idx' in /diag`) and
+# fall through to `diag_json` JSON-decode for v1 files.
+SCHEMA_VERSION = 2
 
 
 def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True,
@@ -237,7 +259,7 @@ def sync_scan_async(scan_id, scan_dir, **kw):
 def _ensure_h5(path):
     """Open `slm_diag.h5` for append; create empty datasets if absent.
 
-    Datasets layout:
+    Datasets layout (schema v2 — Phase 5a):
       /diag/seq_id          int64, resizable
       /diag/retry_count     int64, resizable
       /diag/ts_epoch        float64, resizable
@@ -247,17 +269,25 @@ def _ensure_h5(path):
       /diag/<numeric>       float64, resizable     (per _NUMERIC_DIAG_COLUMNS)
       /diag/<bool>          uint8, resizable       (per _BOOL_DIAG_COLUMNS)
       /diag/<str>           vlen str, resizable    (per _STRING_DIAG_COLUMNS)
+      /diag/loaded_paired   vlen int64, resizable  (per-shot src bit indices)
+      /diag/target_paired   vlen int64, resizable  (per-shot tgt bit indices)
       /diag/diag_json       vlen str, resizable    (full row JSON-encoded)
       /meta/scan_id         attr
-      /meta/schema_version  attr
+      /meta/schema_version  attr  (1 = pre-Phase-5a, 2 = with path columns)
+
+    v1 → v2 upgrade: existing files get the new columns added with
+    defaults backfilled for older rows. Path columns get empty vlen
+    arrays for legacy rows; two_round_idx gets -1; two_round_phase
+    gets the empty string. Idempotent under multiple sync runs.
     """
     f = h5py.File(path, 'a')
     if 'meta' not in f:
         f.create_group('meta')
-        f['meta'].attrs['schema_version'] = 1
+        f['meta'].attrs['schema_version'] = SCHEMA_VERSION
     if 'diag' not in f:
         diag = f.create_group('diag')
         vlen_str = h5py.string_dtype(encoding='utf-8')
+        vlen_int = h5py.vlen_dtype(np.int64)
         # Core columns
         diag.create_dataset('seq_id', (0,), maxshape=(None,), dtype='i8')
         diag.create_dataset('retry_count', (0,), maxshape=(None,), dtype='i8')
@@ -272,9 +302,54 @@ def _ensure_h5(path):
             diag.create_dataset(k, (0,), maxshape=(None,), dtype='u1')
         for k in _STRING_DIAG_COLUMNS:
             diag.create_dataset(k, (0,), maxshape=(None,), dtype=vlen_str)
+        # Phase 5a — per-shot path columns. vlen int64; one row per
+        # ledger entry, each row an array of variable length (= number
+        # of paired atoms in that shot). See plan §Bit-order invariant.
+        for k in _VLEN_INT_PATH_COLUMNS:
+            diag.create_dataset(k, (0,), maxshape=(None,), dtype=vlen_int)
         # Full row as JSON — captures everything not surfaced above
         # (arrays like compute_ms[], Zernike coeffs, future fields, …).
         diag.create_dataset('diag_json', (0,), maxshape=(None,), dtype=vlen_str)
+    else:
+        # Existing file: upgrade in place when columns are missing
+        # (v1 → v2 schema). Read-only callers see the new columns
+        # populated only for rows appended after the upgrade; older
+        # rows keep their empty defaults. Safe under multiple sync
+        # runs because h5py raises if the dataset already exists.
+        diag = f['diag']
+        vlen_str = h5py.string_dtype(encoding='utf-8')
+        vlen_int = h5py.vlen_dtype(np.int64)
+        existing_n = diag['seq_id'].shape[0] if 'seq_id' in diag else 0
+        for k in _NUMERIC_DIAG_COLUMNS:
+            if k not in diag:
+                ds = diag.create_dataset(
+                    k, (existing_n,), maxshape=(None,), dtype='f8')
+                if existing_n:
+                    # `two_round_idx` defaults to -1 (sentinel: not a
+                    # two-round shot) so the column stays integer-valued.
+                    ds[...] = -1.0 if k == 'two_round_idx' else np.nan
+        for k in _BOOL_DIAG_COLUMNS:
+            if k not in diag:
+                ds = diag.create_dataset(
+                    k, (existing_n,), maxshape=(None,), dtype='u1')
+                if existing_n:
+                    ds[...] = 0
+        for k in _STRING_DIAG_COLUMNS:
+            if k not in diag:
+                ds = diag.create_dataset(
+                    k, (existing_n,), maxshape=(None,), dtype=vlen_str)
+                if existing_n:
+                    ds[...] = [''] * existing_n
+        for k in _VLEN_INT_PATH_COLUMNS:
+            if k not in diag:
+                ds = diag.create_dataset(
+                    k, (existing_n,), maxshape=(None,), dtype=vlen_int)
+                if existing_n:
+                    empty = np.array([], dtype=np.int64)
+                    for i in range(existing_n):
+                        ds[i] = empty
+        if 'meta' in f and f['meta'].attrs.get('schema_version', 1) < SCHEMA_VERSION:
+            f['meta'].attrs['schema_version'] = SCHEMA_VERSION
     return f
 
 
@@ -306,7 +381,12 @@ def _append_rows_to_h5(path, entries):
         _append('client_id', [str(r.get('client_id') or '') for r in entries])
 
         for col in _NUMERIC_DIAG_COLUMNS:
-            _append(col, [_safe_float(((r.get('diag') or {}).get(col)))
+            # `two_round_idx` carries an integer index per shot; absent
+            # rows default to -1 (not NaN) so the column stays h5py-int
+            # friendly downstream. Other numeric columns NaN-default.
+            default = -1.0 if col == 'two_round_idx' else None
+            _append(col, [_safe_float(((r.get('diag') or {}).get(col)),
+                                       default=default)
                           for r in entries])
         for col in _BOOL_DIAG_COLUMNS:
             _append(col, [1 if (r.get('diag') or {}).get(col) else 0
@@ -314,6 +394,17 @@ def _append_rows_to_h5(path, entries):
         for col in _STRING_DIAG_COLUMNS:
             _append(col, [str((r.get('diag') or {}).get(col) or '')
                           for r in entries])
+        # Phase 5a — per-shot path index arrays. Build a list-of-arrays
+        # and assign element-by-element so h5py writes them as vlen.
+        # Bit-order invariant: each int indexes into the SAME row's
+        # slm_grid.json::init_grid (loaded_paired) or target_grid
+        # (target_paired); see plan §Bit-order invariant.
+        for col in _VLEN_INT_PATH_COLUMNS:
+            ds = diag[col]
+            old = ds.shape[0]
+            ds.resize((old + n,))
+            for j, r in enumerate(entries):
+                ds[old + j] = _safe_int_array((r.get('diag') or {}).get(col))
         # Full row JSON — preserves arrays + unknown future fields.
         _append('diag_json',
                 [json.dumps(r, default=str) for r in entries])
@@ -328,14 +419,34 @@ def _safe_int(v, default=None):
         return default if default is not None else -1
 
 
-def _safe_float(v):
+def _safe_float(v, default=None):
     if v is None:
-        return np.nan
+        return np.nan if default is None else float(default)
     try:
         f = float(v)
-        return f if np.isfinite(f) else np.nan
+        if np.isfinite(f):
+            return f
+        return np.nan if default is None else float(default)
     except (TypeError, ValueError):
-        return np.nan
+        return np.nan if default is None else float(default)
+
+
+def _safe_int_array(v):
+    """Coerce a diag list field into an int64 numpy array, robustly.
+
+    Used for Phase 5a's vlen-int path columns. Accepts list / tuple /
+    np.ndarray; returns an empty int64 array for None / wrong shape /
+    non-numeric content (legacy runs, fast-path-abort shots, …).
+    """
+    if v is None:
+        return np.array([], dtype=np.int64)
+    try:
+        arr = np.asarray(v).ravel()
+        if arr.size == 0:
+            return np.array([], dtype=np.int64)
+        return arr.astype(np.int64, casting='unsafe')
+    except (TypeError, ValueError):
+        return np.array([], dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------

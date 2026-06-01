@@ -519,6 +519,7 @@ def _register_api_routes(server):
         '/api/runs/<scan_id>/code':     'per-scan code-snapshot manifest: synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/grid':     'per-scan grid sidecar (init/target knm coords + grid_rotation): synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/analysis': 'lab-side per-scan analysis: survival, loading, diag aggregate, sweep description, code/grid pointers',
+        '/api/runs/<scan_id>/avg_image': 'PNG of mean image across all shots (single-image scans only; computed on first call, cached as avg_image.png next to data_*.h5)',
         '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
         '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
         '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its kind',
@@ -729,6 +730,39 @@ def _register_api_routes(server):
         `/slm/runs/<scan_id>/grid_sidecar`. Returns 404 if neither.
         """
         return _runs_grid_response(scan_id)
+
+    @server.route('/api/runs/<scan_id>/avg_image')
+    def _api_runs_avg_image(scan_id):
+        """Averaged camera image for single-image scans (Phase 5a).
+
+        Returns the cached `<scan_dir>/avg_image.png` (computed on
+        first request from /imgs in data_*.h5; ~10 s for a 300-shot
+        scan, written-through to disk so subsequent requests are
+        instant). Returns 404 when the scan has no /imgs or NumImages
+        is not 1.
+        """
+        from yb_analysis.analysis.run_analysis import (
+            ensure_avg_image_png, _scan_data_h5)
+        from flask import send_file
+        from pathlib import Path as _P
+        # _resolve_scan_dir returns a string path (or None); wrap it
+        # for the Path API we use below.
+        sd_str = _resolve_scan_dir(scan_id)
+        if sd_str is None:
+            return jsonify({'error': f'scan_dir not found for {scan_id}'}), 404
+        scan_dir = _P(sd_str)
+        if not scan_dir.is_dir():
+            return jsonify({'error': f'scan_dir not found for {scan_id}'}), 404
+        if _scan_data_h5(scan_dir) is None:
+            return jsonify({'error': 'no data_*.h5 in scan_dir'}), 404
+        png_path = ensure_avg_image_png(scan_dir)
+        if png_path is None or not png_path.is_file():
+            return jsonify({'error': 'no /imgs dataset or compute failed'}), 404
+        # Long cache lifetime — the average is fully determined by the
+        # raw imgs, which never change for a completed scan.
+        resp = send_file(str(png_path), mimetype='image/png')
+        resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
 
     # ---- Programmatic scan submission (Phase 3) ------------------------
     # These accept POST so a one-shot curl works; flask's url_map will

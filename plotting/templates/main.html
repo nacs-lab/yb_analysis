@@ -355,6 +355,17 @@
   <section class="card col-4" data-card-id="analysis-site-survival">
     <h2>Per-site survival<span class="grow"></span>
         <span class="hint mono" id="site-survival-info"></span>
+        <!-- Paths overlay (Phase 5a): show source→target line segments
+             for one shot at a time on top of the per-site map. The
+             entire control row is hidden until run_analysis emits a
+             paths_overlay payload (i.e. the run has populated paths). -->
+        <span id="paths-overlay-ctl" class="paths-overlay-ctl" hidden>
+          <label class="paths-toggle">
+            <input type="checkbox" id="paths-overlay-toggle">
+            <span>paths</span>
+          </label>
+          <select id="paths-overlay-shot" class="paths-shot-select" title="Pick a shot"></select>
+        </span>
     </h2>
     <div class="plot-container" id="plot-site-survival" style="height:360px;"></div>
   </section>
@@ -377,6 +388,10 @@
       <span class="muted">load a run to populate metric toggles</span>
     </div>
     <div class="plot-container" id="plot-per-iter" style="height:380px;"></div>
+    <!-- Phase 5a: histogram of the same per-shot metric values
+         (0.5% bins, frac axis 0..1). Same toggle chips drive both. -->
+    <div class="plot-container" id="plot-per-iter-hist"
+         style="height:260px;margin-top:8px;"></div>
   </section>
 
   <!-- ===== 7. Sequence-specific (blank for now) ===================== -->
