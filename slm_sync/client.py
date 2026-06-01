@@ -148,3 +148,31 @@ class SlmSyncClient:
         # Server returns text/plain; charset=utf-8. Use .text for
         # cross-platform line-ending normalisation.
         return r.text
+
+    def get_grid_sidecar(self, scan_id):
+        """GET /slm/runs/{scan_id}/grid_sidecar.
+
+        Phase 4 addition: fetches the per-run grid sidecar produced by
+        the SLM server's ``rearrange_grid_sidecar.write_grid_sidecar``
+        path (upstream commit ``2b4e179``). The sidecar carries the
+        EXACT derived+reordered (init/target knm coords in bit order +
+        gridLocations reference + grid_rotation + affine diag) so
+        lab-side analysis can reconstruct the scoring lattice by replay
+        instead of re-deriving from the WGS phase. Returns ``None`` if
+        the endpoint is missing (SLM PC not yet on a build that exposes
+        it) or no grid was written for this scan_id.
+        """
+        try:
+            r = self._get(f'/slm/runs/{scan_id}/grid_sidecar')
+        except (requests.ConnectionError, requests.Timeout):
+            return None
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        try:
+            return r.json()
+        except ValueError:
+            # Non-JSON body — surface as None rather than crashing the
+            # whole sync.
+            logger.warning("get_grid_sidecar(%s): non-JSON body", scan_id)
+            return None

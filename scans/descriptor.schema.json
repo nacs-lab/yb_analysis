@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yb-tweezer.local/schemas/scan-descriptor.json",
+  "title": "Yb scan descriptor",
+  "description": "JSON descriptor for a single scan submission. Consumed by matlab_new/YbExptCtrl/dispatch_descriptor.m on the MATLAB side and by yb_analysis/scans/client.py on the lab-PC side. Schema version 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["seq"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Descriptor schema version. Bump when adding incompatible features."
+    },
+    "seq": {
+      "description": "Name of the MATLAB sequence function (e.g. 'CoolingSeq'), the literal string 'auto' to let dispatch_descriptor.m pick the seq from params (e.g. n_rounds branching in SLMRearrangement), or a function-handle object {'@': 'RearrangeCommSeq2'}.",
+      "oneOf": [
+        { "type": "string", "pattern": "^([A-Za-z_][A-Za-z0-9_]*|auto)$" },
+        {
+          "type": "object",
+          "required": ["@"],
+          "additionalProperties": false,
+          "properties": {
+            "@": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+          }
+        }
+      ]
+    },
+    "params": {
+      "description": "Map of dotted ScanGroup paths -> scalar value OR sweep specification. Path components are field names (e.g. 'Cooling.Detuning'). A value may be a JSON scalar, array (vector), JSON-string array for cell-of-string MATLAB values, or a sweep object with 'scan'.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "runp": {
+      "description": "Map of dotted runp() paths -> value. Same value shapes as 'params'.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ParamValue"
+      }
+    },
+    "opts": {
+      "description": "Extra varargin passed through to ybBuildScanPayload (and via that to ybStartScan when invoked directly). Each entry is a {key, value} pair preserved in order.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          { "type": "string" },
+          {}
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "label": {
+      "type": "string",
+      "description": "Optional human label for queue UI; falls back to seq name."
+    }
+  },
+  "$defs": {
+    "ParamValue": {
+      "description": "Either a scalar value, a vector value, a cell-of-string value, a function-handle value, or a sweep object.",
+      "oneOf": [
+        { "type": "number" },
+        { "type": "string" },
+        { "type": "boolean" },
+        { "type": "null" },
+        {
+          "type": "array",
+          "items": { "type": "number" }
+        },
+        {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Becomes a MATLAB cell-of-char (e.g. runp.AWGs = {'AWG556'})."
+        },
+        {
+          "description": "MATLAB function handle: {'@': 'Func'} -> str2func('Func')",
+          "type": "object",
+          "required": ["@"],
+          "additionalProperties": false,
+          "properties": {
+            "@": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+          }
+        },
+        { "$ref": "#/$defs/Sweep" }
+      ]
+    },
+    "Sweep": {
+      "type": "object",
+      "required": ["scan"],
+      "additionalProperties": false,
+      "properties": {
+        "scan": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "ScanGroup axis index (1-based)."
+        },
+        "linspace": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "[start, stop, n] - inclusive linspace."
+        },
+        "logspace": {
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 3,
+          "maxItems": 3,
+          "description": "[10^start, 10^stop, n] - inclusive logspace (MATLAB convention: arguments are exponents)."
+        },
+        "values": {
+          "type": "array",
+          "description": "Explicit list of values. Items must be numeric (vector sweep) or strings (cell-of-string sweep)."
+        }
+      },
+      "oneOf": [
+        { "required": ["linspace"], "not": { "required": ["logspace"] } },
+        { "required": ["logspace"], "not": { "required": ["linspace"] } },
+        { "required": ["values"], "not": { "required": ["linspace"] } }
+      ]
+    }
+  }
+}

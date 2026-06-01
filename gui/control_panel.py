@@ -136,6 +136,9 @@ class ControlPanel(tk.Tk):
             side='right', padx=4)
         ttk.Button(top, text='Restart Dash', command=self._on_restart_dash).pack(
             side='right', padx=4)
+        ttk.Button(top, text='Restart All',
+                   command=self._on_restart_all).pack(
+            side='right', padx=4)
 
         ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=2)
 
@@ -269,6 +272,82 @@ class ControlPanel(tk.Tk):
             logger.info('Dashboard subprocess restarted')
         except Exception:
             logger.error('Dashboard restart failed:\n%s', traceback.format_exc())
+
+    def _on_restart_all(self):
+        """Spawn a fresh run_monitor process and exit this one.
+
+        Use after editing files that this process imports at startup
+        (run_monitor.py, control_panel.py, zmq_client.py, slm_proxy.py).
+        For changes to dashboard.py + its downstream imports, use
+        "Restart Dash" instead -- it's faster and doesn't drop the
+        camera connection.
+
+        Confirmation: a tk dialog gates the action so an accidental
+        click doesn't tear down a running scan.
+        """
+        import sys
+        import subprocess
+        import tkinter.messagebox as mb
+
+        if not mb.askokcancel(
+                'Restart All',
+                'Shut down this process (including the MATLAB runner) '
+                'and respawn a fresh run_monitor in a new terminal? '
+                'The control window will reappear once the new process '
+                'is up.'):
+            return
+
+        # Reconstruct the command line: prefer the module form so this
+        # works regardless of whether the user launched via `python -m
+        # yb_analysis.scripts.run_monitor` or via a script wrapper.
+        cmd = [sys.executable, '-m', 'yb_analysis.scripts.run_monitor'] + sys.argv[1:]
+        logger.info('Restart All: spawning %s', cmd)
+
+        # Tell the new process to wait until WE die before binding any
+        # ports. Without this, the new process and the still-shutting-
+        # down old process race for port 8050 / 1408 -- whichever the
+        # OS hands out the socket to wins, and the loser logs a confusing
+        # "address in use" error. The env var carries our PID; the new
+        # process polls it and blocks until it's gone (max 30 s).
+        env = os.environ.copy()
+        env['YB_WAIT_FOR_PID'] = str(os.getpid())
+
+        # Spawn the new process in its own terminal window so its logs
+        # are visible. On Windows we use CREATE_NEW_CONSOLE; on POSIX
+        # we just start_new_session so the child survives our exit.
+        try:
+            if os.name == 'nt':
+                CREATE_NEW_CONSOLE = 0x00000010
+                subprocess.Popen(cmd, env=env,
+                                 creationflags=CREATE_NEW_CONSOLE,
+                                 close_fds=True)
+            else:
+                subprocess.Popen(cmd, env=env,
+                                 start_new_session=True,
+                                 close_fds=True)
+        except Exception:
+            logger.error('Restart All: spawn failed:\n%s',
+                         traceback.format_exc())
+            mb.showerror('Restart All', 'Failed to spawn the new process. '
+                         'Check the log; you may need to restart manually.')
+            return
+
+        # Brief pause so the new console window appears before this one
+        # disappears; the new process is sleeping on YB_WAIT_FOR_PID so
+        # there's no port race even if we're slow to die.
+        time.sleep(0.5)
+
+        # Now cleanly tear down this process. _on_close handles the
+        # dashboard, the runner, the SLM proxy, and any other cleanup
+        # the main thread registered. The new process resumes once
+        # this PID is gone.
+        logger.info('Restart All: handing off to new process; closing self')
+        try:
+            self._on_close()
+        except Exception:
+            # Last resort: nuke the process. The new run_monitor's
+            # kill_port(8050) will scrub any orphaned dashboard.
+            os._exit(0)
 
     def _on_init_loaded(self, data):
         if self._dashboard and data is not None:

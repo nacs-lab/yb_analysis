@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Filenames written into each scan_dir.
 DIAG_H5 = 'slm_diag.h5'
 CODE_JSON = 'slm_code.json'
+GRID_JSON = 'slm_grid.json'   # Phase 4: per-run grid sidecar from SLM PC
 # Tiny resume-state sidecar so an interrupted sync can pick up exactly
 # where it left off without parsing the HDF5.
 SYNC_STATE = '.slm_sync_state.json'
@@ -66,7 +67,8 @@ _STRING_DIAG_COLUMNS = (
 )
 
 
-def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True):
+def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True,
+              sync_grid=True):
     """Pull SLM-side diag + code-snapshot for ``scan_id`` into ``scan_dir``.
 
     Args:
@@ -100,6 +102,7 @@ def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True):
     diag_path = scan_dir / DIAG_H5
     state_path = scan_dir / SYNC_STATE
     code_path = scan_dir / CODE_JSON
+    grid_path = scan_dir / GRID_JSON
 
     status = {
         'synced': False,
@@ -110,6 +113,7 @@ def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True):
         'overflow': False,
         'diag_path': None,
         'code_path': None,
+        'grid_path': None,    # Phase 4: per-run grid sidecar
     }
 
     # Where did the last sync leave off?
@@ -159,8 +163,28 @@ def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True):
                 logger.warning('slm_sync %s: code json write failed: %s',
                                scan_id, e)
 
+    # Per-run grid sidecar (Phase 4 addition). The endpoint is only
+    # present on SLM builds that include the rearrange_grid_sidecar
+    # writer (upstream 2b4e179). Missing endpoint -> None, no error.
+    if sync_grid:
+        try:
+            grid_payload = client.get_grid_sidecar(scan_id)
+        except Exception as e:
+            logger.warning('slm_sync %s: grid sidecar fetch failed: %s',
+                           scan_id, e)
+            grid_payload = None
+        if grid_payload is not None:
+            try:
+                scan_dir.mkdir(parents=True, exist_ok=True)
+                _write_grid_json(grid_path, grid_payload)
+                status['grid_path'] = str(grid_path)
+            except OSError as e:
+                logger.warning('slm_sync %s: grid json write failed: %s',
+                               scan_id, e)
+
     status['synced'] = (status['rows_written'] > 0
-                        or status['code_path'] is not None)
+                        or status['code_path'] is not None
+                        or status['grid_path'] is not None)
     status['reason'] = 'ok' if status['synced'] else 'no_data'
     return status
 
@@ -354,6 +378,24 @@ def _write_code_json(path, manifest_response):
     analyst can tell when the snapshot was fetched.
     """
     payload = dict(manifest_response)
+    payload['synced_at_iso'] = datetime.now().isoformat(timespec='seconds')
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(payload, indent=2, default=str),
+                   encoding='utf-8')
+    os.replace(tmp, path)
+
+
+def _write_grid_json(path, grid_payload):
+    """Write the SLM-PC per-run grid sidecar to disk (Phase 4).
+
+    The body we get from `/slm/runs/{scan_id}/grid_sidecar` carries the
+    EXACT derived+reordered grid (init/target knm coords in bit order +
+    gridLocations reference + grid_rotation + affine diag) the SLM
+    server commanded for this run. We persist it verbatim plus a top-
+    level ``synced_at_iso`` so lab-side run_analysis.py can replay the
+    scoring lattice without re-deriving from the WGS phase.
+    """
+    payload = dict(grid_payload)
     payload['synced_at_iso'] = datetime.now().isoformat(timespec='seconds')
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(payload, indent=2, default=str),

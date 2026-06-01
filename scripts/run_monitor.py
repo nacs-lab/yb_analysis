@@ -75,6 +75,32 @@ def main():
         datefmt='%H:%M:%S',
     )
 
+    # "Restart All" handoff: if the previous run_monitor process is still
+    # shutting down, wait until its PID is gone before we touch any port
+    # or spawn the runner. Avoids the new process colliding with the old
+    # over port 8050 / 1408. Capped at 30 s -- if the old refuses to die
+    # after that we proceed anyway and kill_port() below will sort it out.
+    _wait_for_pid = os.environ.pop('YB_WAIT_FOR_PID', None)
+    if _wait_for_pid:
+        try:
+            from yb_analysis.plotting.dashboard import _is_pid_alive
+            old_pid = int(_wait_for_pid)
+            logging.info('Waiting for previous process pid=%d to exit...',
+                         old_pid)
+            import time as _t
+            deadline = _t.time() + 30
+            while _t.time() < deadline:
+                if not _is_pid_alive(old_pid):
+                    logging.info('Previous process exited.')
+                    break
+                _t.sleep(0.3)
+            else:
+                logging.warning(
+                    'Previous process pid=%d still alive after 30 s; '
+                    'proceeding anyway (kill_port will scrub).', old_pid)
+        except Exception as _ex:
+            logging.warning('YB_WAIT_FOR_PID wait failed: %s', _ex)
+
     # Clear any stale listener on the dashboard port
     kill_port(args.port)
 
@@ -137,7 +163,14 @@ def main():
     else:
         logging.info('SLM proxy disabled (--no-slm)')
 
+    _cleanup_done = [False]
+
     def _cleanup():
+        # Idempotent: SIGINT handler + atexit can both call us; the
+        # second invocation should be a no-op.
+        if _cleanup_done[0]:
+            return
+        _cleanup_done[0] = True
         logging.info('Shutting down...')
         try:
             client.camera_close()
@@ -157,11 +190,17 @@ def main():
                 runner.stop()
             except Exception as e:
                 logging.warning('Runner stop failed: %s', e)
-        # Final safety net: kill whatever still holds the ZMQ port.
-        # Covers cases where runner.stop() failed or the JVM is orphaned.
+        # Final safety net: kill whatever still holds the ZMQ port AND
+        # the dashboard port. Covers cases where the subprocess didn't
+        # respond to terminate() (e.g. Werkzeug stuck in a request) and
+        # where runner.stop() failed.
         from yb_analysis.acquisition.port_utils import kill_port
         try:
             kill_port(int(args.url.rsplit(':', 1)[-1].split('/')[0]))
+        except Exception:
+            pass
+        try:
+            kill_port(args.port)
         except Exception:
             pass
 
@@ -220,6 +259,14 @@ def main():
     # orphaned. Used by the zombie-repro test harness; harmless otherwise.
     if hasattr(signal, 'SIGBREAK'):
         signal.signal(signal.SIGBREAK, _on_sigint)
+    # SIGTERM is what `Stop-Process` / `taskkill` (without /F) sends; honoring
+    # it lets atexit run instead of leaving an orphan dashboard. SIGTERM is
+    # often delivered when a hosting service or wrapper script asks for a
+    # graceful shutdown.
+    try:
+        signal.signal(signal.SIGTERM, _on_sigint)
+    except (AttributeError, ValueError):
+        pass   # Some embeddings don't allow SIGTERM rebind
 
     app.mainloop()
 

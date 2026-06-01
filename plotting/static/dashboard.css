@@ -1,0 +1,1544 @@
+/* Yb Tweezer Dashboard CSS — ported from SLMnet's dashboard.html so the
+   lab-PC view shares the SLM server's visual language. The two PCs are
+   now both research dashboards, so dressing them the same lets the
+   operator move between them without re-orienting.
+
+   Variables, layout grid, card/tab styling, kv tables, status pills,
+   form controls, log/image/proc tables are 1:1 with the SLM dashboard.
+   Anything specific to SLM operator controls (handoff queue tables,
+   API explorer, GPU per-core grid) is omitted -- they aren't shown on
+   this dashboard. */
+
+:root {
+  --bg: #0e1116;
+  --bg-alt: #161b22;
+  --bg-card: #1a2030;
+  --bg-input: #0b0e13;
+  --border: #2a3242;
+  --text: #d8dee9;
+  --text-dim: #8b97a8;
+  --accent: #58a6ff;
+  --accent-dim: #1f6feb;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  min-height: 100vh;
+}
+
+/* ---- Header ----
+   3-column CSS grid so the centered tab-nav is MATHEMATICALLY centered
+   on the page width, not just balanced between two flex spacers. Left
+   and right columns each get 1fr; their content (status pills / refresh
+   controls) flows naturally inside. */
+header {
+  background: var(--bg-alt);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 20px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 14px;
+}
+.header-left, .header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.header-right { justify-content: flex-end; }
+header h1 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+header a.old-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+header a.old-link:hover { color: var(--accent); border-color: var(--accent); }
+/* Compact status pills -- label is a tight 2-4 char token, dot color
+   carries the state. No more "ok"/"offline" suffix churn. */
+header .status-pill {
+  padding: 3px 7px;
+  font-size: 10.5px;
+  gap: 5px;
+}
+header .status-pill .dot {
+  width: 6px; height: 6px;
+}
+
+/* ---- Status pills ---- */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--ok);
+}
+.status-pill.bad  { background: rgba(248, 81, 73, 0.15); color: var(--err); }
+.status-pill.warn { background: rgba(210, 153, 34, 0.15); color: var(--warn); }
+.status-pill.dim  { background: rgba(255,255,255,0.04); color: var(--text-dim); }
+.status-pill .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+}
+
+/* ---- Main grid ----
+   tab-pane is the 12-col grid container; one per tab, but only the
+   active one is rendered (others get display:none via the [hidden]
+   attribute). NOTE: we use <section class="tab-pane"> rather than
+   multiple <main> elements -- HTML5 spec allows only one <main>
+   per document, and browsers occasionally collapse the layout of
+   subsequent <main> elements unexpectedly.
+*/
+.tab-pane {
+  max-width: 1520px;
+  margin: 0 auto;
+  padding: 20px 24px;
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+}
+.tab-pane[hidden] { display: none !important; }
+
+/* Full-bleed tab variant — drops the 12-col grid, max-width cap, and
+   padding so a single child element (e.g. an iframe) can fill the
+   entire space below the sticky header. Used by the Hardware tab so
+   the embedded SLM dashboard reads as native chrome, not a webpage
+   inside a webpage. */
+.tab-pane.fullbleed-tab {
+  display: block;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  /* Height = viewport minus our sticky header (~56 px). The header
+     is sticky+sized by its own padding rules; this calc matches that
+     after some empirical observation. If the header changes height,
+     update --header-h below. */
+  height: calc(100vh - var(--header-h, 56px));
+  overflow: hidden;
+}
+.iframe-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+}
+.iframe-wrap iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+  background: var(--bg);
+}
+/* Floating action buttons (reload, open-in-new-tab) for the
+   Hardware tab iframe. Positioned over the iframe's top-right corner;
+   stay there as the operator scrolls inside the iframe. */
+.iframe-actions {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  gap: 4px;
+  opacity: 0.45;
+  transition: opacity 0.15s ease;
+}
+.iframe-actions:hover { opacity: 1; }
+.iframe-actions button,
+.iframe-actions a {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  line-height: 26px;
+  text-align: center;
+  font-size: 14px;
+  text-decoration: none;
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.iframe-actions button:hover,
+.iframe-actions a:hover {
+  background: var(--accent-dim);
+  color: white;
+  border-color: var(--accent-dim);
+}
+
+/* ---- Cards ---- */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  overflow: hidden;
+}
+.card h2 {
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.card h2 .badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--border);
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+}
+.card h2 .grow { flex: 1; }
+.col-2  { grid-column: span 2; }
+.col-3  { grid-column: span 3; }
+.col-4  { grid-column: span 4; }
+.col-5  { grid-column: span 5; }
+.col-6  { grid-column: span 6; }
+.col-7  { grid-column: span 7; }
+.col-8  { grid-column: span 8; }
+.col-9  { grid-column: span 9; }
+.col-10 { grid-column: span 10; }
+.col-12 { grid-column: span 12; }
+/* Only collapse on genuinely narrow windows. Lab monitors are wide and
+   the user wants Tweezer Array img1 + img2 (col-6 + col-6) side-by-side
+   regardless of how the dashboard window is sized on a multi-monitor
+   setup. Old breakpoint of 1100 was kicking in any time the window was
+   less than full-screen. */
+@media (max-width: 820px) {
+  .col-2, .col-3, .col-4 { grid-column: span 6; }
+  .col-5, .col-6, .col-7, .col-8, .col-9, .col-10 { grid-column: span 12; }
+}
+@media (max-width: 520px) {
+  .col-2, .col-3, .col-4, .col-5, .col-6, .col-7,
+  .col-8, .col-9, .col-10 { grid-column: span 12; }
+}
+
+/* ---- Top-level tab nav (pill-segment) ----
+   Copied verbatim from SLMnet/dashboard.html .tab-nav rules. Pills are
+   content-sized (no fixed width / flex-basis); they sit in an
+   inline-flex container that itself sits between two `.grow` flex
+   spacers in the header, which keeps the whole pill-row centered. */
+.tab-nav {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.tab-nav button {
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  padding: 5px 14px;
+  font: 12px/1.3 inherit;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  border-radius: 999px;
+  transition: background 120ms ease, color 120ms ease;
+}
+.tab-nav button:hover { color: var(--text); }
+.tab-nav button.active {
+  background: var(--accent-dim);
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset;
+}
+
+/* ---- KV (definition-list) tables ---- */
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.kv dt { color: var(--text-dim); white-space: nowrap; }
+.kv dd {
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.kv dd.ok    { color: var(--ok); }
+.kv dd.bad   { color: var(--err); }
+.kv dd.warn  { color: var(--warn); }
+span.ok    { color: var(--ok); }
+span.bad   { color: var(--err); }
+span.warn  { color: var(--warn); }
+.muted     { color: var(--text-dim); }
+
+/* ---- Form controls ---- */
+label { display: block; margin: 8px 0 4px 0; font-size: 12px; color: var(--text-dim); }
+input[type="text"], input[type="number"], select, textarea {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+.row > * { flex: 1; min-width: 0; }
+.row > .flex-fixed { flex: 0 0 auto; }
+
+/* ---- Buttons ---- */
+button {
+  background: var(--accent-dim);
+  color: white;
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+button:hover { background: var(--accent); }
+button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+button.ghost:hover { background: var(--bg-alt); border-color: var(--accent); }
+button.danger { background: #6e2f2c; }
+button.danger:hover { background: var(--err); }
+button.caution { background: #8a7126; color: white; }
+button.caution:hover { background: var(--warn); }
+
+/* ---- Tables ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 10.5px;
+  letter-spacing: 0.5px;
+}
+td.muted { color: var(--text-dim); }
+tr:last-child td { border-bottom: 0; }
+tr:hover td { background: rgba(255,255,255,0.02); }
+table.dense th, table.dense td { padding: 4px 8px; }
+
+/* Auto-link styling — match SLM's anti-purple-visited treatment. */
+a.dash-link,
+a.dash-link:link,
+a.dash-link:visited { color: var(--accent); text-decoration: none; }
+a.dash-link:hover,
+a.dash-link:visited:hover { color: var(--text); text-decoration: underline; }
+
+/* ---- Logs panel ---- */
+.log {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: #06090e;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+  white-space: pre;
+  line-height: 1.4;
+}
+.log .L-ERROR   { color: var(--err); }
+.log .L-WARNING { color: var(--warn); }
+.log .L-INFO    { color: var(--text); }
+.log .L-DEBUG   { color: var(--text-dim); }
+
+/* ---- Image preview ---- */
+.img-wrap {
+  position: relative;
+  background: #06090e;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+}
+.img-wrap img {
+  max-width: 100%;
+  max-height: 100%;
+  image-rendering: pixelated;
+  display: block;
+}
+.img-wrap .placeholder {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ---- Hint / inline help ---- */
+.hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* ---- Switch toggle ---- */
+label.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+label.switch input { display: none; }
+label.switch .track {
+  width: 30px;
+  height: 16px;
+  background: var(--border);
+  border-radius: 8px;
+  position: relative;
+  transition: background 0.15s;
+}
+label.switch .track::before {
+  content: "";
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: #d8d8e0;
+  transition: transform 0.15s;
+}
+label.switch input:checked + .track { background: var(--accent-dim); }
+label.switch input:checked + .track::before { transform: translateX(14px); background: #fff; }
+
+/* ---- Toasts ---- */
+.toast {
+  position: fixed;
+  bottom: 16px; right: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  color: var(--text);
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.2s, transform 0.2s;
+  pointer-events: none;
+  max-width: 360px;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.bad  { border-color: var(--err); }
+.toast.warn { border-color: var(--warn); }
+
+/* ---- Stat tiles (used in hardware tab) ---- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+.stat-tile {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Top-of-Live-tab horizontal status strip. The card itself stays col-12;
+   inside, the kv tiles flow as evenly-spaced columns. min-height keeps
+   the card the same height as a single stat-tile, no empty space below. */
+.card.status-strip {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 10px;
+  padding: 12px 16px;
+}
+.card.status-strip .stat-tile {
+  padding: 6px 10px;
+  overflow: hidden;
+}
+.card.status-strip .stat-tile .stat-value {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Mini-queue tile highlights state via background tint. */
+#mini-queue-active-tile.idle .stat-value,
+#mini-queue-next-tile.empty .stat-value { color: var(--text-dim); }
+#mini-queue-active-tile.running { background: rgba(63, 185, 80, 0.08); }
+#mini-queue-active-tile.loading { background: rgba(210, 153, 34, 0.08); }
+#mini-queue-next-tile.has-queue { background: rgba(88, 166, 255, 0.06); }
+.stat-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  font-weight: 600;
+}
+.stat-value {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.1;
+}
+.stat-bar {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.stat-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent-dim);
+  transition: width 0.4s ease-out, background-color 0.3s;
+}
+
+/* ---- Run-list / analysis-specific styles ---- */
+table.runs-table { font-size: 12px; }
+table.runs-table tr.selectable td { cursor: pointer; }
+table.runs-table tr.selected td { background: rgba(31, 111, 235, 0.12); color: var(--text); }
+table.runs-table tr.grouped td:first-child::before {
+  content: "▸ "; color: var(--accent);
+}
+
+.group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+.group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 12px;
+  background: rgba(88, 166, 255, 0.10);
+  color: var(--accent);
+  border: 1px solid rgba(88, 166, 255, 0.3);
+  cursor: pointer;
+  user-select: none;
+}
+.group-chip.active {
+  background: var(--accent-dim);
+  color: #fff;
+  border-color: var(--accent-dim);
+}
+.group-chip:hover { filter: brightness(1.2); }
+.group-chip .x {
+  color: var(--text-dim);
+  margin-left: 2px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.group-chip .x:hover { color: var(--err); }
+
+/* ---- Analysis tab selection tray (multi-run picker) ---- */
+.tray-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 28px;
+}
+.tray-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 4px 10px;
+  border-radius: 14px;
+  background: rgba(88, 166, 255, 0.12);
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  color: var(--text);
+  font: 12px var(--mono);
+}
+.tray-chip .chip-label { white-space: nowrap; }
+.tray-chip .chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.06);
+  color: var(--text-dim);
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+}
+.tray-chip .chip-remove:hover {
+  background: var(--err);
+  color: #fff;
+}
+/* Disclosure caret on the runs <details> summary, rotates when open. */
+#runs-details summary .disclosure {
+  display: inline-block;
+  width: 14px;
+  transition: transform 120ms ease;
+  color: var(--text-dim);
+}
+#runs-details:not([open]) summary .disclosure {
+  transform: rotate(-90deg);
+}
+/* Row in the picker that's in the tray gets a subtle accent border. */
+#runs-table tr.in-tray td:first-child {
+  border-left: 3px solid var(--accent);
+  padding-left: 5px;
+}
+#runs-table tr.in-tray { background: rgba(88,166,255,0.06); }
+
+/* ---- Run picker (ported VERBATIM from SLMnet/dashboard.html) ---- */
+/* The "currently analyzing" tray: blue-tinted strip with chips + the
+   Save/Load action cluster pushed to the right via margin-left:auto.  */
+.runs-tray {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(88, 166, 255, 0.05);
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+.runs-tray .tray-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 500;
+}
+.runs-tray .tray-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  font-style: italic;
+}
+/* `display: contents` lets the wrapping <div class="tray-chips"> not
+   eat a grid slot -- chips flow as siblings of the label / action
+   cluster directly. Same trick the SLM dashboard uses. */
+.runs-tray .tray-chips { display: contents; }
+.tray-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px 3px 8px;
+  background: var(--accent-dim);
+  color: #fff;
+  border-radius: 12px;
+  font: 11px/1.3 var(--mono);
+}
+.tray-chip .chip-remove {
+  background: transparent;
+  color: rgba(255,255,255,0.85);
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.tray-chip .chip-remove:hover { background: rgba(255,255,255,0.2); }
+.runs-tray .ghost-action {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Picker rows -- one per run.  Click anywhere on a row to REPLACE the
+   tray with that run; click the [+] to ADD to the tray (merge). */
+.run-picker {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  margin-bottom: 0;
+}
+.run-picker .run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font: 12px/1.4 var(--mono);
+  cursor: pointer;
+}
+.run-picker .run-row:last-child { border-bottom: none; }
+.run-picker .run-row:hover { background: rgba(255,255,255,0.04); }
+.run-picker .run-row.in-tray {
+  background: rgba(88, 166, 255, 0.10);
+}
+.run-picker .run-row.paste-highlight {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  background: rgba(88, 166, 255, 0.18);
+}
+.run-picker .run-add {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font: 12px/1 var(--mono);
+  cursor: pointer;
+  flex-shrink: 0;
+  min-width: 24px;
+  text-align: center;
+}
+.run-picker .run-add:hover { background: var(--accent-dim); color: #fff; }
+.run-picker .run-row.in-tray .run-add { color: var(--ok); border-color: var(--ok); }
+.run-picker .run-info {
+  flex: 1;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-picker .run-info .run-dim {
+  color: var(--text-dim);
+}
+
+/* ---- Tray-as-header layout. The .runs-tray .runs-header div takes
+   the place of the H2: chips + paste-box + action cluster in one row,
+   always visible. Clicking ANY part of the strip that isn't an input
+   or button toggles the picker body. Caret rotates on collapse. ---- */
+.card.runs-card { padding: 12px 16px; }
+.runs-header {
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  /* Tighter padding than the standalone tray since it IS the header. */
+}
+.runs-header input,
+.runs-header button,
+.runs-header select { cursor: default; }
+.runs-header .disclosure {
+  display: inline-block;
+  width: 14px;
+  transition: transform 120ms ease;
+  color: var(--text-dim);
+  font-size: 14px;
+  user-select: none;
+}
+.card.runs-collapsed .runs-header .disclosure { transform: rotate(-90deg); }
+.card.runs-collapsed .runs-picker-body { display: none; }
+
+/* Two-row runs header: Row 1 = chips + group cluster; Row 2 = analyze
+   bar (paste-box + Analyze + Clear). Replaces the old one-line cluster
+   which got squished at narrow widths. */
+.runs-header { flex-direction: column; gap: 6px; }
+.runs-header-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.runs-header-row .tray-chips {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.runs-header-group-cluster {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.runs-header-group-cluster input,
+.runs-header-group-cluster select { width: 120px; }
+.runs-header-row input,
+.runs-header-row select,
+.runs-header-row button {
+  height: 26px;
+  font-size: 11.5px;
+  padding: 2px 8px;
+}
+.runs-header-row .primary-action {
+  background: var(--accent-dim);
+  color: #fff;
+  font-weight: 600;
+}
+.runs-header-row .primary-action:hover { background: var(--accent); }
+.runs-header-analyze input { flex: 1; min-width: 0; }
+.runs-header-analyze button { flex-shrink: 0; }
+
+/* Picker body: padded inset to set it off from the header strip. */
+.runs-picker-body { padding-top: 10px; }
+.runs-search-row { margin-bottom: 8px; gap: 6px; }
+.runs-search-row .runs-date-mini {
+  min-width: 110px;
+  max-width: 130px;
+  font-size: 11.5px;
+}
+
+/* ---- Sweep filter panel (matches SLM's .sweep-filter look) ----
+        Yellow-tinted card. Header is collapsible: clicking it folds
+        the chip rows up. Chips themselves are pill buttons with a
+        selected state. Affects every analysis-tab card below it. */
+.card.sweep-filter {
+  background: rgba(252, 219, 6, 0.04);
+  border-color: rgba(252, 219, 6, 0.25);
+}
+.card.sweep-filter[hidden] { display: none !important; }
+.filter-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--warn);
+}
+.filter-header .disclosure {
+  transition: transform 120ms ease;
+  color: var(--text-dim);
+}
+.card.sweep-filter.collapsed .filter-header .disclosure {
+  transform: rotate(-90deg);
+}
+.card.sweep-filter.collapsed .filter-body { display: none; }
+.filter-body { margin-top: 10px; }
+.filter-row {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 8px 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed rgba(255,255,255,0.04);
+  align-items: start;
+}
+.filter-row:last-child { border-bottom: none; }
+.filter-axis-label {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-right: 8px;
+  word-break: break-all;
+  padding-top: 4px;
+}
+/* Chip grid: fixed-width square chips packed into a contiguous grid so
+   the user can click-and-drag across a region to multi-select. Width
+   is uniform regardless of label content so the row doesn't reflow
+   when the active filter changes. */
+.filter-chip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 2px;
+  user-select: none;
+}
+.filter-chip {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 4px 2px;
+  border-radius: 3px;
+  font: 10.5px var(--mono);
+  cursor: pointer;
+  transition: background 60ms ease, border-color 60ms ease;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-height: 24px;
+}
+.filter-chip:hover {
+  border-color: var(--accent);
+}
+.filter-chip.selected {
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+  color: #fff;
+}
+.filter-chip.drag-target {
+  outline: 1px solid var(--warn);
+  outline-offset: -2px;
+}
+
+/* ---- Small inline slider control (per-site dot size) ---- */
+.site-size-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font: 10.5px var(--mono);
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+.site-size-ctl input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 90px;
+  height: 4px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  outline: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+.site-size-ctl input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 0;
+}
+.site-size-ctl input[type="range"]::-moz-range-thumb {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 0;
+}
+
+/* ---- Reserve heights for analysis cards while data loads ---- */
+/* Plot containers already have explicit heights; the loading state of
+   the run-summary card otherwise reflows the grid as the stat-tiles
+   replace the "loading…" placeholder. Reserve min-height so it doesn't
+   jump. */
+#analysis-detail-body { min-height: 88px; }
+/* Filter card also reserves a min height when populated so a
+   single-axis sweep doesn't make the page reflow.  */
+.card.sweep-filter .filter-body { min-height: 36px; }
+
+/* Plot containers fill the card (no padding around them) -- the
+   breathing room is Plotly's internal margin, so the plot reads as
+   part of the card rather than embedded inside a dark frame. */
+
+/* ====================================================================
+ * Floating Analysis overlay (FLOATING_ANALYSIS_CARDS feature flag).
+ * The dashboard.js reparents #analysis-runs-card and #analysis-filters
+ * into #floating-analysis-host. The original tab-pane grid then has
+ * those slots empty (the rest of the analysis content flows up). To
+ * revert: set FLOATING_ANALYSIS_CARDS = false in dashboard.js (everything
+ * below is gated on the host being non-hidden, so flipping the flag
+ * leaves the cards in their normal in-grid spot).
+ * ==================================================================*/
+/* ====================================================================
+ * Floating analysis cards — 3-STATE STATE MACHINE.
+ * Each card has data-float-state in {edge, peek, expanded}.
+ *   - edge: tucked vertical tab at the right side of the screen, ~40px
+ *     tall x ~22px wide. Mostly hidden; user discovers by mousing right.
+ *   - peek: hover state. Compact single-line pill (max ~200px).
+ *   - expanded: click state. Half-width with full content.
+ * Transitions are driven by dashboard.js -- CSS just renders the state.
+ * Translucent backdrop in all states (NOT opaque) -- user explicitly
+ * preferred the see-through look.
+ * ==================================================================*/
+.floating-analysis-host {
+  position: fixed;
+  top: 64px;
+  right: 0;           /* edge tabs hug the very right of the viewport */
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  max-height: calc(100vh - 80px);
+  pointer-events: none;
+  /* Single source of truth for the short (edge + peek) height. Both
+     states use var(--floating-short-height) so they CAN'T drift apart. */
+  --floating-short-height: 110px;
+}
+.floating-analysis-host[hidden] { display: none !important; }
+/* All three states share these card-frame properties so transitions
+   feel uniform between cards: same border treatment, same radius,
+   same backdrop. Only WIDTH and HEIGHT change between states. */
+/* Card framing -- same border / radius / backdrop in every state so
+   transitions only change geometry, not chrome. Background is darker
+   than before (more opaque) with a yellow tint on top of the card-bg
+   blue. */
+.floating-analysis-host > .card {
+  pointer-events: auto;
+  background:
+    linear-gradient(rgba(252, 219, 6, 0.07), rgba(252, 219, 6, 0.07)),
+    rgba(26, 32, 48, 0.70);
+  border: 1px solid rgba(252, 219, 6, 0.45);
+  border-radius: 6px 0 0 6px;   /* right edge squared; always flush */
+  border-right: none;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  /* Right margin is ZERO in every state so the card's right edge stays
+     pinned at the viewport edge. Old code had margin-right:16px in
+     peek/expanded but margin:0 in edge -- the 16 px jump moved the
+     right edge out from under the cursor on edge→peek, causing a
+     mouseleave→edge→mouseenter flicker loop. Pinning right makes the
+     card grow ONLY leftward / downward. */
+  margin: 0;
+  grid-column: auto;
+  transition: width 180ms ease,
+              max-width 180ms ease,
+              height 180ms ease,
+              max-height 180ms ease,
+              padding 180ms ease;
+  cursor: pointer;
+  overflow: hidden;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- STATE: edge (default) ----------------------------------------
+   Narrow tab. Height matches peek so the edge→peek transition only
+   changes WIDTH (no vertical jump). */
+.floating-analysis-host > .card[data-float-state="edge"] {
+  width: 22px;
+  height: var(--floating-short-height);
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+}
+.floating-analysis-host > .card[data-float-state="edge"] > * {
+  display: none !important;
+}
+/* Edge tab vertical content stack. Label (::before) at the BOTTOM,
+   count (::after) ABOVE -- both rendered in the SAME vertical text
+   orientation so they read as one continuous vertical sequence
+   (bottom→top): "RUNS" then "1" or "FILTER" then "● 1".
+   column-reverse puts ::after visually above ::before. */
+.floating-analysis-host > .card[data-float-state="edge"] {
+  flex-direction: column-reverse;
+  gap: 8px;
+}
+.floating-analysis-host > .card[data-float-state="edge"]::before {
+  content: var(--float-edge-label, "—");
+  color: var(--warn);
+  font: 600 10px var(--mono);
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  line-height: 1;
+  white-space: nowrap;
+}
+.floating-analysis-host > .card[data-float-state="edge"]::after {
+  content: "● " attr(data-float-count);
+  color: var(--text-dim);
+  font: 600 10px var(--mono);
+  letter-spacing: 1px;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  line-height: 1;
+  white-space: nowrap;
+  display: block;
+}
+/* When count is 0, hide ::after ENTIRELY (display:none, not just
+   invisible) so the label naturally centers without an empty slot
+   taking up vertical space above it. */
+.floating-analysis-host > .card[data-float-state="edge"][data-float-count="0"]::after {
+  display: none;
+}
+/* ACTIVE state: accent palette applies to ALL three view states
+   (edge, peek, expanded) -- not just edge. The active indicator
+   shouldn't disappear the moment the user hovers a card open. */
+.floating-analysis-host > .card:not([data-float-count="0"]) {
+  border-color: var(--accent);
+  background:
+    linear-gradient(rgba(88, 166, 255, 0.10), rgba(88, 166, 255, 0.10)),
+    rgba(26, 32, 48, 0.80);
+}
+.floating-analysis-host > .card[data-float-state="edge"]:not([data-float-count="0"])::before,
+.floating-analysis-host > .card[data-float-state="edge"]:not([data-float-count="0"])::after {
+  color: var(--accent);
+}
+/* The float-toggle chevron also re-tints to match the active palette. */
+.floating-analysis-host > .card:not([data-float-count="0"]) .float-toggle {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(88, 166, 255, 0.12);
+}
+.floating-analysis-host > #analysis-runs-card { --float-edge-label: "Runs"; }
+.floating-analysis-host > #analysis-filters   { --float-edge-label: "Filter"; }
+
+/* Hide the old tiny `▾` carets -- replaced by the bigger .float-toggle
+   chevron below. */
+.floating-analysis-host > .card .disclosure { display: none; }
+
+/* ---- Big visible expand/collapse chevron in the header ----
+   Floats in the TOP-RIGHT of each card's header. Big enough (18 px)
+   to be an obvious click target. Rotates 180° between peek (▼ ready
+   to expand) and expanded (▲ ready to collapse). Hidden in edge state
+   since the whole tab is the click target there. */
+.floating-analysis-host > .card .float-toggle {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(252, 219, 6, 0.10);
+  border: 1px solid rgba(252, 219, 6, 0.45);
+  border-radius: 4px;
+  color: var(--warn);
+  cursor: pointer;
+  z-index: 2;
+  transition: background 120ms ease;
+}
+.floating-analysis-host > .card .float-toggle:hover {
+  background: rgba(252, 219, 6, 0.22);
+}
+.floating-analysis-host > .card .float-toggle::before {
+  content: "";
+  display: block;
+  width: 0; height: 0;
+  /* Down-pointing triangle by default (peek -> click to expand more) */
+  border-left:  6px solid transparent;
+  border-right: 6px solid transparent;
+  border-top:   8px solid currentColor;
+  transition: transform 180ms ease;
+  margin-top: 2px;       /* visual centering of the triangle inside the box */
+}
+.floating-analysis-host > .card[data-float-state="expanded"] .float-toggle::before {
+  transform: rotate(180deg);   /* points up = "click to collapse" */
+  margin-top: -2px;
+}
+/* Edge state: no toggle button (the whole tab is the click target). */
+.floating-analysis-host > .card[data-float-state="edge"] .float-toggle {
+  display: none;
+}
+/* Cards need position:relative so the absolute-positioned toggle
+   anchors to them. */
+.floating-analysis-host > .card {
+  position: relative;
+}
+/* Reserve right padding on header rows so chevron never overlaps
+   content. */
+.floating-analysis-host > .card .runs-header,
+.floating-analysis-host > .card .filter-header {
+  padding-right: 36px;
+}
+
+/* ---- Shared header layout (used in BOTH peek and expanded) -------
+   The header is IDENTICAL whether the card is peeking or fully
+   expanded. Only the picker body / chip grid below appears/disappears
+   between states. Reset every per-state override; align left, top. */
+.floating-analysis-host > .card .runs-header,
+.floating-analysis-host > .card .filter-header {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  text-align: left;
+  font-size: 11.5px;
+  font-family: var(--mono);
+}
+
+/* Uniform control sizing -- inputs / buttons / selects all 28 px tall
+   so they line up perfectly across both rows. */
+.floating-analysis-host > .card .runs-header-row input,
+.floating-analysis-host > .card .runs-header-row select,
+.floating-analysis-host > .card .runs-header-row button {
+  height: 28px;
+  font-size: 11.5px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+
+/* Two-row layout. Both rows share the [flex content] | [action cluster]
+   pattern so columns line up visually. */
+.floating-analysis-host > .card .runs-header-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* CHIP ROW: chips (flex 1) on the left, group cluster on the right. */
+.floating-analysis-host > .card .tray-chips {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+}
+.floating-analysis-host > .card .tray-chip {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+}
+.floating-analysis-host > .card .tray-chip .chip-remove {
+  display: inline-flex;
+  width: 14px; height: 14px;
+  font-size: 12px;
+}
+
+/* Group cluster (Save name + Save | Load + X). Internal pairs use
+   tight 2px gap to read as "one control". Bigger 8px gap between the
+   Save-pair and Load-pair as a visual section break. */
+.floating-analysis-host > .card .runs-header-group-cluster {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+.floating-analysis-host > .card .runs-header-group-cluster
+  > input + button { margin-left: -8px;  /* erase outer gap into pair */ }
+.floating-analysis-host > .card .runs-header-group-cluster
+  > select + button { margin-left: -8px; }
+.floating-analysis-host > .card .runs-header-group-cluster input,
+.floating-analysis-host > .card .runs-header-group-cluster select {
+  width: 110px;
+}
+.floating-analysis-host > .card .runs-header-group-cluster #tray-delete-group {
+  width: 28px;
+  padding: 0;
+  font-weight: 600;
+}
+
+/* ANALYZE ROW: paste-box stretches; Analyze button is the primary
+   action (filled blue); Clear is secondary. */
+.floating-analysis-host > .card .runs-header-analyze input {
+  flex: 1; min-width: 0;
+}
+.floating-analysis-host > .card .runs-header-analyze button {
+  flex-shrink: 0;
+}
+.floating-analysis-host > .card .runs-header-row .primary-action {
+  background: var(--accent-dim);
+  color: #fff;
+  font-weight: 600;
+  min-width: 80px;
+  border: 1px solid var(--accent);
+}
+.floating-analysis-host > .card .runs-header-row .primary-action:hover {
+  background: var(--accent);
+}
+.floating-analysis-host > .card #tray-clear {
+  min-width: 60px;
+}
+
+/* FILTER HEADER -- single row: [status .........] [Clear] [▼] */
+.floating-analysis-host > .card .filter-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.floating-analysis-host > .card #filter-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  text-align: left;
+}
+/* Compact Clear button -- width sized to label, NOT stretched. */
+.floating-analysis-host > .card #filter-clear {
+  height: 24px;
+  width: auto;
+  min-width: 0;
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  align-self: center;
+}
+/* Detail line below filter-status -- one axis per line for clean
+   readability. Capped to fit the peek-area height; any overflow
+   beyond what fits gets clipped with ellipsis on the last visible
+   line. Subtle top border separates from the status row. */
+.floating-analysis-host > .card .filter-detail {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  margin-top: 0;
+  padding-top: 6px;
+  border-top: 1px solid rgba(252, 219, 6, 0.20);
+  gap: 2px;
+  /* Cap rows by max-height -- fits the peek area; any rows beyond
+     this clip with ellipsis-on-the-last-visible-line via mask. */
+  overflow: hidden;
+  max-height: calc(var(--floating-short-height) - 56px);  /* peek inner minus filter-header */
+  position: relative;
+}
+/* When there are more axes than fit, fade the bottom to indicate
+   overflow rather than hard-clipping. */
+.floating-analysis-host > .card .filter-detail.overflowed::after {
+  content: "…";
+  position: absolute;
+  bottom: 2px;
+  right: 6px;
+  color: var(--text-dim);
+  background: var(--bg-card);
+  padding: 0 4px;
+  font: 600 11px var(--mono);
+}
+.floating-analysis-host > .card .filter-detail .axis-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.floating-analysis-host > .card .filter-detail .axis-name {
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.floating-analysis-host > .card .filter-detail .axis-counts {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.floating-analysis-host > .card:not([data-float-count="0"]) .filter-detail {
+  border-top-color: rgba(88, 166, 255, 0.30);
+}
+
+/* ---- STATE: peek (hover) ------------------------------------------
+   Card height = natural header height + padding.  No per-element
+   overrides for the header at all -- it's the SAME header as expanded. */
+.floating-analysis-host > .card[data-float-state="peek"] {
+  width: calc(50vw - 48px);
+  max-width: 720px;
+  min-width: 280px;
+  height: var(--floating-short-height);   /* same as edge */
+  padding: 10px 14px;
+}
+.floating-analysis-host > .card[data-float-state="peek"] .runs-picker-body,
+.floating-analysis-host > .card[data-float-state="peek"] .filter-body {
+  display: none;
+}
+
+/* ---- STATE: expanded (click) --------------------------------------
+   SAME width and padding as peek. The HEADER section (runs-header for
+   runs, filter-peek-area for filter) is pinned to a min-height equal
+   to the peek view's INNER content height -- so the divider line and
+   the body's top edge sit EXACTLY where the peek view ended. The
+   entire pinned area above the body remains the clickable header. */
+.floating-analysis-host > .card[data-float-state="expanded"] {
+  width: calc(50vw - 48px);
+  max-width: 720px;
+  min-width: 280px;
+  height: auto;
+  max-height: min(420px, calc(85vh - 80px));
+  padding: 10px 14px;
+  cursor: auto;
+}
+.floating-analysis-host > .card[data-float-state="expanded"] .runs-header,
+.floating-analysis-host > .card[data-float-state="expanded"] .filter-peek-area {
+  /* var(--floating-short-height) is the peek card height (110 px).
+     Subtract the card's vertical padding (10+10 = 20 px) to get the
+     INNER content height -- 90 px. */
+  min-height: calc(var(--floating-short-height) - 20px);
+  display: flex;
+  flex-direction: column;
+}
+.floating-analysis-host > .card[data-float-state="expanded"] .runs-picker-body,
+.floating-analysis-host > .card[data-float-state="expanded"] .filter-body {
+  display: block;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(252, 219, 6, 0.25);
+}
+#filter-status {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+#filter-status.active { color: var(--warn); font-weight: 600; }
+.filter-detail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 4px 0;
+  line-height: 1.5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.filter-detail .axis-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.filter-detail .axis-name { color: var(--text); }
+.filter-detail .axis-counts { color: var(--accent); }
+
+/* ---- Per-iteration metric toggle chips (legend-style on/off) ---- */
+.metric-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  align-items: center;
+}
+.metric-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font: 11px var(--mono);
+  cursor: pointer;
+  user-select: none;
+}
+.metric-chip .dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: currentColor;
+  opacity: 0.4;
+}
+.metric-chip.on {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(88,166,255,0.10);
+}
+.metric-chip.on .dot { opacity: 1; }
+.metric-chip:hover { border-color: var(--accent); }
+
+/* ---- Submit-scan form ---- */
+textarea#submit-scan-json {
+  min-height: 200px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ---- Auxiliary helpers ---- */
+.mono { font-family: var(--mono); }
+.right { text-align: right; }
+.center { text-align: center; }
+.nowrap { white-space: nowrap; }
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scrollable { max-height: 300px; overflow-y: auto; }
+.spaced > * + * { margin-top: 8px; }
+
+/* Plot containers (Plotly.js renders inside these). */
+.plot-container {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+/* Scrollbar styling for darker panels. */
+pre, textarea, .log, .scrollable {
+  scrollbar-color: #444466 var(--bg-input);
+  scrollbar-width: thin;
+}
+pre::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+.log::-webkit-scrollbar,
+.scrollable::-webkit-scrollbar { width: 8px; height: 8px; }
+pre::-webkit-scrollbar-track,
+textarea::-webkit-scrollbar-track,
+.log::-webkit-scrollbar-track,
+.scrollable::-webkit-scrollbar-track { background: var(--bg-input); }
+pre::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb,
+.log::-webkit-scrollbar-thumb,
+.scrollable::-webkit-scrollbar-thumb {
+  background: #444466;
+  border-radius: 4px;
+}
+pre::-webkit-scrollbar-thumb:hover,
+textarea::-webkit-scrollbar-thumb:hover,
+.log::-webkit-scrollbar-thumb:hover,
+.scrollable::-webkit-scrollbar-thumb:hover { background: #5c5c80; }

@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Yb Tweezer Dashboard</title>
+<link rel="stylesheet" href="{{ static_url }}dashboard.css?v={{ cache_bust }}">
+<!-- Plotly.js for the Live tab charts.
+     Served LOCALLY from the bundled plotly-python copy so the page
+     works even when the lab network blocks cdn.plot.ly. CDN fallback
+     attached on error -- if even that fails, the page surfaces a
+     visible banner instead of silently showing black panels (the old
+     failure mode: pollLiveFigures bailed at `if (!window.Plotly)
+     return;` and divs stayed empty). -->
+<script src="{{ plotly_local_url }}?v={{ cache_bust }}"
+        onerror="this.onerror=null;
+                 var s=document.createElement('script');
+                 s.src='https://cdn.plot.ly/plotly-2.35.2.min.js';
+                 s.onerror=function(){window.__plotlyLoadFailed=true;};
+                 document.head.appendChild(s);"></script>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>Yb Tweezer Dashboard</h1>
+    <span id="conn-status" class="status-pill dim" title="Lab dashboard connection">
+      <span class="dot"></span><span>lab</span>
+    </span>
+    <span id="slm-status" class="status-pill dim" title="SLM PC proxy">
+      <span class="dot"></span><span>SLM</span>
+    </span>
+    <span id="runner-status" class="status-pill dim" title="MATLAB SequenceRunner">
+      <span class="dot"></span><span>runner</span>
+    </span>
+  </div>
+  <nav class="tab-nav" role="tablist" aria-label="Dashboard sections">
+    <button id="tab-btn-live"     class="active" data-tab="live"     role="tab" aria-selected="true">Live</button>
+    <button id="tab-btn-hardware" data-tab="hardware" role="tab" aria-selected="false">SLM Hardware</button>
+    <button id="tab-btn-analysis" data-tab="analysis" role="tab" aria-selected="false">Analysis</button>
+    <button id="tab-btn-queue"    data-tab="queue"    role="tab" aria-selected="false">Queue</button>
+    <button id="tab-btn-diag"     data-tab="diag"     role="tab" aria-selected="false">Diag</button>
+  </nav>
+  <div class="header-right">
+    <label class="switch">
+      <input type="checkbox" id="auto-refresh" checked>
+      <span class="track"></span>
+      <span>Auto refresh</span>
+    </label>
+    <button class="ghost" id="manual-refresh" title="Refresh now">Refresh</button>
+    <a class="old-link" href="/old/" title="Old Plotly-based live page">/old</a>
+  </div>
+</header>
+
+<!-- ============================= LIVE TAB ============================ -->
+<section id="tab-live" class="tab-pane">
+
+  <!-- Compact horizontal status strip across the top. Previously
+       Status was a col-3 card next to the col-9 Scan Curve; the grid
+       row's height was forced to 520px by the scan curve, leaving
+       Status sitting in a tall card with most of it empty. Now it's a
+       full-width thin strip and the Scan Curve takes the next row. -->
+  <section class="card col-12 status-strip" data-card-id="status-overview">
+    <div class="stat-tile">
+      <span class="stat-label">scan_id</span>
+      <span class="stat-value mono" id="kv-scan-id">—</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">scan_name</span>
+      <span class="stat-value" id="kv-scan-name">—</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">shot #</span>
+      <span class="stat-value mono" id="kv-shot">—</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">num_sites</span>
+      <span class="stat-value mono" id="kv-sites">—</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">loading rate</span>
+      <span class="stat-value mono" id="kv-loading-rate">—</span>
+    </div>
+    <div class="stat-tile">
+      <span class="stat-label">progress</span>
+      <span class="stat-value mono" id="scan-progress">—</span>
+    </div>
+    <!-- Mini queue: glanceable status of what's happening right now
+         + what's next. Polled alongside the Live tab (every 3s). -->
+    <div class="stat-tile" id="mini-queue-active-tile">
+      <span class="stat-label">active job</span>
+      <span class="stat-value mono" id="mini-queue-active">—</span>
+    </div>
+    <div class="stat-tile" id="mini-queue-next-tile">
+      <span class="stat-label">queue</span>
+      <span class="stat-value mono" id="mini-queue-next">—</span>
+    </div>
+  </section>
+
+  <!-- Array row: 2 panels (img1 + img2) by default. When NumImages >= 3,
+       JS injects col-4 / col-4 / col-4 layout and reveals the middle
+       image card. When NumImages < 3, the middle card is hidden. -->
+  <section class="card col-6 array-card" id="card-array1" data-card-id="live-array1">
+    <h2>Tweezer array — img 1<span class="grow"></span>
+        <label class="switch" style="font-size:11px">
+          <input type="checkbox" id="downsample-live" checked>
+          <span class="track"></span>
+          <span>Downsample</span>
+        </label>
+    </h2>
+    <div class="plot-container" id="plot-array1" style="height: 420px;"></div>
+  </section>
+
+  <section class="card col-4 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
+    <h2>Tweezer array — middle<span class="grow"></span>
+        <span class="hint">NumImages ≥ 3</span>
+    </h2>
+    <div class="plot-container" id="plot-array-mid" style="height: 420px;"></div>
+  </section>
+
+  <section class="card col-6 array-card" id="card-array2" data-card-id="live-array2">
+    <h2>Tweezer array — img 2<span class="grow"></span>
+        <span id="array2-info" class="hint"></span>
+    </h2>
+    <div class="plot-container" id="plot-array2" style="height: 420px;"></div>
+  </section>
+
+  <section class="card col-12" data-card-id="live-scan-curve">
+    <h2>Scan curve<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-scan" style="height: 480px;"></div>
+  </section>
+
+  <section class="card col-8" data-card-id="live-intensities">
+    <h2>Atom intensities<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-intensities" style="height: 280px;"></div>
+  </section>
+
+  <section class="card col-4" data-card-id="live-loading">
+    <h2>Loading rate (live)<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-loading-live" style="height: 280px;"></div>
+  </section>
+
+  <section class="card col-4" data-card-id="live-load-map">
+    <h2>Per-site loading<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-load-map" style="height: 380px;"></div>
+  </section>
+
+  <section class="card col-4" data-card-id="live-infid-map">
+    <h2>Per-site infidelity<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-infid-map" style="height: 380px;"></div>
+  </section>
+
+  <section class="card col-4" data-card-id="live-shift">
+    <h2>Grid shift<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-shift" style="height: 380px;"></div>
+  </section>
+
+  <section class="card col-12" data-card-id="live-histograms">
+    <h2>Histograms<span class="grow"></span></h2>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;">
+      <div class="plot-container" id="plot-hist-avg" style="height: 220px;"></div>
+      <div class="plot-container" id="plot-hist-rep0" style="height: 220px;"></div>
+      <div class="plot-container" id="plot-hist-rep1" style="height: 220px;"></div>
+      <div class="plot-container" id="plot-hist-rep2" style="height: 220px;"></div>
+      <div class="plot-container" id="plot-hist-rep3" style="height: 220px;"></div>
+    </div>
+  </section>
+
+  <!-- Per-site histogram with a site picker + info readout, matching
+       the old Dash dashboard's Row 4 site selector. Plot is fetched via
+       /api/live/figures?which=site&site=N each time the picker
+       changes (and on each live poll while the panel is visible). -->
+  <section class="card col-12" data-card-id="live-site-hist">
+    <h2>Per-site histogram<span class="grow"></span>
+        <span class="hint">pick any site by number</span>
+    </h2>
+    <div class="row" style="gap:14px;align-items:flex-start;">
+      <div class="flex-fixed" style="min-width:200px;max-width:240px;">
+        <label>Site #</label>
+        <input type="number" id="site-pick" min="1" value="1" step="1">
+        <div id="site-info" class="hint mono" style="margin-top:10px;line-height:1.7;">
+          (pick a site)
+        </div>
+      </div>
+      <div style="flex:1;min-width:0;">
+        <div class="plot-container" id="plot-hist-site" style="height: 320px;"></div>
+      </div>
+    </div>
+  </section>
+
+</section>
+
+<!-- =========================== HARDWARE TAB ========================== -->
+<!-- The Hardware tab embeds the SLM server's existing dashboard via an
+     iframe.  This is intentionally a thin wrapper: the SLM dashboard
+     already has every hardware-control widget the operator needs
+     (server-control, phase canvas, camera preview, clock-lock,
+     locks/clients tables, logs, ↗-expand focus pages).  Embedding it
+     gives us automatic parity with the SLM team's UX without porting
+     all of that JavaScript -- AND any future change on the SLM side
+     (new feature, new metric) appears here for free.
+
+     Lab-PC-specific cards (Rearrange diag, per-scan ledger lookup)
+     live in the Diag tab instead, so this tab is just the SLM server. -->
+<section id="tab-hardware" class="tab-pane fullbleed-tab" hidden>
+  <div id="hw-iframe-wrap" class="iframe-wrap">
+    <iframe id="hw-iframe"
+            src="{{ slm_url }}/dashboard/hardware"
+            referrerpolicy="no-referrer"
+            allow="fullscreen"
+    ></iframe>
+    <!-- Floating escape hatch (top-right corner): reload + open-in-new-tab
+         buttons. Lets the operator recover if the iframe is blank without
+         abandoning the lab dashboard. We DON'T probe SLM reachability
+         and overlay a fallback -- the iframe loads independently of
+         /api/slm/health (the proxy can be cold while the iframe URL is
+         still reachable), so probing was over-eager. -->
+    <div class="iframe-actions">
+      <button class="ghost" id="hw-iframe-reload"
+              title="Reload iframe">↻</button>
+      <a class="ghost iframe-actions-link" href="{{ slm_url }}/dashboard/hardware"
+         target="_blank" title="Open SLM dashboard in a new tab">↗</a>
+    </div>
+  </div>
+</section>
+
+<!-- =========================== ANALYSIS TAB ========================== -->
+<section id="tab-analysis" class="tab-pane" hidden>
+
+  <!-- ===== 1. Unified runs picker + tray ============================
+       The tray strip itself IS the collapsible header. No separate
+       "Runs" h2 label -- chips + action cluster are always visible,
+       caret on the left toggles the picker body. Click anywhere on
+       the tray header (not on buttons / inputs) to expand/collapse. -->
+  <section class="card col-12 runs-card runs-collapsed" id="analysis-runs-card"
+           data-card-id="analysis-runs-card">
+
+    <!-- Header = tray. Two-row layout:
+         Row 1: chip strip (selected runs) | Save/Load group (right)
+         Row 2: paste-box + Analyze + Clear (the "analyze bar")
+         Both rows visible in peek + expanded; rows are restyled by
+         the floating CSS to fit the taller peek height. -->
+    <div class="runs-header" id="runs-card-header">
+      <button class="float-toggle" title="Click to expand / collapse"
+              aria-label="Expand or collapse"></button>
+      <div class="runs-header-row runs-header-chips">
+        <div id="tray-chips" class="tray-chips">
+          <span class="tray-empty" id="tray-empty">no run selected</span>
+        </div>
+        <div class="runs-header-group-cluster">
+          <input type="text" id="tray-save-name" placeholder="group name">
+          <button class="ghost" id="tray-save" title="Save current tray as a group">Save</button>
+          <select id="tray-load-group">
+            <option value="">Load group…</option>
+          </select>
+          <button class="ghost danger" id="tray-delete-group" title="Delete the loaded group">×</button>
+        </div>
+      </div>
+      <div class="runs-header-row runs-header-analyze">
+        <input type="text" id="manual-scan-id"
+               placeholder="paste a 14-digit scan_id">
+        <button class="primary-action" id="tray-analyze"
+                title="Analyze the tray (or the pasted scan_id)">Analyze</button>
+        <button class="ghost" id="tray-clear" title="Clear tray">Clear</button>
+      </div>
+    </div>
+
+    <div class="runs-picker-body" id="runs-picker-body">
+      <!-- Search + filter row. Date filter inline, smaller. -->
+      <div class="row runs-search-row">
+        <input type="text" id="runs-search" placeholder="Search scan_id or name…">
+        <select id="runs-date-filter" class="flex-fixed runs-date-mini">
+          <option value="">All dates</option>
+        </select>
+        <button class="ghost flex-fixed" id="manual-scan-load"
+                title="Load pasted scan_id from header into picker">Load</button>
+        <button class="ghost flex-fixed" id="runs-refresh">Refresh</button>
+        <span class="grow"></span>
+        <span class="badge mono" id="runs-count">—</span>
+      </div>
+
+      <!-- The picker proper: one .run-row per run, with [+] button. -->
+      <div id="runs-table" class="run-picker">
+        <div class="run-row"><div class="run-info muted">loading…</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 2. Run summary (the "dividing line") ======================
+       Stat tiles, sweep description, code/grid sidecar badges. Cards
+       BELOW this section are filtered by the Filter panel. -->
+  <section class="card col-12" data-card-id="analysis-detail">
+    <h2>Run summary<span class="grow"></span>
+        <span class="badge mono" id="selected-scan-id">none</span>
+        <span class="status-pill dim" id="analysis-status"
+              style="margin-left:6px;font-size:11px;">
+          <span class="dot"></span><span class="status-label">idle</span>
+        </span>
+    </h2>
+    <div id="analysis-detail-body">
+      <div class="hint">Click a row in Runs above (or paste a scan_id) to load analysis.</div>
+    </div>
+  </section>
+
+  <!-- ===== 3. Filters ================================================
+       Per-axis chips (one button per discrete sweep value). Clicking a
+       chip toggles inclusion. Affects EVERY card below this point. -->
+  <section class="card col-12 sweep-filter" data-card-id="analysis-filters"
+           id="analysis-filters" hidden>
+    <!-- Peek-area wrapper: contains the header + detail line, the two
+         things visible in peek. min-height pinned to peek view size
+         when expanded so the divider line below sits exactly at the
+         peek-view bottom edge. -->
+    <div class="filter-peek-area">
+      <div class="filter-header">
+        <span class="filter-status" id="filter-status">no filter</span>
+        <span class="grow"></span>
+        <button class="ghost flex-fixed" id="filter-clear">Clear</button>
+        <button class="float-toggle" title="Click to expand / collapse"
+                aria-label="Expand or collapse"></button>
+        <span class="disclosure">▾</span>
+      </div>
+      <div class="filter-detail" id="filter-detail">
+        <span class="muted">load a run with a swept axis</span>
+      </div>
+    </div>
+    <div class="filter-body" id="filter-body">
+      <div class="hint">Filters appear here once a run with a swept axis is loaded.</div>
+    </div>
+  </section>
+
+  <!-- ===== 4. Sweep visualization (scan curve) ======================= -->
+  <section class="card col-12" data-card-id="analysis-scan-curve">
+    <h2>Sweep visualization<span class="grow"></span>
+        <span class="hint mono" id="analysis-scan-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-analysis-scan" style="height:420px;"></div>
+  </section>
+
+  <!-- ===== 5. Per-site maps ==========================================
+       Three side-by-side scattergl maps: loading rate, survival, false
+       positives. A tiny dot-size slider lives in the top-right of the
+       loading panel and controls all three at once (single source of
+       truth for marker scale). -->
+  <section class="card col-4" data-card-id="analysis-site-loading">
+    <h2>Per-site loading<span class="grow"></span>
+        <span class="hint mono" id="site-loading-info"></span>
+        <label class="site-size-ctl" title="Dot size">
+          <span>size</span>
+          <input type="range" id="site-dot-size" min="1" max="22" step="1" value="4">
+        </label>
+    </h2>
+    <div class="plot-container" id="plot-site-loading" style="height:360px;"></div>
+  </section>
+  <section class="card col-4" data-card-id="analysis-site-survival">
+    <h2>Per-site survival<span class="grow"></span>
+        <span class="hint mono" id="site-survival-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-site-survival" style="height:360px;"></div>
+  </section>
+  <section class="card col-4" data-card-id="analysis-site-fp">
+    <h2>Per-site false-positive<span class="grow"></span>
+        <span class="hint mono" id="site-fp-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-site-fp" style="height:360px;"></div>
+  </section>
+
+  <!-- ===== 6. Per-iteration time-series ==============================
+       One chart, X = shot index. Toggle which metrics are visible as
+       chips (loading, survival, FP, swept param value, diag fields). -->
+  <section class="card col-12" data-card-id="analysis-per-iter">
+    <h2>Per-iteration metrics<span class="grow"></span>
+        <span class="hint mono" id="per-iter-info"></span>
+    </h2>
+    <div id="per-iter-toggles" class="metric-toggles"
+         style="margin-bottom:10px;">
+      <span class="muted">load a run to populate metric toggles</span>
+    </div>
+    <div class="plot-container" id="plot-per-iter" style="height:380px;"></div>
+  </section>
+
+  <!-- ===== 7. Sequence-specific (blank for now) ===================== -->
+  <section class="card col-12" data-card-id="analysis-seq-specific">
+    <h2>Sequence-specific analysis<span class="grow"></span>
+        <span class="hint mono" id="seq-specific-name">—</span>
+    </h2>
+    <div id="seq-specific-body" class="hint" style="padding:24px 8px;">
+      (placeholder — per-Seq custom analyses will live here)
+    </div>
+  </section>
+
+  <section class="card col-12" data-card-id="analysis-protocol-src">
+    <h2>Protocol source<span class="grow"></span>
+        <button class="ghost" id="show-protocol-src" style="font-size:11px;">Show</button>
+    </h2>
+    <pre id="protocol-src-body" class="log scrollable" style="display:none;max-height:600px;">(none loaded)</pre>
+  </section>
+
+</section>
+
+<!-- =========================== QUEUE TAB ============================= -->
+<!-- Modeled on SLMnet's handoff_dashboard.html structure (status row
+     + queue/detail side-by-side + history + protocol catalog). -->
+<section id="tab-queue" class="tab-pane" hidden>
+
+  <!-- Status row -->
+  <section class="card col-12" data-card-id="queue-status">
+    <div class="row" style="gap:24px;align-items:flex-end;">
+      <div>
+        <div class="hint">Active job</div>
+        <div id="queue-active-name" class="mono" style="font-size:14px;">
+          <span class="muted">(none)</span>
+        </div>
+        <div id="queue-active-progress" class="hint mono" style="margin-top:2px;">—</div>
+      </div>
+      <div>
+        <div class="hint">Queue depth</div>
+        <div id="queue-depth" style="font-size:22px;font-weight:600;">—</div>
+      </div>
+      <div>
+        <div class="hint">Descriptors waiting</div>
+        <div id="queue-desc-depth" style="font-size:22px;font-weight:600;">—</div>
+      </div>
+      <div>
+        <div class="hint">History (today)</div>
+        <div id="queue-history-count" style="font-size:22px;font-weight:600;">—</div>
+      </div>
+      <div class="grow"></div>
+    </div>
+    <div id="queue-last-shot" class="hint" style="margin-top:8px;">—</div>
+  </section>
+
+  <!-- Queue + Active detail (side by side) -->
+  <section class="card col-7" data-card-id="queue-active">
+    <h2>Queue<span class="grow"></span><span class="badge mono" id="queue-counts">—</span></h2>
+    <table id="queue-table" class="dense">
+      <thead>
+        <tr>
+          <th>id</th><th>kind</th><th>state</th><th>name/label</th><th>file_id</th><th></th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card col-5" data-card-id="queue-active-detail">
+    <h2>Active detail<span class="grow"></span></h2>
+    <div id="queue-active-detail-body">
+      <span class="muted">(no active job)</span>
+    </div>
+  </section>
+
+  <!-- Recent history -->
+  <section class="card col-12" data-card-id="queue-history">
+    <h2>Recent history<span class="grow"></span>
+        <button class="ghost flex-fixed" id="queue-refresh-btn"
+                style="font-size:11px;padding:3px 10px;">Refresh</button>
+    </h2>
+    <table id="history-table" class="dense">
+      <thead>
+        <tr>
+          <th>id</th><th>kind</th><th>name</th>
+          <th>status</th><th>file_id</th>
+          <th>built_job_id</th><th>error</th>
+        </tr>
+      </thead>
+      <tbody><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- Submit Scan form -->
+  <section class="card col-7" data-card-id="queue-submit">
+    <h2>Submit scan<span class="grow"></span>
+        <button class="ghost flex-fixed" id="format-json-btn"
+                style="font-size:11px;padding:3px 10px;">Format JSON</button>
+        <button id="submit-scan-btn"
+                style="font-size:11px;padding:3px 14px;">Submit</button>
+    </h2>
+    <div class="row" style="gap:8px;align-items:flex-end;margin-bottom:8px;">
+      <div class="flex-fixed" style="min-width:240px;">
+        <label>Seq function</label>
+        <select id="submit-seq-select">
+          <option value="">— pick a sequence —</option>
+        </select>
+      </div>
+      <div class="flex-fixed">
+        <label>Label (optional)</label>
+        <input type="text" id="submit-label" placeholder="e.g. cooling-sweep">
+      </div>
+      <button class="ghost flex-fixed" id="fill-template-btn"
+              style="font-size:11px;padding:5px 10px;">
+        Fill descriptor template from seq
+      </button>
+    </div>
+    <textarea id="submit-scan-json"
+      placeholder='{
+  "seq": "CoolingSeq",
+  "params": {"Cooling.Detuning": {"scan": 1, "linspace": [20e6, 30e6, 11]}},
+  "runp": {"NumPerGroup": 4000, "Scramble": true}
+}'></textarea>
+    <div class="hint" style="margin-top:6px;" id="submit-scan-result">
+      ready
+    </div>
+  </section>
+
+  <!-- Sequence catalog (analog to handoff's "Custom protocols" panel) -->
+  <section class="card col-5" data-card-id="queue-seq-catalog">
+    <h2>Available sequences<span class="grow"></span>
+        <button class="ghost flex-fixed" id="seq-refresh-btn"
+                style="font-size:11px;padding:3px 10px;"
+                title="Re-scan YbSeqs/YbSteps from disk">Refresh</button>
+    </h2>
+    <p class="hint">
+      Sequences are introspected from
+      <code class="mono">matlab_new/YbSeqs/</code> +
+      <code class="mono">matlab_new/YbSteps/</code>.
+      Click a row to see its params; click <b>Use</b> to pre-fill the
+      descriptor template.
+    </p>
+    <div class="row" style="margin:8px 0;">
+      <input type="text" id="seq-filter" placeholder="filter…" style="flex:1;">
+    </div>
+    <div class="scrollable" style="max-height:340px;">
+      <table id="seq-catalog-table" class="dense">
+        <thead>
+          <tr><th>name</th><th>steps</th><th>params</th><th></th></tr>
+        </thead>
+        <tbody><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="seq-detail" style="margin-top:14px; display:none;">
+      <h3 style="font-size:12px;color:var(--text-dim);
+                 text-transform:uppercase;letter-spacing:0.5px;
+                 margin:0 0 6px 0;">
+        <span id="seq-detail-name" class="mono">—</span>
+        <button class="ghost flex-fixed" id="seq-use-btn"
+                style="font-size:10px;padding:2px 8px;margin-left:8px;">
+          Use this seq
+        </button>
+      </h3>
+      <div class="hint" id="seq-detail-file"></div>
+      <div style="margin-top:10px;">
+        <div class="hint" style="text-transform:uppercase;letter-spacing:0.5px;">Params</div>
+        <table class="dense">
+          <thead><tr><th>path</th><th>step</th><th>default</th></tr></thead>
+          <tbody id="seq-detail-params"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:10px;">
+        <div class="hint" style="text-transform:uppercase;letter-spacing:0.5px;">Runp knobs</div>
+        <table class="dense">
+          <thead><tr><th>field</th><th>default</th><th>note</th></tr></thead>
+          <tbody id="seq-detail-runp"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</section>
+
+<!-- ============================= DIAG TAB ============================ -->
+<section id="tab-diag" class="tab-pane" hidden>
+
+  <section class="card col-12" data-card-id="diag-rearrange">
+    <h2>Rearrange diagnostics (last shots)
+      <span class="grow"></span>
+      <span class="badge mono" id="diag-rearrange-count">—</span>
+    </h2>
+    <p class="hint">
+      Per-shot SLM rearrangement diagnostics from
+      <code class="mono">/slm/rearrange_diag</code>: timing, n_loaded,
+      abort flags, two-round phase, etc. Cached by the lab-PC proxy
+      thread; click Refresh on top right to force a fresh poll.
+    </p>
+    <div id="rearrange-diag-body" style="margin-top:10px;">
+      <div class="hint">no diag rows yet</div>
+    </div>
+  </section>
+
+  <section class="card col-6" data-card-id="diag-ledger-lookup">
+    <h2>Look up scan ledger<span class="grow"></span></h2>
+    <p class="hint">
+      Pull every diag row the SLM server kept for a specific scan_id.
+      Sidecar-first (lab-PC <code class="mono">slm_diag.h5</code>) then
+      live SLM passthrough.
+    </p>
+    <div class="row" style="margin-top:8px;">
+      <input type="text" id="ledger-scan-id"
+             placeholder="14-digit scan_id (e.g. 20260529025015)">
+      <button class="flex-fixed" id="ledger-load-btn">Load</button>
+    </div>
+    <div id="ledger-status" class="hint" style="margin-top:8px;">ready</div>
+  </section>
+
+  <section class="card col-6" data-card-id="diag-ledger-summary">
+    <h2>Ledger summary<span class="grow"></span>
+        <span class="badge mono" id="ledger-rows-count">0 rows</span>
+    </h2>
+    <dl class="kv" id="ledger-summary">
+      <dt>scan_id</dt><dd>—</dd>
+      <dt>total rows</dt><dd>—</dd>
+      <dt>mean total_ms</dt><dd>—</dd>
+      <dt>mean n_loaded</dt><dd>—</dd>
+      <dt>aborted</dt><dd>—</dd>
+    </dl>
+  </section>
+
+  <section class="card col-12" data-card-id="diag-ledger-rows">
+    <h2>Ledger rows<span class="grow"></span></h2>
+    <div class="scrollable" style="max-height: 500px;">
+      <table id="ledger-table" class="dense">
+        <thead>
+          <tr><th>ts</th><th>seq_id</th><th>retry</th>
+              <th>total_ms</th><th>n_loaded</th><th>aborted</th>
+              <th>two_round</th></tr>
+        </thead>
+        <tbody>
+          <tr><td colspan="7" class="muted">type a scan_id above and click Load</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</section>
+
+<!-- Floating overlay host: only used when FLOATING_ANALYSIS_CARDS=true.
+     dashboard.js reparents the Runs picker + Filter cards into here on
+     load. Sits fixed top-right; auto-hidden when the active tab isn't
+     Analysis. Empty / display:none-by-default so it costs nothing if
+     the feature is disabled. -->
+<div id="floating-analysis-host" class="floating-analysis-host" hidden></div>
+
+<div id="toast" class="toast"></div>
+
+<script src="{{ static_url }}dashboard.js?v={{ cache_bust }}"></script>
+</body>
+</html>

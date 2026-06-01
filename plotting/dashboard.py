@@ -72,12 +72,17 @@ class DashboardRenderer:
 
     def start(self):
         if self._proc is None or not self._proc.is_alive():
+            # Pass the parent (this process) PID so the child can watchdog
+            # us. If we die unexpectedly (terminal close, taskkill, crash)
+            # the child notices in ~3 s and self-terminates, releasing
+            # port 8050 instead of becoming an orphan.
             self._proc = multiprocessing.Process(
-                target=_dash_main, args=(self._host, self._port, _DATA_FILE),
+                target=_dash_main,
+                args=(self._host, self._port, _DATA_FILE, os.getpid()),
                 daemon=True)
             self._proc.start()
-            logger.info('Dashboard process started (pid=%d) at http://%s:%d',
-                        self._proc.pid, self._host, self._port)
+            logger.info('Dashboard process started (pid=%d, parent=%d) at http://%s:%d',
+                        self._proc.pid, os.getpid(), self._host, self._port)
 
     def update(self, data):
         """Write plot data to the shared file.
@@ -342,6 +347,12 @@ _HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri',
                '_img_vlo', '_img_vhi', '_img2_vlo', '_img2_vhi',
                '_img_mid_vlo', '_img_mid_vhi')
 
+# Heavy keys excluded from /api/snapshot output. Only the data URIs
+# themselves are oversized -- the shape/percentile metadata is a
+# few floats and is useful for the HTML dashboard's Plotly.js
+# image-with-overlay panel, so we keep it on snapshot.
+_SNAPSHOT_HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri')
+
 
 def _resolve_scan_dir(scan_id):
     """Map a 14-digit scan_id to its data directory on disk.
@@ -417,6 +428,39 @@ def _runs_code_response(scan_id):
         return jsonify({'error': str(e)}), 503
 
 
+def _runs_grid_response(scan_id):
+    """Phase 4 helper: return per-run grid sidecar for a scan.
+
+    Sidecar-first: returns `<scan_dir>/slm_grid.json` when Phase 4 sync
+    has saved it. Otherwise falls through to a live SLM passthrough
+    against `/slm/runs/<scan_id>/grid_sidecar`. 404 if neither has it
+    (typical for runs whose SLM build predates the rearrange_grid_sidecar
+    writer).
+    """
+    from flask import jsonify
+    scan_dir = _resolve_scan_dir(scan_id)
+    if scan_dir:
+        sidecar = os.path.join(scan_dir, 'slm_grid.json')
+        if os.path.exists(sidecar):
+            try:
+                with open(sidecar, 'r', encoding='utf-8') as f:
+                    return jsonify(json.load(f))
+            except Exception as e:
+                logger.warning('slm_grid.json read failed (%s): %s',
+                               sidecar, e)
+    # Live passthrough.
+    try:
+        from yb_analysis.slm_sync import SlmSyncClient
+        client = SlmSyncClient()
+        data = client.get_grid_sidecar(scan_id)
+        if data is None:
+            return jsonify({'error': 'no grid sidecar for this scan_id'}), 404
+        return jsonify(data)
+    except Exception as e:
+        logger.warning('runs_grid passthrough failed: %s', e)
+        return jsonify({'error': str(e)}), 503
+
+
 def _read_slm_diag_h5(path, scan_id):
     """Read all rows from a synced slm_diag.h5 sidecar.
 
@@ -471,8 +515,13 @@ def _register_api_routes(server):
         '/api/slm/rearrange/diag':  'SLM PC /slm/rearrange_diag passthrough (cached, ~5s stale)',
         '/api/slm/camera/png':      'SLM PC /camera/capture_png passthrough (cached, ~2s stale)',
         '/api/slm/phase/png':       'SLM PC /slm/phase_png passthrough (cached, ~2s stale)',
-        '/api/runs/<scan_id>/diag': 'per-scan SLM diag rows: synced sidecar first, then live SLM passthrough',
-        '/api/runs/<scan_id>/code': 'per-scan code-snapshot manifest: synced sidecar first, then live SLM passthrough',
+        '/api/runs/<scan_id>/diag':     'per-scan SLM diag rows: synced sidecar first, then live SLM passthrough',
+        '/api/runs/<scan_id>/code':     'per-scan code-snapshot manifest: synced sidecar first, then live SLM passthrough',
+        '/api/runs/<scan_id>/grid':     'per-scan grid sidecar (init/target knm coords + grid_rotation): synced sidecar first, then live SLM passthrough',
+        '/api/runs/<scan_id>/analysis': 'lab-side per-scan analysis: survival, loading, diag aggregate, sweep description, code/grid pointers',
+        '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
+        '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
+        '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its kind',
     }
 
     def _list_endpoints():
@@ -533,8 +582,12 @@ def _register_api_routes(server):
     @server.route('/api/snapshot')
     def _api_snapshot():
         d = _read_data() or {}
+        # Strip the megabyte-scale image data URIs (Live tab fetches PNG
+        # bytes via /api/live/imageN), but keep _img_shape / vlo / vhi so
+        # the dashboard's Plotly.js heatmap-with-overlay knows the
+        # geometry + colour range.
         return jsonify(_to_jsonable(
-            {k: v for k, v in d.items() if k not in _HEAVY_KEYS}))
+            {k: v for k, v in d.items() if k not in _SNAPSHOT_HEAVY_KEYS}))
 
     # ---- SLM passthrough routes (read from yb_dash_slm.pkl) ----
     # All return cached SLM-PC data, polled by yb_analysis.slm_proxy on the
@@ -624,17 +677,730 @@ def _register_api_routes(server):
         """
         return _runs_code_response(scan_id)
 
+    # ---- Per-scan analysis (Phase 4) ---------------------------------
+    @server.route('/api/runs/<scan_id>/analysis')
+    def _api_runs_analysis(scan_id):
+        """Lab-side per-scan analysis: survival, loading, diag aggregate,
+        sweep description, code/grid sidecar pointers. JSON-safe.
 
-def _dash_main(host, port, data_file):
-    """Entry point for the Dash subprocess."""
+        Query params:
+          ``filter`` — JSON-encoded ``{axis_name: [allowed values]}``.
+            Limits the analysis to scan points whose swept-param value
+            matches one of the allowed values for each constrained
+            axis. Cards downstream of the filter card (sweep / per-site
+            / per-iteration) re-render with the filtered subset.
+
+        Errors:
+          400 — scan_id not a 14-digit string, or filter not valid JSON
+          404 — scan_dir not found under DATA_DIR
+          500 — analysis failed (logicals unpacking, h5 corruption, ...)
+        """
+        from yb_analysis.analysis.run_analysis import (
+            analyze_scan, RunAnalysisError)
+        filters = None
+        raw_filter = request.args.get('filter')
+        if raw_filter:
+            try:
+                filters = json.loads(raw_filter)
+                if not isinstance(filters, dict):
+                    raise ValueError('filter must be a JSON object')
+            except (ValueError, json.JSONDecodeError) as ex:
+                return jsonify({'error': f'invalid filter: {ex}'}), 400
+        try:
+            result = analyze_scan(scan_id, filters=filters)
+        except RunAnalysisError as ex:
+            msg = str(ex).lower()
+            if 'must be 14 digits' in msg or 'must pass scan_id' in msg:
+                return jsonify({'error': str(ex)}), 400
+            if 'could not find' in msg or 'not a directory' in msg:
+                return jsonify({'error': str(ex)}), 404
+            return jsonify({'error': str(ex)}), 500
+        except Exception as ex:
+            logging.exception('analyze_scan(%s) failed', scan_id)
+            return jsonify({'error': str(ex)}), 500
+        return jsonify(result)
+
+    @server.route('/api/runs/<scan_id>/grid')
+    def _api_runs_grid(scan_id):
+        """Per-run grid sidecar (Phase 4).
+
+        Sidecar-first: returns `<scan_dir>/slm_grid.json` if Phase 2/4
+        sync persisted it. Otherwise passes through to the SLM PC's
+        `/slm/runs/<scan_id>/grid_sidecar`. Returns 404 if neither.
+        """
+        return _runs_grid_response(scan_id)
+
+    # ---- Programmatic scan submission (Phase 3) ------------------------
+    # These accept POST so a one-shot curl works; flask's url_map will
+    # complain on GET, which is the right error for "this is an action,
+    # not a fetch".
+    from flask import request
+
+    @server.route('/api/queue/submit', methods=['POST'])
+    def _api_queue_submit():
+        """Submit a scan descriptor. Body: JSON conforming to
+        `yb_analysis/scans/descriptor.schema.json`. Returns
+        `{descriptor_id: N, kind: 'descriptor'}` on success, or
+        `{error: ...}` with 400/503."""
+        try:
+            payload = request.get_json(force=True, silent=False) or {}
+        except Exception as ex:
+            return jsonify({'error': f'invalid JSON body: {ex}'}), 400
+        try:
+            from yb_analysis.scans.client import submit_scan
+            from yb_analysis.scans.descriptor import DescriptorError
+        except Exception as ex:
+            return jsonify({'error': f'scans package import failed: {ex}'}), 500
+        try:
+            did = submit_scan(
+                seq=payload.get('seq'),
+                params=payload.get('params'),
+                runp=payload.get('runp'),
+                opts=payload.get('opts'),
+                label=payload.get('label', ''))
+        except DescriptorError as ex:
+            return jsonify({'error': f'descriptor invalid: {ex}'}), 400
+        except TimeoutError as ex:
+            return jsonify({'error': f'runner unreachable: {ex}'}), 503
+        except Exception as ex:
+            return jsonify({'error': f'submit failed: {ex}'}), 500
+        return jsonify({'descriptor_id': int(did), 'kind': 'descriptor'})
+
+    @server.route('/api/queue/cancel/<int:entry_id>', methods=['POST'])
+    def _api_queue_cancel(entry_id):
+        """Cancel a queued job or descriptor by id (auto-detects kind)."""
+        try:
+            from yb_analysis.scans.client import cancel
+            ok = cancel(int(entry_id))
+        except TimeoutError as ex:
+            return jsonify({'error': f'runner unreachable: {ex}'}), 503
+        except Exception as ex:
+            return jsonify({'error': f'cancel failed: {ex}'}), 500
+        if ok:
+            return jsonify({'ok': True, 'id': int(entry_id)})
+        return jsonify({'ok': False, 'id': int(entry_id),
+                        'error': 'not found or already running'}), 404
+
+    @server.route('/api/queue/move/<int:entry_id>/<direction>',
+                  methods=['POST'])
+    def _api_queue_move(entry_id, direction):
+        """Move a queued entry up or down (within its own kind)."""
+        if direction not in ('up', 'down'):
+            return jsonify({'error': "direction must be 'up' or 'down'"}), 400
+        try:
+            from yb_analysis.scans.client import move
+            ok = move(int(entry_id), direction)
+        except TimeoutError as ex:
+            return jsonify({'error': f'runner unreachable: {ex}'}), 503
+        except Exception as ex:
+            return jsonify({'error': f'move failed: {ex}'}), 500
+        if ok:
+            return jsonify({'ok': True, 'id': int(entry_id),
+                            'direction': direction})
+        return jsonify({'ok': False, 'id': int(entry_id),
+                        'error': 'cannot move (at edge or unknown id)'}), 400
+
+    # ---- Phase 4: runs list / groups / seqs ---------------------------
+    @server.route('/api/runs/list')
+    def _api_runs_list():
+        from yb_analysis.analysis.runs_list import list_runs
+        try:
+            since_days = request.args.get('since_days', type=int)
+            max_count  = request.args.get('max', type=int, default=500)
+            with_meta  = request.args.get('with_meta', '1') != '0'
+            rows = list_runs(since_days=since_days, max_count=max_count,
+                             with_meta=with_meta)
+            return jsonify({'runs': rows, 'count': len(rows)})
+        except Exception as ex:
+            logger.exception('runs_list failed')
+            return jsonify({'error': str(ex), 'runs': []}), 500
+
+    @server.route('/api/runs/groups', methods=['GET', 'POST'])
+    def _api_runs_groups():
+        from yb_analysis.analysis import run_groups
+        if request.method == 'POST':
+            try:
+                body = request.get_json(force=True, silent=True) or {}
+                name = body.get('name') or ''
+                gid = run_groups.create_group(name)
+                g = run_groups.get_group(gid)
+                return jsonify({'group_id': gid, 'group': g})
+            except ValueError as ex:
+                return jsonify({'error': str(ex)}), 400
+            except Exception as ex:
+                logger.exception('create_group failed')
+                return jsonify({'error': str(ex)}), 500
+        # GET
+        return jsonify({'groups': run_groups.list_groups()})
+
+    @server.route('/api/runs/groups/<group_id>', methods=['GET', 'DELETE'])
+    def _api_runs_group(group_id):
+        from yb_analysis.analysis import run_groups
+        if request.method == 'DELETE':
+            ok = run_groups.delete_group(group_id)
+            return jsonify({'ok': ok, 'group_id': group_id}), (200 if ok else 404)
+        g = run_groups.get_group(group_id)
+        if g is None:
+            return jsonify({'error': 'group not found'}), 404
+        return jsonify(g)
+
+    @server.route('/api/runs/groups/<group_id>/add/<scan_id>',
+                  methods=['POST'])
+    def _api_runs_group_add(group_id, scan_id):
+        from yb_analysis.analysis import run_groups
+        ok = run_groups.add_member(group_id, scan_id)
+        return jsonify({'ok': ok, 'group_id': group_id, 'scan_id': scan_id}), \
+            (200 if ok else 404)
+
+    @server.route('/api/runs/groups/<group_id>/remove/<scan_id>',
+                  methods=['POST'])
+    def _api_runs_group_remove(group_id, scan_id):
+        from yb_analysis.analysis import run_groups
+        ok = run_groups.remove_member(group_id, scan_id)
+        return jsonify({'ok': ok, 'group_id': group_id, 'scan_id': scan_id}), \
+            (200 if ok else 404)
+
+    @server.route('/api/runs/groups/<group_id>/analysis')
+    def _api_runs_group_analysis(group_id):
+        """Aggregate analysis across every member scan of a group.
+        Returns the same shape as /api/runs/<id>/analysis, with the
+        per-param survival / loading curves averaged across the
+        members (un-weighted mean; future Phase: weighted by n_shots)."""
+        from yb_analysis.analysis import run_groups
+        from yb_analysis.analysis.run_analysis import analyze_scan, RunAnalysisError
+        g = run_groups.get_group(group_id)
+        if g is None:
+            return jsonify({'error': 'group not found'}), 404
+        members = g.get('members') or []
+        if not members:
+            return jsonify({'error': 'group is empty', 'group_id': group_id}), 400
+        results = []
+        errors = []
+        for m in members:
+            try:
+                results.append(analyze_scan(m['scan_id']))
+            except RunAnalysisError as ex:
+                errors.append({'scan_id': m['scan_id'], 'error': str(ex)})
+            except Exception as ex:
+                errors.append({'scan_id': m['scan_id'], 'error': str(ex)})
+        if not results:
+            return jsonify({
+                'error': 'no member scan analyzed successfully',
+                'errors': errors,
+            }), 500
+        return jsonify(_aggregate_group_analysis(results, group=g, errors=errors))
+
+    # ---- Phase 4: seq catalog -----------------------------------------
+    @server.route('/api/seqs/list')
+    def _api_seqs_list():
+        from yb_analysis.scans.seq_catalog import list_seqs, cache_version
+        return jsonify({
+            'seqs': list_seqs(summary=True),
+            'cache_version': cache_version(),
+        })
+
+    @server.route('/api/seqs/<name>')
+    def _api_seqs_get(name):
+        from yb_analysis.scans.seq_catalog import get_seq
+        entry = get_seq(name)
+        if entry is None:
+            return jsonify({'error': f'seq {name} not found'}), 404
+        return jsonify(entry)
+
+    @server.route('/api/seqs/refresh', methods=['POST'])
+    def _api_seqs_refresh():
+        from yb_analysis.scans.seq_catalog import invalidate_cache, cache_version
+        invalidate_cache()
+        return jsonify({'ok': True, 'cache_version': cache_version()})
+
+    # ---- Phase 4: extra SLM proxies ----------------------------------
+    @server.route('/api/slm/clients')
+    def _api_slm_clients():
+        return _slm_passthrough('/clients', cache_key='clients',
+                                slow_poll=True)
+
+    @server.route('/api/slm/logs')
+    def _api_slm_logs():
+        # SLM PC exposes /logs (not /logs/tail). Pass through `lines` arg.
+        n = request.args.get('lines', '200')
+        return _slm_passthrough(f'/logs?lines={n}', cache_key='logs',
+                                slow_poll=True)
+
+    @server.route('/api/slm/server_info')
+    def _api_slm_server_info():
+        return _slm_passthrough('/server_info', cache_key='server_info',
+                                slow_poll=True)
+
+    @server.route('/api/slm/gpu')
+    def _api_slm_gpu():
+        return _slm_passthrough('/gpu/info', cache_key='gpu', slow_poll=True)
+
+    # ---- Phase 4b: live image as data URI for the new HTML dashboard ----
+    # The /api/snapshot path strips _img_data_uri (it's heavy ~MB); the
+    # HTML dashboard wants the PNG to render as an <img>. These endpoints
+    # surface the cached data URI from yb_dash_data.pkl directly.
+
+    @server.route('/api/live/image1')
+    def _api_live_image1():
+        return _live_image_response('_img_data_uri', '_img_shape',
+                                    '_img_vlo', '_img_vhi')
+
+    @server.route('/api/live/image2')
+    def _api_live_image2():
+        return _live_image_response('_img2_data_uri', '_img2_shape',
+                                    '_img2_vlo', '_img2_vhi')
+
+    @server.route('/api/live/image_mid')
+    def _api_live_image_mid():
+        return _live_image_response('_img_mid_data_uri', '_img_mid_shape',
+                                    '_img_mid_vlo', '_img_mid_vhi')
+
+    @server.route('/api/live/figures')
+    def _api_live_figures():
+        """Return ONE or ALL live-tab Plotly figures as JSON.
+
+        Calls the same ``_fig_*`` functions Dash uses. plotly.py 6.x's
+        ``to_plotly_json()`` emits typed-array blobs (``{bdata, dtype}``)
+        instead of plain arrays — we decode them HERE to plain lists +
+        nulls so the wire format works with any Plotly.js version. JSON
+        encoded via ``PlotlyJSONEncoder`` so any leftover numpy / NaN
+        / data URIs get the same treatment Dash gives them internally.
+        """
+        from flask import Response, jsonify
+        import plotly.utils as _putils
+        d = _read_data() or {}
+        which = request.args.get('which', '').lower()
+        try:
+            marker_size = int(request.args.get('marker_size', 12))
+        except ValueError:
+            marker_size = 12
+        cbar_scale = request.args.get('cbar_scale', '01')
+
+        # Site-resolved histogram: ?which=site&site=N (1-indexed).
+        try:
+            site_idx = int(request.args.get('site', '1')) - 1
+            if site_idx < 0:
+                site_idx = 0
+        except ValueError:
+            site_idx = 0
+
+        def _fig_for(name):
+            try:
+                if name == 'array':
+                    return _fig_array(d)
+                if name == 'array_mid':
+                    return _fig_array(d, img_key='_img_mid_data_uri',
+                                      shape_key='_img_mid_shape',
+                                      vlo_key='_img_mid_vlo',
+                                      vhi_key='_img_mid_vhi',
+                                      logicals_key='logicals_mid',
+                                      grid_key='grid_locations',
+                                      title='Tweezer Array (middle)')
+                if name == 'array2':
+                    return _fig_array(d, img_key='_img2_data_uri',
+                                      shape_key='_img2_shape',
+                                      vlo_key='_img2_vlo', vhi_key='_img2_vhi',
+                                      logicals_key=('logicals2'
+                                          if d.get('is_two_array') else 'logicals'),
+                                      grid_key=('grid_locations_img2'
+                                          if d.get('is_two_array') else 'grid_locations'),
+                                      title='Tweezer Array (img 2)')
+                if name == 'intens':   return _fig_intens(d)
+                if name == 'loadlive': return _fig_loading_live(d)
+                if name == 'load':     return _fig_loading(d, marker_size=marker_size)
+                if name == 'infid':    return _fig_infid(d, marker_size=marker_size)
+                if name == 'shift':    return _fig_shift(d)
+                if name == 'scan':     return _fig_scan_curve(d, cbar_scale=cbar_scale)
+                if name == 'avghist':  return _fig_avghist(d)
+                if name in ('rep0', 'rep1', 'rep2', 'rep3'):
+                    figs = _figs_reps(d)
+                    idx = int(name[3])
+                    return figs[idx] if idx < len(figs) else _waiting('Site Hist')
+                if name == 'site':
+                    fig, _info = _fig_site(d, site_idx)
+                    return fig
+            except Exception as ex:
+                logger.exception('_fig_for %s failed', name)
+                return _waiting(name, message=f'render error: {ex}')
+            return None
+
+        def _figdict(fig):
+            if fig is None:
+                return None
+            try:
+                raw = fig.to_plotly_json()
+            except Exception:
+                raw = {'data': list(getattr(fig, 'data', [])),
+                       'layout': getattr(fig, 'layout', {})}
+            return _decode_plotly_bdata(raw)
+
+        if which:
+            fig = _fig_for(which)
+            if fig is None:
+                return jsonify({'error': f'unknown figure name: {which}'}), 400
+            body = json.dumps(_figdict(fig), cls=_putils.PlotlyJSONEncoder,
+                              allow_nan=False, default=str)
+            return Response(body, mimetype='application/json')
+
+        names = ['array', 'array_mid', 'array2', 'intens', 'loadlive',
+                 'load', 'infid', 'shift', 'scan', 'avghist',
+                 'rep0', 'rep1', 'rep2', 'rep3']
+        out = {n: _figdict(_fig_for(n)) for n in names}
+        body = json.dumps({'figures': out}, cls=_putils.PlotlyJSONEncoder,
+                          allow_nan=False, default=str)
+        return Response(body, mimetype='application/json')
+
+
+def _aggregate_group_analysis(results, *, group, errors):
+    """Combine a list of per-scan analysis dicts into a single dict.
+
+    Strategy: take the param-axis-aligned average of survival_mean and
+    loading_rate, propagating Bessel-corrected SEM. Falls back to the
+    longest individual scan's sweep description when member sweeps
+    don't match (more sophisticated joining could be added in
+    Phase 5).
+    """
+    import math
+    # Find the largest n_params across members and use that scan as the
+    # sweep reference.
+    primary = max(results, key=lambda r: r.get('n_params', 0) or 0)
+    n_params = primary.get('n_params', 0) or 0
+
+    def _stack(field):
+        rows = []
+        for r in results:
+            vs = (r.get('summary') or {}).get(field) or []
+            if len(vs) == n_params and any(v is not None for v in vs):
+                rows.append(vs)
+        return rows
+
+    def _mean(rows):
+        if not rows:
+            return [None] * n_params
+        out = []
+        for j in range(n_params):
+            xs = [row[j] for row in rows if row[j] is not None]
+            out.append(sum(xs) / len(xs) if xs else None)
+        return out
+
+    def _sem(rows):
+        if not rows:
+            return [None] * n_params
+        out = []
+        for j in range(n_params):
+            xs = [row[j] for row in rows if row[j] is not None]
+            if len(xs) < 2:
+                out.append(None)
+                continue
+            m = sum(xs) / len(xs)
+            v = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+            out.append(math.sqrt(v / len(xs)))
+        return out
+
+    surv_rows = _stack('survival_mean')
+    load_rows = _stack('loading_rate')
+    aggregated = {
+        'scan_id': f'group:{group.get("id", "")}',
+        'scan_dir': None,
+        'scan_name': group.get('name'),
+        'scan_filename': None,
+        'n_params': n_params,
+        'n_shots': sum((r.get('n_shots') or 0) for r in results),
+        'sweep': primary.get('sweep'),
+        'summary': {
+            'survival_mean':     _mean(surv_rows),
+            'survival_sem':      _sem(surv_rows),
+            'loading_rate':      _mean(load_rows),
+            'loading_rate_sem':  _sem(load_rows),
+            'loss_mean':         [None] * n_params,
+            'loss_sem':          [None] * n_params,
+        },
+        'per_site': None,
+        'diag_aggregate': None,
+        'code': {'present': False, 'n_files': 0},
+        'grid': {'present': False, 'n_sites': 0},
+        'round1': None,
+        'survival_vs_distance': None,
+        'survival_vs_distance_per_step': None,
+        'per_shot_extra': None,
+        # Group metadata: useful to the dashboard.
+        'group': {
+            'id': group.get('id'),
+            'name': group.get('name'),
+            'n_members': len(group.get('members') or []),
+            'analyzed_members': [r.get('scan_id') for r in results],
+            'failed_members': errors,
+        },
+    }
+    return aggregated
+
+
+def _decode_plotly_bdata(obj):
+    """Recursively replace Plotly's binary-encoded array blobs with plain lists.
+
+    Plotly.py 6.x emits typed arrays as ``{"bdata": "<b64>", "dtype": "<np>"}``
+    inside the figure JSON for compactness. Plotly.js < 2.35 doesn't know
+    how to decode those (the result renders as a blank plot). To stay
+    compatible with older Plotly.js, walk the dict/list tree and inflate
+    each bdata blob back to a Python list before jsonifying.
+    """
+    import base64
+    if isinstance(obj, dict):
+        # bdata-encoded array: {"bdata": "...", "dtype": "..."} (sometimes
+        # with an optional "shape" key for multi-dim arrays).
+        if 'bdata' in obj and 'dtype' in obj:
+            try:
+                buf = base64.b64decode(obj['bdata'])
+                arr = np.frombuffer(buf, dtype=obj['dtype'])
+                shape = obj.get('shape')
+                if shape:
+                    # Plotly emits shape as a string like "3,4" sometimes.
+                    if isinstance(shape, str):
+                        shape = [int(x) for x in shape.split(',') if x]
+                    arr = arr.reshape(shape)
+                # NaN/Inf are not JSON-valid; coerce to None.
+                if arr.dtype.kind == 'f':
+                    arr = np.where(np.isfinite(arr), arr, None).tolist()
+                else:
+                    arr = arr.tolist()
+                return arr
+            except Exception:
+                return obj
+        return {k: _decode_plotly_bdata(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_plotly_bdata(v) for v in obj]
+    return obj
+
+
+def _live_image_response(uri_key, shape_key, vlo_key, vhi_key):
+    """Serve a cached PNG image from yb_dash_data.pkl.
+
+    Decodes the data URI back to raw PNG bytes and returns them with
+    ``Content-Type: image/png`` so the dashboard can just
+    ``<img src=...>`` against this endpoint -- no JSON parsing, no
+    multi-megabyte base64 on every poll.
+
+    Set ``?json=1`` for the legacy ``{data_uri, shape, vlo, vhi}`` JSON
+    shape (still used by any caller that wants the percentile clip).
+    """
+    from flask import jsonify, Response, request
+    import base64
+    d = _read_data() or {}
+    uri = d.get(uri_key)
+    if uri is None:
+        return jsonify({'error': 'no image yet'}), 404
+    if request.args.get('json'):
+        shape = d.get(shape_key)
+        if shape is not None:
+            try:
+                shape = list(shape)
+            except Exception:
+                shape = None
+        return jsonify({
+            'data_uri': uri,
+            'shape':    shape,
+            'vlo':      d.get(vlo_key),
+            'vhi':      d.get(vhi_key),
+        })
+    # Strip "data:image/png;base64," prefix and decode to raw PNG.
+    if uri.startswith('data:image/png;base64,'):
+        png = base64.b64decode(uri[len('data:image/png;base64,'):])
+    else:
+        return jsonify({'error': 'unexpected data URI format'}), 500
+    return Response(png, mimetype='image/png', headers={
+        # No browser caching -- the URL doesn't change but the bytes do.
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+    })
+
+
+def _slm_passthrough(slm_path, *, cache_key=None, slow_poll=False):
+    """Generic SLM passthrough used by Phase 4 extra proxies.
+
+    Hits the SLM PC via the existing SlmSyncClient (Tailscale, retry on
+    503, etc.). Returns JSON verbatim, or `{error:...}` with 503/404.
+    slow_poll: hint for the dashboard JS not to spam this endpoint.
+    """
+    from flask import jsonify
+    from yb_analysis.slm_sync import SlmSyncClient
+    try:
+        client = SlmSyncClient()
+        # Use the private session/get pattern -- the typed accessors
+        # don't cover every SLM path. The slow_poll flag is a doc hint;
+        # we don't cache server-side (the SLM caches its own state).
+        r = client._get(slm_path)   # pylint: disable=protected-access
+        if r.status_code == 404:
+            return jsonify({'error': f'SLM endpoint {slm_path} not found'}), 404
+        if r.status_code == 503:
+            return jsonify({'error': 'SLM server busy', 'slm_path': slm_path}), 503
+        r.raise_for_status()
+        try:
+            return jsonify(r.json())
+        except ValueError:
+            # Non-JSON response (logs/tail may stream plain text). Wrap.
+            return jsonify({'text': r.text})
+    except Exception as ex:
+        logger.warning('slm_passthrough %s failed: %s', slm_path, ex)
+        return jsonify({'error': str(ex), 'slm_path': slm_path}), 503
+
+
+# ===========================================================================
+# Phase 4 main HTML dashboard (served at /)
+# ===========================================================================
+
+def _register_main_html_routes(server):
+    """Mount the new SLM-styled HTML dashboard at / (and serve its
+    static assets). The old Dash app lives at /old/ via
+    `url_base_pathname='/old/'`."""
+    from flask import send_from_directory, send_file
+    import os as _os
+    import time as _time
+
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    static_dir = _os.path.join(here, 'static')
+    templates_dir = _os.path.join(here, 'templates')
+
+    # Locate the bundled plotly.min.js (ships with plotly-python). Serving
+    # locally avoids the silent-bail when a CDN is blocked by lab network
+    # policy or unreachable -- in that case pollLiveFigures() returns at
+    # `if (!window.Plotly) return;` and every live-tab div stays empty
+    # (renders as the card's dark background -> "completely black").
+    try:
+        import plotly as _plotly
+        _plotly_js_path = _os.path.join(
+            _os.path.dirname(_plotly.__file__),
+            'package_data', 'plotly.min.js')
+        if not _os.path.exists(_plotly_js_path):
+            _plotly_js_path = None
+    except Exception:
+        _plotly_js_path = None
+
+    @server.route('/static/dashboard/<path:fname>')
+    def _serve_main_static(fname):
+        return send_from_directory(static_dir, fname)
+
+    @server.route('/vendor/plotly.min.js')
+    def _serve_plotly_js():
+        if _plotly_js_path is None:
+            return ('plotly.js bundle not found', 500)
+        return send_file(_plotly_js_path, mimetype='application/javascript')
+
+    @server.route('/')
+    def _serve_main_html():
+        # Use Flask's render_template from the templates/ dir we ship.
+        # Lazy import jinja so the test fixture doesn't pull it before
+        # the route is hit.
+        from jinja2 import Environment, FileSystemLoader, select_autoescape
+        from yb_analysis import config as yb_cfg
+        env = Environment(
+            loader=FileSystemLoader(templates_dir),
+            autoescape=select_autoescape(['html']),
+        )
+        tmpl = env.get_template('main.html')
+        # Cache-bust static URLs with a per-process timestamp so a
+        # browser that's been holding the dashboard tab open while we
+        # iterate doesn't end up running stale dashboard.js / dashboard.css.
+        return tmpl.render(
+            static_url='/static/dashboard/',
+            slm_url=yb_cfg.SLM_URL,
+            cache_bust=str(int(_time.time())),
+            plotly_local_url='/vendor/plotly.min.js',
+        )
+
+
+def _dash_main(host, port, data_file, parent_pid=None):
+    """Entry point for the Dash subprocess.
+
+    parent_pid: if provided, the child spawns a watchdog thread that
+    polls the parent's liveness every 3 s. When the parent disappears
+    (Ctrl+C with no atexit, terminal close, taskkill, segfault, ...),
+    the watchdog calls ``os._exit(0)`` to release port 8050 immediately
+    instead of becoming a zombie that the operator has to hand-kill.
+    """
     # Reconfigure logging for child process
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [dash] %(levelname)s: %(message)s',
         datefmt='%H:%M:%S',
     )
+    if parent_pid is not None:
+        _start_parent_watchdog(parent_pid)
     app = _build_app()
     app.run(host=host, port=port, debug=False, use_reloader=False)
+
+
+# ---------------------------------------------------------------------------
+# Parent watchdog (subprocess-side)
+# ---------------------------------------------------------------------------
+
+def _is_pid_alive(pid):
+    """Cross-platform: return True iff a process with `pid` exists.
+
+    Tries psutil first (if installed); falls back to OpenProcess /
+    GetExitCodeProcess on Windows and signal 0 elsewhere. Conservatively
+    returns True on errors so a transient permission glitch doesn't
+    cause us to wrongly self-terminate.
+    """
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    try:
+        if os.name == 'nt':
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                     False, int(pid))
+            if not h:
+                # OpenProcess returns NULL when the PID is gone OR when
+                # we lack permission. ERROR_INVALID_PARAMETER (87) is
+                # the "no such process" code; everything else is treated
+                # as alive-but-not-queryable.
+                last = ctypes.get_last_error()
+                return last != 87
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+                return bool(ok) and exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(h)
+        else:
+            os.kill(int(pid), 0)
+            return True
+    except (OSError, PermissionError):
+        # PermissionError on POSIX = pid exists but we can't signal it;
+        # ProcessLookupError (OSError ESRCH) = gone. Conservatively
+        # treat both as "alive" so we don't false-positive-exit.
+        return True
+    except Exception:
+        return True
+
+
+def _start_parent_watchdog(parent_pid, poll_interval_s=3.0):
+    """Daemon thread that calls os._exit(0) when the parent dies."""
+    import threading
+
+    def _loop():
+        while True:
+            time.sleep(poll_interval_s)
+            if not _is_pid_alive(parent_pid):
+                # Parent gone -- die immediately. os._exit (not sys.exit)
+                # bypasses Python finalisation so we release port 8050
+                # without the slow Flask/Werkzeug teardown that can
+                # itself hang during shutdown.
+                try:
+                    logger.warning(
+                        'parent pid %d gone — dashboard exiting', parent_pid)
+                except Exception:
+                    pass
+                os._exit(0)
+
+    t = threading.Thread(target=_loop, name='dash-parent-watchdog',
+                         daemon=True)
+    t.start()
+    return t
 
 
 # ---- Partial-update (Patch) machinery --------------------------------------
@@ -848,12 +1614,18 @@ def _gated(pid, sig, builder, force_full):
 
 
 def _build_app():
-    app = Dash(__name__, title='Yb Tweezer Dashboard')
+    # Phase 4 routing: mount Dash at /old/ so the new SLM-styled HTML
+    # dashboard can take /. The url_base_pathname must end in /.
+    app = Dash(__name__, title='Yb Tweezer Dashboard (old live page)',
+               url_base_pathname='/old/')
 
     # ---- Read-only JSON endpoints (piggyback on Dash's Flask server) ----
     # Lets external clients (e.g. the SLM server) poll experiment state over
     # the LAN. All GET, no writes. Bound to the same port as the dashboard.
     _register_api_routes(app.server)
+
+    # ---- New SLM-styled HTML dashboard at / (Phase 4) -----------------
+    _register_main_html_routes(app.server)
 
     # Force crisp pixel rendering on zoomed images. Plotly recreates SVG
     # elements on each update, so CSS alone doesn't stick. A MutationObserver
@@ -925,10 +1697,21 @@ new MutationObserver(function(mutations) {
 }).observe(document.body, {childList: true, subtree: true});
 </script></body></html>'''
 
-    app.layout = html.Div(style={'backgroundColor': BG, 'minHeight': '100vh',
-        'fontFamily': '"Segoe UI", sans-serif', 'color': TEXT, 'padding': '10px'}, children=[
-        html.H1('Yb Tweezer Dashboard', style={'textAlign': 'center', 'color': '#e94560',
-            'margin': '5px 0 10px 0', 'fontSize': '24px'}),
+    # Phase 4 layout: 4 named tabs sharing the existing callback machinery.
+    # Every callback-bound ID stays in the DOM (Dash dcc.Tabs renders all
+    # children and uses display:none to hide inactive ones), so refresh()
+    # and the SLM / queue callbacks fire on every tick regardless of which
+    # tab is visible. Anchor URLs come from dcc.Location: /#live, /#slm,
+    # /#analysis, /#queue.
+    _tab_style = {'backgroundColor': PANEL, 'color': TEXT,
+                  'border': 'none', 'padding': '8px 18px',
+                  'fontFamily': '"Segoe UI", sans-serif'}
+    _tab_selected = {'backgroundColor': '#1c1c2e', 'color': '#e94560',
+                     'border': 'none', 'padding': '8px 18px',
+                     'borderBottom': '2px solid #e94560',
+                     'fontWeight': '600'}
+
+    _live_children = [
         # Row 1: image1 | middle | image2 | scan curve — up to four
         # equal-width 670px panels (per-shot live data: gets the most
         # vertical real estate). The middle-frame panel is wrapped in a
@@ -1026,22 +1809,157 @@ new MutationObserver(function(mutations) {
             ]),
             _graph('shift', 600),
         ]),
-        # Row 5: SLM hardware (filled by the slm callback below). Phase 0 lands
-        # these as a row; Phase 4 moves them into a dedicated tab.
+    ]   # end of _live_children
+
+    _slm_children = [
         html.Div(id='slm-panel', style={
             'backgroundColor': PANEL, 'padding': '10px 14px',
-            'marginTop': '10px', 'borderRadius': '4px',
+            'marginTop': '6px', 'borderRadius': '4px',
             'fontFamily': '"Segoe UI", sans-serif', 'fontSize': '12px',
             'color': TEXT}),
-        # Row 6: Scan queue (filled by the queue callback below)
+    ]
+
+    # Analysis tab (Phase 4): scan picker + lab-side run_analysis output +
+    # protocol source viewer. All driven by callbacks below.
+    _analysis_children = [
+        html.Div(style={'display': 'flex', 'gap': '12px', 'marginTop': '6px',
+                        'alignItems': 'flex-end', 'flexWrap': 'wrap'},
+                 children=[
+            html.Div(style={'flex': '1', 'minWidth': '320px'}, children=[
+                html.Label('Scan ID (YYYYMMDDHHMMSS):',
+                           style={'fontSize': '11px', 'color': '#aaa'}),
+                dcc.Input(id='analysis-scan-id', type='text',
+                          placeholder='e.g. 20260529025015',
+                          debounce=True,
+                          style={'width': '100%',
+                                 'backgroundColor': '#1a1a2e',
+                                 'color': TEXT,
+                                 'border': '1px solid #2b2b4a',
+                                 'borderRadius': '3px',
+                                 'padding': '6px 8px',
+                                 'fontFamily': 'monospace'}),
+            ]),
+            html.Button('Load', id='analysis-load-btn', n_clicks=0,
+                        style={'backgroundColor': '#2a7fff', 'color': '#fff',
+                               'border': 'none', 'borderRadius': '3px',
+                               'padding': '7px 18px', 'cursor': 'pointer',
+                               'fontWeight': '600'}),
+            html.Div(id='analysis-status', style={
+                'fontSize': '11px', 'color': '#888', 'flex': '1',
+                'minWidth': '200px'}),
+        ]),
+        # Three side-by-side panels: summary text, survival curve,
+        # loading-rate curve. Heights kept generous so survival fits read.
+        html.Div(style={'display': 'flex', 'gap': '10px',
+                        'marginTop': '10px'}, children=[
+            html.Div(style={'flex': '1', 'minWidth': '0',
+                            'backgroundColor': PANEL,
+                            'padding': '10px 14px',
+                            'borderRadius': '4px'}, children=[
+                html.Div('Summary', style={'fontWeight': '600',
+                                            'marginBottom': '6px',
+                                            'color': '#e94560'}),
+                html.Pre(id='analysis-summary', style={
+                    'fontSize': '12px', 'color': TEXT,
+                    'whiteSpace': 'pre-wrap', 'lineHeight': '1.5',
+                    'margin': '0'}),
+            ]),
+            html.Div(style={'flex': '2', 'minWidth': '0'}, children=[
+                dcc.Graph(id='analysis-survival',
+                          figure=_waiting(''),
+                          style={'height': '380px'},
+                          config={'displayModeBar': False}),
+            ]),
+            html.Div(style={'flex': '2', 'minWidth': '0'}, children=[
+                dcc.Graph(id='analysis-loading',
+                          figure=_waiting(''),
+                          style={'height': '380px'},
+                          config={'displayModeBar': False}),
+            ]),
+        ]),
+        # Protocol source viewer (lazy-fetched via slm_sync.ondemand).
+        html.Details([
+            html.Summary('Protocol source (rearrange_protocols.py at scan time)',
+                         style={'cursor': 'pointer', 'color': '#aaa',
+                                'fontSize': '12px', 'padding': '8px 0'}),
+            html.Pre(id='analysis-protocol-src', style={
+                'fontSize': '11px', 'color': '#ccc',
+                'backgroundColor': '#101020', 'padding': '10px 14px',
+                'borderRadius': '4px', 'maxHeight': '500px',
+                'overflow': 'auto', 'whiteSpace': 'pre',
+                'fontFamily': 'Consolas, "Courier New", monospace'}),
+        ], style={'marginTop': '14px'}),
+    ]
+
+    # Queue tab (Phase 4): existing queue-panel + Submit-Scan form.
+    _queue_children = [
         html.Div(id='queue-panel', style={
             'backgroundColor': PANEL, 'padding': '10px 14px',
-            'marginTop': '10px', 'borderRadius': '4px',
+            'marginTop': '6px', 'borderRadius': '4px',
             'fontFamily': '"Segoe UI", sans-serif', 'fontSize': '12px',
             'color': TEXT}),
+        html.Div(style={'backgroundColor': PANEL,
+                        'padding': '12px 14px', 'marginTop': '12px',
+                        'borderRadius': '4px'}, children=[
+            html.Div('Submit Scan (Phase 3 descriptor)', style={
+                'fontWeight': '600', 'color': '#e94560',
+                'marginBottom': '8px'}),
+            html.Div(style={'fontSize': '11px', 'color': '#888',
+                            'marginBottom': '8px'},
+                children=['Paste a JSON descriptor conforming to ',
+                          html.Code('yb_analysis/scans/descriptor.schema.json',
+                                    style={'fontSize': '11px',
+                                           'backgroundColor': '#1a1a2e',
+                                           'padding': '1px 5px'}),
+                          ' — see /api/endpoints for the route.']),
+            dcc.Textarea(id='submit-scan-json',
+                         placeholder='{\n  "seq": "CoolingSeq",\n  '
+                                     '"params": {"Cooling.Detuning": '
+                                     '{"scan": 1, "linspace": [20e6, 30e6, 11]}},\n  '
+                                     '"runp": {"NumPerGroup": 4000, "Scramble": true}\n}',
+                         style={'width': '100%', 'minHeight': '180px',
+                                'backgroundColor': '#101020', 'color': TEXT,
+                                'border': '1px solid #2b2b4a',
+                                'borderRadius': '3px', 'padding': '10px',
+                                'fontFamily': 'Consolas, "Courier New", monospace',
+                                'fontSize': '12px'}),
+            html.Div(style={'marginTop': '8px', 'display': 'flex',
+                            'gap': '10px', 'alignItems': 'center'}, children=[
+                html.Button('Submit', id='submit-scan-btn', n_clicks=0,
+                            style={'backgroundColor': '#2a7fff',
+                                   'color': '#fff', 'border': 'none',
+                                   'borderRadius': '3px',
+                                   'padding': '7px 18px', 'cursor': 'pointer',
+                                   'fontWeight': '600'}),
+                html.Div(id='submit-scan-result', style={
+                    'fontSize': '11px', 'color': '#888', 'flex': '1'}),
+            ]),
+        ]),
+    ]
+
+    app.layout = html.Div(style={'backgroundColor': BG, 'minHeight': '100vh',
+        'fontFamily': '"Segoe UI", sans-serif', 'color': TEXT,
+        'padding': '10px'}, children=[
+        # Drive tab selection from #fragment so /#live, /#slm, /#analysis,
+        # /#queue are bookmarkable.
+        dcc.Location(id='tab-url', refresh=False),
+        html.H1('Yb Tweezer Dashboard', style={'textAlign': 'center',
+            'color': '#e94560', 'margin': '5px 0 10px 0', 'fontSize': '24px'}),
+        dcc.Tabs(id='main-tabs', value='live', persistence=True,
+                 persistence_type='session', children=[
+            dcc.Tab(label='Live', value='live', style=_tab_style,
+                    selected_style=_tab_selected, children=_live_children),
+            dcc.Tab(label='SLM hardware', value='slm', style=_tab_style,
+                    selected_style=_tab_selected, children=_slm_children),
+            dcc.Tab(label='Analysis', value='analysis', style=_tab_style,
+                    selected_style=_tab_selected, children=_analysis_children),
+            dcc.Tab(label='Queue', value='queue', style=_tab_style,
+                    selected_style=_tab_selected, children=_queue_children),
+        ]),
         # Debug
         html.Details([
-            html.Summary('Debug Info', style={'cursor': 'pointer', 'color': '#888', 'fontSize': '11px'}),
+            html.Summary('Debug Info', style={'cursor': 'pointer',
+                'color': '#888', 'fontSize': '11px'}),
             html.Pre(id='debug-pre', style={'fontSize': '10px', 'color': '#aaa',
                 'maxHeight': '300px', 'overflow': 'auto', 'whiteSpace': 'pre-wrap'}),
         ], style={'marginTop': '10px'}),
@@ -1049,6 +1967,9 @@ new MutationObserver(function(mutations) {
         # Holds the downsample-toggle state; the callback's real job is the
         # side effect of writing _CONTROL_FILE for the main process to read.
         dcc.Store(id='downsample-state'),
+        # Cache the most recent analysis-result so the protocol-source
+        # callback can reference it without re-running run_analysis.
+        dcc.Store(id='analysis-result-store'),
     ])
 
     # --- Single callback for all panels ---
@@ -1257,6 +2178,137 @@ new MutationObserver(function(mutations) {
     def refresh_slm(_n):
         return _render_slm_panel(_read_slm_data())
 
+    # ===== Phase 4 callbacks =====================================
+
+    # Tab <-> URL sync: bookmark /#live, /#slm, /#analysis, /#queue.
+    @app.callback(Output('main-tabs', 'value'),
+                  Input('tab-url', 'hash'),
+                  prevent_initial_call=True)
+    def _sync_tab_from_url(h):
+        if not h:
+            return no_update
+        h = h.lstrip('#').lower()
+        return h if h in ('live', 'slm', 'analysis', 'queue') else no_update
+
+    @app.callback(Output('tab-url', 'hash'),
+                  Input('main-tabs', 'value'),
+                  prevent_initial_call=True)
+    def _sync_url_from_tab(tab_val):
+        return f'#{tab_val}' if tab_val else no_update
+
+    # Analysis tab: load button -> run analysis -> render results.
+    @app.callback(
+        [Output('analysis-summary', 'children'),
+         Output('analysis-survival', 'figure'),
+         Output('analysis-loading', 'figure'),
+         Output('analysis-status', 'children'),
+         Output('analysis-result-store', 'data')],
+        Input('analysis-load-btn', 'n_clicks'),
+        State('analysis-scan-id', 'value'),
+        prevent_initial_call=True)
+    def _run_analysis_cb(n_clicks, scan_id):
+        if not scan_id:
+            return ('Enter a scan_id and click Load.',
+                    _waiting('survival'), _waiting('loading'),
+                    'no scan_id supplied', None)
+        scan_id = str(scan_id).strip()
+        try:
+            from yb_analysis.analysis.run_analysis import (
+                analyze_scan, RunAnalysisError)
+        except Exception as ex:
+            return (f'analysis import failed: {ex}',
+                    _waiting('survival'), _waiting('loading'),
+                    'import error', None)
+        try:
+            result = analyze_scan(scan_id)
+        except RunAnalysisError as ex:
+            return (f'Could not analyze: {ex}',
+                    _waiting('survival'), _waiting('loading'),
+                    f'error: {ex}', None)
+        except Exception as ex:
+            logger.exception('analysis callback failed')
+            return (f'Unexpected error: {ex}',
+                    _waiting('survival'), _waiting('loading'),
+                    'unexpected error', None)
+        summary_txt = _format_analysis_summary(result)
+        surv_fig = _build_analysis_curve(result, 'survival_mean',
+                                         'survival_sem', 'Survival (P11)')
+        load_fig = _build_analysis_curve(result, 'loading_rate',
+                                         'loading_rate_sem',
+                                         'Loading rate')
+        status = (f'loaded scan {result.get("scan_id","")}, '
+                  f'{result.get("n_params",0)} params, '
+                  f'{result.get("n_shots",0)} shots')
+        return summary_txt, surv_fig, load_fig, status, result
+
+    # Protocol source viewer: when analysis-result-store gets a scan, fetch
+    # rearrange_protocols.py source via slm_sync.ondemand. The Details
+    # element collapses by default; the body is rendered eagerly so opening
+    # the disclosure is instant. Failures (no scan, no code snapshot, SLM
+    # offline) surface as a one-line message rather than blank.
+    @app.callback(Output('analysis-protocol-src', 'children'),
+                  Input('analysis-result-store', 'data'),
+                  prevent_initial_call=True)
+    def _fetch_protocol_source(result):
+        if not isinstance(result, dict):
+            return '(no analysis loaded)'
+        scan_id = result.get('scan_id')
+        if not scan_id:
+            return '(no scan_id)'
+        scan_dir = result.get('scan_dir')
+        try:
+            from yb_analysis.slm_sync.ondemand import get_protocol_source
+        except Exception as ex:
+            return f'(import failed: {ex})'
+        try:
+            src = get_protocol_source(scan_id, scan_dir=scan_dir)
+        except Exception as ex:
+            return f'(fetch failed: {ex})'
+        if src is None:
+            return ('(no protocol source available — either no code '
+                    'snapshot for this scan_id or the SLM PC is offline)')
+        return src
+
+    # Submit Scan form: POST descriptor JSON to /api/queue/submit.
+    @app.callback(Output('submit-scan-result', 'children'),
+                  Input('submit-scan-btn', 'n_clicks'),
+                  State('submit-scan-json', 'value'),
+                  prevent_initial_call=True)
+    def _submit_scan_cb(n_clicks, body):
+        if not body or not body.strip():
+            return html.Span('Empty descriptor.',
+                             style={'color': '#e94560'})
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as ex:
+            return html.Span(f'Invalid JSON: {ex}',
+                             style={'color': '#e94560'})
+        try:
+            from yb_analysis.scans.client import submit_scan
+            from yb_analysis.scans.descriptor import DescriptorError
+        except Exception as ex:
+            return html.Span(f'scans import failed: {ex}',
+                             style={'color': '#e94560'})
+        try:
+            did = submit_scan(
+                seq=payload.get('seq'),
+                params=payload.get('params'),
+                runp=payload.get('runp'),
+                opts=payload.get('opts'),
+                label=payload.get('label', ''))
+        except DescriptorError as ex:
+            return html.Span(f'Descriptor invalid: {ex}',
+                             style={'color': '#e94560'})
+        except TimeoutError as ex:
+            return html.Span(f'Runner unreachable: {ex}',
+                             style={'color': '#e94560'})
+        except Exception as ex:
+            logger.exception('submit_scan callback failed')
+            return html.Span(f'Submit failed: {ex}',
+                             style={'color': '#e94560'})
+        return html.Span(f'submitted descriptor_id={did}',
+                         style={'color': '#52d273', 'fontWeight': '600'})
+
     return app
 
 
@@ -1280,6 +2332,133 @@ def _waiting(title, message='Waiting for data...'):
     fig.update_layout(paper_bgcolor=PANEL, plot_bgcolor=PANEL, font=dict(color=TEXT, size=10),
                       margin=dict(l=40, r=15, t=35, b=30), uirevision='waiting',
                       title=title)
+    return fig
+
+
+# ---- Phase 4: Analysis tab helpers ----
+
+def _format_analysis_summary(result):
+    """Human-readable text block for the Summary panel in the Analysis tab.
+
+    Pulls the high-signal fields from an `analyze_scan` result so the
+    operator can see at a glance: scan id, sweep shape, mean survival,
+    mean loading, SLM diag rollups, and code/grid sidecar presence.
+    """
+    if not isinstance(result, dict):
+        return 'No analysis result.'
+    sweep = result.get('sweep') or {}
+    summary = result.get('summary') or {}
+    diag = result.get('diag_aggregate')
+    code = result.get('code') or {}
+    grid = result.get('grid') or {}
+
+    def _avg(values):
+        vs = [v for v in (values or []) if v is not None]
+        if not vs:
+            return None
+        return sum(vs) / len(vs)
+
+    lines = [
+        f"scan_id    : {result.get('scan_id', '')}",
+        f"scan_name  : {result.get('scan_name') or '(none)'}",
+        f"sweep cols : {', '.join(sweep.get('cols') or []) or '(none)'}",
+        f"sweep dims : {sweep.get('dims') or []}",
+        f"n_params   : {result.get('n_params', 0)}",
+        f"n_shots    : {result.get('n_shots', 0)}",
+        '',
+        f"mean survival : {_fmt_pct(_avg(summary.get('survival_mean')))}",
+        f"mean loading  : {_fmt_pct(_avg(summary.get('loading_rate')))}",
+        f"mean loss     : {_fmt_pct(_avg(summary.get('loss_mean')))}",
+    ]
+    if diag is not None:
+        lines += [
+            '',
+            f"diag rows     : {diag.get('n_rows', 0)}",
+            f"mean total_ms : {_fmt_num(diag.get('mean_total_ms'))}",
+            f"p99 total_ms  : {_fmt_num(diag.get('p99_total_ms'))}",
+            f"mean n_loaded : {_fmt_num(diag.get('mean_n_loaded'))}",
+            f"aborted shots : {diag.get('aborted_count', 0)}",
+        ]
+    lines += [
+        '',
+        f"code snapshot : {'present' if code.get('present') else '(none)'}"
+        + (f" ({code.get('n_files', 0)} files)" if code.get('present') else ''),
+        f"grid sidecar  : {'present' if grid.get('present') else '(none)'}"
+        + (f" ({grid.get('n_sites', 0)} sites)" if grid.get('present') else ''),
+    ]
+    return '\n'.join(lines)
+
+
+def _fmt_pct(v):
+    if v is None:
+        return '(no data)'
+    try:
+        return f'{100.0 * float(v):.2f}%'
+    except (TypeError, ValueError):
+        return '(no data)'
+
+
+def _fmt_num(v):
+    if v is None:
+        return '(no data)'
+    try:
+        return f'{float(v):.2f}'
+    except (TypeError, ValueError):
+        return '(no data)'
+
+
+def _build_analysis_curve(result, mean_key, sem_key, title):
+    """Build a 1-D Plotly line+errorbar figure from the summary block.
+
+    For 2-D scans this still renders (x = scan_point_index instead of a
+    sweep value), but the picker would ideally pivot to a heatmap; that's
+    a Phase 4b polish.
+    """
+    summary = (result or {}).get('summary') or {}
+    sweep = (result or {}).get('sweep') or {}
+    y = summary.get(mean_key) or []
+    yerr = summary.get(sem_key) or []
+    if not y:
+        return _waiting(title, 'No data')
+
+    # x axis: 1-D scan -> sweep values, else scan-point index.
+    values = sweep.get('values') or []
+    if len(values) == 1 and len(values[0]) == len(y):
+        x = values[0]
+        xlabel = (sweep.get('cols') or ['param'])[0]
+    else:
+        x = list(range(1, len(y) + 1))
+        xlabel = 'scan point'
+
+    # Drop None entries from y / yerr in parallel.
+    pts = [(xi, yi, ei if isinstance(ei, (int, float)) else None)
+           for xi, yi, ei in zip(x, y, yerr + [None] * len(y))
+           if yi is not None]
+    if not pts:
+        return _waiting(title, 'No data')
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    es = [p[2] for p in pts]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys,
+        error_y=dict(type='data', array=es, visible=True, color='#2a7fff'),
+        mode='markers+lines',
+        marker=dict(size=8, color='#2a7fff'),
+        line=dict(color='#2a7fff', width=2),
+        name=mean_key,
+    ))
+    fig.update_layout(
+        paper_bgcolor=PANEL, plot_bgcolor=PANEL,
+        font=dict(color=TEXT, size=11),
+        margin=dict(l=50, r=20, t=40, b=45),
+        title=title,
+        xaxis=dict(title=xlabel, gridcolor='#2b2b4a'),
+        yaxis=dict(gridcolor='#2b2b4a'),
+        showlegend=False,
+        uirevision=mean_key,
+    )
     return fig
 
 
@@ -1590,7 +2769,11 @@ def _fig_shift(d):
 def _fig_scan_curve(d, cbar_scale='01'):
     sc = d.get('scan_curve')
     if sc is None or sc.get('mode') == 'undefined':
-        return _waiting('Scan Curve')
+        # 0d (no swept axis): fall back to a per-shot time series so the
+        # panel isn't dead during single-point scans. Uses
+        # `loading_history`, which the data manager already maintains
+        # as a rolling window of fraction-loaded per shot.
+        return _fig_scan_timeseries(d)
 
     # --- 2-D heatmap ---
     if sc.get('ndim', 1) >= 2:
@@ -1633,6 +2816,46 @@ def _fig_scan_curve(d, cbar_scale='01'):
     fig.update_layout(**_L, title=title_text,
                       xaxis=dict(title=x_label, **_A),
                       yaxis=dict(title=y_label, range=[-0.05, 1.05], **_A))
+    return fig
+
+
+def _fig_scan_timeseries(d):
+    """0d-scan fallback for the Scan Curve panel.
+
+    When no scan axis is defined, show fraction-loaded per shot over
+    the recent history window. This is the same data the small
+    "Loading rate (live)" panel uses, but rendered at full Scan-Curve
+    size so the operator isn't staring at "Waiting for data..." for an
+    entire 0d run.
+    """
+    hist = d.get('loading_history')
+    if hist is None or len(hist) == 0:
+        return _waiting('Scan Curve',
+                        'No swept axis; waiting for shots to fill time series...')
+    hist = np.asarray(hist, dtype=float)
+    n = hist.size
+    x = np.arange(1, n + 1)
+    avg = float(hist.mean()) if n else 0.0
+    fig = go.Figure(go.Scatter(
+        x=x, y=hist, mode='lines+markers',
+        line=dict(color='#58a6ff', width=1.5),
+        marker=dict(size=4, color='#58a6ff'),
+        name='loaded fraction',
+    ))
+    fig.add_shape(type='line', xref='paper', x0=0, x1=1, y0=avg, y1=avg,
+                  line=dict(color='#ffdd44', width=1.5, dash='dash'))
+    fig.add_annotation(
+        text=f'Avg: {100*avg:.1f}%  ({n} shots, 0d / no swept axis)',
+        xref='paper', yref='paper', x=0.99, y=0.99,
+        showarrow=False, xanchor='right', yanchor='top',
+        font=dict(color='#ffdd44', size=11),
+        bgcolor='rgba(20,20,40,0.7)')
+    title = _scan_title(d.get('scan_name') or 'Scan (0d)',
+                        d.get('scan_filename'))
+    fig.update_layout(**_L, title=title,
+                      xaxis=dict(title='Shot # (oldest → latest)', **_A),
+                      yaxis=dict(title='Fraction loaded',
+                                 tickformat='.0%', autorange=True, **_A))
     return fig
 
 

@@ -194,6 +194,22 @@ class ZmqClient:
         with self._lock:
             return self._client.queue_move(job_id, direction)
 
+    # -------- Descriptor queue (Phase 3) --------
+
+    def submit_scan_descriptor(self, descriptor_json, label=''):
+        """Submit a JSON scan descriptor. Returns the descriptor's queue
+        id. The SequenceRunner pops it between jobs and dispatcher
+        converts it to a regular job; the resulting job_id appears as
+        the descriptor row's `built_job_id` in queue_list output."""
+        with self._lock:
+            return self._client.submit_scan_descriptor(
+                descriptor_json, label=label)
+
+    def descriptor_remove(self, desc_id):
+        """Cancel a queued descriptor. Returns 'ok' or 'error: ...'."""
+        with self._lock:
+            return self._client.descriptor_remove(desc_id)
+
     # -------- Camera --------
 
     def camera_init(self, roi, exposure_time=None, timeout_ms=10000,
