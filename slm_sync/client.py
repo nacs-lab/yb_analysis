@@ -90,6 +90,33 @@ class SlmSyncClient:
         # Final attempt; return whatever we got even if it's still 503.
         return r
 
+    def _post(self, path, json_body, timeout=None, headers=None, **kw):
+        """POST with the same retry-on-503-gate-busy behavior as ``_get``.
+
+        Sends a stable ``X-Client-Id`` so SLM-side lock ownership (for
+        write paths) is attributable. Raises for non-gate HTTP errors and
+        lets connection errors bubble up to the caller."""
+        url = self._url + path
+        to = timeout or self._timeout
+        hdrs = {'X-Client-Id': 'yb-analysis'}
+        if headers:
+            hdrs.update(headers)
+        r = None
+        for _ in range(self._max_retries):
+            r = self._session.post(
+                url, json=json_body, timeout=to, verify=self._verify_tls,
+                auth=self._auth, headers=hdrs, **kw)
+            if r.status_code == 503:
+                try:
+                    detail = r.json().get('detail', '')
+                except Exception:
+                    detail = r.text
+                if _GATE_BUSY_PREFIX in detail:
+                    time.sleep(self._retry_backoff_s)
+                    continue
+            return r
+        return r
+
     # ---- Endpoint wrappers ----
 
     def get_diag(self, scan_id, since_seq_id=None):
@@ -176,3 +203,89 @@ class SlmSyncClient:
             # whole sync.
             logger.warning("get_grid_sidecar(%s): non-JSON body", scan_id)
             return None
+
+    # ---- Loading-pattern endpoints (POST) ----
+
+    def initialize_loading_pattern(self, *, phase_path=None, phase_b64=None,
+                                   phase_shape=None, loading_zernike=None,
+                                   baked_zernike=None, legacy_zerniked=False,
+                                   order='col', fft_shape=(4096, 4096),
+                                   threshold=0.30, min_dist=None,
+                                   write_to_slm=False, name=None,
+                                   timeout=(3.0, 60.0)):
+        """POST /slm/initialize_loading_pattern.
+
+        Simulate a base loading WGS phase, extract trap positions +
+        per-site phases (shared column-major order), optionally write the
+        loading phase to the SLM. Returns the parsed JSON dict, or ``None``
+        if the SLM PC is unreachable. Raises ``requests.HTTPError`` on
+        4xx/5xx (e.g. a missing phase file → 404).
+
+        Pass either ``phase_path`` (server-side .pt) or
+        ``phase_b64`` + ``phase_shape``. ``loading_zernike`` is the defocus
+        applied on write; ``baked_zernike`` + ``legacy_zerniked=True`` lets
+        the server recover the base from a still-zerniked .pt.
+        """
+        body = {
+            'order': order,
+            'fft_shape': list(fft_shape),
+            'threshold': float(threshold),
+            'write_to_slm': bool(write_to_slm),
+            'legacy_zerniked': bool(legacy_zerniked),
+        }
+        if phase_path is not None:
+            body['phase_filepath'] = phase_path
+        if phase_b64 is not None:
+            body['phase_b64'] = phase_b64
+            body['phase_shape'] = list(phase_shape)
+        if loading_zernike is not None:
+            body['loading_zernike'] = list(loading_zernike)
+        if baked_zernike is not None:
+            body['baked_zernike'] = list(baked_zernike)
+        if min_dist is not None:
+            body['min_dist'] = int(min_dist)
+        if name is not None:
+            body['name'] = name
+        try:
+            r = self._post('/slm/initialize_loading_pattern', body,
+                           timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout):
+            return None
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    def write_loading_phase(self, *, phase_path=None, phase_b64=None,
+                            phase_shape=None, loading_zernike=None,
+                            baked_zernike=None, legacy_zerniked=False,
+                            name=None, block_timeout=0.0, timeout=(3.0, 30.0)):
+        """POST /slm/write_loading_phase — write ``base +
+        zernike(loading_zernike)`` to the SLM WITHOUT re-extracting.
+
+        Requires the caller to hold the ``slm`` lock (scan-long hold).
+        Returns the parsed JSON dict or ``None`` if unreachable.
+        """
+        body = {'legacy_zerniked': bool(legacy_zerniked)}
+        if phase_path is not None:
+            body['phase_filepath'] = phase_path
+        if phase_b64 is not None:
+            body['phase_b64'] = phase_b64
+            body['phase_shape'] = list(phase_shape)
+        if loading_zernike is not None:
+            body['loading_zernike'] = list(loading_zernike)
+        if baked_zernike is not None:
+            body['baked_zernike'] = list(baked_zernike)
+        if name is not None:
+            body['name'] = name
+        headers = ({'X-Block-Timeout': str(float(block_timeout))}
+                   if block_timeout else None)
+        try:
+            r = self._post('/slm/write_loading_phase', body, timeout=timeout,
+                           headers=headers)
+        except (requests.ConnectionError, requests.Timeout):
+            return None
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()

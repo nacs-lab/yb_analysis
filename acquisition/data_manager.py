@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 _cache = {}
 _cache_lock = threading.Lock()
+# Serialises post-scan affine updates (one global affine file).
+_AFFINE_UPDATE_LOCK = threading.Lock()
 
 # Per-shot mean loading rate (img1), held at module scope so it survives
 # scan transitions — the DataManager (and its log_buffer) is recreated on
@@ -87,6 +89,15 @@ def get_data_manager(scan_id):
                     logger.warning(
                         'SLM sync schedule failed for scan %d: %s',
                         old_id, e)
+                # Loading-pattern affine migration: update the global
+                # SLM->camera affine from this scan's observed drift
+                # (background thread; no-op unless a pattern was declared).
+                try:
+                    old_dm._schedule_affine_update()
+                except Exception as e:
+                    logger.warning(
+                        'Affine update schedule failed for scan %d: %s',
+                        old_id, e)
                 logger.debug('Evicting DataManager for scan %d', old_id)
                 del _cache[old_id]
         dm = DataManager(scan_id)
@@ -106,6 +117,28 @@ def _scalar(val, default=0):
     return float(val) if val is not None else default
 
 
+def _mat_str(val):
+    """Coerce a MATLAB string field to a Python str. v7.3 HDF5 stores char
+    arrays as uint16; scipy gives str/bytes. Returns None for empty/None."""
+    if val is None:
+        return None
+    if isinstance(val, bytes):
+        return val.decode('utf-8', 'replace').strip() or None
+    if isinstance(val, str):
+        return val.strip() or None
+    if isinstance(val, np.ndarray):
+        if val.dtype.kind in ('u', 'i'):       # uint16/uint8 char codes
+            try:
+                return ''.join(chr(int(c)) for c in val.ravel()).strip() or None
+            except Exception:
+                return None
+        if val.dtype.kind in ('S', 'U'):
+            return ''.join(val.ravel().astype(str)).strip() or None
+        if val.size == 1:
+            return _mat_str(val.flat[0])
+    return str(val).strip() or None
+
+
 def _vector(val):
     """Flatten MATLAB vector to 1-D float64 array."""
     return np.asarray(val, dtype=np.float64).ravel()
@@ -120,8 +153,21 @@ class DataManager:
     # run_monitor flips it on at startup unless --no-slm.
     sync_after_finish = True
 
+    # Loading-pattern affine migration: after each scan, update the global
+    # SLM->camera affine from the observed drift (mirrors the live grid-shift
+    # tracker). Off-by-default at the class level for tests/mock runs;
+    # run_monitor leaves it on. Only acts when the scan declared a loading
+    # pattern (self._pattern_grids is not None).
+    affine_autoupdate = True
+
     def __init__(self, scan_id):
         self.scan_id = scan_id
+        # Loading-pattern state (set by _build_pattern_grids; None = legacy
+        # day-folder-grid behaviour, unchanged).
+        self._pattern_grids = None      # {frame_idx: cropped grid [Y,X]}
+        self._pattern_names = {}        # {frame_idx: pattern name}
+        self._roi = None                # [Xoff, Yoff, W, H] for this scan
+        self._affine_grid0 = None       # frame-0 affine-predicted grid (pre-drift)
 
         # Paths
         date_stamp, time_stamp = scan_id_to_stamps(scan_id)
@@ -171,6 +217,15 @@ class DataManager:
         # --- LOADED state (from disk, read-only during scan) ---
         self.num_sites = 0
         self._load_from_disk()
+
+        # If the scan declared loading pattern(s), replace the day-folder grid
+        # with the pattern's simulated positions mapped through the global
+        # affine (per-image). Falls back to the day-folder grid on any failure.
+        try:
+            self._build_pattern_grids()
+        except Exception as e:
+            logger.warning('pattern-grid build failed (%s); using day grid', e)
+            self._pattern_grids = None
 
         # --- LIVE state (accumulates, resets at 2000) ---
         self._intensity_accum = []          # list of (num_sites,) arrays
@@ -456,6 +511,214 @@ class DataManager:
 
         logger.info('Two-array mode active: img1=%d sites, img2=%d sites',
                     self.num_sites, self.num_sites_img2)
+
+    # --- Loading-pattern grids (affine migration) ---
+
+    def _image_pattern_specs(self):
+        """Per-image loading-pattern specs, or None for legacy behaviour.
+
+        Priority:
+          1. config['imagePatternsJson'] — JSON list of dicts
+             {name, base_phase_path, zernike?, order?, legacy_zerniked?,
+              baked_zernike?}; entry k -> camera frame k (last entry reused
+              if the list is shorter than NumImages).
+          2. warmup_kwargs (rearrange scans): initial_phase -> frame 0,
+             final_phase -> final frame; extras.*_phase_zernike give the
+             baked Zernike to strip for extraction.
+        Returns a length-NumImages list (each entry a spec dict or None), or
+        None when the scan declares no loading pattern.
+        """
+        import json as _json
+        cfg = self.config
+        pSeq = max(1, self.num_images_per_seq)
+
+        def _norm(p):
+            s = _mat_str(p)
+            return s.replace('\\', '/') if s else None
+
+        def _zern_list(z):
+            if z is None:
+                return None
+            try:
+                zl = _vector(z).tolist()
+            except Exception:
+                return None
+            return zl if any(c != 0.0 for c in zl) else None
+
+        raw = cfg.get('imagePatternsJson')
+        if raw is not None:
+            s = _mat_str(raw)
+            try:
+                items = _json.loads(s) if s else None
+            except Exception:
+                items = None
+            if items:
+                specs = [None] * pSeq
+                for k in range(pSeq):
+                    it = items[k] if k < len(items) else items[-1]
+                    if it and it.get('name') and it.get('base_phase_path'):
+                        bz = _zern_list(it.get('baked_zernike'))
+                        specs[k] = {
+                            'name': str(it['name']),
+                            'base_phase_path': _norm(it['base_phase_path']),
+                            'zernike': it.get('zernike'),
+                            'order': it.get('order', 'col'),
+                            'legacy_zerniked': bool(it.get('legacy_zerniked',
+                                                           bz is not None)),
+                            'baked_zernike': bz,
+                        }
+                if any(specs):
+                    return specs
+
+        wk = cfg.get('warmup_kwargs')
+        if isinstance(wk, dict):
+            init_p = _norm(wk.get('initial_phase'))
+            final_p = _norm(wk.get('final_phase'))
+            extras = wk.get('extras') if isinstance(wk.get('extras'), dict) else {}
+
+            def _spec(path, zern):
+                bz = _zern_list(zern)
+                return {'name': os.path.splitext(os.path.basename(path))[0],
+                        'base_phase_path': path, 'zernike': None, 'order': 'col',
+                        'legacy_zerniked': bz is not None, 'baked_zernike': bz}
+            if init_p:
+                specs = [None] * pSeq
+                specs[0] = _spec(init_p, extras.get('initial_phase_zernike'))
+                if final_p and pSeq >= 2:
+                    specs[pSeq - 1] = _spec(
+                        final_p, extras.get('final_phase_zernike'))
+                return specs
+        return None
+
+    def _default_thresholds(self, n):
+        """Length-n initial thresholds when no per-pattern thresholds exist
+        yet (a new pattern with a different site count). Broadcasts the median
+        of the loaded thresholds; live Gaussian refitting replaces these
+        within ~200 shots. Per-pattern stored thresholds are a follow-up."""
+        base = np.asarray(self.loaded_thresholds, dtype=np.float64).ravel()
+        base = base[np.isfinite(base)]
+        val = float(np.median(base)) if base.size else 0.0
+        return np.full(int(n), val, dtype=np.float64)
+
+    def _build_pattern_grids(self):
+        """Replace the day-folder grid with per-image loading-pattern grids:
+        each pattern's simulated knm positions mapped through the global
+        affine and the per-scan crop ROI. Sets frame-0 -> grid_locations and
+        the final frame -> grid_locations_img2 so the EXISTING per-frame
+        selection + live drift correction apply unchanged. No-ops (keeps the
+        day grid) if no pattern/ROI/affine is available."""
+        roi = self.config.get('roi')
+        roi = _vector(roi) if roi is not None else None
+        if roi is None or roi.size < 4:
+            return
+        self._roi = [float(v) for v in roi[:4]]
+
+        specs = self._image_pattern_specs()
+        if not specs or not any(specs):
+            return
+
+        import yb_analysis.analysis.affine_transform as aff
+        import yb_analysis.analysis.pattern_registry as reg
+        self._pattern_names = {k: s['name'] for k, s in enumerate(specs) if s}
+
+        A = aff.load_matrix()
+        if A is None:
+            logger.warning('loading pattern(s) %s declared but no affine '
+                           'committed; using day-folder grid',
+                           list(self._pattern_names.values()))
+            return
+
+        grids = {}
+        for k, s in enumerate(specs):
+            if not s:
+                continue
+            try:
+                rec = reg.fetch_or_refresh_pattern(
+                    s['name'], base_phase_path=s['base_phase_path'],
+                    default_loading_zernike=s.get('zernike'),
+                    order=s.get('order', 'col'),
+                    legacy_zerniked=s.get('legacy_zerniked', False),
+                    baked_zernike=s.get('baked_zernike'))
+            except Exception as e:
+                logger.warning('pattern %s fetch failed (%s); trying cache',
+                               s['name'], e)
+                rec = reg.get_pattern(s['name'])
+            if not rec or not rec.get('knm'):
+                logger.warning('no registry record for pattern %s', s['name'])
+                continue
+            knm = np.asarray(rec['knm'], dtype=np.float64)
+            grids[k] = aff.apply_affine_cropped(aff._knm_to_xy(knm), A, self._roi)
+        if not grids:
+            return
+        self._pattern_grids = grids
+
+        pSeq = max(1, self.num_images_per_seq)
+        if 0 in grids:
+            self.grid_locations = np.ascontiguousarray(grids[0])
+            self.num_sites = len(grids[0])
+            self._affine_grid0 = grids[0].copy()
+            if len(np.ravel(self.loaded_thresholds)) != self.num_sites:
+                self.loaded_thresholds = self._default_thresholds(self.num_sites)
+                self.loaded_infidelities = np.full(self.num_sites, np.nan)
+                self.loaded_gauss_fits = None
+        last = pSeq - 1
+        if last >= 1 and last in grids:
+            self.is_two_array = True
+            self.grid_locations_img2 = np.ascontiguousarray(grids[last])
+            self.num_sites_img2 = len(grids[last])
+            if (self.loaded_thresholds_img2 is None or
+                    len(np.ravel(self.loaded_thresholds_img2)) != self.num_sites_img2):
+                self.loaded_thresholds_img2 = self._default_thresholds(
+                    self.num_sites_img2)
+                self.loaded_infidelities_img2 = np.full(self.num_sites_img2, np.nan)
+        logger.info('Loading-pattern grids active: %s (sites %s); affine '
+                    'mapped + ROI-cropped', self._pattern_names,
+                    {k: len(v) for k, v in grids.items()})
+
+    def _schedule_affine_update(self):
+        """After a scan with a declared loading pattern, update the global
+        affine from the observed drift (background thread). Mirrors the live
+        grid-shift tracker. Off if affine_autoupdate is False or no pattern."""
+        if not getattr(type(self), 'affine_autoupdate', True):
+            return
+        if self._pattern_grids is None or self._roi is None:
+            return
+        name = self._pattern_names.get(0)
+        if not name or self.img_buffer is None or self.img_buffer.size() < 10:
+            return
+        try:
+            n = min(self.img_buffer.size(), UPDATE_GRID_BATCH_SIZE)
+            imgs = self.img_buffer.get_last_n(n).astype(np.float64)
+        except Exception:
+            return
+        threading.Thread(
+            target=self._affine_update_worker,
+            args=(name, np.asarray(self._roi, dtype=np.float64), imgs),
+            name='affine-update-%s' % self.scan_id, daemon=True).start()
+
+    def _affine_update_worker(self, name, roi, imgs):
+        try:
+            import yb_analysis.analysis.pattern_registry as reg
+            import yb_analysis.analysis.affine_transform as aff
+            with _AFFINE_UPDATE_LOCK:
+                rec = reg.get_pattern(name)
+                if not rec or not rec.get('knm'):
+                    return
+                cand = aff.propose_scan_update(
+                    imgs, np.asarray(rec['knm'], dtype=np.float64), roi,
+                    self.mask_mat, str(self.scan_id))
+                if cand.get('accept'):
+                    aff.commit_update(cand, ema_weight=aff.SHIFT_EMA_WEIGHT)
+                    logger.info('Affine drift-updated from scan %s: shift '
+                                '(dy=%s, dx=%s) prominence %.1f', self.scan_id,
+                                cand.get('shift_dy'), cand.get('shift_dx'),
+                                cand.get('prominence'))
+                else:
+                    logger.info('Affine update skipped for scan %s (%s)',
+                                self.scan_id, cand.get('reason'))
+        except Exception as e:
+            logger.warning('Affine update failed for scan %s: %s',
+                           self.scan_id, e)
 
     # --- EFFECTIVE properties ---
 

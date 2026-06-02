@@ -71,6 +71,7 @@ class FakeSlmServer:
             'health': 0, 'devices': 0, 'lock_status': 0,
             'camera_png': 0, 'phase_png': 0, 'rearrange_diag': 0,
             'rearrange': 0, 'results': 0, 'setup_rearrangement': 0,
+            'initialize_loading_pattern': 0, 'write_loading_phase': 0,
         }
         # Phase 1: captured request bodies for the POST endpoints. Tests
         # use these to assert MATLAB sent scan_id / seq_id correctly.
@@ -78,13 +79,33 @@ class FakeSlmServer:
             'rearrange': [],
             'results': [],
             'setup_rearrangement': [],
+            'initialize_loading_pattern': [],
+            'write_loading_phase': [],
         }
+        # Per-endpoint gate-busy injection: name -> remaining number of
+        # 503 'server busy' responses to emit before succeeding. Lets
+        # tests exercise the client's gate-busy retry loop.
+        self._gate_busy = {}
         # Default response payloads for the POST endpoints (override-able).
         self._post_payloads = {
             'rearrange': {'ok': True, 'diag': {'total_ms': 42, 'n_loaded': 100}},
             'results':   {'ok': True, 'saved_path': '/fake/path.json'},
             'setup_rearrangement': {'ok': True, 'n_init_grid': 100,
                                     'n_targets': 50},
+            'initialize_loading_pattern': {
+                'ok': True, 'name': 'fake', 'order': 'col', 'n_sites': 4,
+                'positions_knm': [[0, 0], [1, 0], [0, 1], [1, 1]],
+                'phases': [0.0, 0.1, 0.2, 0.3], 'amps': [1, 1, 1, 1],
+                'lattice': {'rows': [0, 1, 0, 1], 'cols': [0, 0, 1, 1],
+                            'n_rows': 2, 'n_cols': 2, 'pitch_x': 1.0,
+                            'pitch_y': 1.0, 'row_basis': [1, 0],
+                            'col_basis': [0, 1], 'tilt_deg': 0.0,
+                            'n_missing': 0, 'x0': 0.0, 'y0': 0.0},
+                'base_sha256': 'ab' * 32, 'loading_zernike': None,
+                'wrote_to_slm': False, 'derive_ms': 1.0,
+            },
+            'write_loading_phase': {'ok': True, 'base_sha256': 'ab' * 32,
+                                    'loading_zernike': None},
         }
         # Phase 2: per-scan diag ledger + code-snapshot stores. Tests
         # populate via add_diag_row / set_code_manifest / add_blob.
@@ -144,6 +165,10 @@ class FakeSlmServer:
                 except Exception:
                     body = {}
                 self._captured_bodies[name].append(body)
+                gb = self._gate_busy.get(name, 0)
+                if gb > 0:
+                    self._gate_busy[name] = gb - 1
+                    return jsonify({'detail': 'server busy: rearrange'}), 503
                 fail = self._fail_status.get(name)
                 if fail:
                     return jsonify({'error': f'forced {fail}'}), fail
@@ -160,6 +185,14 @@ class FakeSlmServer:
         @self._app.route('/slm/setup_rearrangement', methods=['POST'])
         def _setup_rearr():
             return _resp_post('setup_rearrangement')
+
+        @self._app.route('/slm/initialize_loading_pattern', methods=['POST'])
+        def _init_loading():
+            return _resp_post('initialize_loading_pattern')
+
+        @self._app.route('/slm/write_loading_phase', methods=['POST'])
+        def _write_loading():
+            return _resp_post('write_loading_phase')
 
         # ---- Phase 2 retrieval endpoints ----
         # Per-scan diag ledger (Phase 1 endpoint, fake-ified for Phase 2 sync tests).
@@ -264,6 +297,12 @@ class FakeSlmServer:
         """Clear any forced failure on `name`."""
         with self._lock:
             self._fail_status.pop(name, None)
+
+    def gate_busy(self, name, times):
+        """Make `name` return 503 'server busy' for the next `times`
+        requests before succeeding — exercises the client retry loop."""
+        with self._lock:
+            self._gate_busy[name] = int(times)
 
     def hits(self, name):
         """How many requests this endpoint has served so far."""

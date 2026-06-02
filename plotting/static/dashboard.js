@@ -488,6 +488,14 @@
     });
 
     // Tweezer overlay: green box = loaded (logical=1), red = empty.
+    // Fail-loud when the live state has no gridLocations / no sites
+    // — same root cause as a .h5 with all-zero per-site logicals
+    // (detection wasn't initialized before the scan started). Without
+    // this hint the operator sees the bare camera image and may not
+    // realize detection isn't wired up.
+    const noGrid = !grid || !grid.length;
+    const noGridWarn = noGrid && (snap.num_sites === 0 ||
+                                    snap.num_sites == null);
     if (grid && grid.length) {
       const n = grid.length;
       const occ = new Array(n);
@@ -543,6 +551,15 @@
       yaxis: { range: [H, 0], scaleanchor: "x", scaleratio: 1,
                showgrid: false, zeroline: false, visible: false },
       margin: { l: 0, r: 60, t: 4, b: 4 },
+      annotations: noGridWarn ? [{
+        xref: "paper", yref: "paper", x: 0.5, y: 0.04,
+        text: "no gridLocations — detection not initialized<br>"
+              + "<span style='font-size:10px'>(run init / threshold setup before scanning)</span>",
+        showarrow: false, align: "center",
+        font: { color: "#ffdd44", size: 13, family: "Inter, sans-serif" },
+        bgcolor: "rgba(20, 18, 8, 0.85)",
+        bordercolor: "#ffdd44", borderwidth: 1, borderpad: 6,
+      }] : [],
     }), { images: layoutImages });
     Plotly.react(el, traces, layout, plotConfig());
   }
