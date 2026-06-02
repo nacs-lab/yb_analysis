@@ -657,23 +657,37 @@ class DataManager:
             self.grid_locations = np.ascontiguousarray(grids[0])
             self.num_sites = len(grids[0])
             self._affine_grid0 = grids[0].copy()
-            if len(np.ravel(self.loaded_thresholds)) != self.num_sites:
-                self.loaded_thresholds = self._default_thresholds(self.num_sites)
-                self.loaded_infidelities = np.full(self.num_sites, np.nan)
-                self.loaded_gauss_fits = None
+            (self.loaded_thresholds, self.loaded_infidelities,
+             self.loaded_gauss_fits) = self._pattern_thresholds(
+                self._pattern_names[0], self.num_sites)
         last = pSeq - 1
         if last >= 1 and last in grids:
             self.is_two_array = True
             self.grid_locations_img2 = np.ascontiguousarray(grids[last])
             self.num_sites_img2 = len(grids[last])
-            if (self.loaded_thresholds_img2 is None or
-                    len(np.ravel(self.loaded_thresholds_img2)) != self.num_sites_img2):
-                self.loaded_thresholds_img2 = self._default_thresholds(
-                    self.num_sites_img2)
-                self.loaded_infidelities_img2 = np.full(self.num_sites_img2, np.nan)
+            (self.loaded_thresholds_img2, self.loaded_infidelities_img2,
+             self.loaded_gauss_fits_img2) = self._pattern_thresholds(
+                self._pattern_names[last], self.num_sites_img2)
         logger.info('Loading-pattern grids active: %s (sites %s); affine '
                     'mapped + ROI-cropped', self._pattern_names,
                     {k: len(v) for k, v in grids.items()})
+
+    def _pattern_thresholds(self, name, n):
+        """Per-pattern detection thresholds for a grid of n sites: from the
+        pattern's threshold store when it matches, else placeholders (the
+        live Gaussian refit replaces these within ~200 shots and saves back
+        per-pattern via _save_threshold). Returns (thresholds, infidelities,
+        gauss_fits)."""
+        try:
+            import yb_analysis.analysis.pattern_registry as reg
+            td = reg.load_pattern_thresholds(name)
+        except Exception:
+            td = None
+        if td and len(np.ravel(td.get('thresholds', []))) == n:
+            return (np.asarray(td['thresholds'], dtype=np.float64).ravel(),
+                    np.asarray(td['infidelities'], dtype=np.float64).ravel(),
+                    td.get('gauss_fits'))
+        return self._default_thresholds(n), np.full(n, np.nan), None
 
     def _schedule_affine_update(self):
         """After a scan with a declared loading pattern, update the global
@@ -1126,11 +1140,19 @@ class DataManager:
             for s in range(self.num_sites):
                 p = self.live_gauss_fits[s].get('params') if self.live_gauss_fits else None
                 gs[s]['params'] = p if p is not None else np.array([])
-            savemat(os.path.join(self._day_dir, 'threshold.mat'), {
+            mat = {
                 'thresholds': self.thresholds,
                 'infidelities': self.infidelities,
                 'gaussFitsStruct': gs,
-            })
+            }
+            savemat(os.path.join(self._day_dir, 'threshold.mat'), mat)
+            # Per-pattern persistence (loading-pattern affine migration): save
+            # the live-refined thresholds back to the frame-0 pattern so it
+            # reloads them next time (self-calibrating per pattern; daily drift
+            # absorbed by the live refit).
+            if self._pattern_grids is not None and self._pattern_names.get(0):
+                import yb_analysis.analysis.pattern_registry as reg
+                reg.save_pattern_thresholds(self._pattern_names[0], mat)
         except Exception as e:
             logger.warning('Threshold save failed: %s', e)
 

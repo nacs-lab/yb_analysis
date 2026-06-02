@@ -148,6 +148,37 @@ def test_build_grids_no_affine_keeps_day_grid(tmp_state):
     assert dm._pattern_names.get(0) == 'p'     # surfaced for the dashboard
 
 
+def _save_thr(reg, name, n, base=10.0):
+    gs = np.empty(n, dtype=[('params', 'O')])
+    for s in range(n):
+        gs[s]['params'] = np.array([])
+    reg.save_pattern_thresholds(name, {
+        'thresholds': np.arange(n, dtype=float) + base,
+        'infidelities': np.full(n, 0.01),
+        'gaussFitsStruct': gs})
+
+
+def test_pattern_thresholds_roundtrip(tmp_state):
+    _save_thr(reg, 'p', 25)
+    td = reg.load_pattern_thresholds('p')
+    assert td is not None and len(td['thresholds']) == 25
+    np.testing.assert_allclose(td['thresholds'], np.arange(25) + 10.0)
+    assert len(td['infidelities']) == 25
+
+
+def test_build_grids_uses_pattern_thresholds(tmp_state):
+    A = np.array([[0.0, 2.0, 300.0], [2.0, 0.0, 300.0]])
+    aff.commit_update(aff._make_candidate(A, 0.1, 100, 100, 's0', bootstrap=True))
+    _register('p', _knm_5x5())          # 25 sites
+    _save_thr(reg, 'p', 25, base=7.0)   # per-pattern thresholds
+    cfg = {'roi': [1000, 100, 2100, 2100], 'imagePatternsJson': json.dumps(
+        [{'name': 'p', 'base_phase_path': 'phase/base/p.pt'}])}
+    dm = _bare_dm(cfg, pSeq=1)
+    dm._build_pattern_grids()
+    assert len(dm.loaded_thresholds) == 25
+    np.testing.assert_allclose(dm.loaded_thresholds, np.arange(25) + 7.0)
+
+
 def test_build_grids_no_pattern_is_legacy(tmp_state):
     aff.commit_update(aff._make_candidate(
         np.array([[0., 2., 300.], [2., 0., 300.]]), 0.1, 100, 100, 's', bootstrap=True))

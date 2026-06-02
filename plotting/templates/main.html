@@ -53,7 +53,11 @@
 </header>
 
 <!-- ============================= LIVE TAB ============================ -->
-<section id="tab-live" class="tab-pane">
+<!-- live-flat: strips card chrome from chart cards so plots flow
+     flush to the tab edges. Adds a right-edge sidebar column for the
+     Phase 5.5 control panel mirror (currently scaffolded with
+     disabled "not wired" buttons — wire-up is Phase 5.5 Track A). -->
+<section id="tab-live" class="tab-pane live-flat">
 
   <!-- Compact horizontal status strip across the top. Previously
        Status was a col-3 card next to the col-9 Scan Curve; the grid
@@ -97,10 +101,67 @@
     </div>
   </section>
 
-  <!-- Array row: 2 panels (img1 + img2) by default. When NumImages >= 3,
-       JS injects col-4 / col-4 / col-4 layout and reveals the middle
-       image card. When NumImages < 3, the middle card is hidden. -->
-  <section class="card col-6 array-card" id="card-array1" data-card-id="live-array1">
+  <!-- ===== Right sidebar: Yb tweezer control panel (Phase 5.5 prep)
+       Mirror of the Tkinter control_panel.py — Start/Pause/Abort/
+       Restart Dash/Restart All + dummy-mode radios + init folder +
+       current-scan readout. All disabled with a "not wired" banner
+       until Phase 5.5 Track A wires them to MemoryMap. Position
+       (right column, sticky, vertical stack) is the production
+       layout; only the click handlers + hold-to-confirm progress
+       bars are deferred. -->
+  <aside class="card live-sidebar" data-card-id="live-control-panel">
+    <button class="live-sidebar-toggle" id="live-sidebar-toggle"
+            title="Collapse / expand control panel"
+            aria-label="toggle control panel"></button>
+    <h2>Yb Control<span class="grow"></span></h2>
+    <div class="not-wired-banner">scaffolding · not wired (Phase 5.5)</div>
+
+    <div class="ctrl-row">
+      <button class="ctrl-btn" data-kind="start"   disabled title="Phase 5.5 — Start">Start</button>
+      <button class="ctrl-btn" data-kind="pause"   disabled title="Phase 5.5 — Pause">Pause</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" data-kind="abort"   disabled title="Phase 5.5 — Abort (1s hold)">Abort</button>
+      <button class="ctrl-btn" data-kind="restart-dash" disabled title="Phase 5.5 — Restart Dash">Restart Dash</button>
+    </div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn" data-kind="restart-all" disabled title="Phase 5.5 — Restart All (3s hold)" style="grid-column: span 2;">Restart All</button>
+    </div>
+
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Dummy mode</div>
+      <div class="ctrl-row dummy-mode">
+        <label><input type="radio" name="dummy-mode-ph5" value="off"     disabled> Off</label>
+        <label><input type="radio" name="dummy-mode-ph5" value="default" disabled> Default dummy</label>
+        <label><input type="radio" name="dummy-mode-ph5" value="last"    disabled checked> Last seq</label>
+      </div>
+    </div>
+
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Init folder</div>
+      <button class="ctrl-btn" data-kind="init-folder" disabled
+              title="Phase 5.5 — Load init folder" style="width:100%;">
+        Load init folder…
+      </button>
+    </div>
+
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Current scan</div>
+      <dl class="ctrl-kv">
+        <dt>scan</dt>  <dd id="ctrl-scan-id">—</dd>
+        <dt>seq</dt>   <dd id="ctrl-seq-id">—</dd>
+        <dt>file</dt>  <dd id="ctrl-scan-file">—</dd>
+        <dt>state</dt> <dd id="ctrl-runner-state">—</dd>
+      </dl>
+    </div>
+  </aside>
+
+  <!-- Compressed top-of-tab: img1 + img2 + scan curve share one row
+       (col-4 each); JS shrinks all to col-3 + reveals card-array-mid
+       when NumImages >= 3. Heights tuned so the status strip + this
+       row + the intensities/loading row below all fit on a 1080p
+       viewport without scrolling. -->
+  <section class="card col-4 array-card" id="card-array1" data-card-id="live-array1">
     <h2>Tweezer array — img 1<span class="grow"></span>
         <label class="switch" style="font-size:11px">
           <input type="checkbox" id="downsample-live" checked>
@@ -108,36 +169,36 @@
           <span>Downsample</span>
         </label>
     </h2>
-    <div class="plot-container" id="plot-array1" style="height: 420px;"></div>
+    <div class="plot-container" id="plot-array1" style="height: 320px;"></div>
   </section>
 
-  <section class="card col-4 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
+  <section class="card col-3 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
     <h2>Tweezer array — middle<span class="grow"></span>
         <span class="hint">NumImages ≥ 3</span>
     </h2>
-    <div class="plot-container" id="plot-array-mid" style="height: 420px;"></div>
+    <div class="plot-container" id="plot-array-mid" style="height: 320px;"></div>
   </section>
 
-  <section class="card col-6 array-card" id="card-array2" data-card-id="live-array2">
+  <section class="card col-4 array-card" id="card-array2" data-card-id="live-array2">
     <h2>Tweezer array — img 2<span class="grow"></span>
         <span id="array2-info" class="hint"></span>
     </h2>
-    <div class="plot-container" id="plot-array2" style="height: 420px;"></div>
+    <div class="plot-container" id="plot-array2" style="height: 320px;"></div>
   </section>
 
-  <section class="card col-12" data-card-id="live-scan-curve">
+  <section class="card col-4" id="card-scan-curve" data-card-id="live-scan-curve">
     <h2>Scan curve<span class="grow"></span></h2>
-    <div class="plot-container" id="plot-scan" style="height: 480px;"></div>
+    <div class="plot-container" id="plot-scan" style="height: 320px;"></div>
   </section>
 
   <section class="card col-8" data-card-id="live-intensities">
     <h2>Atom intensities<span class="grow"></span></h2>
-    <div class="plot-container" id="plot-intensities" style="height: 280px;"></div>
+    <div class="plot-container" id="plot-intensities" style="height: 220px;"></div>
   </section>
 
   <section class="card col-4" data-card-id="live-loading">
     <h2>Loading rate (live)<span class="grow"></span></h2>
-    <div class="plot-container" id="plot-loading-live" style="height: 280px;"></div>
+    <div class="plot-container" id="plot-loading-live" style="height: 220px;"></div>
   </section>
 
   <section class="card col-4" data-card-id="live-load-map">
@@ -299,6 +360,22 @@
     </h2>
     <div id="analysis-detail-body">
       <div class="hint">Click a row in Runs above (or paste a scan_id) to load analysis.</div>
+    </div>
+  </section>
+
+  <!-- ===== Calibration: global SLM->camera affine + loading patterns ==
+       The loading-pattern affine migration: trap positions are simulated
+       on the SLM (FFT) per loading pattern and mapped to camera pixels by
+       a single global affine that auto-updates from recent scans. -->
+  <section class="card col-12" data-card-id="analysis-calibration">
+    <h2>Calibration<span class="grow"></span>
+        <span class="hint mono" id="calib-status"></span>
+        <button class="ghost flex-fixed" id="calib-rollback"
+                title="Restore the previous affine">Rollback</button>
+        <button class="ghost flex-fixed" id="calib-refresh">Refresh</button>
+    </h2>
+    <div id="calib-body">
+      <div class="hint">Loading SLM&rarr;camera affine + patterns&hellip;</div>
     </div>
   </section>
 

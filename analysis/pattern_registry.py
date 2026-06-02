@@ -77,8 +77,18 @@ def _sanitize_name(name: str) -> str:
     return safe
 
 
+def _pattern_dir(name: str) -> Path:
+    return _patterns_dir() / _sanitize_name(name)
+
+
 def _record_path(name: str) -> Path:
-    return _patterns_dir() / _sanitize_name(name) / _RECORD_FILENAME
+    return _pattern_dir(name) / _RECORD_FILENAME
+
+
+def pattern_threshold_path(name: str) -> Path:
+    """Per-pattern threshold store (same layout as the day-folder
+    threshold.mat: thresholds, infidelities, gaussFitsStruct)."""
+    return _pattern_dir(name) / 'threshold.mat'
 
 
 def _now_iso() -> str:
@@ -194,6 +204,41 @@ def _params_match(rec: dict, *, base_phase_path, order, fft_shape, threshold,
     if list(rec.get('baked_zernike') or []) != list(baked_zernike or []):
         return False
     return bool(rec.get('base_sha256'))  # only trust a successfully-derived rec
+
+
+def load_pattern_thresholds(name):
+    """Load per-pattern detection thresholds, or None. Mirrors the day-folder
+    threshold.mat parsing in data_manager._load_from_disk. Returns
+    {'thresholds': (N,), 'infidelities': (N,), 'gauss_fits': list|None}."""
+    p = pattern_threshold_path(name)
+    if not p.is_file():
+        return None
+    try:
+        import numpy as np
+        from scipy.io import loadmat
+        from yb_analysis.io.preload import _parse_gauss_fits_struct
+        td = loadmat(str(p), squeeze_me=True)
+        thr = np.asarray(td['thresholds'], dtype=np.float64).ravel()
+        inf = np.asarray(td.get('infidelities', np.full(len(thr), np.nan)),
+                         dtype=np.float64).ravel()
+        gf = _parse_gauss_fits_struct(td.get('gaussFitsStruct'))
+        return {'thresholds': thr, 'infidelities': inf, 'gauss_fits': gf}
+    except Exception as ex:  # noqa: BLE001
+        logger.warning('load_pattern_thresholds(%s) failed: %s', name, ex)
+        return None
+
+
+def save_pattern_thresholds(name, mat_dict):
+    """Write <pattern>/threshold.mat (keys: thresholds, infidelities,
+    gaussFitsStruct) — the same dict data_manager writes to the day folder, so
+    the formats stay identical and the live refit self-calibrates per pattern."""
+    try:
+        from scipy.io import savemat
+        p = pattern_threshold_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        savemat(str(p), mat_dict)
+    except Exception as ex:  # noqa: BLE001
+        logger.warning('save_pattern_thresholds(%s) failed: %s', name, ex)
 
 
 def fetch_or_refresh_pattern(name, *, base_phase_path,

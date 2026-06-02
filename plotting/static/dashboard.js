@@ -93,6 +93,7 @@
     if (location.hash !== "#" + tab) location.hash = "#" + tab;
     // Render once on tab switch in case the poll interval hasn't fired.
     pollOnceForTab(tab);
+    if (tab === "analysis") { try { loadCalibration(); } catch (e) {} }
     // Plotly re-sizes layouts when the container becomes visible.
     setTimeout(() => {
       if (window.Plotly) {
@@ -109,6 +110,52 @@
     });
     const hash = location.hash.replace("#", "");
     if (TABS.includes(hash)) setTab(hash);
+  }
+
+  // ---- Calibration card: global SLM->camera affine + loading patterns ----
+  function _calFmt(v, d) {
+    return (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
+  }
+  async function loadCalibration() {
+    const body = document.getElementById("calib-body");
+    const statusEl = document.getElementById("calib-status");
+    if (!body) return;
+    try {
+      const [aff, pats] = await Promise.all([
+        api("/api/affine/current"), api("/api/patterns"),
+      ]);
+      let html = "";
+      if (aff && aff.A) {
+        const A = aff.A;
+        html += '<div class="mono" style="font-size:12px;line-height:1.6;">';
+        html += '<b>SLM&rarr;camera affine</b> (knm[x,y] &rarr; absolute camera[Y,X]; crop applied separately)<br>';
+        html += `rotation ${_calFmt(aff.rotation_deg, 2)}&deg; &nbsp; scale ${_calFmt(aff.scale_x, 3)} / ${_calFmt(aff.scale_y, 3)} &nbsp; rms ${_calFmt(aff.rms_px, 2)} px &nbsp; coverage ${_calFmt((aff.coverage || 0) * 100, 1)}%<br>`;
+        html += `last scan ${aff.last_scan_id || "—"} &nbsp; updated ${aff.updated_iso || "—"}${aff.rolled_back ? " (rolled back)" : ""}<br>`;
+        html += `A = [[${_calFmt(A[0][0], 4)}, ${_calFmt(A[0][1], 4)}, ${_calFmt(A[0][2], 2)}], [${_calFmt(A[1][0], 4)}, ${_calFmt(A[1][1], 4)}, ${_calFmt(A[1][2], 2)}]]`;
+        html += "</div>";
+        if (statusEl) statusEl.textContent = `affine rot ${_calFmt(aff.rotation_deg, 1)}° rms ${_calFmt(aff.rms_px, 2)}px`;
+      } else {
+        html += '<div class="hint">No affine committed yet — bootstrap with <span class="mono">yb_analysis.scripts.bootstrap_affine</span>.</div>';
+        if (statusEl) statusEl.textContent = "no affine";
+      }
+      const names = (pats && pats.patterns) ? Object.keys(pats.patterns) : [];
+      html += '<h3 style="margin:12px 0 4px;">Loading patterns</h3>';
+      if (names.length) {
+        html += '<table class="mono" style="font-size:12px;border-collapse:collapse;">';
+        html += '<tr><th style="text-align:left;padding:2px 12px;">pattern</th><th>sites</th><th>order</th><th>defocus z</th><th>updated</th></tr>';
+        for (const n of names) {
+          const m = pats.patterns[n] || {};
+          const z = m.default_loading_zernike ? JSON.stringify(m.default_loading_zernike) : "—";
+          html += `<tr><td style="padding:2px 12px;">${n}</td><td style="text-align:center;">${m.n_sites || "—"}</td><td style="text-align:center;">${m.order || "—"}</td><td style="text-align:center;">${z}</td><td style="text-align:center;">${m.updated_iso || "—"}</td></tr>`;
+        }
+        html += "</table>";
+      } else {
+        html += '<div class="hint">No loading patterns registered yet.</div>';
+      }
+      body.innerHTML = html;
+    } catch (e) {
+      body.innerHTML = `<div class="hint">Calibration unavailable: ${e.message || e}</div>`;
+    }
   }
 
   // ---- Polling orchestrator ----
@@ -154,6 +201,21 @@
     pollOnceForTab(activeTab);
     toast("Refreshed", "warn");
   });
+
+  // Calibration card buttons (Analysis tab).
+  (function wireCalibration() {
+    const rb = document.getElementById("calib-refresh");
+    if (rb) rb.addEventListener("click", () => loadCalibration());
+    const back = document.getElementById("calib-rollback");
+    if (back) back.addEventListener("click", async () => {
+      try {
+        const r = await api("/api/affine/rollback", {method: "POST"});
+        toast(r && r.ok ? "Affine rolled back" : "Nothing to roll back",
+              r && r.ok ? "warn" : "err");
+      } catch (e) { toast("Rollback failed: " + (e.message || e), "err"); }
+      loadCalibration();
+    });
+  })();
 
   // Site picker: changing the number reruns the site histogram against
   // the new index. Debounced via natural Plotly poll cadence.
@@ -249,24 +311,33 @@
         const cur = snap.n_accum_shots || 0;
         $("scan-progress").textContent = `${cur} shots`;
       }
-      // Show/hide the middle-image card based on NumImages.  When the
-      // scan uses 3 images per shot, the array row layout becomes
-      // col-4 / col-4 / col-4 so all three fit on the same row; with 2
-      // it stays col-6 / col-6.
+      // Show/hide the middle-image card based on NumImages. The
+      // compressed top row holds {img1, [mid?], img2, scan curve}
+      // — col-4 each when 2 images (img1/img2/scan), or col-3 each
+      // when 3 (img1/mid/img2/scan).
       const nImg = snap.num_images != null ? Number(snap.num_images) : 0;
       const hasMid = nImg >= 3;
-      const cardMid  = $("card-array-mid");
-      const card1    = $("card-array1");
-      const card2    = $("card-array2");
+      const cardMid    = $("card-array-mid");
+      const card1      = $("card-array1");
+      const card2      = $("card-array2");
+      const cardScan   = $("card-scan-curve");
+      const _swapCol = (el, from, to) => {
+        if (!el) return;
+        el.classList.remove(from);
+        el.classList.add(to);
+      };
       if (cardMid && card1 && card2) {
         if (hasMid) {
           cardMid.hidden = false;
-          card1.classList.remove("col-6"); card1.classList.add("col-4");
-          card2.classList.remove("col-6"); card2.classList.add("col-4");
+          _swapCol(card1,   "col-4", "col-3");
+          _swapCol(cardMid, "col-4", "col-3");
+          _swapCol(card2,   "col-4", "col-3");
+          _swapCol(cardScan,"col-4", "col-3");
         } else {
           cardMid.hidden = true;
-          card1.classList.remove("col-4"); card1.classList.add("col-6");
-          card2.classList.remove("col-4"); card2.classList.add("col-6");
+          _swapCol(card1,   "col-3", "col-4");
+          _swapCol(card2,   "col-3", "col-4");
+          _swapCol(cardScan,"col-3", "col-4");
         }
       }
       // Site picker bounds + info block.
@@ -2110,6 +2181,31 @@
   }
 
   // Toggle / shot-picker handlers — re-render only the survival map.
+  // Phase 5.5 prep: control sidebar toggle. The sidebar is
+   // position:fixed on the right edge; the Live tab pane reserves
+   // padding-right for it so chart content isn't covered. Default
+   // OPEN (Phase 5.5 spec). Operator preference persists in
+   // localStorage so a closed-then-refresh stays closed.
+  (function wireLiveSidebarToggle() {
+    const tab     = document.getElementById("tab-live");
+    const sidebar = document.querySelector(".live-sidebar");
+    const btn     = document.getElementById("live-sidebar-toggle");
+    if (!tab || !sidebar || !btn) return;
+    const KEY = "yb-dash-live-sidebar-collapsed";
+    let collapsed = (() => {
+      try { return localStorage.getItem(KEY) === "1"; }
+      catch { return false; }
+    })();
+    const apply = () => {
+      sidebar.classList.toggle("collapsed", collapsed);
+      tab.classList.toggle("sidebar-collapsed", collapsed);
+      tab.classList.toggle("sidebar-open", !collapsed);
+      try { localStorage.setItem(KEY, collapsed ? "1" : "0"); } catch {}
+    };
+    btn.addEventListener("click", () => { collapsed = !collapsed; apply(); });
+    apply();
+  })();
+
   (function wirePathsOverlayHandlers() {
     const toggle = document.getElementById("paths-overlay-toggle");
     const sel    = document.getElementById("paths-overlay-shot");

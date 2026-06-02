@@ -125,6 +125,179 @@ header .status-pill .dot {
 }
 .tab-pane[hidden] { display: none !important; }
 
+/* Live tab compact mode: the WHOLE tab is one big card (background =
+   the old card colour) and individual chart cards lose all chrome so
+   plots flow flush. Plot titles live inside the Plotly figures
+   themselves (server-side /api/live/figures already paints titles
+   into each), so the redundant section h2 above each chart is
+   hidden in this mode. Phase 5.5 prep. */
+/* Live-tab compact mode (reverted to standard 12-col grid; the
+   sidebar lives as a position:fixed slide-in panel — see below).
+   Only thing we strip from the chart cards is the border/background
+   so plots flow without a visible box around each one. */
+.tab-pane.live-flat.sidebar-open {
+  padding-right: calc(20px + var(--live-sidebar-w, 260px));
+}
+.tab-pane.live-flat.sidebar-collapsed {
+  padding-right: 44px;
+}
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar) {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+/* Title belongs INSIDE the plot (Plotly-rendered already paints
+   each chart's name). Suppress the h2 text but keep any inline
+   controls that live INSIDE h2 (Downsample switch on img1,
+   array2-info hint, etc.) — collapse the h2 to a thin row that
+   only shows its non-text children. */
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar) > h2 {
+  font-size: 0;
+  line-height: 1;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  border: none;
+  gap: 6px;
+}
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar) > h2 > * {
+  font-size: 11px;
+  line-height: 1.2;
+}
+/* No-op gap when h2 collapsed to truly nothing (no inline controls). */
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar) > h2:empty {
+  display: none;
+}
+/* Slide-in control sidebar: a position:fixed panel on the right edge
+   of the viewport, below the sticky header. Default state is OPEN
+   (visible). The ‹/› toggle on its LEFT edge collapses it to a thin
+   handle so the chart area can reclaim the full width. Tab-pane gets
+   `padding-right: <sidebar-width>` or `44px` (handle only) to keep
+   chart content out from under the panel. Hidden on every tab except
+   Live via the [hidden] descendant rule below. */
+:root { --live-sidebar-w: 260px; }
+.live-sidebar {
+  position: fixed;
+  top: 64px;
+  right: 0;
+  width: var(--live-sidebar-w);
+  height: calc(100vh - 72px);
+  z-index: 20;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-top-left-radius: 8px;
+  border-bottom-left-radius: 8px;
+  box-shadow: -4px 0 14px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  overflow-y: auto;
+  transition: transform 180ms ease;
+}
+.live-sidebar.collapsed {
+  transform: translateX(calc(100% - 32px));
+}
+.live-sidebar-toggle {
+  position: absolute;
+  top: 12px;
+  left: -1px;
+  transform: translateX(-100%);
+  width: 28px;
+  height: 36px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-right: none;
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
+  color: var(--text-dim);
+  font-size: 16px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+}
+.live-sidebar-toggle:hover { color: var(--text); background: var(--bg-alt); }
+.live-sidebar.collapsed .live-sidebar-toggle::before { content: "‹"; }
+.live-sidebar:not(.collapsed) .live-sidebar-toggle::before { content: "›"; }
+/* Hide the fixed-positioned sidebar when its parent tab is hidden. */
+.tab-pane[hidden] .live-sidebar { display: none !important; }
+.live-sidebar h2 { margin: 0 0 4px; }
+.live-sidebar .ctrl-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.live-sidebar .ctrl-btn {
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: not-allowed;
+  opacity: 0.55;
+  position: relative;
+  letter-spacing: 0.4px;
+}
+.live-sidebar .ctrl-btn[data-kind="abort"] {
+  color: #ff8585;
+  border-color: rgba(248, 81, 73, 0.4);
+}
+.live-sidebar .ctrl-btn[data-kind="restart-all"] {
+  color: #f0bb50;
+  border-color: rgba(210, 153, 34, 0.4);
+}
+.live-sidebar .ctrl-section {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  margin-top: 4px;
+}
+.live-sidebar .ctrl-section-label {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.live-sidebar .ctrl-row.dummy-mode {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+.live-sidebar .ctrl-row.dummy-mode label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.live-sidebar .not-wired-banner {
+  background: rgba(210, 153, 34, 0.12);
+  color: #d29922;
+  border: 1px dashed rgba(210, 153, 34, 0.5);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 10.5px;
+  text-align: center;
+  letter-spacing: 0.3px;
+  margin-bottom: 4px;
+}
+.live-sidebar .ctrl-kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+.live-sidebar .ctrl-kv dt { color: var(--text-dim); }
+.live-sidebar .ctrl-kv dd { margin: 0; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+
 /* Full-bleed tab variant — drops the 12-col grid, max-width cap, and
    padding so a single child element (e.g. an iframe) can fill the
    entire space below the sticky header. Used by the Hardware tab so

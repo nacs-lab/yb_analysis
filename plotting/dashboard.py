@@ -523,6 +523,12 @@ def _register_api_routes(server):
         '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
         '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
         '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its kind',
+        '/api/affine/current':       'current global SLM->camera affine (2x3 + rotation/scale/rms/coverage/last_scan_id)',
+        '/api/affine/history':       'bounded history of past affines + current',
+        '/api/affine/rollback':      'POST: restore the most recent history affine',
+        '/api/patterns':             'registered loading patterns (compact metadata; no big arrays)',
+        '/api/patterns/<name>':      'full pattern record incl. knm positions + per-site phases',
+        '/api/patterns/<name>/refresh': 'POST: re-derive a pattern from the SLM (force)',
     }
 
     def _list_endpoints():
@@ -589,6 +595,67 @@ def _register_api_routes(server):
         # geometry + colour range.
         return jsonify(_to_jsonable(
             {k: v for k, v in d.items() if k not in _SNAPSHOT_HEAVY_KEYS}))
+
+    # ---- Loading-pattern affine + registry (calibration) ----
+    # The global SLM->camera affine and the per-pattern grid registry live as
+    # JSON under <PATH_PREFIX>/yb_dashboard_state/; these routes expose them
+    # read-only (plus guarded rollback/refresh) for the Calibration card.
+
+    @server.route('/api/affine/current')
+    def _api_affine_current():
+        from yb_analysis.analysis import affine_transform as _aff
+        return jsonify(_to_jsonable(_aff.load_affine() or {}))
+
+    @server.route('/api/affine/history')
+    def _api_affine_history():
+        from yb_analysis.analysis import affine_transform as _aff
+        try:
+            data = _aff._read()
+        except Exception:
+            data = {'current': None, 'history': []}
+        return jsonify(_to_jsonable({'current': data.get('current'),
+                                     'history': data.get('history', [])}))
+
+    @server.route('/api/affine/rollback', methods=['POST'])
+    def _api_affine_rollback():
+        from yb_analysis.analysis import affine_transform as _aff
+        ok = _aff.rollback()
+        return jsonify(_to_jsonable({'ok': ok, 'current': _aff.load_affine()})), \
+            (200 if ok else 409)
+
+    @server.route('/api/patterns')
+    def _api_patterns():
+        from yb_analysis.analysis import pattern_registry as _reg
+        return jsonify(_to_jsonable({'patterns': _reg.list_patterns()}))
+
+    @server.route('/api/patterns/<name>')
+    def _api_pattern(name):
+        from yb_analysis.analysis import pattern_registry as _reg
+        rec = _reg.get_pattern(name)
+        if rec is None:
+            return jsonify({'error': 'pattern not found'}), 404
+        return jsonify(_to_jsonable(rec))
+
+    @server.route('/api/patterns/<name>/refresh', methods=['POST'])
+    def _api_pattern_refresh(name):
+        from yb_analysis.analysis import pattern_registry as _reg
+        rec = _reg.get_pattern(name)
+        if rec is None:
+            return jsonify({'error': 'pattern not found (refresh needs an '
+                                     'existing record for its base_phase_path)'}), 404
+        try:
+            out = _reg.fetch_or_refresh_pattern(
+                name, base_phase_path=rec.get('base_phase_path'),
+                default_loading_zernike=rec.get('default_loading_zernike'),
+                order=rec.get('order', 'col'),
+                legacy_zerniked=rec.get('legacy_zerniked', False),
+                baked_zernike=rec.get('baked_zernike'), force=True)
+            return jsonify(_to_jsonable(
+                {'ok': out is not None,
+                 'pattern': _reg._compact(out) if out else None}))
+        except Exception as ex:
+            logger.exception('pattern refresh failed')
+            return jsonify({'error': str(ex)}), 500
 
     # ---- SLM passthrough routes (read from yb_dash_slm.pkl) ----
     # All return cached SLM-PC data, polled by yb_analysis.slm_proxy on the
