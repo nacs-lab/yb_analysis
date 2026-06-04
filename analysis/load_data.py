@@ -8,7 +8,7 @@ import glob
 import numpy as np
 
 from yb_analysis.config import DATA_DIR
-from yb_analysis.io.mat_reader import load_scan_config_from_mat
+from yb_analysis.io.mat_reader import load_scan_config, load_scan_config_from_mat
 
 
 def load_latest_scan(data_dir=None, date=None):
@@ -87,7 +87,14 @@ def _load_from_h5(h5_path, scan_dir, base):
     import h5py
 
     mat_path = os.path.join(scan_dir, base + '.mat')
-    scan = load_scan_config_from_mat(mat_path) if os.path.isfile(mat_path) else {}
+    json_path = os.path.join(scan_dir, base + '.json')
+    # Prefer the pyctrl .json sidecar, fall back to the MATLAB .mat. Without
+    # this, a pyctrl scan (no .mat) loads an EMPTY config — so unpack finds no
+    # Params/ScanGroup and the analysis pane renders blank curves.
+    if os.path.isfile(mat_path) or os.path.isfile(json_path):
+        scan = load_scan_config(mat_path)
+    else:
+        scan = {}
 
     logicals = intensities = None
     logicals_img1 = logicals_img2 = None

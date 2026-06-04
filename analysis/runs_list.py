@@ -79,9 +79,15 @@ def list_runs(*, since_days: Optional[int] = None,
             if not m:
                 continue
             base_name = scan_dir.name   # data_YYYYMMDD_HHMMSS
-            mat_path = scan_dir / f'{base_name}.mat'
-            h5_path  = scan_dir / f'{base_name}.h5'
-            complete = mat_path.is_file() and h5_path.is_file()
+            mat_path  = scan_dir / f'{base_name}.mat'
+            json_path = scan_dir / f'{base_name}.json'
+            h5_path   = scan_dir / f'{base_name}.h5'
+            # A scan's config sidecar is a MATLAB ``.mat`` (matlab backend) OR a
+            # ``.json`` (pyctrl backend) — either counts as a written config.
+            # Without this, pyctrl scans (which never emit a ``.mat``) are seen
+            # as incomplete and silently dropped from the analysis pane.
+            has_config = mat_path.is_file() or json_path.is_file()
+            complete = has_config and h5_path.is_file()
             if not include_incomplete and not complete:
                 # Skip aborted-before-write scans (empty dirs / partial
                 # writes); they clutter the runs table and can't be
@@ -110,23 +116,30 @@ def list_runs(*, since_days: Optional[int] = None,
 
 
 def _enrich_meta(scan_dir: Path, row: dict) -> None:
-    """Best-effort: pull scan name + swept-param info from the .mat sidecar.
+    """Best-effort: pull scan name + swept-param info from the config sidecar.
 
-    Uses ``extract_scan_dims_h5`` to resolve real swept-param paths
-    (dotted, e.g. ``Pushout.Green.Freq``) by walking ScanGroup.base.vars
-    inside the v7.3 HDF5 .mat. Falls back gracefully when the structure
-    isn't in the expected shape.
+    For a MATLAB ``.mat`` sidecar, ``extract_scan_dims_h5`` resolves real
+    swept-param paths (dotted, e.g. ``Pushout.Green.Freq``) by walking
+    ScanGroup.base.vars inside the v7.3 HDF5. For a pyctrl ``.json`` sidecar
+    the ScanGroup is already a plain nested dict, so the dict-based
+    ``extract_scan_dims`` recovers the same paths. Falls back gracefully when
+    the structure isn't in the expected shape.
     """
     base = scan_dir.name
-    mat_path = scan_dir / f'{base}.mat'
-    if not mat_path.is_file():
+    mat_path  = scan_dir / f'{base}.mat'
+    json_path = scan_dir / f'{base}.json'
+    has_mat = mat_path.is_file()
+    if not has_mat and not json_path.is_file():
         return
     try:
         import numpy as np
-        from yb_analysis.io.mat_reader import load_scan_config_from_mat
+        from yb_analysis.io.mat_reader import load_scan_config
         from yb_analysis.analysis.run_analysis import _resolve_scan_name
-        from yb_analysis.detection.scan_analysis import extract_scan_dims_h5
-        scan = load_scan_config_from_mat(str(mat_path)) or {}
+        from yb_analysis.detection.scan_analysis import (
+            extract_scan_dims, extract_scan_dims_h5)
+        # load_scan_config prefers a .json sibling (pyctrl) and falls back to
+        # the .mat reader (matlab), so this handles both backends.
+        scan = load_scan_config(str(mat_path)) or {}
         row['name'] = _resolve_scan_name(scan)
         # NumPerGroup is the shot count per scan point.
         npg = scan.get('NumPerGroup')
@@ -135,8 +148,10 @@ def _enrich_meta(scan_dir: Path, row: dict) -> None:
                 row['n_shots'] = int(np.asarray(npg).ravel()[0])
             except Exception:
                 pass
-        # Swept-param names via the HDF5 walker that already exists.
-        dims = extract_scan_dims_h5(str(mat_path))
+        # Swept-param names: walk the v7.3 HDF5 refs for a .mat sidecar, or
+        # the plain nested dict for a pyctrl .json sidecar.
+        dims = (extract_scan_dims_h5(str(mat_path)) if has_mat
+                else extract_scan_dims(scan))
         if dims:
             names = [d.get('name') or f'axis{i}'
                      for i, d in enumerate(dims)]

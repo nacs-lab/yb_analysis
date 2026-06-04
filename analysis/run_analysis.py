@@ -629,6 +629,19 @@ def _str_or_none(v) -> Optional[str]:
                     return s or None
                 except (ValueError, OverflowError):
                     return None
+            if arr.dtype.kind == 'f':
+                # pyctrl JSON sidecar: char codes (scanname) pass through
+                # _config_arrays, which floats numeric lists. Decode iff every
+                # entry is an integral, in-range codepoint (else it's a real
+                # numeric field, not a string — leave it alone).
+                try:
+                    codes = arr.tolist()
+                    if codes and all(float(x).is_integer() and 0 < x < 0x110000
+                                     for x in codes):
+                        s = ''.join(chr(int(x)) for x in codes).strip()
+                        return s or None
+                except (ValueError, OverflowError):
+                    return None
             if arr.dtype.kind in ('U', 'S'):
                 s = str(arr[0]) if arr.size else ''
                 return s.strip() or None
@@ -687,6 +700,17 @@ def _build_sweep(scan: dict, scan_params: np.ndarray,
                 cols.append(name)
         except Exception as ex:
             logger.debug('extract_scan_dims_h5 failed: %s', ex)
+
+    # pyctrl scans have no .mat (mat_path is None), but their JSON config
+    # carries ScanGroup.base.vars as a plain dict — recover dotted axis names
+    # from it so the dashboard labels the sweep correctly (not "axis0").
+    if not cols:
+        try:
+            from yb_analysis.detection.scan_analysis import extract_scan_dims
+            for d in (extract_scan_dims(scan) or []):
+                cols.append(d.get('name') or f'axis{len(cols)}')
+        except Exception as ex:
+            logger.debug('extract_scan_dims (dict) failed: %s', ex)
 
     if not cols:
         sv = scan.get('ScanVar')

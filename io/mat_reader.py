@@ -147,6 +147,41 @@ def load_scan_config_from_mat(path):
     raise RuntimeError(f"Cannot load {path}: install h5py and/or scipy")
 
 
+def load_scan_config(mat_fname):
+    """Load a scan config, preferring a pyctrl JSON sidecar over the MATLAB ``.mat``.
+
+    The pyctrl backend (scan_prep.write_scan_config) writes ``<dir>/data_<stamp>.json`` instead
+    of a MATLAB ``.mat`` (a Python backend has no reason to emit MATLAB binary). If that JSON is
+    present it is loaded directly; otherwise we fall back to the MATLAB ``.mat`` reader, so
+    MATLAB-written scans are unaffected. Returns a dict of ``Scan`` fields either way.
+    """
+    import json
+    json_fname = os.path.splitext(mat_fname)[0] + '.json'
+    if os.path.exists(json_fname):
+        with open(json_fname) as f:
+            return _config_arrays(json.load(f))
+    return load_scan_config_from_mat(mat_fname)
+
+
+def _config_arrays(obj):
+    """Coerce numeric JSON lists to float ndarrays so a JSON-sourced config reads like a
+    scipy-loaded ``.mat``.
+
+    The ``.mat`` path returns numpy arrays; the config consumers built for it
+    (``extract_scan_dims`` / ``_find_first_numeric``, which only recognize ``np.ndarray``
+    leaves) would silently miss a pyctrl JSON config's swept-axis values (plain lists) and
+    report no scan dimensions. Recursively: an all-numeric list -> ``np.ndarray`` (float);
+    a list with dicts/strings -> recurse element-wise but stay a list; dicts recurse;
+    scalars/strings pass through. (``bool`` is excluded so flag lists aren't floated.)"""
+    if isinstance(obj, dict):
+        return {k: _config_arrays(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if obj and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in obj):
+            return np.asarray(obj, dtype=float)
+        return [_config_arrays(x) for x in obj]
+    return obj
+
+
 def _load_hdf5_group(grp, max_bytes=_MAX_DATASET_BYTES):
     """Load an HDF5 group into a nested dict (only datasets + subgroups)."""
     result = {}
