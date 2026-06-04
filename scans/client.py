@@ -14,9 +14,12 @@ Example::
         params={'Cooling.Detuning': sweep_linspace(20e6, 30e6, 21)},
         runp={'NumPerGroup': 4000, 'Scramble': True})
 
-The returned id is the descriptor's queue position. The actual job id
-appears as ``built_job_id`` in :func:`list_jobs` output once the
-SequenceRunner dispatches the descriptor.
+The returned id is the descriptor's queue position. How it maps to the
+running job depends on the live backend: the **MATLAB** runner dispatches the
+descriptor into a distinct-id job (follow the descriptor row's
+``built_job_id`` in :func:`list_jobs` output), while the **pyctrl** backend
+reuses the descriptor's id for the job -- the returned id IS the job id, and
+there is no ``built_job_id`` (the descriptor row is dropped, not archived).
 """
 
 from __future__ import annotations
@@ -95,9 +98,11 @@ def submit_scan(seq: Any,
     Returns
     -------
     int
-        The descriptor's queue id. Watch :func:`list_jobs` for the
-        descriptor row's ``built_job_id`` to follow the resulting scan
-        through to disk.
+        The descriptor's queue id. To follow the resulting scan through to
+        disk: under the **MATLAB** backend, watch :func:`list_jobs` for the
+        descriptor row's ``built_job_id`` (a distinct job id); under the
+        **pyctrl** backend, the job reuses this id (it IS the job id -- there
+        is no ``built_job_id``, and the descriptor row is dropped).
     """
     desc: dict = {'schema_version': SCHEMA_VERSION, 'seq': seq}
     if params:
