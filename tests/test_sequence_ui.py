@@ -36,6 +36,12 @@ def test_index_renders_sequence_tab(html_client):
         'id="seq-seq-select"', 'id="seq-chn-select"', 'id="seq-params"',
         'data-card-id="sequence-source"', 'data-card-id="sequence-plot"',
         'data-card-id="sequence-params"', 'id="seq-autosave"',
+        # Two floating-picker hosts: Scans docked LEFT, Channels docked RIGHT.
+        'id="floating-seqscan-host"', 'id="seqscan-card"',
+        'id="floating-sequence-host"', 'id="sequence-chn-card"',
+        # Params search + config/modified/scanned show-hide toggles.
+        'id="seq-param-search"', 'id="seq-filter-config"',
+        'id="seq-filter-modified"', 'id="seq-filter-scanned"',
     ]:
         assert marker in html, "missing in rendered HTML: " + marker
 
@@ -56,6 +62,18 @@ def test_dashboard_js_wires_sequence():
         'if (tab === "sequence") return loadSequence();',
         '/api/sequence/dump_toggle',  # the auto-dump toggle
         'seq-autosave',
+        'floating-seqscan-host',      # the left-docked Scans host (toggled per tab)
+        # Three-state picker + reconstruct trigger (§12.4).
+        'function seqReconstruct',
+        '/api/sequence/reconstruct',
+        'has_snapshot',
+        'seq-row-working',      # the in-flight reconstruct row class (literal in JS)
+        # Req 1/2/3: last-30 scans, params filter tree, param<->channel xref.
+        'SEQ_SCANS_LIMIT',
+        'function seqRenderParamTree',
+        'function seqOnParamChannels',
+        'function seqHighlightParamsForChannel',
+        '/api/sequence/xref',
     ]:
         assert marker in js, "missing JS wiring: " + marker
 
@@ -64,5 +82,10 @@ def test_dashboard_css_has_sequence_styles():
     css = open(os.path.join(_PLOTTING, "static", "dashboard.css"),
                encoding="utf-8").read()
     for marker in ["#tab-sequence .plot-container", ".seq-tree",
-                   ".seq-modified", ".seq-config", ".seq-scanned-badge"]:
+                   ".seq-modified", ".seq-config", ".seq-scanned-badge",
+                   "#floating-seqscan-host",          # left-dock for the Scans picker
+                   ".seq-row-reconstructable",        # three-state picker
+                   ".seq-row-unrecoverable",
+                   ".seq-param-filters",              # params category toggles
+                   ".seq-leaf-xref-hit"]:             # channel->param highlight
         assert marker in css, "missing CSS: " + marker
