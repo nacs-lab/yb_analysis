@@ -5924,7 +5924,7 @@
     // spinning on "building", which is how the silent-failure mode used to look.
     const pendingG = (seqState.xref && seqState.xref.pending_globals) || 0;
     if (r.xref_build_error) { seqSetXrefNotice("error", r.xref_build_error); }
-    else if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting"); seqAwaitGlobals(qs, pollGen); }
+    else if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting", pendingG); seqAwaitGlobals(qs, pollGen); }
     else if (r.xref_building) { seqSetXrefNotice("building"); seqPollXrefUpdate(qs, pollGen); }
     // Partial map: the ruler is drawn but N bands still wait on the run's globals (e.g. the
     // EOM ramp). Show how many, and poll so they fill in once globals land + the xref rebuilds.
@@ -5943,10 +5943,13 @@
     if (!kind) { el.hidden = true; el.textContent = ""; el.className = "seq-notice"; return; }
     if (kind === "awaiting") {
       el.className = "seq-notice seq-notice-wait";
+      const n = detail | 0;                          // pending_globals (0 = unknown/none)
+      const what = n > 0
+        ? (n + ' step/band' + (n === 1 ? '' : 's') + ' can’t be placed')
+        : 'the step ruler &amp; timing bands can’t be placed';
       el.innerHTML = '<span class="seq-notice-ic">⏳</span> Waiting for the run’s globals ' +
-        '(captured at the <b>end of the run</b>) — only then can the step ruler &amp; timing ' +
-        'bands be placed. Channel waveforms and the param↔channel/pulse map are already ' +
-        'available.';
+        '(captured at the <b>end of the run</b>) — ' + what + ' until then. Channel waveforms ' +
+        'and the param↔channel/pulse map are already available.';
     } else if (kind === "error") {
       // The background provenance build failed (e.g. a config error). Show the producer's
       // message so it's diagnosable instead of looking like "the map just doesn't work".
@@ -6044,7 +6047,7 @@
       }
       const hasMap = seqXrefHasTimingMap(x);
       if (hasMap && pend(x) === 0) { seqSetXrefNotice(null); return; }    // fully placed -> done
-      if (!hasMap && x.awaiting_globals) seqSetXrefNotice("awaiting");    // nothing placed yet
+      if (!hasMap && x.awaiting_globals) seqSetXrefNotice("awaiting", pend(x));  // nothing placed yet
       else if (pend(x) > 0) seqSetXrefNotice("pending", pend(x));         // partial -> N pending
       else if (x.building) seqSetXrefNotice("building");
       else { seqSetXrefNotice(null); return; }             // nothing pending
