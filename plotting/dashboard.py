@@ -1195,25 +1195,45 @@ def _register_api_routes(server):
     def _api_sequence_backtrace():
         """Resolved source backtrace (file · function · line) for a clicked point's pulse_id.
 
-        Each ``.seq`` point carries the build-time call stack of the pulse that produced it
-        (MATLAB's dumper writes it today; pyctrl's producer-side capture is the pending B3
-        work). The client passes the clicked point's ``customdata`` (= its pulse_id); the
-        reader resolves it to ``[{file, name, line}]``. Empty frames -> a default/non-pulse
-        point, or a .seq with no backtrace block (``has_bt`` False).
+        Two sources, same pid space: (1) the ``.seq``-embedded backtrace block (MATLAB's
+        dumper writes it inline), and (2) the xref's ``backtraces`` map (pyctrl's ``.seq``
+        carries no block; its B3 producer captures backtraces OFFLINE into ``xref.json``
+        keyed by the same pid). We prefer the embedded block, then fall back to the xref.
+        Empty ``frames`` -> a default/non-pulse point; ``has_bt`` False -> the scan carries
+        no backtraces at all (the client then renders nothing, keeping it clutter-free).
         """
         from flask import request, jsonify
+        from yb_analysis.sequence import xref as _xref
         sf, seq, err = _load_selected_seq()
         if err:
             return err
         pid = request.args.get('pulse_id')
-        try:
-            frames = seq.backtrace(int(pid)) if pid not in (None, '') else []
-        except (TypeError, ValueError):
-            frames = []
+        pid_s = None if pid in (None, '') else str(pid)
+        # (1) .seq-embedded block.
+        seq_has_bt = getattr(seq, '_bt', None) is not None
+        frames, source = [], None
+        if seq_has_bt and pid_s is not None:
+            try:
+                frames = [{'file': f.file, 'name': f.name, 'line': f.line}
+                          for f in seq.backtrace(int(pid))]
+                source = 'seq' if frames else None
+            except (TypeError, ValueError):
+                frames = []
+        # (2) xref fallback (pyctrl B3): keyed by the same pid as the .seq's customdata.
+        fname = request.args.get('file')
+        if not fname:
+            files = sf.seq_files()
+            fname = files[0] if files else None
+        xr_bts = _xref.load_xref(sf.dir, fname).get('backtraces') or {}
+        if not frames and pid_s is not None and pid_s in xr_bts:
+            frames = [{'file': f.get('file'), 'name': f.get('name'), 'line': f.get('line')}
+                      for f in (xr_bts[pid_s] or [])]
+            source = 'xref' if frames else source
         return jsonify({
             'pulse_id': pid,
-            'has_bt': getattr(seq, '_bt', None) is not None,
-            'frames': [{'file': f.file, 'name': f.name, 'line': f.line} for f in frames],
+            'has_bt': bool(seq_has_bt or xr_bts),   # scan carries backtraces (either source)
+            'frames': frames,
+            'source': source,
         })
 
     def _seq_scan_base():

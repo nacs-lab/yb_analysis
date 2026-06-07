@@ -112,6 +112,54 @@ def test_bad_scan_id_400(client):
     assert r.status_code == 400
 
 
+def _write_xref(seqdir, fname, backtraces):
+    """Minimal xref.json carrying only a per-pulse ``backtraces`` map (pyctrl B3 output)."""
+    doc = {"scan_id": "1", "v": 7, "by_file": {fname: {"backtraces": backtraces}}}
+    with open(os.path.join(seqdir, "xref.json"), "w") as f:
+        json.dump(doc, f)
+
+
+def test_backtrace_route_xref_fallback(client, tmp_path):
+    """pyctrl: the .seq carries NO embedded backtrace, but the xref's `backtraces` map (B3)
+    does -> the route serves them, keyed by the clicked point's pid."""
+    scan = tmp_path / "data_20250619_170317"
+    seqdir = scan / "sequence"
+    _write_scan(str(seqdir))
+    fn = "point_00001__seqid_0001.seq"
+    bt = [{"file": "C:/x/YbSteps/InitStep.py", "name": "InitStep", "line": 38}]
+    _write_xref(str(seqdir), fn, {"1": bt})
+    r = client.get(f"/api/sequence/backtrace?folder={scan}&file={fn}&pulse_id=1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["has_bt"] is True
+    assert body["source"] == "xref"
+    assert body["frames"] == bt
+
+
+def test_backtrace_route_pid_absent_keeps_has_bt(client, tmp_path):
+    """A pid with no recorded backtrace -> empty frames, but has_bt stays True (the scan DOES
+    carry backtraces) so the client shows 'no source for this point', not nothing."""
+    scan = tmp_path / "data_20250619_170318"
+    seqdir = scan / "sequence"
+    _write_scan(str(seqdir))
+    fn = "point_00001__seqid_0001.seq"
+    _write_xref(str(seqdir), fn, {"1": [{"file": "InitStep.py", "name": "InitStep", "line": 38}]})
+    body = client.get(f"/api/sequence/backtrace?folder={scan}&file={fn}&pulse_id=999").get_json()
+    assert body["has_bt"] is True
+    assert body["frames"] == []
+
+
+def test_backtrace_route_no_backtraces(client, tmp_path):
+    """No .seq block and no xref -> has_bt False (the client renders no backtrace row)."""
+    scan = tmp_path / "data_20250619_170319"
+    seqdir = scan / "sequence"
+    _write_scan(str(seqdir))
+    fn = "point_00001__seqid_0001.seq"
+    body = client.get(f"/api/sequence/backtrace?folder={scan}&file={fn}&pulse_id=1").get_json()
+    assert body["has_bt"] is False
+    assert body["frames"] == []
+
+
 def test_dump_toggle_route(client, tmp_path, monkeypatch):
     from yb_analysis.sequence import dump_toggle
     monkeypatch.setattr(dump_toggle, "_PATH", str(tmp_path / "rs.dat"))

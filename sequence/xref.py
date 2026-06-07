@@ -40,7 +40,7 @@ XREF_NAME = "xref.json"
 def _empty():
     return {"available": False, "version": 0, "param_to_channels": {},
             "channel_to_params": {}, "pulses": {}, "param_to_pids": {},
-            "time_regions": {}, "steps": []}
+            "time_regions": {}, "steps": [], "backtraces": {}}
 
 
 def load_xref(seq_dir, fname=None):
@@ -81,6 +81,11 @@ def load_xref(seq_dir, fname=None):
         "time_regions": entry.get("time_regions") or {},
         # Top-level step boundaries: [{label, t0, t1}, ...] -> the labeled phase ruler.
         "steps": entry.get("steps") or [],
+        # Per-pulse source backtrace (producer B3): {pid(str): [{file, name, line}, ...]},
+        # innermost (the user's .add/.add_step) first. pyctrl writes these here (its .seq has
+        # no embedded backtrace block); the /api/sequence/backtrace route reads them keyed by
+        # the clicked point's pid. Absent in older artifacts -> empty.
+        "backtraces": entry.get("backtraces") or {},
     }
 
 

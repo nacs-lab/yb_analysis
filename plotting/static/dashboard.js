@@ -6077,8 +6077,9 @@
   // The current xref schema/format version the viewer expects. Older artifacts (aggregate
   // only, per-pulse without formulas, or verbose pre-cleanup formulas) carry a lower/absent
   // version and are rebuilt in place on load. Keep in lock-step with XREF_VERSION in
-  // pyctrl/tools/provenance_scan.py.
-  const SEQ_XREF_VERSION = 6;
+  // pyctrl/tools/provenance_scan.py (7 = + per-pulse source backtraces, read by the
+  // /api/sequence/backtrace route's xref fallback).
+  const SEQ_XREF_VERSION = 7;
   function seqXrefComplete(xr) {
     return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
   }
@@ -6517,6 +6518,10 @@
     seqClearEmphasis();
   }
 
+  // pulse_id sentinel for a channel's default / non-pulse point (== reader's
+  // PULSE_ID_DEFAULT, 2**32-1): such points have no source pulse, so no backtrace.
+  const SEQ_PID_DEFAULT = 4294967295;
+
   // Backtrace panel (click a point -> where in the source that pulse was built).
   // innermost frame first = the user's add/add_step call (e.g. PushoutSurvivalSeq.py:40).
   function seqBacktraceHtml(frames) {
@@ -6556,9 +6561,12 @@
     if (box) $$(".seq-leaf.seq-leaf-xref-hit, .seq-leaf.seq-leaf-active", box).forEach((el) =>
       el.classList.remove("seq-leaf-xref-hit", "seq-leaf-active"));
     const pulse = (pid != null && xr.pulses) ? xr.pulses[String(pid)] : null;
-    // Track which pulse the focus currently shows, so the async backtrace fetch only
+    // A REAL pulse (not the channel's default/idle value, pid sentinel 0xFFFFFFFF) gets a
+    // source backtrace even when it carries no params (a constant TTL/voltage set) -- the
+    // producer captured all of them. Track the focused pid so the async backtrace fetch only
     // injects into the matching selection (a fast second click supersedes it).
-    seqState._focusPid = pulse ? Number(pid) : null;
+    const realPid = (pid != null && Number(pid) !== SEQ_PID_DEFAULT) ? Number(pid) : null;
+    seqState._focusPid = realPid;
     let params, formula = null, idle = false;
     if (pulse) {
       params = pulse.params || []; formula = pulse.expr || null;
@@ -6588,8 +6596,9 @@
                             params.length + " params that touch this channel";
     seqSetFocus({ title, formula, channels: [chn],
                   params: params.map((p) => ({ path: p, value: seqParamValue(p) })) });
-    // Show where this pulse was built (source file:line), appended async once it returns.
-    if (pulse) seqShowBacktrace(pid);
+    // Show where this pulse was built (source file:line), appended async once it returns --
+    // for ANY real pulse, including param-less ones (the focus box is shown either way).
+    if (realPid != null) seqShowBacktrace(pid);
     // Frame the view so BOTH the plot and the focus/highlight region are visible
     // un-clipped (req 4) -- replaces the old jump deep into the param tree.
     seqScrollFraming();
