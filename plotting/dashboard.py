@@ -359,6 +359,126 @@ _SNAPSHOT_HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri')
 # Sequence tab spawns at most one background provenance build at a time.
 _XREF_BUILDS = {}
 _XREF_BUILD_LOCK = threading.Lock()
+# Scan dirs we've already rebuilt ONCE to pick up late-arriving globals (so an
+# empty-but-current xref doesn't trigger an endless rebuild loop -- mtime comparison
+# is unreliable on a OneDrive-synced data folder). Reset on process restart.
+_XREF_GLOBALS_REBUILT = set()
+
+
+def _xref_tool_version():
+    """The producer's ``XREF_VERSION`` (regex-read from ``provenance_scan.py`` so it
+    auto-stays-in-lock-step). 0 if unknown -> we then only auto-build a MISSING xref,
+    never trigger a (possibly spurious) version upgrade."""
+    try:
+        import os
+        import re
+        from yb_analysis import config as _cfg
+        tool = os.path.join(getattr(_cfg, 'PYCTRL_CWD', '') or '',
+                            'tools', 'provenance_scan.py')
+        with open(tool, encoding='utf-8') as f:
+            for line in f:
+                m = re.match(r'\s*XREF_VERSION\s*=\s*(\d+)', line)
+                if m:
+                    return int(m.group(1))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _maybe_autobuild_xref(base):
+    """Fire-and-forget: ensure a CURRENT-version ``sequence/xref.json`` exists for ``base``.
+
+    Called whenever a scan is viewed in the Sequence tab, so the param↔channel map, the
+    wait/timing regions and the step ruler appear WITHOUT a manual "Rebuild" click. Spawns
+    the engine-free ``provenance_scan.py`` (LIVE-lib producer) only when the scan has a
+    ``.seq`` (auto-dump) + a descriptor AND the xref is missing or below the producer's
+    version. Idempotent (one build per scan dir). A scan with NO ``.seq`` is left alone --
+    that needs the heavier engine reconstruct path. Best-effort: never breaks the response.
+
+    Returns True if a build is now in progress (just started or already running) so the
+    caller can tell the client to poll for the result; False otherwise.
+    """
+    try:
+        import os
+        import json as _json
+        import subprocess
+        from yb_analysis.sequence import xref as _xref
+        from yb_analysis.sequence import manifest as _seqman
+        from yb_analysis.sequence.params_from_config import find_config_sidecar
+        from yb_analysis import config as _cfg
+        if not base or not os.path.isdir(base):
+            return False
+        sf = _seqman.SequenceFolder.open(base)
+        if sf is None or not sf.seq_files():
+            return False                            # no .seq -> can't build a usable xref
+        seq_dir = sf.dir
+        xr = _xref.load_xref(seq_dir)
+        current = bool(xr.get('available')) and (xr.get('version') or 0) >= _xref_tool_version()
+        # A CURRENT-version xref can still be INCOMPLETE: if it was built before the run's
+        # globals.json existed, the global-dependent step/wait times resolved to nothing
+        # (empty `steps` AND `time_regions`). If globals.json is now present, rebuild ONCE
+        # to fill them in -- tracked per dir so a genuinely step-less scan (or OneDrive
+        # mtime churn) can't trigger an endless rebuild loop.
+        if current:
+            no_content = not (xr.get('steps') or xr.get('time_regions'))
+            key0 = os.path.abspath(base)
+            if (no_content and os.path.exists(os.path.join(seq_dir, 'globals.json'))
+                    and key0 not in _XREF_GLOBALS_REBUILT):
+                _XREF_GLOBALS_REBUILT.add(key0)
+                current = False                     # one rebuild now that globals exist
+        if current:
+            return False                            # up to date
+        sidecar = find_config_sidecar(base)
+        if not sidecar:
+            return False
+        try:
+            with open(sidecar, encoding='utf-8') as fh:
+                if not _json.load(fh).get('descriptor'):
+                    return False                    # can't rebuild the ScanGroup
+        except (OSError, ValueError):
+            return False
+        # Runs even while a scan is in progress: this build is engine-free (no libnacs /
+        # hardware / ports / MemoryMap, no generate()), so it can't perturb the live run's
+        # timing or data -- only some CPU, which the user has opted to accept.
+        py = getattr(_cfg, 'PYCTRL_PYTHON', None)
+        tool = os.path.join(getattr(_cfg, 'PYCTRL_CWD', '') or '',
+                            'tools', 'provenance_scan.py')
+        if not py or not os.path.exists(py) or not os.path.exists(tool):
+            return False
+        key = os.path.abspath(base)
+        with _XREF_BUILD_LOCK:
+            running = _XREF_BUILDS.get(key)
+            if running is not None and running.poll() is None:
+                return True                         # a build is already in flight
+            _XREF_BUILDS[key] = subprocess.Popen(
+                [py, tool, '--scan-dir', base],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:  # noqa: BLE001 - best-effort; never break the params response
+        return False
+
+
+def _xref_awaiting_globals(base):
+    """True if the step ruler + wait bands can't be built yet because the run's
+    ``globals.json`` hasn't been written (globals are captured DURING the run, often only
+    at the end). The waveforms still plot; only the global-dependent step/timing info waits.
+
+    Gated on a scan being live so a long-finished scan that simply never had globals isn't
+    flagged forever: globals.json absent AND a scan currently running -> awaiting.
+    """
+    try:
+        import os
+        from yb_analysis.sequence import manifest as _seqman
+        if not base or not os.path.isdir(base):
+            return False
+        sf = _seqman.SequenceFolder.open(base)
+        seq_dir = sf.dir if sf is not None else os.path.join(base, 'sequence')
+        if os.path.exists(os.path.join(seq_dir, 'globals.json')):
+            return False                            # globals present -> not waiting
+        q = _read_queue_data()
+        return bool(q and q.get('running') and q['running'].get('id') is not None)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _resolve_scan_dir(scan_id):
@@ -581,7 +701,7 @@ def _register_api_routes(server):
         '/api/sequence/build_xref': 'POST ?scan_id=|folder=: build sequence/xref.json in the BACKGROUND (live-lib provenance_scan.py subprocess) for a scan with a .seq but no xref; -> {ok,started} / {ok,available} / {ok:False}',
         '/api/sequence/reconstruct': 'POST ?scan_id=: regenerate a scan\'s missing .seq via the engine-python driver (use_dummy_device subprocess); -> {ok,n_seq,approximate} or {deferred}',
         '/api/sequence/dump_toggle': 'GET/POST the "save sequence dumps" toggle (pyctrl runtime_state flag); POST ?on=1|0',
-        '/api/sequence/scans':  'all scans (Analysis-picker list) flagged with has_seq + has_snapshot + has_descriptor (three-state picker): -> {scans:[{scan_id,name,swept,has_seq,n_seq,has_snapshot,has_descriptor}]}',
+        '/api/sequence/scans':  'all scans (Analysis-picker list) flagged with has_seq + has_snapshot + has_descriptor (three-state picker): -> {scans:[{scan_id,name,swept,date,time,n_shots,n_params,n_total_shots,has_diag,has_code,has_grid,has_seq,n_seq,has_snapshot,has_descriptor}]}',
         '/api/sequence/pick_folder': 'POST: open a native folder picker on the lab PC desktop -> {path}',
         '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
         '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
@@ -999,6 +1119,11 @@ def _register_api_routes(server):
         """
         from yb_analysis.sequence import params_from_config as _pfc
         base = _seq_scan_base()
+        # Auto-build/upgrade the xref in the background on view, so the param↔channel
+        # map + wait regions + step ruler appear without a manual "Rebuild" click.
+        # `xref_building` tells the client to poll for the (re)built artifact.
+        xref_building = _maybe_autobuild_xref(base)
+        xref_awaiting = _xref_awaiting_globals(base)
         built = _pfc.build_params_tree_for_folder(base) if base else None
         if built and built.get('has_params'):
             return jsonify(_to_jsonable({
@@ -1007,6 +1132,8 @@ def _register_api_routes(server):
                 'scanned_paths': built['scanned_paths'],
                 'stats': built.get('stats'),
                 'source': 'config',
+                'xref_building': xref_building,
+                'xref_awaiting_globals': xref_awaiting,
             }))
         # Fallback: the params block embedded in the selected .seq file.
         sf, seq, err = _load_selected_seq()
@@ -1020,6 +1147,8 @@ def _register_api_routes(server):
             'has_params': seq.params is not None,
             'scanned_paths': scanned_paths,
             'source': 'seq',
+            'xref_building': xref_building,
+            'xref_awaiting_globals': xref_awaiting,
         }))
 
     @server.route('/api/sequence/xref')
@@ -1036,11 +1165,19 @@ def _register_api_routes(server):
         sf, err = _open_seq_folder()
         if err:
             return err
+        # Re-trigger the (idempotent) auto-build on every poll: once the run's globals.json
+        # lands, this rebuilds the previously-empty steps/regions. Then surface the status
+        # so the client can keep/clear the "awaiting globals" notice + poll for the result.
+        base = _seq_scan_base()
+        building = _maybe_autobuild_xref(base)
         fname = request.args.get('file')
         if not fname:
             files = sf.seq_files()
             fname = files[0] if files else None
-        return jsonify(_to_jsonable(_xref.load_xref(sf.dir, fname)))
+        out = dict(_to_jsonable(_xref.load_xref(sf.dir, fname)))
+        out['building'] = bool(building)
+        out['awaiting_globals'] = bool(_xref_awaiting_globals(base))
+        return jsonify(out)
 
     @server.route('/api/sequence/build_xref', methods=['POST'])
     def _api_sequence_build_xref():
@@ -1199,6 +1336,16 @@ def _register_api_routes(server):
                 'scan_dir': r['scan_dir'],
                 'name': r.get('name'),
                 'swept': r.get('swept'),
+                # Richer meta for the picker's full-info hover tooltip (the row
+                # is too narrow to show all of this inline).
+                'date': r.get('date'),
+                'time': r.get('time'),
+                'n_shots': r.get('n_shots'),
+                'n_params': r.get('n_params'),
+                'n_total_shots': r.get('n_total_shots'),
+                'has_diag': bool(r.get('has_diag')),
+                'has_code': bool(r.get('has_code')),
+                'has_grid': bool(r.get('has_grid')),
                 'has_seq': n > 0,
                 'n_seq': n,
                 # Three-state picker (§12.4): has_seq -> Ready; else

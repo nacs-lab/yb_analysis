@@ -39,7 +39,8 @@ XREF_NAME = "xref.json"
 
 def _empty():
     return {"available": False, "version": 0, "param_to_channels": {},
-            "channel_to_params": {}, "pulses": {}, "param_to_pids": {}, "time_regions": {}}
+            "channel_to_params": {}, "pulses": {}, "param_to_pids": {},
+            "time_regions": {}, "steps": []}
 
 
 def load_xref(seq_dir, fname=None):
@@ -78,6 +79,8 @@ def load_xref(seq_dir, fname=None):
         "param_to_pids": entry.get("param_to_pids") or {},
         # Wait/timing regions: {param: [[t0_ms, t1_ms], ...]} -> shaded time-axis bands.
         "time_regions": entry.get("time_regions") or {},
+        # Top-level step boundaries: [{label, t0, t1}, ...] -> the labeled phase ruler.
+        "steps": entry.get("steps") or [],
     }
 
 

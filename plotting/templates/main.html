@@ -986,6 +986,9 @@
         <span class="hint flex-fixed">pick channels in the floating
           <b>Channels</b> tab&nbsp;→</span>
     </h2>
+    <!-- Banner: shown while the step ruler / wait bands can't finish building because the
+         run's globals haven't been captured yet (or while the map is rebuilding). -->
+    <div id="seq-xref-notice" class="seq-notice" hidden></div>
     <div id="plot-sequence" class="plot-container"></div>
   </section>
 
@@ -1042,11 +1045,15 @@
   <!-- Channels picker (RIGHT). -->
   <section class="card" id="sequence-chn-card" data-float-count="0">
     <div class="chn-header">
-      <div class="chn-header-title">Channels</div>
-      <div class="hint chn-header-hint">ctrl/⌘-click for multiple</div>
+      <div class="chn-header-title">Channels<span id="seq-chn-count-badge" class="chn-count-badge" hidden></span></div>
+      <div class="hint chn-header-hint">click to add · again to remove · shift-click for a range</div>
     </div>
     <div class="chn-picker-body">
-      <select id="seq-chn-select" multiple size="16"></select>
+      <div class="chn-picker-toolbar">
+        <input type="text" id="seq-chn-search" class="chn-search" placeholder="filter channels…">
+        <button class="ghost flex-fixed" id="seq-chn-clear">Clear all</button>
+      </div>
+      <div id="seq-chn-list" class="chn-list" tabindex="0"></div>
     </div>
   </section>
 </div>

@@ -33,7 +33,9 @@ def test_index_renders_sequence_tab(html_client):
         'id="tab-btn-sequence"', 'data-tab="sequence"',
         'id="tab-sequence"', 'id="plot-sequence"',
         'id="seq-folder"', 'id="seq-load-btn"', 'id="seq-point-select"',
-        'id="seq-seq-select"', 'id="seq-chn-select"', 'id="seq-params"',
+        'id="seq-seq-select"', 'id="seq-params"',
+        # Custom channel picker (replaced the native <select multiple>).
+        'id="seq-chn-list"', 'id="seq-chn-clear"', 'id="seq-chn-search"',
         'data-card-id="sequence-source"', 'data-card-id="sequence-plot"',
         'data-card-id="sequence-params"', 'id="seq-autosave"',
         # Two floating-picker hosts: Scans docked LEFT, Channels docked RIGHT.

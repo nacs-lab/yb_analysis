@@ -25,7 +25,8 @@ _ENTRY = {
 
 
 _DORMANT = {"available": False, "version": 0, "param_to_channels": {},
-            "channel_to_params": {}, "pulses": {}, "param_to_pids": {}, "time_regions": {}}
+            "channel_to_params": {}, "pulses": {}, "param_to_pids": {},
+            "time_regions": {}, "steps": []}
 
 
 def test_load_xref_exposes_version(tmp_path):

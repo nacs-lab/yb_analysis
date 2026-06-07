@@ -1807,26 +1807,100 @@ table.runs-table tr.grouped td:first-child::before {
 }
 #sequence-chn-card:not([data-float-count="0"]) .chn-header-title { color: var(--accent); }
 #sequence-chn-card .chn-header-hint { font-size: 10px; margin-top: 2px; }
+/* Selection-count badge in the header (visible when expanded; the edge tab carries
+   its own vertical count). */
+.chn-count-badge {
+  display: inline-block; margin-left: 6px; padding: 0 6px;
+  border-radius: 9px; font: 600 10px var(--mono);
+  background: var(--accent); color: var(--bg-input); vertical-align: middle;
+}
+.chn-count-badge[hidden] { display: none; }
 .floating-analysis-host > #sequence-chn-card[data-float-state="expanded"] .chn-picker-body {
   display: flex; flex-direction: column;
   margin-top: 8px; padding-top: 8px;
   border-top: 1px solid rgba(252, 219, 6, 0.25);
   flex: 1; min-height: 0;
 }
-.floating-analysis-host > #sequence-chn-card[data-float-state="expanded"] #seq-chn-select {
-  flex: 1; width: 100%; min-height: 220px;
-  font-family: var(--mono); font-size: 11px;
+/* Toolbar above the channel list: filter box + Clear-all (req 9). */
+.chn-picker-toolbar {
+  display: flex; gap: 6px; align-items: center; margin-bottom: 6px;
 }
-/* Keep the channel picker docked on the RIGHT (base host styling), but
-   vertically CENTERED, and compact -- not the 50vw analysis width. */
+.chn-search {
+  flex: 1; min-width: 0; font: 11px var(--mono); padding: 4px 8px;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; outline: none;
+}
+.chn-search:focus { border-color: var(--accent); }
+#seq-chn-clear {
+  font-size: 10.5px; padding: 4px 10px; border-radius: 6px; flex-shrink: 0;
+}
+/* Custom channel list (replaces the native <select multiple>, req 9). */
+.chn-list {
+  flex: 1; min-height: 220px; overflow-y: auto; outline: none;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input);
+  user-select: none;   /* shift-click range-select shouldn't highlight row text */
+}
+.chn-list-empty { padding: 10px 12px; color: var(--text-dim); font: 11px var(--mono); }
+.chn-row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 3px 8px 3px 4px; cursor: pointer;
+  font: 11px var(--mono); color: var(--text);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.chn-row:last-child { border-bottom: none; }
+.chn-row:hover { background: rgba(255, 255, 255, 0.05); }
+.chn-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+/* The ✕ cue: hidden by default; for a SELECTED row it slides in on hover at the
+   left as the "click to remove" affordance. */
+.chn-row-x {
+  width: 0; opacity: 0; flex-shrink: 0; text-align: center;
+  color: var(--err); font-size: 11px; transition: width 120ms ease, opacity 120ms ease;
+}
+.chn-row.selected {
+  background: rgba(88, 166, 255, 0.16); color: #fff; font-weight: 600;
+}
+.chn-row.selected:hover { background: rgba(255, 99, 99, 0.18); }
+.chn-row.selected:hover .chn-row-x { width: 14px; opacity: 1; }
+/* Channel picker docked on the RIGHT (base host styling). TOP-anchored (not
+   vertically centered) so it grows straight DOWN from a stable top edge -- the
+   same calm motion as the Analysis selector. (Center-anchoring grew the card
+   both up and down at once, which amplified the felt "bounce".) */
 #floating-sequence-host {
-  top: 50%; bottom: auto;
-  transform: translateY(-50%);
-  justify-content: center;
+  top: 92px; bottom: auto;
+  transform: none;
+  justify-content: flex-start;
 }
 .floating-analysis-host > #sequence-chn-card[data-float-state="expanded"] {
-  width: 300px; min-width: 240px; max-width: 340px;
-  max-height: min(640px, calc(90vh - 90px));
+  /* min-width:0 (not the base 280 / a floor): a min-width FLOOR can't animate
+     from the edge tab's `auto`, so it snapped the width to the floor at frame 0
+     -- THAT was the residual "bounce". With no floor, width glides 30->300px. */
+  width: 300px; min-width: 0; max-width: 340px;
+  /* CONCRETE height (not auto) so the edge->expanded transition animates height
+     smoothly instead of snapping (the snap is what read as "bouncing"). Capped
+     against the viewport bottom (card is top-anchored at 92px). */
+  height: min(560px, calc(100vh - 130px));
+  max-height: min(560px, calc(100vh - 130px));
+}
+
+/* ---- Sequence float cards: smooth, NON-bouncing open/collapse (req 5) ----
+   Two fixes vs the first attempt: (1) ease-OUT curve so motion decelerates into
+   place; (2) the expanded state now has a CONCRETE height (above / below) -- a
+   transition from a fixed edge height (160px) to `height:auto` CANNOT animate, so
+   the height used to snap while the width slid, which looked like a bounce. With
+   both endpoints concrete, width AND height glide together. */
+#sequence-chn-card, #seqscan-card {
+  transition: width 260ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              height 260ms cubic-bezier(0.22, 0.61, 0.36, 1),
+              padding 260ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+/* Edge tabs: wider so the count is readable, and the CHANNELS tab is TALLER so its
+   vertical label + "● N" count don't clip (the count was getting cut off). */
+.floating-analysis-host > #sequence-chn-card[data-float-state="edge"],
+.floating-analysis-host > #seqscan-card[data-float-state="edge"] { width: 30px; }
+.floating-analysis-host > #sequence-chn-card[data-float-state="edge"] { height: 168px; }
+.floating-analysis-host > #sequence-chn-card[data-float-state="edge"]::after {
+  font-size: 13px; letter-spacing: 0; font-weight: 700;
 }
 
 /* ---- Floating "Scans" picker (Sequence tab): LEFT-docked in its own host
@@ -1836,10 +1910,10 @@ table.runs-table tr.grouped td:first-child::before {
    squared on the left, rounded + bordered on the right, growing rightward. ---- */
 #floating-seqscan-host {
   left: 0; right: auto;          /* edge tab hugs the very LEFT of the viewport */
-  top: 50%; bottom: auto;
-  transform: translateY(-50%);
+  top: 92px; bottom: auto;       /* TOP-anchored: grows DOWN, no center "bounce" */
+  transform: none;
   align-items: flex-start;       /* cards hug the left; grow rightward only */
-  justify-content: center;
+  justify-content: flex-start;
 }
 #floating-seqscan-host > .card {
   border-radius: 0 6px 6px 0;    /* left edge squared (flush at viewport left) */
@@ -1853,8 +1927,12 @@ table.runs-table tr.grouped td:first-child::before {
 }
 .floating-analysis-host > #seqscan-card { --float-edge-label: "Scans"; }
 .floating-analysis-host > #seqscan-card[data-float-state="expanded"] {
-  width: 620px; min-width: 380px; max-width: 70vw;
-  max-height: min(72vh, 760px); padding: 10px 14px;
+  width: 620px; min-width: 0; max-width: 70vw;
+  /* Concrete height (see the Channels card note) so the expand animation glides
+     instead of snapping. The scan list scrolls within. min-width:0 -> no width
+     snap (see the Channels card min-width note). */
+  height: min(680px, 78vh);
+  max-height: min(680px, 78vh); padding: 10px 14px;
 }
 #seqscan-card .seqscan-header {
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
@@ -2410,8 +2488,27 @@ textarea::-webkit-scrollbar-thumb:hover,
   text-align: center;
 }
 
+/* Sequence-tab banner: awaiting-globals / building notice above the plot. */
+.seq-notice {
+  margin: 0 0 10px; padding: 8px 12px; border-radius: 8px;
+  font: 12px/1.4 var(--mono); display: flex; align-items: center; gap: 8px;
+}
+.seq-notice[hidden] { display: none; }
+.seq-notice-ic { font-size: 14px; line-height: 1; flex-shrink: 0; }
+.seq-notice-wait {
+  background: rgba(255, 209, 102, 0.12);
+  border: 1px solid rgba(255, 209, 102, 0.5); color: #ffd166;
+}
+.seq-notice-build {
+  background: rgba(88, 166, 255, 0.10);
+  border: 1px solid var(--accent-dim); color: var(--accent);
+}
+
 /* ===================== Sequence tab (flattened .seq viewer) ============ */
-#tab-sequence .plot-container { min-height: 540px; }
+/* Viewport-relative height: the plot grows to use the window but always leaves
+   room below for the focus/highlight region, so clicking a pulse frames both
+   un-clipped (req 1/4). */
+#tab-sequence .plot-container { height: 62vh; min-height: 420px; max-height: 820px; }
 /* Scan picker list: reuses the Analysis .run-picker / .run-row styling (the
    container carries both classes), just a shorter list here. */
 .seq-scan-table { max-height: 220px; }
@@ -2540,31 +2637,91 @@ textarea::-webkit-scrollbar-thumb:hover,
   color: #ffd166; }
 .seq-chip.chan:hover { background: rgba(255, 209, 102, 0.3); color: #fff; }
 
-/* Channel multi-select: match the dark card theme (overrides native listbox). */
-#seq-chn-select {
-  background: var(--bg-input);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px;
-  outline: none;
+/* Dark scrollbar for the custom channel list. */
+.chn-list::-webkit-scrollbar { width: 10px; height: 10px; }
+.chn-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+.chn-list::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- Focus-region param chip: hover-revealed ✕ deselects (req 7) ---- */
+.seq-chip-param { position: relative; padding-right: 8px; }
+.seq-chip-x {
+  display: inline-block; width: 0; overflow: hidden; opacity: 0;
+  margin-left: 0; color: var(--err); font-weight: 700;
+  transition: width 120ms ease, opacity 120ms ease, margin-left 120ms ease;
+  vertical-align: middle;
 }
-#seq-chn-select:focus { border-color: var(--accent); }
-#seq-chn-select option {
-  padding: 3px 7px;
-  border-radius: 4px;
-  color: var(--text);
+.seq-chip-param:hover { border-color: var(--err); }
+.seq-chip-param:hover .seq-chip-x { width: 12px; opacity: 1; margin-left: 5px; }
+
+/* ---- Plot overlay buttons (req 3/4) ---- */
+/* Shared pill styling for the small controls floated over the plot. */
+.seq-legend-toggle, .seq-clear-others, .seq-step-toggle {
+  position: absolute; z-index: 7; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 6px;
+  font: 600 10.5px var(--mono); letter-spacing: 0.5px;
+  background: rgba(11, 14, 19, 0.82); color: var(--text-dim);
+  border: 1px solid var(--border); backdrop-filter: blur(3px);
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
-/* Force the selected-row colour even when the listbox isn't focused (the
-   linear-gradient + text-fill hack defeats the browser's grey override). */
-#seq-chn-select option:checked {
-  background: linear-gradient(var(--accent), var(--accent));
-  color: var(--bg-input);
-  -webkit-text-fill-color: var(--bg-input);
-  font-weight: 600;
+/* Right-side control stack (all top-right, clear of the top-left plot area):
+   [modebar] · Only highlighted · Steps · Legend (legend sits at the bottom). */
+.seq-legend-toggle { top: 106px; right: 12px; }
+.seq-legend-toggle:hover { color: var(--text); border-color: var(--accent); }
+.seq-legend-toggle.pinned {
+  color: var(--accent); border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.14);
 }
-#seq-chn-select::-webkit-scrollbar { width: 10px; height: 10px; }
-#seq-chn-select::-webkit-scrollbar-thumb {
-  background: var(--border); border-radius: 6px;
+.seq-legend-toggle-ic { font-size: 12px; line-height: 1; }
+/* "Only highlighted" (isolate channels): top of the right-side stack. */
+.seq-clear-others { top: 42px; right: 12px; left: auto; }
+.seq-clear-others:hover { color: var(--text); border-color: #ffd166; }
+.seq-clear-others-ic { font-size: 12px; line-height: 1; color: #ffd166; }
+/* Step/phase ruler toggle: between "Only highlighted" and Legend. */
+.seq-step-toggle { top: 74px; right: 12px; left: auto; }
+.seq-step-toggle:hover { color: var(--text); border-color: #7ee787; }
+.seq-step-toggle.on {
+  color: #7ee787; border-color: #7ee787; background: rgba(126, 231, 135, 0.12);
 }
-#seq-chn-select::-webkit-scrollbar-track { background: transparent; }
+.seq-step-toggle-ic { font-size: 12px; line-height: 1; color: #7ee787; }
+
+/* ---- Step / phase ruler overlay: boundary lines + top labels ---- */
+.seq-step-line {
+  stroke: rgba(255, 255, 255, 0.20); stroke-width: 1; stroke-dasharray: 4 4;
+}
+.seq-step-label {
+  fill: #cdd9e5; font: 9.5px var(--mono); letter-spacing: 0.2px;
+  /* halo (paint-order stroke) so the name stays readable over the traces */
+  paint-order: stroke; stroke: rgba(11, 14, 19, 0.9); stroke-width: 3px;
+  stroke-linejoin: round;
+}
+/* Interactive step tab: hover shades the step + highlights the label; click zooms. */
+.seq-step-tab { pointer-events: all; cursor: pointer; }
+.seq-step-tab-bg { fill: transparent; transition: fill 100ms ease; }
+.seq-step-tab:hover .seq-step-tab-bg {
+  fill: rgba(126, 231, 135, 0.20);
+  stroke: rgba(126, 231, 135, 0.65); stroke-width: 1;
+}
+.seq-step-tab:hover .seq-step-label { fill: #ffffff; }
+.seq-step-hover-band { fill: rgba(126, 231, 135, 0.13); pointer-events: none; }
+
+/* ---- Full-info scan tooltip (req 10): floats over everything, escapes the pane ---- */
+.seq-scan-tip {
+  position: fixed; z-index: 1000; pointer-events: none;
+  max-width: 460px; padding: 8px 10px;
+  background: rgba(15, 19, 28, 0.97); color: var(--text);
+  border: 1px solid var(--accent-dim); border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
+  font: 11px/1.5 var(--mono); backdrop-filter: blur(4px);
+}
+.seq-scan-tip[hidden] { display: none; }
+.seq-scan-tip .seq-tip-title {
+  font-weight: 700; color: var(--accent); margin-bottom: 5px;
+  border-bottom: 1px solid var(--border); padding-bottom: 4px;
+}
+.seq-scan-tip .seq-tip-row { display: flex; gap: 10px; }
+.seq-scan-tip .seq-tip-k {
+  flex: 0 0 84px; color: var(--text-dim); text-transform: uppercase;
+  font-size: 9px; letter-spacing: 0.5px; padding-top: 2px;
+}
+.seq-scan-tip .seq-tip-v { flex: 1; min-width: 0; word-break: break-word; white-space: normal; }

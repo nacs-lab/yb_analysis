@@ -5249,6 +5249,72 @@
     sel.value = cur;
   }
 
+  // ---- Full-info hover tooltip for the scan picker (req 10) -----------------
+  // A floating tip appended to <body> (so it escapes the narrow pane) showing the
+  // complete scan metadata, not just the truncated row.
+  function _seqScanTip() {
+    let t = document.getElementById("seq-scan-tip");
+    if (!t) {
+      t = document.createElement("div");
+      t.id = "seq-scan-tip";
+      t.className = "seq-scan-tip";
+      t.hidden = true;
+      document.body.appendChild(t);
+    }
+    return t;
+  }
+  function seqScanTipHtml(s) {
+    const id = s.scan_id || "";
+    const when = (id.length === 14)
+      ? `${id.slice(0,4)}-${id.slice(4,6)}-${id.slice(6,8)} ` +
+        `${id.slice(8,10)}:${id.slice(10,12)}:${id.slice(12,14)}`
+      : id;
+    const rows = [];
+    const add = (k, v) => { if (v != null && v !== "") rows.push(
+      '<div class="seq-tip-row"><span class="seq-tip-k">' + seqEsc(k) +
+      '</span><span class="seq-tip-v">' + seqEsc(String(v)) + "</span></div>"); };
+    add("scan_id", id);
+    add("name", s.name || "—");
+    add("swept", s.swept || "—");
+    add("points", s.n_params);
+    add("reps/pt", s.n_shots);
+    add("total shots", s.n_total_shots);
+    if (s.has_seq) add(".seq dumps", s.n_seq);
+    const state = s.has_seq ? "ready ✓"
+      : (s.has_snapshot && s.has_descriptor) ? "reconstructable ⟳" : "unrecoverable";
+    add("state", state);
+    const flags = [];
+    if (s.has_diag) flags.push("diag");
+    if (s.has_code) flags.push("code");
+    if (s.has_grid) flags.push("grid");
+    if (s.has_snapshot) flags.push("snapshot");
+    if (s.has_descriptor) flags.push("descriptor");
+    if (flags.length) add("artifacts", flags.join(", "));
+    return '<div class="seq-tip-title">' + seqEsc(when) + "</div>" + rows.join("");
+  }
+  function seqShowScanTip(ev, s) {
+    const t = _seqScanTip();
+    t.innerHTML = seqScanTipHtml(s);
+    t.hidden = false;
+    seqMoveScanTip(ev);
+  }
+  function seqMoveScanTip(ev) {
+    const t = document.getElementById("seq-scan-tip");
+    if (!t || t.hidden) return;
+    const pad = 14, w = t.offsetWidth, h = t.offsetHeight;
+    let x = ev.clientX + pad, y = ev.clientY + pad;
+    if (x + w > window.innerWidth - 8) x = ev.clientX - w - pad;   // flip left if off-screen
+    if (x < 8) x = 8;
+    if (y + h > window.innerHeight - 8) y = window.innerHeight - h - 8;
+    if (y < 8) y = 8;
+    t.style.left = x + "px";
+    t.style.top = y + "px";
+  }
+  function seqHideScanTip() {
+    const t = document.getElementById("seq-scan-tip");
+    if (t) t.hidden = true;
+  }
+
   function renderSeqScans() {
     const wrap = $("seq-scan-table");
     if (!wrap) return;
@@ -5298,7 +5364,7 @@
       }
       return `
         <div class="run-row seq-row-${state} ${id === cur ? "in-tray" : ""}"
-             data-scan-id="${id}" data-state="${state}" title="${seqEsc(title)}">
+             data-scan-id="${id}" data-state="${state}">
           <div class="run-info">
             ${idShort}
             <span class="run-dim"> · ${seqEsc(s.name || "—")}</span>
@@ -5307,8 +5373,17 @@
           </div>
         </div>`;
     }).join("");
+    seqHideScanTip();   // clear any tooltip pinned to a now-replaced row
     $$(".run-row", wrap).forEach((row) => {
       if (!row.dataset.scanId) return;
+      // Full-info hover tooltip (req 10): the row is too narrow for everything,
+      // so a floating tip (escapes the pane) shows the complete scan metadata.
+      const sInfo = seqScansCache.find((x) => (x.scan_id || "") === row.dataset.scanId);
+      if (sInfo) {
+        row.addEventListener("mouseenter", (e) => seqShowScanTip(e, sInfo));
+        row.addEventListener("mousemove", seqMoveScanTip);
+        row.addEventListener("mouseleave", seqHideScanTip);
+      }
       const state = row.dataset.state;
       if (state === "ready") {
         row.addEventListener("click", () => {
@@ -5412,54 +5487,115 @@
     const seqIdx = ssel ? ssel.value : null;
     const seqs = (fileEntry && fileEntry.sequences) || [];
     const seq = seqs.find((s) => String(s.seq_idx) === String(seqIdx)) || seqs[0];
-    const csel = $("seq-chn-select");
-    const prev = csel ? new Set(Array.from(csel.selectedOptions).map((o) => o.value))
-                      : new Set();
-    if (csel && seq) {
-      csel.innerHTML = "";
-      (seq.channels || []).forEach((name) => {
-        const o = document.createElement("option");
-        o.value = name; o.textContent = name;
-        if (prev.has(name)) o.selected = true;
-        csel.appendChild(o);
-      });
-    }
+    // Custom channel picker model: chnOrder = display order (mutated by param
+    // promotion), chnSel = the selected set. Preserve selection across a sequence
+    // switch by intersecting with the new channel list.
+    const names = (seq && seq.channels) || [];
+    const prev = seqState.chnSel || new Set();
+    seqState.chnOrder = names.slice();
+    seqState.chnSel = new Set(names.filter((n) => prev.has(n)));
+    seqRenderChnList();
     seqUpdateChnCount();
     seqRenderPlot();
     seqRenderParams();
   }
 
   function seqSelectedChannels() {
-    const csel = $("seq-chn-select");
-    return csel ? Array.from(csel.selectedOptions).map((o) => o.value) : [];
+    const order = seqState.chnOrder || [];
+    const sel = seqState.chnSel || new Set();
+    return order.filter((n) => sel.has(n));   // selected, in display order
+  }
+
+  // Render the custom channel picker (replaces the native <select multiple>):
+  // click an UNSELECTED row -> ADD it (others untouched); click a SELECTED row ->
+  // REMOVE it (a ✕ cue slides in on the left on hover). Honors the filter box.
+  function seqRenderChnList() {
+    const box = $("seq-chn-list");
+    if (!box) return;
+    const order = seqState.chnOrder || [];
+    const sel = seqState.chnSel || new Set();
+    const search = (($("seq-chn-search") || {}).value || "").trim().toLowerCase();
+    const rows = order
+      .filter((n) => !search || n.toLowerCase().includes(search))
+      .map((n) => {
+        const on = sel.has(n);
+        return '<div class="chn-row' + (on ? " selected" : "") + '" data-chn="' +
+          seqEsc(n) + '" title="' + seqEsc(n) + '">' +
+          '<span class="chn-row-x">✕</span>' +
+          '<span class="chn-row-name">' + seqEsc(n) + "</span></div>";
+      });
+    box.innerHTML = rows.length ? rows.join("")
+      : '<div class="chn-list-empty">' +
+        (order.length ? "no channels match" : "no channels") + "</div>";
+  }
+
+  // Toggle one channel in/out of the selection (custom-list click handler).
+  async function seqToggleChannel(name) {
+    const sel = seqState.chnSel || (seqState.chnSel = new Set());
+    if (sel.has(name)) sel.delete(name); else sel.add(name);
+    seqRenderChnList();
+    seqUpdateChnCount();
+    await seqRenderPlot();
+    seqReapplyEmph();
+  }
+
+  // SHIFT-click: ADD every channel between the anchor and the clicked row (over the
+  // currently-displayed order, honoring the filter). Never removes -- pure additive range.
+  async function seqSelectChannelRange(aName, bName) {
+    const order = seqState.chnOrder || [];
+    const search = (($("seq-chn-search") || {}).value || "").trim().toLowerCase();
+    const disp = order.filter((n) => !search || n.toLowerCase().includes(search));
+    const ia = disp.indexOf(aName), ib = disp.indexOf(bName);
+    if (ia < 0 || ib < 0) { seqToggleChannel(bName); return; }   // anchor not visible -> plain
+    const lo = Math.min(ia, ib), hi = Math.max(ia, ib);
+    const sel = seqState.chnSel || (seqState.chnSel = new Set());
+    for (let k = lo; k <= hi; k++) sel.add(disp[k]);
+    seqRenderChnList();
+    seqUpdateChnCount();
+    await seqRenderPlot();
+    seqReapplyEmph();
   }
 
   // Reflect the # of selected channels on the floating card (drives the
-  // edge-tab count badge + the active accent palette).
+  // edge-tab count badge + the active accent palette) and the in-header badge.
   function seqUpdateChnCount() {
+    const n = seqSelectedChannels().length;
     const card = document.getElementById("sequence-chn-card");
-    if (card) card.dataset.floatCount = String(seqSelectedChannels().length);
+    if (card) card.dataset.floatCount = String(n);
+    const badge = $("seq-chn-count-badge");
+    if (badge) { badge.textContent = n ? String(n) : ""; badge.hidden = !n; }
   }
 
-  // Hover-driven floating card: edge (minimized) -> expanded on mouseenter ->
-  // edge on mouseleave, after a 400 ms grace. Never collapses while the mouse
-  // is still over it OR while a field inside has focus (so typing in the scan
-  // search box holds the panel open even if the cursor drifts off).
-  function _wireSeqFloatCard(card) {
+  // Hover-driven floating card. Smoothed to feel like the Analysis selector (req 5):
+  // a short hover-INTENT delay before expanding kills the "brush-past" flicker that
+  // made it feel bouncy, and a longer collapse grace keeps it open if the cursor
+  // briefly drifts off. Never collapses while the mouse is over it OR a field inside
+  // has focus (so typing in the search box holds it open). `onReveal` (optional) fires
+  // when the card starts to open -- used to auto-refresh the scans list (req 8).
+  function _wireSeqFloatCard(card, onReveal) {
     if (!card) return;
     _setFloatState(card, "edge");
-    let timer = null;
+    let openT = null, closeT = null;
+    const clearTimers = () => {
+      if (openT) { clearTimeout(openT); openT = null; }
+      if (closeT) { clearTimeout(closeT); closeT = null; }
+    };
     card.addEventListener("mouseenter", () => {
-      if (timer) { clearTimeout(timer); timer = null; }
-      _setFloatState(card, "expanded");
+      clearTimers();
+      if (card.dataset.floatState === "expanded") return;
+      if (onReveal) { try { onReveal(); } catch (e) {} }
+      openT = setTimeout(() => {
+        if (card.matches(":hover")) _setFloatState(card, "expanded");
+        openT = null;
+      }, 110);   // hover-intent: ignore a quick brush across the edge tab
     });
     card.addEventListener("mouseleave", () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(() => {
+      clearTimers();
+      closeT = setTimeout(() => {
         if (!card.matches(":hover") && !card.contains(document.activeElement))
           _setFloatState(card, "edge");
-        timer = null;
-      }, 400);
+        closeT = null;
+      }, 450);
     });
   }
 
@@ -5478,10 +5614,259 @@
                          { responsive: true, displayModeBar: true });
       seqWirePlotClick(el);          // click point -> segment params + formula
       seqWirePlotHover(el);          // hover point -> SVG-overlay highlight of the pulse
+      seqWireLegendToggle(el);       // hover-reveal / click-pin the channel legend (req 3)
+      seqWireClearOthers(el);        // "only highlighted" -> drop the other channels (req 4)
+      seqWireStepRuler(el);          // step/phase boundary ruler + toggle
       const _hp = _seqHoverPath(el, true);
       if (_hp) _hp.setAttribute("points", "");     // clear stale hover line after a rebuild
-      if (seqState._emphParam) seqEmphasizeParamRegion(seqState._emphParam);  // survive rebuild
+      if (seqState._legendPinned)                  // re-apply pinned legend across react
+        try { Plotly.relayout(el, { showlegend: true }); } catch (e) {}
+      seqReapplyEmph();                            // survive rebuild (req 6)
+      seqRenderStepRuler(el);                      // draw the phase ruler (xref.steps)
     } catch (e) { console.warn("seq figure", e); }
+  }
+
+  // Legend reveal/pin control (req 3). The legend is collapsed by default
+  // (figure.py: showlegend=false). A small tab at the plot's top-left reveals it
+  // while hovered, and a click PINS it open. Created once; survives Plotly.react
+  // (it's a plain DOM child of the plot div, like the hover overlay).
+  function seqWireLegendToggle(el) {
+    if (el._seqLegendWired) return;
+    el._seqLegendWired = true;
+    if (getComputedStyle(el).position === "static") el.style.position = "relative";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "seq-legend-toggle";
+    btn.title = "Show the channel legend (click to pin it open)";
+    btn.innerHTML = '<span class="seq-legend-toggle-ic">☰</span> Legend';
+    el.appendChild(btn);
+    const show = (on) => { try { Plotly.relayout(el, { showlegend: on }); } catch (e) {} };
+    let hideT = null;
+    const cancelHide = () => { if (hideT) { clearTimeout(hideT); hideT = null; } };
+    btn.addEventListener("mouseenter", () => { cancelHide(); if (!seqState._legendPinned) show(true); });
+    // Disappear quickly once the cursor leaves the BUTTON (short grace), not only on
+    // leaving the whole plot. Click to pin if you want it to stay open.
+    btn.addEventListener("mouseleave", () => {
+      cancelHide();
+      if (!seqState._legendPinned)
+        hideT = setTimeout(() => { if (!seqState._legendPinned) show(false); }, 220);
+    });
+    el.addEventListener("mouseleave", () => { cancelHide(); if (!seqState._legendPinned) show(false); });
+    btn.addEventListener("click", (e) => {
+      cancelHide();
+      e.stopPropagation();
+      seqState._legendPinned = !seqState._legendPinned;
+      btn.classList.toggle("pinned", seqState._legendPinned);
+      show(seqState._legendPinned);
+    });
+    if (seqState._legendPinned) btn.classList.add("pinned");
+  }
+
+  // The channels involved in the CURRENT highlight (active param's driven channels,
+  // or the clicked pulse's channel). Used by the "only highlighted" button (req 4).
+  function seqHighlightedChannels() {
+    const e = seqState._emph, xr = seqState.xref, out = new Set();
+    if (!e || !xr) return [];
+    if (e.kind === "param") {
+      ((xr.param_to_channels && xr.param_to_channels[e.path]) || []).forEach((c) => out.add(c));
+      ((xr.param_to_pids && xr.param_to_pids[e.path]) || []).forEach((pid) => {
+        const pu = xr.pulses && xr.pulses[String(pid)];
+        if (pu && pu.channel) out.add(pu.channel);
+      });
+    } else if (e.kind === "pulse" && xr.pulses) {
+      const pu = xr.pulses[String(e.pid)];
+      if (pu && pu.channel) out.add(pu.channel);
+    }
+    return Array.from(out);
+  }
+
+  // Drop every plotted channel EXCEPT the currently-highlighted one(s) -- i.e. isolate
+  // the selection on the plot (req 4). With nothing highlighted there's nothing to keep,
+  // so it clears all channels.
+  async function seqClearOtherChannels() {
+    const keep = new Set(seqHighlightedChannels());
+    const order = seqState.chnOrder || [];
+    seqState.chnSel = new Set(order.filter((n) => keep.has(n)));
+    seqRenderChnList();
+    seqUpdateChnCount();
+    await seqRenderPlot();
+    seqReapplyEmph();
+    toast(keep.size ? ("Isolated " + keep.size + " channel(s)") : "Cleared all channels",
+          keep.size ? "ok" : "");
+  }
+
+  // "Only highlighted" button overlaid top-LEFT of the plot (legend control is top-right).
+  function seqWireClearOthers(el) {
+    if (el._seqClearOthersWired) return;
+    el._seqClearOthersWired = true;
+    if (getComputedStyle(el).position === "static") el.style.position = "relative";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "seq-clear-others";
+    btn.title = "Remove every channel except the highlighted one(s)";
+    btn.innerHTML = '<span class="seq-clear-others-ic">⊙</span> Only highlighted';
+    btn.addEventListener("click", (e) => { e.stopPropagation(); seqClearOtherChannels(); });
+    el.appendChild(btn);
+  }
+
+  // ---- Step / phase ruler (xref.steps) --------------------------------------
+  // Vertical boundary lines at each top-level step's start/end + a name label at the top
+  // (the experiment phases: InitStep/BlueMOTStep/GreenMOTStep/...). Drawn on a plain SVG
+  // overlay (like the hover line) -- NOT Plotly shapes -- so it never clobbers the param/
+  // pulse emphasis (which uses layout.shapes) and costs no Plotly redraw. Recomputed on
+  // zoom/pan/resize from the axis pixel geometry.
+  function _seqStepOv(el, existingOnly) {
+    let ov = el.querySelector(":scope > svg.seq-step-ov");
+    if (!ov) {
+      if (existingOnly) return null;
+      const NS = "http://www.w3.org/2000/svg";
+      ov = document.createElementNS(NS, "svg");
+      ov.setAttribute("class", "seq-step-ov");
+      ov.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;" +
+                         "pointer-events:none;z-index:5;overflow:hidden;";
+      if (getComputedStyle(el).position === "static") el.style.position = "relative";
+      el.appendChild(ov);
+      // Delegated label interactions. The <svg> is pointer-events:none; only the
+      // .seq-step-tab groups opt back in -- hover shades the step span, click zooms
+      // the time axis to that step (+ buffer). Attached ONCE (the svg is cached).
+      ov.addEventListener("mouseover", (e) => {
+        const tab = e.target.closest(".seq-step-tab");
+        if (tab) seqShowStepBand(el, +tab.dataset.t0, +tab.dataset.t1);
+      });
+      ov.addEventListener("mouseout", (e) => {
+        const tab = e.target.closest(".seq-step-tab");
+        if (tab && !tab.contains(e.relatedTarget)) seqHideStepBand(el);
+      });
+      ov.addEventListener("click", (e) => {
+        const tab = e.target.closest(".seq-step-tab");
+        if (!tab) return;
+        e.stopPropagation();
+        seqZoomToStep(el, +tab.dataset.t0, +tab.dataset.t1);
+      });
+    }
+    return ov;
+  }
+
+  function seqRenderStepRuler(el) {
+    if (!el) return;
+    const on = seqState._stepsOn !== false;        // default ON
+    const ov = _seqStepOv(el, !on);
+    if (ov) ov.innerHTML = "";
+    if (!on || !ov) return;
+    const steps = (seqState.xref && seqState.xref.steps) || [];
+    const fl = el._fullLayout;
+    if (!steps.length || !fl || !fl.xaxis || !fl.yaxis) return;
+    const xa = fl.xaxis, ya = fl.yaxis;
+    if (!xa.range || xa._length == null || ya._length == null) return;
+    const r0 = xa.range[0], r1 = xa.range[1], xw = r1 - r0;
+    if (!isFinite(xw) || xw === 0) return;
+    const xoff = xa._offset, xl = xa._length, ytop = ya._offset, yh = ya._length;
+    const NS = "http://www.w3.org/2000/svg";
+    const X = (t) => xoff + (t - r0) / xw * xl;
+    // Boundary lines (unique start/end times within the visible range).
+    const bounds = new Set();
+    steps.forEach((s) => { bounds.add(s.t0); bounds.add(s.t1); });
+    bounds.forEach((t) => {
+      const px = X(t);
+      if (px < xoff - 0.5 || px > xoff + xl + 0.5) return;
+      const ln = document.createElementNS(NS, "line");
+      ln.setAttribute("x1", px.toFixed(1)); ln.setAttribute("x2", px.toFixed(1));
+      ln.setAttribute("y1", ytop.toFixed(1)); ln.setAttribute("y2", (ytop + yh).toFixed(1));
+      ln.setAttribute("class", "seq-step-line");
+      ov.appendChild(ln);
+    });
+    // Name labels at the top, staggered over 2 rows. Each is an interactive "tab"
+    // (hover -> shade the step; click -> zoom to it); handlers live in _seqStepOv.
+    steps.forEach((s, i) => {
+      const a = Math.max(s.t0, r0), b = Math.min(s.t1, r1);
+      if (b < r0 || a > r1) return;                // off-screen
+      const cx = (s.t1 > s.t0) ? X((a + b) / 2) : X(s.t0);
+      const ty = ytop + 11 + (i % 2) * 13;
+      const g = document.createElementNS(NS, "g");
+      g.setAttribute("class", "seq-step-tab");
+      g.dataset.t0 = String(s.t0);
+      g.dataset.t1 = String(s.t1);
+      const txt = document.createElementNS(NS, "text");
+      txt.setAttribute("x", cx.toFixed(1));
+      txt.setAttribute("y", ty.toFixed(1));
+      txt.setAttribute("text-anchor", "middle");
+      txt.setAttribute("class", "seq-step-label");
+      txt.textContent = s.label || "step";
+      g.appendChild(txt);
+      ov.appendChild(g);
+      try {                                        // hit-area + hover bg sized to the text
+        const bb = txt.getBBox();
+        const rc = document.createElementNS(NS, "rect");
+        rc.setAttribute("class", "seq-step-tab-bg");
+        rc.setAttribute("x", (bb.x - 3).toFixed(1));
+        rc.setAttribute("y", (bb.y - 1).toFixed(1));
+        rc.setAttribute("width", (bb.width + 6).toFixed(1));
+        rc.setAttribute("height", (bb.height + 2).toFixed(1));
+        rc.setAttribute("rx", "3");
+        g.insertBefore(rc, txt);
+      } catch (e) {}
+    });
+  }
+
+  // Click a step label -> zoom the time axis to that step's span + a side buffer.
+  function seqZoomToStep(el, t0, t1) {
+    if (!el || !window.Plotly) return;
+    const span = (t1 - t0) || 0;
+    const pad = Math.max(span * 0.12, 3);          // a bit of buffer on each side
+    let lo = t0 - pad, hi = t1 + pad;
+    if (hi <= lo) hi = lo + 1;
+    try { Plotly.relayout(el, { "xaxis.range": [lo, hi] }); } catch (e) {}
+  }
+
+  // Hover a step label -> shade that step's time span (band behind the lines/labels).
+  function seqShowStepBand(el, t0, t1) {
+    const ov = _seqStepOv(el, true);
+    const fl = el && el._fullLayout;
+    if (!ov || !fl || !fl.xaxis || !fl.yaxis || !fl.xaxis.range) return;
+    const xa = fl.xaxis, ya = fl.yaxis, r0 = xa.range[0], xw = xa.range[1] - r0;
+    if (!isFinite(xw) || xw === 0) return;
+    const x0 = xa._offset + (t0 - r0) / xw * xa._length;
+    const x1 = xa._offset + (t1 - r0) / xw * xa._length;
+    let band = ov.querySelector(".seq-step-hover-band");
+    if (!band) {
+      band = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      band.setAttribute("class", "seq-step-hover-band");
+      ov.insertBefore(band, ov.firstChild);        // behind the lines + labels
+    }
+    band.setAttribute("x", Math.min(x0, x1).toFixed(1));
+    band.setAttribute("y", ya._offset.toFixed(1));
+    band.setAttribute("width", Math.max(Math.abs(x1 - x0), 2).toFixed(1));
+    band.setAttribute("height", ya._length.toFixed(1));
+    band.style.display = "";
+  }
+
+  function seqHideStepBand(el) {
+    const ov = _seqStepOv(el, true);
+    const band = ov && ov.querySelector(".seq-step-hover-band");
+    if (band) band.style.display = "none";
+  }
+
+  // Toggle button + recompute-on-relayout wiring (created once per plot div).
+  function seqWireStepRuler(el) {
+    if (el._seqStepWired) return;
+    el._seqStepWired = true;
+    if (seqState._stepsOn === undefined) seqState._stepsOn = true;   // default ON
+    if (getComputedStyle(el).position === "static") el.style.position = "relative";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "seq-step-toggle";
+    btn.title = "Show step/phase boundaries on the time axis";
+    btn.innerHTML = '<span class="seq-step-toggle-ic">⊓</span> Steps';
+    btn.classList.toggle("on", seqState._stepsOn);
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      seqState._stepsOn = !seqState._stepsOn;
+      btn.classList.toggle("on", seqState._stepsOn);
+      seqRenderStepRuler(el);
+    });
+    el.appendChild(btn);
+    el.on("plotly_relayout", () => seqRenderStepRuler(el));   // zoom / pan / autosize
+    window.addEventListener("resize", () => seqRenderStepRuler(el));
   }
 
   // Click a point in the plot -> highlight the params whose value appears in that
@@ -5503,6 +5888,12 @@
   async function seqRenderParams() {
     const box = $("seq-params");
     if (!box || !seqState.index || !seqState.file) return;
+    // Invalidate any xref poll loop from a PRIOR load (a different seq of the same scan, or
+    // a re-render): each loop carries the token snapshotted HERE and bails the moment the
+    // live token moves past it, so an old loop can't re-set the "building"/"awaiting" banner
+    // after a newer load cleared it. Snapshot now (before the awaits) so concurrent
+    // seqRenderParams calls each tag their own loop, not whatever the token grew to later.
+    const pollGen = (seqState._xrefPollGen = (seqState._xrefPollGen || 0) + 1);
     seqClearFocus();                 // selection context changes when params reload
     const ssel = $("seq-seq-select");
     const qs = seqQueryString({ file: seqState.file, seq: ssel ? ssel.value : "" });
@@ -5525,9 +5916,105 @@
     try { seqState.xref = await api("/api/sequence/xref?" + qs); }
     catch (e) { seqState.xref = null; }
     seqRenderParamTree();
-    // No xref yet (or a pre-region one)? Kick a BACKGROUND build/upgrade (non-blocking) and
-    // light up the affordance once it lands. The .seq plot is already shown.
-    seqMaybeBuildXref(qs);
+    seqRenderStepRuler($("plot-sequence"));        // phase ruler depends on xref.steps
+    // The SERVER auto-builds/upgrades the xref on view. Three states drive the notice +
+    // how we wait for it: awaiting the run's globals (can't build steps/regions yet),
+    // rebuilding (globals present, build in flight), or nothing pending.
+    if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting"); seqAwaitGlobals(qs, pollGen); }
+    else if (r.xref_building) { seqSetXrefNotice("building"); seqPollXrefUpdate(qs, pollGen); }
+    else { seqSetXrefNotice(null); seqMaybeBuildXref(qs); }
+  }
+
+  // Banner above the plot: shown while the step ruler / wait bands can't finish building.
+  //   "awaiting" -> the run hasn't captured its globals yet (global-dependent step/timing
+  //                 offsets can't resolve); the channel waveforms still plot.
+  //   "building" -> globals present, the map is rebuilding.
+  //   null       -> hide.
+  function seqSetXrefNotice(kind) {
+    const el = $("seq-xref-notice");
+    if (!el) return;
+    if (!kind) { el.hidden = true; el.textContent = ""; el.className = "seq-notice"; return; }
+    if (kind === "awaiting") {
+      el.className = "seq-notice seq-notice-wait";
+      el.innerHTML = '<span class="seq-notice-ic">⏳</span> Waiting for the run’s globals ' +
+        '(captured at the <b>end of the run</b>) — only then can the step ruler &amp; timing ' +
+        'bands be placed. Channel waveforms and the param↔channel/pulse map are already ' +
+        'available.';
+    } else {
+      el.className = "seq-notice seq-notice-build";
+      el.innerHTML = '<span class="seq-notice-ic">⟳</span> Building the step / timing map…';
+    }
+    el.hidden = false;
+  }
+
+  // Does this xref already carry the step ruler / wait bands the banner waits for? The
+  // "building" notice is ONLY about that timing map -- if it's present there's nothing to
+  // wait for, regardless of what the (possibly stale) server `building` flag says.
+  const seqXrefHasTimingMap = (xr) =>
+    (((xr && xr.steps) || []).length > 0) ||
+    (Object.keys((xr && xr.time_regions) || {}).length > 0);
+
+  // The server kicked off a background xref (re)build for the loaded scan -- poll until the
+  // artifact GROWS (steps / time_regions appear, or the version bumps), then re-render.
+  // Handles the case the version check alone misses: a current-version xref that was built
+  // before the run's globals.json was finalized (empty steps/regions). Bails on navigation.
+  async function seqPollXrefUpdate(qs, gen) {
+    const scanId = seqState.query && seqState.query.scan_id;
+    // The engine-free build can finish in the gap between the params response (which set
+    // `xref_building`) and this call -- in which case seqState.xref was already loaded
+    // complete and the ruler already rendered. Nothing to poll for: clear and bail, else
+    // `size(x) > start` never trips (start == final size) and the banner sticks ~40 s.
+    if (seqXrefHasTimingMap(seqState.xref)) { seqSetXrefNotice(null); return; }
+    const size = (xr) => (((xr && xr.steps) || []).length +
+                          Object.keys((xr && xr.time_regions) || {}).length);
+    const start = size(seqState.xref);
+    const startV = (seqState.xref && seqState.xref.version) || 0;
+    for (let i = 0; i < 25; i++) {                  // ~40 s (engine-free build is quick)
+      await new Promise((res) => setTimeout(res, 1600));
+      if (seqState._xrefPollGen !== gen) return;                          // superseded
+      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      let x = null;
+      try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
+      if (x && (size(x) > start || (x.version || 0) > startV)) {
+        seqState.xref = x;
+        seqRenderParamTree();
+        seqRenderStepRuler($("plot-sequence"));
+        seqSetXrefNotice(null);                     // built -> clear the banner
+        return;
+      }
+    }
+    seqSetXrefNotice(null);                          // timed out -> drop the banner
+  }
+
+  // Awaiting the run's globals: poll the xref (which re-triggers the build once globals
+  // land) until the steps/regions appear, updating the banner as it moves awaiting ->
+  // building -> done. Long cap (a run can take minutes); bails on navigation.
+  async function seqAwaitGlobals(qs, gen) {
+    const scanId = seqState.query && seqState.query.scan_id;
+    if (seqXrefHasTimingMap(seqState.xref)) { seqSetXrefNotice(null); return; }  // already built
+    const pc = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
+    for (let i = 0; i < 150; i++) {                 // ~12 min cap (5 s poll)
+      await new Promise((res) => setTimeout(res, 5000));
+      if (seqState._xrefPollGen !== gen) return;                          // superseded
+      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      let x = null;
+      try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
+      if (!x) continue;
+      const hasSteps = seqXrefHasTimingMap(x);
+      // The param<->channel/pulse map does NOT depend on globals -- render it the moment
+      // the build produces it, so clicking params/pulses works WHILE we wait for globals.
+      // Only the step ruler + wait bands keep the banner up.
+      if (x.available && (pc(x) > pc(seqState.xref) || hasSteps)) {
+        seqState.xref = x;
+        seqRenderParamTree();
+        seqRenderStepRuler($("plot-sequence"));
+      }
+      if (hasSteps) { seqSetXrefNotice(null); return; }    // fully built (steps too)
+      if (x.awaiting_globals) seqSetXrefNotice("awaiting");
+      else if (x.building) seqSetXrefNotice("building");
+      else { seqSetXrefNotice(null); return; }             // nothing pending
+    }
+    seqSetXrefNotice(null);
   }
 
   // Build (or upgrade) sequence/xref.json in the background for the loaded scan, then poll
@@ -5564,6 +6051,7 @@
         if (x && (stale ? seqXrefComplete(x) : x.available)) {
           seqState.xref = x;
           seqRenderParamTree();                       // affordance lights up
+          seqRenderStepRuler($("plot-sequence"));     // phase ruler (xref.steps)
           if (r.started) toast("param↔channel map ready", "ok");
           return;
         }
@@ -5578,7 +6066,7 @@
   // only, per-pulse without formulas, or verbose pre-cleanup formulas) carry a lower/absent
   // version and are rebuilt in place on load. Keep in lock-step with XREF_VERSION in
   // pyctrl/tools/provenance_scan.py.
-  const SEQ_XREF_VERSION = 4;
+  const SEQ_XREF_VERSION = 6;
   function seqXrefComplete(xr) {
     return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
   }
@@ -5610,6 +6098,7 @@
         if (x && seqXrefComplete(x)) {
           seqState.xref = x;
           seqRenderParamTree();
+          seqRenderStepRuler($("plot-sequence"));     // phase ruler (xref.steps)
           toast("param↔channel map rebuilt", "ok");
           return;
         }
@@ -5714,18 +6203,24 @@
   // Select + PROMOTE the channels a param drives: mark them selected and move them to the
   // TOP of the channel list (front), then re-render so the regions exist before emphasis.
   async function seqOnParamChannels(path) {
-    if (!seqState.xref || !seqState.xref.available) return;
-    const chns = (seqState.xref.param_to_channels &&
-                  seqState.xref.param_to_channels[path]) || [];
-    if (!chns.length) return;
-    const csel = $("seq-chn-select");
-    if (!csel) return;
-    const want = new Set(chns);
-    const opts = Array.from(csel.options);
-    const driven = opts.filter((o) => want.has(o.value));
-    const rest = opts.filter((o) => !want.has(o.value));
-    driven.forEach((o) => { o.selected = true; });
-    driven.concat(rest).forEach((o) => csel.appendChild(o));   // reorder: driven to front
+    const xr = seqState.xref;
+    if (!xr || !xr.available) return;
+    // Channels a param drives: param_to_channels is the primary map, but it can
+    // miss some -- so also pull each driven pulse's channel (fixes "channel
+    // sometimes not showing" on param click, req 1).
+    const want = new Set((xr.param_to_channels && xr.param_to_channels[path]) || []);
+    ((xr.param_to_pids && xr.param_to_pids[path]) || []).forEach((pid) => {
+      const pu = xr.pulses && xr.pulses[String(pid)];
+      if (pu && pu.channel) want.add(pu.channel);
+    });
+    if (!want.size) return;
+    const order = seqState.chnOrder || [];
+    const present = order.filter((n) => want.has(n));    // only channels in THIS seq
+    if (!present.length) return;
+    const sel = seqState.chnSel || (seqState.chnSel = new Set());
+    present.forEach((n) => sel.add(n));
+    seqState.chnOrder = present.concat(order.filter((n) => !want.has(n)));  // driven → front
+    seqRenderChnList();
     seqUpdateChnCount();
     await seqRenderPlot();
   }
@@ -5735,8 +6230,8 @@
   async function seqSelectParam(path) {
     const pbox = $("seq-params");
     if (pbox) {
-      $$(".seq-leaf.seq-leaf-active", pbox).forEach((el) =>
-        el.classList.remove("seq-leaf-active"));
+      $$(".seq-leaf.seq-leaf-active, .seq-leaf.seq-leaf-xref-hit", pbox).forEach((el) =>
+        el.classList.remove("seq-leaf-active", "seq-leaf-xref-hit"));
       const row = pbox.querySelector('.seq-leaf[data-param-path="' +
                                      path.replace(/"/g, '\\"') + '"]');
       if (row) row.classList.add("seq-leaf-active");
@@ -5749,14 +6244,13 @@
   // Click a channel chip -> ensure that channel is shown (select + render), keeping any
   // active param's region emphasis.
   async function seqShowChannel(name) {
-    const csel = $("seq-chn-select");
-    if (!csel) return;
-    let changed = false;
-    Array.from(csel.options).forEach((o) => {
-      if (o.value === name && !o.selected) { o.selected = true; changed = true; }
-    });
-    if (changed) { seqUpdateChnCount(); await seqRenderPlot();
-                   if (seqState._emphParam) seqEmphasizeParamRegion(seqState._emphParam); }
+    const sel = seqState.chnSel || (seqState.chnSel = new Set());
+    if (sel.has(name)) return;
+    sel.add(name);
+    seqRenderChnList();
+    seqUpdateChnCount();
+    await seqRenderPlot();
+    seqReapplyEmph();
   }
 
   // Overlay (not marker-resize) emphasis: a thicker LINE drawn on top of the matched pulse
@@ -5785,9 +6279,13 @@
     Object.keys(byAxis).forEach((ax) => {
       const a = byAxis[ax];
       if (!a.x.length) return;
-      const t = { x: a.x, y: a.y, mode: "lines", name: name,
+      // Scattergl to match the base channel traces (figure.py): keeping every trace
+      // on the one WebGL layer means trace order alone sets z-order -- this overlay is
+      // appended last (addTraces) so it draws ON TOP of the channels, with no ambiguous
+      // SVG-vs-GL layer stacking. (cliponaxis is a no-op under GL -- GL always clips.)
+      const t = { x: a.x, y: a.y, type: "scattergl", mode: "lines", name: name,
                   line: { color: color, width: width }, hoverinfo: "skip",
-                  showlegend: false, cliponaxis: false };
+                  showlegend: false };
       if (ax !== "y") t.yaxis = ax;
       traces.push(t);
     });
@@ -5801,34 +6299,78 @@
     if (idx.length) Plotly.deleteTraces(el, idx);
   }
 
-  // Param-region highlight: a thick line over the channel segments the param drives, plus
-  // shaded time bands for any wait/timing regions it controls (waits have no channel output).
-  function seqEmphasizeParamRegion(path) {
+  // Background time-band(s) for a set of pids: one shaded rect per pulse, spanning
+  // that pulse's [min,max] time. Selecting a param/pulse shades the period its
+  // pulses occupy (req 1), the same way wait regions are shaded.
+  function _seqPulseBands(el, pidSet) {
+    const ext = {};   // pid -> [min, max]
+    el.data.forEach((tr) => {
+      if (!tr.customdata || tr.name === SEQ_HILITE || tr.name === "Selected") return;
+      for (let k = 0; k < tr.customdata.length; k++) {
+        const p = Number(tr.customdata[k]);
+        if (!pidSet.has(p)) continue;
+        const x = tr.x[k];
+        if (x == null || !isFinite(x)) continue;
+        const e = ext[p] || (ext[p] = [x, x]);
+        if (x < e[0]) e[0] = x;
+        if (x > e[1]) e[1] = x;
+      }
+    });
+    return Object.keys(ext).map((p) => ext[p]).filter((r) => r[1] > r[0]);
+  }
+
+  // Unified plot-emphasis driver -- param AND pulse clicks both route through here, so
+  // the plot highlight ALWAYS matches the current selection (req 6). Draws a thick line
+  // over the matched pulse segments + a shaded background band over each pulse's time
+  // period + any explicit wait/timing bands. `key` records WHAT is emphasized so it can
+  // be re-applied after a plot rebuild (channel toggle / Plotly.react).
+  function seqEmphasize(pidSet, waitRegions, key) {
     seqClearEmphasis();
     const el = $("plot-sequence");
-    if (!el || !el.data || !window.Plotly) return;
-    const xr = seqState.xref;
-    if (!xr || !xr.available) return;
-    const pids = new Set(((xr.param_to_pids || {})[path] || []).map(Number));
-    const overlays = pids.size ? _seqOverlayTraces(el, pids, SEQ_HILITE, "#ffd166", 6) : [];
+    if (!el || !el.data || !window.Plotly) return null;
+    const overlays = (pidSet && pidSet.size)
+      ? _seqOverlayTraces(el, pidSet, SEQ_HILITE, "#ffd166", 6) : [];
     if (overlays.length) Plotly.addTraces(el, overlays);
-    const regions = (xr.time_regions || {})[path] || [];
-    if (regions.length) {
-      Plotly.relayout(el, { shapes: regions.map(([t0, t1]) => ({
-        type: "rect", xref: "x", yref: "paper", x0: t0, x1: t1, y0: 0, y1: 1,
+    const bands = [];
+    if (pidSet && pidSet.size) _seqPulseBands(el, pidSet).forEach((r) => bands.push(r));
+    (waitRegions || []).forEach((r) => { if (r && r.length === 2) bands.push(r); });
+    if (bands.length) {
+      Plotly.relayout(el, { shapes: bands.map((r) => ({
+        type: "rect", xref: "x", yref: "paper", x0: r[0], x1: r[1], y0: 0, y1: 1,
         fillcolor: "rgba(255,209,102,0.13)", line: { width: 0 }, layer: "below" })) });
     }
-    seqState._emphParam = path;
+    seqState._emph = key || null;
+    return { overlays: overlays.length, bands: bands.length };
+  }
+
+  // Param-region highlight: thick line over the param's pulses + a shaded band over
+  // their time period + any wait/timing regions it controls (waits have no channel output).
+  function seqEmphasizeParamRegion(path) {
+    const el = $("plot-sequence");
+    const xr = seqState.xref;
+    if (!el || !el.data || !window.Plotly || !xr || !xr.available) return;
+    const pids = new Set(((xr.param_to_pids || {})[path] || []).map(Number));
+    const regions = (xr.time_regions || {})[path] || [];
+    const r = seqEmphasize(pids, regions, { kind: "param", path }) || {};
     const bits = [];
-    if (overlays.length) bits.push("waveform region");
+    if (r.overlays) bits.push("waveform region");
     if (regions.length) bits.push(regions.length + " time band(s)");
     toast(bits.length ? (path + " → " + bits.join(" + ")) : ("No region for " + path),
           bits.length ? "ok" : "");
   }
 
-  // Remove the param-selection overlay + its time bands.
+  // Re-apply the current emphasis after a plot rebuild (channel toggle / react).
+  function seqReapplyEmph() {
+    const e = seqState._emph;
+    if (!e) return;
+    if (e.kind === "param") seqEmphasizeParamRegion(e.path);
+    else if (e.kind === "pulse" && e.pid != null)
+      seqEmphasize(new Set([Number(e.pid)]), [], e);
+  }
+
+  // Remove the selection overlay + its shaded bands.
   function seqClearEmphasis() {
-    seqState._emphParam = null;
+    seqState._emph = null;
     const el = $("plot-sequence");
     if (!el || !el.data || !window.Plotly) return;
     _seqRemoveTraces(el, SEQ_HILITE);
@@ -5882,10 +6424,13 @@
                          "pointer-events:none;z-index:6;overflow:hidden;";
       const pl = document.createElementNS(NS, "polyline");
       pl.setAttribute("fill", "none");
-      pl.setAttribute("stroke", "#7ee787");
+      // Cyan: high contrast against the dark bg AND the many greenish channel
+      // colours, and distinct from the yellow click-selection highlight (req 2a).
+      pl.setAttribute("stroke", "#36e0ff");
       pl.setAttribute("stroke-width", "5");
       pl.setAttribute("stroke-linejoin", "round");
       pl.setAttribute("stroke-linecap", "round");
+      pl.setAttribute("opacity", "0.95");
       ov.appendChild(pl);
       if (getComputedStyle(el).position === "static") el.style.position = "relative";
       el.appendChild(ov);
@@ -5919,9 +6464,12 @@
         opts.params.map((p) => {
           const path = (typeof p === "string") ? p : p.path;
           const v = (typeof p === "object" && p.value != null) ? seqFmt(p.value) : null;
-          return '<span class="seq-chip" data-focus-param="' + seqEsc(path) + '">' +
-            seqEsc(path) + (v != null ? ' <span class="seq-chip-val">' + seqEsc(v) +
-            "</span>" : "") + "</span>";
+          // A hover-revealed ✕ deselects the param (req 7).
+          return '<span class="seq-chip seq-chip-param" data-focus-param="' + seqEsc(path) +
+            '" title="click to deselect">' + seqEsc(path) +
+            (v != null ? ' <span class="seq-chip-val">' + seqEsc(v) + "</span>" : "") +
+            '<span class="seq-chip-x" data-focus-param-remove="' + seqEsc(path) + '">✕</span>' +
+            "</span>";
         }).join("") + "</div>");
     if (opts.channels && opts.channels.length)
       parts.push('<div class="seq-focus-row"><span class="lbl">channels</span>' +
@@ -5962,8 +6510,8 @@
     const xr = seqState.xref;
     if (!xr || !xr.available) return;
     const box = $("seq-params");
-    if (box) $$(".seq-leaf.seq-leaf-xref-hit", box).forEach((el) =>
-      el.classList.remove("seq-leaf-xref-hit"));
+    if (box) $$(".seq-leaf.seq-leaf-xref-hit, .seq-leaf.seq-leaf-active", box).forEach((el) =>
+      el.classList.remove("seq-leaf-xref-hit", "seq-leaf-active"));
     const pulse = (pid != null && xr.pulses) ? xr.pulses[String(pid)] : null;
     let params, formula = null, idle = false;
     if (pulse) {
@@ -5972,20 +6520,42 @@
       params = (xr.channel_to_params && xr.channel_to_params[chn]) || [];
       idle = true;                                  // pid=-1 / no per-pulse data
     }
-    let first = null;
+    // Sync the PLOT highlight to the clicked pulse (req 6): so clicking a pulse
+    // always re-highlights THAT pulse (thick line + shaded time band), replacing
+    // any stale param/channel emphasis. Idle points clear the emphasis.
+    if (pulse) seqEmphasize(new Set([Number(pid)]), [], { kind: "pulse", pid: Number(pid) });
+    else seqClearEmphasis();
     if (box) params.forEach((p) => {
       const row = box.querySelector('.seq-leaf[data-param-path="' +
                                     p.replace(/"/g, '\\"') + '"]');
-      if (row) { row.classList.add("seq-leaf-xref-hit"); if (!first) first = row; }
+      if (row) row.classList.add("seq-leaf-xref-hit");
     });
-    if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
     const tStr = (time != null && isFinite(time)) ? Number(time).toFixed(3) + " ms" : "";
     const vStr = (value != null && isFinite(value)) ? seqFmt(value) : "";
     let title = chn + (tStr ? " @ " + tStr : "") + (vStr ? " = " + vStr : "");
-    if (idle && !params.length) title += "  (idle / no pulse here)";
-    else if (idle) title += "  (whole channel)";
+    // "idle" = the clicked point's pid has NO per-segment provenance (it's the
+    // channel's initial/idle value, or a collapsed pulse not in the map). We then
+    // fall back to EVERY param that touches this channel anywhere -- spell that out
+    // so the long list isn't mistaken for params that derive THIS point.
+    if (idle && !params.length) title += "  ·  idle / no pulse at this point";
+    else if (idle) title += "  ·  no per-segment data here — showing all " +
+                            params.length + " params that touch this channel";
     seqSetFocus({ title, formula, channels: [chn],
                   params: params.map((p) => ({ path: p, value: seqParamValue(p) })) });
+    // Frame the view so BOTH the plot and the focus/highlight region are visible
+    // un-clipped (req 4) -- replaces the old jump deep into the param tree.
+    seqScrollFraming();
+  }
+
+  // Scroll so the plot sits just under the top bar, bringing the focus/highlight
+  // region (directly below it) into view without clipping the plot (req 4).
+  function seqScrollFraming() {
+    const plot = document.getElementById("plot-sequence");
+    const focus = document.getElementById("seq-focus");
+    if (!plot || !focus || focus.hidden) return;
+    const desiredTop = 70;        // clears the sticky tab bar
+    const delta = plot.getBoundingClientRect().top - desiredTop;
+    if (Math.abs(delta) > 4) window.scrollBy({ top: delta, behavior: "smooth" });
   }
 
   // Click a param -> gather the params co-deriving its segments + the formula + driven
@@ -6043,8 +6613,29 @@
     if (psel) psel.addEventListener("change", seqOnPoint);
     const ssel = $("seq-seq-select");
     if (ssel) ssel.addEventListener("change", seqOnSeq);
-    const csel = $("seq-chn-select");
-    if (csel) csel.addEventListener("change", () => { seqUpdateChnCount(); seqRenderPlot(); });
+    // Custom channel picker: click a row to add/remove; SHIFT-click to add the whole
+    // range from the last click to here; Clear all; filter box.
+    const clist = $("seq-chn-list");
+    if (clist) clist.addEventListener("click", (e) => {
+      const row = e.target.closest(".chn-row[data-chn]");
+      if (!row || !clist.contains(row)) return;
+      const name = row.dataset.chn;
+      if (e.shiftKey && seqState._chnAnchor) {
+        seqSelectChannelRange(seqState._chnAnchor, name);   // add the range (anchor stays)
+      } else {
+        seqToggleChannel(name);
+        seqState._chnAnchor = name;                         // new anchor for future shift-clicks
+      }
+    });
+    const cclear = $("seq-chn-clear");
+    if (cclear) cclear.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!seqState.chnSel || !seqState.chnSel.size) return;
+      seqState.chnSel = new Set();
+      seqRenderChnList(); seqUpdateChnCount(); seqRenderPlot();
+    });
+    const csearch = $("seq-chn-search");
+    if (csearch) csearch.addEventListener("input", seqRenderChnList);
 
     // Params card: search box + config/modified/scanned toggles re-render the tree.
     const pSearch = $("seq-param-search");
@@ -6067,8 +6658,10 @@
     const fbox = $("seq-focus");
     if (fbox) fbox.addEventListener("click", (e) => {
       if (e.target.closest("#seq-focus-clear")) { seqClearFocus(); return; }
-      const pc = e.target.closest("[data-focus-param]");
-      if (pc) { seqSelectParam(pc.dataset.focusParam); return; }
+      // Click a param chip (or its hover-✕) -> DESELECT / clear the selection (req 7).
+      if (e.target.closest("[data-focus-param-remove], [data-focus-param]")) {
+        seqClearFocus(); return;
+      }
       const cc = e.target.closest("[data-focus-chan]");
       if (cc) { seqShowChannel(cc.dataset.focusChan); }
     });
@@ -6077,7 +6670,15 @@
     // like the Analysis selector -- a thin edge tab that expands on hover and
     // auto-minimizes on leave (see _wireSeqFloatCard).
     _wireSeqFloatCard(document.getElementById("sequence-chn-card"));
-    _wireSeqFloatCard(document.getElementById("seqscan-card"));
+    // Scans card: auto-refresh its list each time it opens (req 8), debounced so a
+    // flurry of hovers doesn't spam the backend.
+    let _scanRefreshAt = 0;
+    _wireSeqFloatCard(document.getElementById("seqscan-card"), () => {
+      const now = (window.performance && performance.now) ? performance.now() : 0;
+      if (now - _scanRefreshAt < 1500) return;
+      _scanRefreshAt = now;
+      loadSeqScans();
+    });
 
     // Scan picker (Analysis-style): search / date filter / refresh.
     const scanSearch = $("seq-scan-search");
