@@ -40,7 +40,7 @@ XREF_NAME = "xref.json"
 def _empty():
     return {"available": False, "version": 0, "param_to_channels": {},
             "channel_to_params": {}, "pulses": {}, "param_to_pids": {},
-            "time_regions": {}, "steps": [], "backtraces": {}}
+            "time_regions": {}, "steps": [], "backtraces": {}, "pending_globals": 0}
 
 
 def load_xref(seq_dir, fname=None):
@@ -86,6 +86,10 @@ def load_xref(seq_dir, fname=None):
         # no embedded backtrace block); the /api/sequence/backtrace route reads them keyed by
         # the clicked point's pid. Absent in older artifacts -> empty.
         "backtraces": entry.get("backtraces") or {},
+        # # of step/wait bands not yet placed for lack of the run's globals (captured at run
+        # end). >0 -> the ruler is PARTIAL; the viewer shows "N bands pending globals" and a
+        # rebuild fills them in once globals.json lands. 0 (or absent) -> fully placed.
+        "pending_globals": int(entry.get("pending_globals") or 0),
     }
 
 

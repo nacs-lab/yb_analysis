@@ -501,14 +501,15 @@ def _maybe_autobuild_xref(base):
                 _XREF_BUILDS.pop(key, None)
         xr = _xref.load_xref(seq_dir)
         current = bool(xr.get('available')) and (xr.get('version') or 0) >= _xref_tool_version()
-        # A CURRENT-version xref can still be INCOMPLETE: if it was built before the run's
-        # globals.json existed, the global-dependent step/wait times resolved to nothing
-        # (empty `steps` AND `time_regions`). If globals.json is now present, rebuild ONCE
-        # to fill them in -- tracked per dir so a genuinely step-less scan (or OneDrive
-        # mtime churn) can't trigger an endless rebuild loop.
+        # A CURRENT-version xref can still be INCOMPLETE: built before the run's globals.json
+        # existed, its global-dependent step/wait bands resolved to nothing -- recorded as
+        # `pending_globals` > 0 (could be the WHOLE map, or just a partial one, e.g. the
+        # EOM-ramp wait band while the rest resolved). If globals.json is now present, rebuild
+        # ONCE to fill them in -- tracked per dir so OneDrive mtime churn (or a build that was
+        # already done with globals, pending_globals == 0) can't trigger an endless loop.
         if current:
-            no_content = not (xr.get('steps') or xr.get('time_regions'))
-            if (no_content and os.path.exists(os.path.join(seq_dir, 'globals.json'))
+            pending = int(xr.get('pending_globals') or 0)
+            if (pending > 0 and os.path.exists(os.path.join(seq_dir, 'globals.json'))
                     and key not in _XREF_GLOBALS_REBUILT):
                 _XREF_GLOBALS_REBUILT.add(key)
                 current = False                     # one rebuild now that globals exist

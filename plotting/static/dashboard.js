@@ -5922,9 +5922,13 @@
     // rebuilding (globals present, build in flight), or nothing pending.
     // A producer crash (e.g. a config error) takes precedence -- surface it instead of
     // spinning on "building", which is how the silent-failure mode used to look.
+    const pendingG = (seqState.xref && seqState.xref.pending_globals) || 0;
     if (r.xref_build_error) { seqSetXrefNotice("error", r.xref_build_error); }
     else if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting"); seqAwaitGlobals(qs, pollGen); }
     else if (r.xref_building) { seqSetXrefNotice("building"); seqPollXrefUpdate(qs, pollGen); }
+    // Partial map: the ruler is drawn but N bands still wait on the run's globals (e.g. the
+    // EOM ramp). Show how many, and poll so they fill in once globals land + the xref rebuilds.
+    else if (pendingG > 0) { seqSetXrefNotice("pending", pendingG); seqAwaitGlobals(qs, pollGen); }
     else { seqSetXrefNotice(null); seqMaybeBuildXref(qs); }
   }
 
@@ -5950,6 +5954,15 @@
       el.innerHTML = '<span class="seq-notice-ic">⚠</span> Sequence map build failed: ' +
         '<code>' + seqEsc(detail || "unknown error") + '</code> — fix the cause, then ' +
         'use <b>Rebuild ⟳</b> to retry.';
+    } else if (kind === "pending") {
+      // The ruler is drawn but a few global-dependent bands (e.g. the EOM ramp) can't be
+      // placed until the run's globals land. Say how many; they fill in automatically then.
+      const n = detail | 0;
+      el.className = "seq-notice seq-notice-wait";
+      el.innerHTML = '<span class="seq-notice-ic">⏳</span> ' + n + ' timing band' +
+        (n === 1 ? '' : 's') + ' still waiting on the run’s globals (captured at the ' +
+        '<b>end of the run</b>) — they’ll fill in once it finishes. Steps, channels and the ' +
+        'param↔channel map are already shown.';
     } else {
       el.className = "seq-notice seq-notice-build";
       el.innerHTML = '<span class="seq-notice-ic">⟳</span> Building the step / timing map…';
@@ -5997,13 +6010,21 @@
     seqSetXrefNotice(null);                          // timed out -> drop the banner
   }
 
-  // Awaiting the run's globals: poll the xref (which re-triggers the build once globals
-  // land) until the steps/regions appear, updating the banner as it moves awaiting ->
-  // building -> done. Long cap (a run can take minutes); bails on navigation.
+  // Waiting on the run's globals (captured at run END): poll the xref (which re-triggers the
+  // build once globals land) until the timing map is FULLY placed -- i.e. present AND nothing
+  // still pending (pending_globals==0). Handles both the empty-map "awaiting" state and the
+  // partial-map "N bands pending" state (a global-dependent band like the EOM ramp resolves
+  // only once globals arrive). Renders the param map / steps as they grow; bails on navigation.
   async function seqAwaitGlobals(qs, gen) {
     const scanId = seqState.query && seqState.query.scan_id;
-    if (seqXrefHasTimingMap(seqState.xref)) { seqSetXrefNotice(null); return; }  // already built
     const pc = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
+    const sz = (xr) => (((xr && xr.steps) || []).length +
+                        Object.keys((xr && xr.time_regions) || {}).length);
+    const pend = (xr) => (xr && xr.pending_globals) || 0;
+    // Fully resolved already (map present, nothing pending) -> nothing to wait for.
+    if (seqXrefHasTimingMap(seqState.xref) && pend(seqState.xref) === 0) {
+      seqSetXrefNotice(null); return;
+    }
     for (let i = 0; i < 150; i++) {                 // ~12 min cap (5 s poll)
       await new Promise((res) => setTimeout(res, 5000));
       if (seqState._xrefPollGen !== gen) return;                          // superseded
@@ -6012,17 +6033,19 @@
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
       if (!x) continue;
       if (x.build_error) { seqSetXrefNotice("error", x.build_error); return; }   // crashed
-      const hasSteps = seqXrefHasTimingMap(x);
-      // The param<->channel/pulse map does NOT depend on globals -- render it the moment
-      // the build produces it, so clicking params/pulses works WHILE we wait for globals.
-      // Only the step ruler + wait bands keep the banner up.
-      if (x.available && (pc(x) > pc(seqState.xref) || hasSteps)) {
+      // Re-render when the artifact GREW (param map / steps / bands) or pending dropped --
+      // the param map renders the moment it exists (it needs no globals); steps + bands fill
+      // in once globals land and the build re-resolves them.
+      if (x.available && (pc(x) > pc(seqState.xref) || sz(x) > sz(seqState.xref) ||
+                          pend(x) < pend(seqState.xref))) {
         seqState.xref = x;
         seqRenderParamTree();
         seqRenderStepRuler($("plot-sequence"));
       }
-      if (hasSteps) { seqSetXrefNotice(null); return; }    // fully built (steps too)
-      if (x.awaiting_globals) seqSetXrefNotice("awaiting");
+      const hasMap = seqXrefHasTimingMap(x);
+      if (hasMap && pend(x) === 0) { seqSetXrefNotice(null); return; }    // fully placed -> done
+      if (!hasMap && x.awaiting_globals) seqSetXrefNotice("awaiting");    // nothing placed yet
+      else if (pend(x) > 0) seqSetXrefNotice("pending", pend(x));         // partial -> N pending
       else if (x.building) seqSetXrefNotice("building");
       else { seqSetXrefNotice(null); return; }             // nothing pending
     }
@@ -6078,8 +6101,8 @@
   // only, per-pulse without formulas, or verbose pre-cleanup formulas) carry a lower/absent
   // version and are rebuilt in place on load. Keep in lock-step with XREF_VERSION in
   // pyctrl/tools/provenance_scan.py (7 = + per-pulse source backtraces, read by the
-  // /api/sequence/backtrace route's xref fallback).
-  const SEQ_XREF_VERSION = 7;
+  // /api/sequence/backtrace route's xref fallback; 8 = + pending_globals count).
+  const SEQ_XREF_VERSION = 8;
   function seqXrefComplete(xr) {
     return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
   }
