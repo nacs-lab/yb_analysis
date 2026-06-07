@@ -355,14 +355,92 @@ _HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri',
 _SNAPSHOT_HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri')
 
 
-# In-flight xref builds (scan dir -> Popen), so a scan loaded repeatedly in the
-# Sequence tab spawns at most one background provenance build at a time.
+# In-flight xref builds (scan dir -> (Popen, logpath)), so a scan loaded repeatedly in the
+# Sequence tab spawns at most one background provenance build at a time. The logpath is a
+# temp file capturing the build's combined stdout+stderr so a finished build's
+# ``XREF_RESULT``/traceback can be harvested instead of vanishing into DEVNULL.
 _XREF_BUILDS = {}
 _XREF_BUILD_LOCK = threading.Lock()
+# Scan dir -> last build's error string (cleared on success). Surfaced via the params/xref
+# routes so a producer crash (e.g. a config error) shows in the Sequence tab instead of just
+# looking like "param<->channel doesn't work". A recorded error ALSO suppresses auto-respawn
+# (see _maybe_autobuild_xref) so a deterministically-failing build can't crash-loop on every
+# poll; a manual Rebuild (build_xref?force=1) clears it and retries.
+_XREF_BUILD_ERRORS = {}
 # Scan dirs we've already rebuilt ONCE to pick up late-arriving globals (so an
 # empty-but-current xref doesn't trigger an endless rebuild loop -- mtime comparison
 # is unreliable on a OneDrive-synced data folder). Reset on process restart.
 _XREF_GLOBALS_REBUILT = set()
+
+
+def _spawn_xref_build(key, py, tool, base):
+    """Spawn the engine-free provenance build for ``base``, capturing combined stdout+stderr
+    to a temp log so a finished build's ``XREF_RESULT``/traceback can be harvested (and
+    surfaced) instead of vanishing into DEVNULL. Stores ``(proc, logpath)`` in ``_XREF_BUILDS``
+    and clears any prior recorded error for ``key`` (a fresh build supersedes it). Caller
+    holds ``_XREF_BUILD_LOCK``."""
+    import os
+    import subprocess
+    import tempfile
+    fd, logpath = tempfile.mkstemp(prefix='xref_build_', suffix='.log')
+    os.close(fd)
+    logf = open(logpath, 'w', encoding='utf-8')
+    try:
+        proc = subprocess.Popen([py, tool, '--scan-dir', base],
+                                stdout=logf, stderr=subprocess.STDOUT)
+    finally:
+        logf.close()                                # the child holds its own inherited handle
+    _XREF_BUILDS[key] = (proc, logpath)
+    _XREF_BUILD_ERRORS.pop(key, None)
+    return proc
+
+
+def _harvest_xref_build(key, proc, logpath):
+    """Read a FINISHED build's captured output, record a concise error in ``_XREF_BUILD_ERRORS``
+    (or clear it on success), and delete the temp log. Best-effort; never raises."""
+    import os
+    import json as _json
+    err = None
+    try:
+        txt = ''
+        try:
+            with open(logpath, encoding='utf-8', errors='replace') as f:
+                txt = f.read()
+        except OSError:
+            pass
+        result = None
+        for line in txt.splitlines():
+            if line.startswith('XREF_RESULT:'):
+                try:
+                    result = _json.loads(line[len('XREF_RESULT:'):])
+                except ValueError:
+                    result = None
+                break
+        if result is not None:
+            if not result.get('ok', False):
+                err = str(result.get('error') or 'xref build failed')
+        elif (proc.returncode or 0) != 0:
+            # the producer died before emitting a result -> surface its last output line
+            tail = [ln for ln in txt.splitlines() if ln.strip()]
+            err = tail[-1] if tail else ('xref build exited with code %s' % proc.returncode)
+        try:
+            os.remove(logpath)
+        except OSError:
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    if err:
+        _XREF_BUILD_ERRORS[key] = err
+    else:
+        _XREF_BUILD_ERRORS.pop(key, None)
+
+
+def _xref_build_error(base):
+    """The last xref-build error for ``base`` (None if the last build succeeded / none ran)."""
+    import os
+    if not base:
+        return None
+    return _XREF_BUILD_ERRORS.get(os.path.abspath(base))
 
 
 def _xref_tool_version():
@@ -412,6 +490,15 @@ def _maybe_autobuild_xref(base):
         if sf is None or not sf.seq_files():
             return False                            # no .seq -> can't build a usable xref
         seq_dir = sf.dir
+        key = os.path.abspath(base)
+        # Harvest a finished background build FIRST: success clears any recorded error,
+        # failure records it (surfaced via the API). Done before the current-ness check so
+        # the outcome is reflected even once the xref then reads as up to date.
+        with _XREF_BUILD_LOCK:
+            running = _XREF_BUILDS.get(key)
+            if running is not None and running[0].poll() is not None:
+                _harvest_xref_build(key, running[0], running[1])
+                _XREF_BUILDS.pop(key, None)
         xr = _xref.load_xref(seq_dir)
         current = bool(xr.get('available')) and (xr.get('version') or 0) >= _xref_tool_version()
         # A CURRENT-version xref can still be INCOMPLETE: if it was built before the run's
@@ -421,10 +508,9 @@ def _maybe_autobuild_xref(base):
         # mtime churn) can't trigger an endless rebuild loop.
         if current:
             no_content = not (xr.get('steps') or xr.get('time_regions'))
-            key0 = os.path.abspath(base)
             if (no_content and os.path.exists(os.path.join(seq_dir, 'globals.json'))
-                    and key0 not in _XREF_GLOBALS_REBUILT):
-                _XREF_GLOBALS_REBUILT.add(key0)
+                    and key not in _XREF_GLOBALS_REBUILT):
+                _XREF_GLOBALS_REBUILT.add(key)
                 current = False                     # one rebuild now that globals exist
         if current:
             return False                            # up to date
@@ -445,14 +531,16 @@ def _maybe_autobuild_xref(base):
                             'tools', 'provenance_scan.py')
         if not py or not os.path.exists(py) or not os.path.exists(tool):
             return False
-        key = os.path.abspath(base)
         with _XREF_BUILD_LOCK:
             running = _XREF_BUILDS.get(key)
-            if running is not None and running.poll() is None:
+            if running is not None and running[0].poll() is None:
                 return True                         # a build is already in flight
-            _XREF_BUILDS[key] = subprocess.Popen(
-                [py, tool, '--scan-dir', base],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if _XREF_BUILD_ERRORS.get(key):
+                # The last auto-build FAILED (e.g. a config error). Don't respawn it on every
+                # poll -- that crash-loops invisibly. The error is surfaced; a manual Rebuild
+                # (build_xref?force=1) clears it and retries.
+                return False
+            _spawn_xref_build(key, py, tool, base)
         return True
     except Exception:  # noqa: BLE001 - best-effort; never break the params response
         return False
@@ -1124,6 +1212,7 @@ def _register_api_routes(server):
         # `xref_building` tells the client to poll for the (re)built artifact.
         xref_building = _maybe_autobuild_xref(base)
         xref_awaiting = _xref_awaiting_globals(base)
+        xref_error = _xref_build_error(base)        # surface a producer crash, don't hide it
         built = _pfc.build_params_tree_for_folder(base) if base else None
         if built and built.get('has_params'):
             return jsonify(_to_jsonable({
@@ -1134,6 +1223,7 @@ def _register_api_routes(server):
                 'source': 'config',
                 'xref_building': xref_building,
                 'xref_awaiting_globals': xref_awaiting,
+                'xref_build_error': xref_error,
             }))
         # Fallback: the params block embedded in the selected .seq file.
         sf, seq, err = _load_selected_seq()
@@ -1149,6 +1239,7 @@ def _register_api_routes(server):
             'source': 'seq',
             'xref_building': xref_building,
             'xref_awaiting_globals': xref_awaiting,
+            'xref_build_error': xref_error,
         }))
 
     @server.route('/api/sequence/xref')
@@ -1177,6 +1268,7 @@ def _register_api_routes(server):
         out = dict(_to_jsonable(_xref.load_xref(sf.dir, fname)))
         out['building'] = bool(building)
         out['awaiting_globals'] = bool(_xref_awaiting_globals(base))
+        out['build_error'] = _xref_build_error(base)
         return jsonify(out)
 
     @server.route('/api/sequence/build_xref', methods=['POST'])
@@ -1227,12 +1319,12 @@ def _register_api_routes(server):
         key = os.path.abspath(base)
         with _XREF_BUILD_LOCK:
             running = _XREF_BUILDS.get(key)
-            if running is not None and running.poll() is None:
+            if running is not None and running[0].poll() is None:
                 return jsonify({'ok': True, 'started': True, 'already': True})
             try:
-                _XREF_BUILDS[key] = subprocess.Popen(
-                    [py, tool, '--scan-dir', base],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Shared spawn: captures output for harvesting AND clears any recorded error,
+                # so the explicit Rebuild button retries a build that previously failed.
+                _spawn_xref_build(key, py, tool, base)
             except Exception as ex:  # noqa: BLE001
                 return jsonify({'ok': False, 'error': 'spawn failed: %s' % ex}), 500
         return jsonify({'ok': True, 'started': True})

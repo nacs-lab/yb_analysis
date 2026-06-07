@@ -5920,7 +5920,10 @@
     // The SERVER auto-builds/upgrades the xref on view. Three states drive the notice +
     // how we wait for it: awaiting the run's globals (can't build steps/regions yet),
     // rebuilding (globals present, build in flight), or nothing pending.
-    if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting"); seqAwaitGlobals(qs, pollGen); }
+    // A producer crash (e.g. a config error) takes precedence -- surface it instead of
+    // spinning on "building", which is how the silent-failure mode used to look.
+    if (r.xref_build_error) { seqSetXrefNotice("error", r.xref_build_error); }
+    else if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting"); seqAwaitGlobals(qs, pollGen); }
     else if (r.xref_building) { seqSetXrefNotice("building"); seqPollXrefUpdate(qs, pollGen); }
     else { seqSetXrefNotice(null); seqMaybeBuildXref(qs); }
   }
@@ -5930,7 +5933,7 @@
   //                 offsets can't resolve); the channel waveforms still plot.
   //   "building" -> globals present, the map is rebuilding.
   //   null       -> hide.
-  function seqSetXrefNotice(kind) {
+  function seqSetXrefNotice(kind, detail) {
     const el = $("seq-xref-notice");
     if (!el) return;
     if (!kind) { el.hidden = true; el.textContent = ""; el.className = "seq-notice"; return; }
@@ -5940,6 +5943,13 @@
         '(captured at the <b>end of the run</b>) — only then can the step ruler &amp; timing ' +
         'bands be placed. Channel waveforms and the param↔channel/pulse map are already ' +
         'available.';
+    } else if (kind === "error") {
+      // The background provenance build failed (e.g. a config error). Show the producer's
+      // message so it's diagnosable instead of looking like "the map just doesn't work".
+      el.className = "seq-notice seq-notice-error";
+      el.innerHTML = '<span class="seq-notice-ic">⚠</span> Sequence map build failed: ' +
+        '<code>' + seqEsc(detail || "unknown error") + '</code> — fix the cause, then ' +
+        'use <b>Rebuild ⟳</b> to retry.';
     } else {
       el.className = "seq-notice seq-notice-build";
       el.innerHTML = '<span class="seq-notice-ic">⟳</span> Building the step / timing map…';
@@ -5975,6 +5985,7 @@
       if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
       let x = null;
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
+      if (x && x.build_error) { seqSetXrefNotice("error", x.build_error); return; }  // crashed
       if (x && (size(x) > start || (x.version || 0) > startV)) {
         seqState.xref = x;
         seqRenderParamTree();
@@ -6000,6 +6011,7 @@
       let x = null;
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
       if (!x) continue;
+      if (x.build_error) { seqSetXrefNotice("error", x.build_error); return; }   // crashed
       const hasSteps = seqXrefHasTimingMap(x);
       // The param<->channel/pulse map does NOT depend on globals -- render it the moment
       // the build produces it, so clicking params/pulses works WHILE we wait for globals.

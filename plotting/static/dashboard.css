@@ -2503,6 +2503,13 @@ textarea::-webkit-scrollbar-thumb:hover,
   background: rgba(88, 166, 255, 0.10);
   border: 1px solid var(--accent-dim); color: var(--accent);
 }
+.seq-notice-error {
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid rgba(248, 81, 73, 0.55); color: #ff7b72;
+}
+.seq-notice-error code {
+  background: rgba(0, 0, 0, 0.25); padding: 0 4px; border-radius: 3px; color: inherit;
+}
 
 /* ===================== Sequence tab (flattened .seq viewer) ============ */
 /* Viewport-relative height: the plot grows to use the window but always leaves
