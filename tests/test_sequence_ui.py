@@ -85,6 +85,9 @@ def test_dashboard_js_wires_sequence():
         'time_regions',                  # wait/timing param -> shaded time bands (point 3)
         '/api/sequence/xref',
         '/api/sequence/build_xref',
+        '/api/sequence/backtrace',        # click point -> source file:line panel
+        'function seqShowBacktrace',
+        'seq-notice-error',               # surfaced xref-build failure banner
     ]:
         assert marker in js, "missing JS wiring: " + marker
 

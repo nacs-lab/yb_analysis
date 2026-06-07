@@ -1184,6 +1184,31 @@ def _register_api_routes(server):
                           allow_nan=False, default=str)
         return Response(body, mimetype='application/json')
 
+    @server.route('/api/sequence/backtrace')
+    def _api_sequence_backtrace():
+        """Resolved source backtrace (file · function · line) for a clicked point's pulse_id.
+
+        Each ``.seq`` point carries the build-time call stack of the pulse that produced it
+        (MATLAB's dumper writes it today; pyctrl's producer-side capture is the pending B3
+        work). The client passes the clicked point's ``customdata`` (= its pulse_id); the
+        reader resolves it to ``[{file, name, line}]``. Empty frames -> a default/non-pulse
+        point, or a .seq with no backtrace block (``has_bt`` False).
+        """
+        from flask import request, jsonify
+        sf, seq, err = _load_selected_seq()
+        if err:
+            return err
+        pid = request.args.get('pulse_id')
+        try:
+            frames = seq.backtrace(int(pid)) if pid not in (None, '') else []
+        except (TypeError, ValueError):
+            frames = []
+        return jsonify({
+            'pulse_id': pid,
+            'has_bt': getattr(seq, '_bt', None) is not None,
+            'frames': [{'file': f.file, 'name': f.name, 'line': f.line} for f in frames],
+        })
+
     def _seq_scan_base():
         """Scan folder (where ``data_<stamp>.json`` lives) from ?scan_id= or ?folder=."""
         from flask import request

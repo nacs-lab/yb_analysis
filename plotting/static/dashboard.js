@@ -6506,6 +6506,7 @@
   function seqClearFocus() {
     const box = $("seq-focus");
     if (box) { box.innerHTML = ""; box.hidden = true; }
+    seqState._focusPid = null;
     const pbox = $("seq-params");
     if (pbox) {
       $$(".seq-leaf.seq-leaf-xref-hit", pbox).forEach((el) =>
@@ -6514,6 +6515,36 @@
         el.classList.remove("seq-leaf-active"));
     }
     seqClearEmphasis();
+  }
+
+  // Backtrace panel (click a point -> where in the source that pulse was built).
+  // innermost frame first = the user's add/add_step call (e.g. PushoutSurvivalSeq.py:40).
+  function seqBacktraceHtml(frames) {
+    if (!frames || !frames.length)
+      return '<div class="seq-focus-row seq-bt-row"><span class="lbl">source</span>' +
+             '<span class="seq-bt-empty">no source line recorded for this point</span></div>';
+    return '<div class="seq-focus-row seq-bt-row"><span class="lbl">source</span>' +
+      '<div class="seq-bt-frames">' +
+      frames.map((f) => '<div class="seq-bt-frame" title="' + seqEsc(f.file) + '">' +
+        '<span class="seq-bt-loc">' + seqEsc(f.file.split(/[\\/]/).pop()) + ':' +
+        seqEsc(String(f.line)) + '</span> <span class="seq-bt-fn">' + seqEsc(f.name) +
+        '</span></div>').join("") +
+      '</div></div>';
+  }
+
+  // Fetch the clicked pulse's source backtrace and inject it into the focus box. No-op when
+  // the .seq carries no backtrace block (e.g. pyctrl until B3 lands) -> zero clutter there.
+  async function seqShowBacktrace(pid) {
+    if (pid == null) return;
+    const ssel = $("seq-seq-select");
+    const qs = seqQueryString({ file: seqState.file, seq: ssel ? ssel.value : "",
+                                pulse_id: String(pid) });
+    let r;
+    try { r = await api("/api/sequence/backtrace?" + qs); } catch (e) { return; }
+    if (!r || !r.has_bt) return;                            // seq has no backtraces at all
+    if (String(seqState._focusPid) !== String(pid)) return;  // selection moved on meanwhile
+    const box = $("seq-focus");
+    if (box && !box.hidden) box.insertAdjacentHTML("beforeend", seqBacktraceHtml(r.frames));
   }
 
   // Click a plot point -> focus the params that derive THAT segment (per-pulse), with the
@@ -6525,6 +6556,9 @@
     if (box) $$(".seq-leaf.seq-leaf-xref-hit, .seq-leaf.seq-leaf-active", box).forEach((el) =>
       el.classList.remove("seq-leaf-xref-hit", "seq-leaf-active"));
     const pulse = (pid != null && xr.pulses) ? xr.pulses[String(pid)] : null;
+    // Track which pulse the focus currently shows, so the async backtrace fetch only
+    // injects into the matching selection (a fast second click supersedes it).
+    seqState._focusPid = pulse ? Number(pid) : null;
     let params, formula = null, idle = false;
     if (pulse) {
       params = pulse.params || []; formula = pulse.expr || null;
@@ -6554,6 +6588,8 @@
                             params.length + " params that touch this channel";
     seqSetFocus({ title, formula, channels: [chn],
                   params: params.map((p) => ({ path: p, value: seqParamValue(p) })) });
+    // Show where this pulse was built (source file:line), appended async once it returns.
+    if (pulse) seqShowBacktrace(pid);
     // Frame the view so BOTH the plot and the focus/highlight region are visible
     // un-clipped (req 4) -- replaces the old jump deep into the param tree.
     seqScrollFraming();
