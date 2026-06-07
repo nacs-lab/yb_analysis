@@ -367,10 +367,30 @@ _XREF_BUILD_LOCK = threading.Lock()
 # (see _maybe_autobuild_xref) so a deterministically-failing build can't crash-loop on every
 # poll; a manual Rebuild (build_xref?force=1) clears it and retries.
 _XREF_BUILD_ERRORS = {}
-# Scan dirs we've already rebuilt ONCE to pick up late-arriving globals (so an
-# empty-but-current xref doesn't trigger an endless rebuild loop -- mtime comparison
-# is unreliable on a OneDrive-synced data folder). Reset on process restart.
-_XREF_GLOBALS_REBUILT = set()
+# Scan dir -> the globals.json seqid-count at our last globals-driven rebuild. globals.json
+# is now flushed INCREMENTALLY during the run (one seqid at a time), so a once-per-dir guard
+# would fire after the first seqid and never resolve the rest. Instead we rebuild whenever the
+# captured-seqid count GREW since our last build (while anything is still pending). The count
+# comes from the JSON content, NOT mtime -- mtime is unreliable on a OneDrive-synced data
+# folder (re-bumped on sync), which would crash-loop a rebuild. The count is monotonic and
+# bounded by the number of unique seqids, so this stops on its own once the scan ends /
+# pending hits 0 -- no churn loop. Reset on process restart.
+_XREF_GLOBALS_REBUILT_COUNT = {}
+
+
+def _globals_seqid_count(seq_dir):
+    """Number of seqids captured in ``seq_dir/globals.json`` (0 if absent/unreadable).
+
+    Content-based (``len(doc["globals"])``), NOT mtime -- mtime churns on the OneDrive-synced
+    data folder, which would falsely look like growth and crash-loop the rebuild gate."""
+    import os
+    import json as _json
+    try:
+        with open(os.path.join(seq_dir, 'globals.json'), encoding='utf-8') as fh:
+            doc = _json.load(fh)
+        return len(doc.get('globals') or {})
+    except (OSError, ValueError):
+        return 0
 
 
 def _spawn_xref_build(key, py, tool, base):
@@ -502,17 +522,23 @@ def _maybe_autobuild_xref(base):
         xr = _xref.load_xref(seq_dir)
         current = bool(xr.get('available')) and (xr.get('version') or 0) >= _xref_tool_version()
         # A CURRENT-version xref can still be INCOMPLETE: built before the run's globals.json
-        # existed, its global-dependent step/wait bands resolved to nothing -- recorded as
-        # `pending_globals` > 0 (could be the WHOLE map, or just a partial one, e.g. the
-        # EOM-ramp wait band while the rest resolved). If globals.json is now present, rebuild
-        # ONCE to fill them in -- tracked per dir so OneDrive mtime churn (or a build that was
-        # already done with globals, pending_globals == 0) can't trigger an endless loop.
+        # had captured all seqids, its global-dependent step/wait bands resolved to nothing --
+        # recorded as `pending_globals` > 0 (could be the WHOLE map, or just a partial one, e.g.
+        # the EOM-ramp wait band while the rest resolved). globals.json is flushed INCREMENTALLY
+        # during the run (one seqid at a time), so we rebuild whenever its captured-seqid count
+        # GREW since our last globals-driven build -- not just once -- so later seqids resolve
+        # as they land. The count is content-based (not mtime: OneDrive re-bumps mtime, which
+        # would crash-loop), monotonic, and bounded by the unique-seqid count, so it converges
+        # and stops on its own once the scan ends / pending hits 0.
         if current:
             pending = int(xr.get('pending_globals') or 0)
-            if (pending > 0 and os.path.exists(os.path.join(seq_dir, 'globals.json'))
-                    and key not in _XREF_GLOBALS_REBUILT):
-                _XREF_GLOBALS_REBUILT.add(key)
-                current = False                     # one rebuild now that globals exist
+            if (pending > 0
+                    and _globals_seqid_count(seq_dir)
+                    > _XREF_GLOBALS_REBUILT_COUNT.get(key, 0)):
+                current = False                     # globals.json grew -> rebuild to fill in
+                # NB: the count is recorded at SPAWN (below), read fresh under the build lock --
+                # NOT here. If a build is already in flight we return True without spawning, and
+                # recording here would wrongly advance past a seqid no build has yet picked up.
         if current:
             return False                            # up to date
         sidecar = find_config_sidecar(base)
@@ -542,6 +568,11 @@ def _maybe_autobuild_xref(base):
                 # (build_xref?force=1) clears it and retries.
                 return False
             _spawn_xref_build(key, py, tool, base)
+            # Record the globals seqid-count this build will incorporate (read fresh under the
+            # lock). The incremental-globals gate above only re-triggers once the JSON grows
+            # PAST this -> a build is spawned for every new seqid, exactly once each, with no
+            # crash-loop (it can only advance, and only while a scan is writing globals.json).
+            _XREF_GLOBALS_REBUILT_COUNT[key] = _globals_seqid_count(seq_dir)
         return True
     except Exception:  # noqa: BLE001 - best-effort; never break the params response
         return False
@@ -575,6 +606,90 @@ def _xref_awaiting_globals(base):
         return bool(q and q.get('running') and q['running'].get('id') is not None)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _seq_scan_is_running(base):
+    """True iff a scan is currently running AND ``base`` is that running scan's data dir.
+
+    Drives the Sequence tab's LIVE refresh: globals.json now flushes incrementally, so the
+    viewed point resolves the moment its seqid runs and none of the old globals-pending poll
+    loops start -- the tab would otherwise sit frozen (stale point count, no progress banner)
+    for the whole run. This says "keep refreshing this scan", matched precisely (not just "a
+    scan is running") so viewing an OLD scan while a different one runs doesn't poll forever.
+
+    Match = the live data snapshot's ``scan_id`` (the scan being processed) resolves to the
+    same dir as ``base``. A folder-load (no scan_id) still matches by resolved path.
+    """
+    try:
+        import os
+        q = _read_queue_data()
+        if not (q and q.get('running') and q['running'].get('id') is not None):
+            return False
+        sid = (_read_data() or {}).get('scan_id')
+        if sid is None or not base:
+            return False
+        running_dir = _resolve_scan_dir(sid)
+        return bool(running_dir
+                    and os.path.abspath(running_dir) == os.path.abspath(base))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _xref_scan_pending(seq_dir):
+    """Scan-WIDE globals-pending summary from ``xref.json`` (read once). Returns a dict
+    ``{pending_points, total_points, pending_bands}``.
+
+    The producer builds a ``by_file`` entry for EVERY unique seqid in the scan (from the
+    descriptor), even points that haven't run yet -- those carry ``pending_globals`` > 0 until
+    their seqid runs and its globals are captured. So across the whole xref:
+      * ``pending_points`` -- # of scan points whose step/timing bands aren't placed yet
+        (their globals haven't been captured -> they haven't run). Ticks down during the run.
+      * ``total_points``   -- # of unique seqids in the scan (all ``by_file`` entries).
+      * ``pending_bands``  -- sum of per-entry ``pending_globals`` (total unplaced bands).
+    The *viewed* point is essentially always already placed (its .seq + globals are captured
+    together), so this scan-wide count -- not the per-file one -- is what the progress banner
+    shows. All-zero (or no xref) -> nothing pending. Best-effort; never raises.
+    """
+    import os
+    import json as _json
+    out = {'pending_points': 0, 'total_points': 0, 'pending_bands': 0}
+    try:
+        with open(os.path.join(seq_dir, 'xref.json'), encoding='utf-8') as fh:
+            by_file = _json.load(fh).get('by_file') or {}
+    except (OSError, ValueError):
+        return out
+    for e in by_file.values():
+        p = int((e or {}).get('pending_globals') or 0)
+        if p > 0:
+            out['pending_points'] += 1
+            out['pending_bands'] += p
+    out['total_points'] = len(by_file)
+    return out
+
+
+def _seq_live_status(base):
+    """Live-refresh status block shared by the Sequence tab routes:
+      * ``running``      -- is THIS scan the one currently running (drives the live poll)?
+      * ``n_seq_files``  -- # of dumped ``.seq`` files = # of SELECTABLE points (grows during
+        the run; the client appends new options when this exceeds the dropdown length).
+      * scan-wide ``pending_points`` / ``total_points`` / ``pending_bands`` (see
+        ``_xref_scan_pending``) -- drives the "N scan points still awaiting globals" banner.
+    Cheap (one ``listdir`` + one ``xref.json`` read); best-effort, never raises."""
+    import os
+    out = {'running': bool(_seq_scan_is_running(base)),
+           'pending_points': 0, 'total_points': 0, 'pending_bands': 0, 'n_seq_files': 0}
+    try:
+        from yb_analysis.sequence import manifest as _seqman
+        sf = _seqman.SequenceFolder.open(base) if base else None
+        seq_dir = (sf.dir if sf is not None
+                   else (os.path.join(base, 'sequence') if base else None))
+        if sf is not None:
+            out['n_seq_files'] = len(sf.seq_files())
+        if seq_dir:
+            out.update(_xref_scan_pending(seq_dir))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _resolve_scan_dir(scan_id):
@@ -1266,9 +1381,10 @@ def _register_api_routes(server):
         xref_building = _maybe_autobuild_xref(base)
         xref_awaiting = _xref_awaiting_globals(base)
         xref_error = _xref_build_error(base)        # surface a producer crash, don't hide it
+        live = _seq_live_status(base)               # running? + scan-wide pending + .seq count
         built = _pfc.build_params_tree_for_folder(base) if base else None
         if built and built.get('has_params'):
-            return jsonify(_to_jsonable({
+            return jsonify(_to_jsonable(dict({
                 'params': built['params'],
                 'has_params': True,
                 'scanned_paths': built['scanned_paths'],
@@ -1277,13 +1393,13 @@ def _register_api_routes(server):
                 'xref_building': xref_building,
                 'xref_awaiting_globals': xref_awaiting,
                 'xref_build_error': xref_error,
-            }))
+            }, **live)))
         # Fallback: the params block embedded in the selected .seq file.
         sf, seq, err = _load_selected_seq()
         if err:
             return err
         scanned_paths = [a.get('path') for a in sf.scanned_axes() if a.get('path')]
-        return jsonify(_to_jsonable({
+        return jsonify(_to_jsonable(dict({
             'seq_name': seq.name,
             'seq_idx': seq.seq_idx,
             'params': seq.params,
@@ -1293,7 +1409,7 @@ def _register_api_routes(server):
             'xref_building': xref_building,
             'xref_awaiting_globals': xref_awaiting,
             'xref_build_error': xref_error,
-        }))
+        }, **live)))
 
     @server.route('/api/sequence/xref')
     def _api_sequence_xref():
@@ -1322,6 +1438,7 @@ def _register_api_routes(server):
         out['building'] = bool(building)
         out['awaiting_globals'] = bool(_xref_awaiting_globals(base))
         out['build_error'] = _xref_build_error(base)
+        out.update(_seq_live_status(base))   # running? + scan-wide pending + .seq count (live poll)
         return jsonify(out)
 
     @server.route('/api/sequence/build_xref', methods=['POST'])

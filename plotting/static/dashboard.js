@@ -5924,12 +5924,105 @@
     // spinning on "building", which is how the silent-failure mode used to look.
     const pendingG = (seqState.xref && seqState.xref.pending_globals) || 0;
     if (r.xref_build_error) { seqSetXrefNotice("error", r.xref_build_error); }
+    // This scan is the one currently RUNNING: globals.json flushes incrementally, so the
+    // viewed point resolves the moment its seqid runs -- none of the per-point poll loops
+    // below would start, leaving the tab frozen (stale point count, no progress banner). Drive
+    // a single LIVE loop instead: it refreshes the point dropdown + ruler/bands as new points
+    // run and shows the scan-wide "N points awaiting globals" banner, ticking down to scan end.
+    else if (r.running) { seqLiveBanner(r); seqLiveLoop(qs, pollGen); }
     else if (r.xref_awaiting_globals) { seqSetXrefNotice("awaiting", pendingG); seqAwaitGlobals(qs, pollGen); }
     else if (r.xref_building) { seqSetXrefNotice("building"); seqPollXrefUpdate(qs, pollGen); }
     // Partial map: the ruler is drawn but N bands still wait on the run's globals (e.g. the
     // EOM ramp). Show how many, and poll so they fill in once globals land + the xref rebuilds.
     else if (pendingG > 0) { seqSetXrefNotice("pending", pendingG); seqAwaitGlobals(qs, pollGen); }
     else { seqSetXrefNotice(null); seqMaybeBuildXref(qs); }
+  }
+
+  // Pick the live-run banner from a params/xref response (key names differ slightly between
+  // the two routes -- normalize both). Scan-wide pending takes precedence; before any point
+  // has run (no xref yet) fall back to the generic "awaiting"; then "building"; else clear.
+  function seqLiveBanner(r) {
+    const pp = (r.pending_points | 0), tot = (r.total_points | 0);
+    const awaiting = r.awaiting_globals || r.xref_awaiting_globals;
+    const building = r.building || r.xref_building;
+    if (pp > 0) seqSetXrefNotice("scan-pending", { pending: pp, total: tot });
+    else if (awaiting) seqSetXrefNotice("awaiting", 0);
+    else if (building) seqSetXrefNotice("building");
+    else seqSetXrefNotice(null);
+  }
+
+  // Append point-dropdown options for points dumped SINCE the last populate, preserving the
+  // user's current selection (we only add new <option>s; we never reset selectedIndex or
+  // re-render the viewed point). Keeps seqState.index fresh so a later manual point/seq pick
+  // sees the new files. Used by the live loop so a running scan's point count tracks the run.
+  function seqAppendNewPoints(idx) {
+    const psel = $("seq-point-select");
+    if (!psel || !idx) return;
+    const pts = idx.points || [];
+    for (let i = psel.options.length; i < pts.length; i++) {
+      const pt = pts[i];
+      const o = document.createElement("option");
+      o.value = String(i);
+      const sc = pt.scanned && Object.keys(pt.scanned).length
+        ? "  " + Object.entries(pt.scanned).map(([k, v]) => `${k}=${seqFmt(v)}`).join(", ")
+        : "";
+      o.textContent = `#${pt.n != null ? pt.n : i + 1}${sc}`;
+      psel.appendChild(o);
+    }
+    seqState.index = idx;            // keep files/points fresh for seqOnPoint / seqOnSeq
+    const status = $("seq-source-status");
+    if (status) {
+      const nf = (idx.files || []).length, np = (idx.points || []).length;
+      status.textContent = `${np} point(s), ${nf} file(s)` +
+        (idx.has_manifest ? "" : "  (no manifest)");
+    }
+  }
+
+  // Live refresh while THIS scan is running (server says r.running). globals.json flushes per
+  // seqid, so we keep the Sequence tab current: every 5 s re-fetch the xref (re-render the
+  // ruler/bands as the viewed point resolves + update the scan-wide pending banner), and when
+  // new .seq files have appeared (n_seq_files grew past the dropdown) re-fetch the heavier
+  // /api/sequence/list ONCE to append the new point options. Bails on navigation/supersede;
+  // when the run ends it does a final refresh, lets the last rebuild zero the banner, and stops.
+  async function seqLiveLoop(qs, gen) {
+    const scanId = seqState.query && seqState.query.scan_id;
+    const qsList = new URLSearchParams(seqState.query || {}).toString();
+    const sz = (xr) => (((xr && xr.steps) || []).length +
+                        Object.keys((xr && xr.time_regions) || {}).length);
+    const pc = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
+    let endedPolls = 0;
+    for (let i = 0; i < 1440; i++) {                // ~2 h cap at 5 s; bails when the run ends
+      await new Promise((res) => setTimeout(res, 5000));
+      if (seqState._xrefPollGen !== gen) return;                          // superseded
+      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      let x = null;
+      try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
+      if (!x) continue;
+      if (x.build_error) { seqSetXrefNotice("error", x.build_error); return; }   // crashed
+      // New points dumped since we last populated -> append their dropdown options (one heavier
+      // list fetch only when the cheap n_seq_files count says there's actually something new).
+      const haveOpts = ($("seq-point-select") || { options: [] }).options.length;
+      if ((x.n_seq_files | 0) > haveOpts) {
+        try { seqAppendNewPoints(await api("/api/sequence/list?" + qsList)); }
+        catch (e) { /* keep going; retry next poll */ }
+      }
+      // Re-render the viewed point's ruler/bands if its xref grew (it resolves once its seqid
+      // ran) or pending dropped.
+      if (x.available && (pc(x) > pc(seqState.xref) || sz(x) > sz(seqState.xref))) {
+        seqState.xref = x;
+        seqRenderParamTree();
+        seqRenderStepRuler($("plot-sequence"));
+      }
+      seqLiveBanner(x);
+      if (!x.running) {
+        // Run ended: keep polling briefly so the finalize() globals.json + final rebuild can
+        // place the last points and zero the banner; then a final list refresh and stop.
+        if ((x.pending_points | 0) === 0 || ++endedPolls > 12) {
+          try { seqAppendNewPoints(await api("/api/sequence/list?" + qsList)); } catch (e) {}
+          return;
+        }
+      } else { endedPolls = 0; }
+    }
   }
 
   // Banner above the plot: shown while the step ruler / wait bands can't finish building.
@@ -5966,6 +6059,18 @@
         (n === 1 ? '' : 's') + ' still waiting on the run’s globals (captured at the ' +
         '<b>end of the run</b>) — they’ll fill in once it finishes. Steps, channels and the ' +
         'param↔channel map are already shown.';
+    } else if (kind === "scan-pending") {
+      // SCAN-WIDE (live run): globals.json flushes incrementally, so the point you're VIEWING
+      // is already placed -- but other scan points haven't run yet, so their rulers/bands
+      // aren't placed. Show how many remain; the count ticks down as the scan progresses.
+      const d = detail || {};
+      const pp = d.pending | 0, tot = d.total | 0;
+      el.className = "seq-notice seq-notice-wait";
+      el.innerHTML = '<span class="seq-notice-ic">⏳</span> ' + pp +
+        (tot ? ' of ' + tot : '') + ' scan point' + (pp === 1 ? '' : 's') +
+        ' still awaiting their globals (captured as each point first runs) — their step ' +
+        'ruler &amp; timing bands fill in as the scan progresses. The point you’re viewing ' +
+        'is already fully placed.';
     } else {
       el.className = "seq-notice seq-notice-build";
       el.innerHTML = '<span class="seq-notice-ic">⟳</span> Building the step / timing map…';
