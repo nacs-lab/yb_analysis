@@ -547,22 +547,29 @@ def _maybe_autobuild_xref(base):
 
 
 def _xref_awaiting_globals(base):
-    """True if the step ruler + wait bands can't be built yet because the run's
-    ``globals.json`` hasn't been written (globals are captured DURING the run, often only
-    at the end). The waveforms still plot; only the global-dependent step/timing info waits.
+    """True only when the step ruler + wait bands genuinely can't be placed yet: the run's
+    ``globals.json`` hasn't been written (globals are captured DURING the run, often at the
+    end), a scan is running, AND the xref doesn't already carry a timing map.
 
-    Gated on a scan being live so a long-finished scan that simply never had globals isn't
-    flagged forever: globals.json absent AND a scan currently running -> awaiting.
+    The last clause is the accuracy fix: most step boundaries + non-global wait regions
+    resolve WITHOUT globals (only global-dependent offsets -- e.g. the 616-EOM opening ramp --
+    actually wait), so once the xref has steps/time_regions the ruler IS drawn and the
+    "waiting for globals — only then can the ruler be placed" banner is misleading. We only
+    flag awaiting while the timing map is still empty.
     """
     try:
         import os
         from yb_analysis.sequence import manifest as _seqman
+        from yb_analysis.sequence import xref as _xref
         if not base or not os.path.isdir(base):
             return False
         sf = _seqman.SequenceFolder.open(base)
         seq_dir = sf.dir if sf is not None else os.path.join(base, 'sequence')
         if os.path.exists(os.path.join(seq_dir, 'globals.json')):
             return False                            # globals present -> not waiting
+        xr = _xref.load_xref(seq_dir)
+        if xr.get('steps') or xr.get('time_regions'):
+            return False                            # ruler already placed (built global-free)
         q = _read_queue_data()
         return bool(q and q.get('running') and q['running'].get('id') is not None)
     except Exception:  # noqa: BLE001
