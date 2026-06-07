@@ -15,10 +15,17 @@ Artifact schema (written by the engine-side builder, keyed by the ``.seq`` filen
       "by_file": {
         "point_00001__seqid_1.seq": {
           "param_to_channels": {"Init.EOM616.Freq": ["FreqEOM616"], ...},
-          "channel_to_params": {"FreqEOM616": ["Init.EOM616.Freq"], ...}
+          "channel_to_params": {"FreqEOM616": ["Init.EOM616.Freq"], ...},
+          "pulses": {"60": {"channel": "VBiasCoilY (NiDAQ/Dev1/1)",
+                            "params": ["GreenMOT.BFieldRampTime", ...]}, ...},
+          "param_to_pids": {"GreenMOT.BFieldRampTime": [60, ...], ...}
         }
       }
     }
+
+``pulses`` is keyed by the pulse id (== the ``.seq``'s per-point ``pid``), so a clicked plot
+point maps to exactly its segment's params; ``param_to_pids`` is the inverse, for highlighting
+a parameter's region(s). Both are absent in pre-region artifacts (the aggregate maps remain).
 
 Until that artifact exists the feature is dormant: :func:`load_xref` returns
 ``available=False`` and the dashboard shows no param<->channel affordance.
@@ -31,7 +38,8 @@ XREF_NAME = "xref.json"
 
 
 def _empty():
-    return {"available": False, "param_to_channels": {}, "channel_to_params": {}}
+    return {"available": False, "version": 0, "param_to_channels": {},
+            "channel_to_params": {}, "pulses": {}, "param_to_pids": {}, "time_regions": {}}
 
 
 def load_xref(seq_dir, fname=None):
@@ -59,8 +67,17 @@ def load_xref(seq_dir, fname=None):
         return _empty()
     return {
         "available": True,
+        "version": int(doc.get("v") or 0),       # 0 == pre-versioning (viewer upgrades it)
         "param_to_channels": entry.get("param_to_channels") or {},
         "channel_to_params": entry.get("channel_to_params") or {},
+        # Per-pulse (region) provenance: ``pulses`` is {pid(str): {channel, params}} and
+        # ``param_to_pids`` is {param: [pid]} -- the viewer maps a clicked plot point
+        # (customdata=pid) to just that segment's params, and a clicked param to its
+        # region(s). Absent in older artifacts -> empty (the aggregate maps still work).
+        "pulses": entry.get("pulses") or {},
+        "param_to_pids": entry.get("param_to_pids") or {},
+        # Wait/timing regions: {param: [[t0_ms, t1_ms], ...]} -> shaded time-axis bands.
+        "time_regions": entry.get("time_regions") or {},
     }
 
 

@@ -40,6 +40,7 @@
     <button id="tab-btn-analysis" data-tab="analysis" role="tab" aria-selected="false">Analysis</button>
     <button id="tab-btn-queue"    data-tab="queue"    role="tab" aria-selected="false">Queue</button>
     <button id="tab-btn-diag"     data-tab="diag"     role="tab" aria-selected="false">Diag</button>
+    <button id="tab-btn-sequence" data-tab="sequence" role="tab" aria-selected="false">Sequence</button>
   </nav>
   <div class="header-right">
     <label class="switch">
@@ -89,59 +90,150 @@
       <span class="stat-label">progress</span>
       <span class="stat-value mono" id="scan-progress">—</span>
     </div>
-    <!-- Mini queue: glanceable status of what's happening right now
-         + what's next. Polled alongside the Live tab (every 3s). -->
-    <div class="stat-tile" id="mini-queue-active-tile">
-      <span class="stat-label">active job</span>
-      <span class="stat-value mono" id="mini-queue-active">—</span>
-    </div>
-    <div class="stat-tile" id="mini-queue-next-tile">
-      <span class="stat-label">queue</span>
-      <span class="stat-value mono" id="mini-queue-next">—</span>
+    <!-- The "active job" + "queue" tiles moved to the Yb Control sidebar
+         (a preview list there mirrors the Tkinter queue pane), so the top
+         strip stays a single fixed-height row that never reflows. -->
+    <!-- Phase 5.5 Track D: near-real-time SLM diag rows pulled while a
+         scan is live (every 2 s). Hidden until rows arrive. -->
+    <div class="stat-tile" id="live-diag-tile" hidden>
+      <span class="stat-label">live diag</span>
+      <span class="stat-value mono" id="live-diag-readout">—</span>
     </div>
   </section>
 
-  <!-- ===== Right sidebar: Yb tweezer control panel (Phase 5.5 prep)
+  <!-- ===== Right sidebar: Yb tweezer control panel (Phase 5.5 Track A)
        Mirror of the Tkinter control_panel.py — Start/Pause/Abort/
        Restart Dash/Restart All + dummy-mode radios + init folder +
-       current-scan readout. All disabled with a "not wired" banner
-       until Phase 5.5 Track A wires them to MemoryMap. Position
-       (right column, sticky, vertical stack) is the production
-       layout; only the click handlers + hold-to-confirm progress
-       bars are deferred. -->
+       current-scan readout. Non-destructive ops are single-click;
+       Abort (1 s) and Restart All (3 s) require a press-and-hold. -->
   <aside class="card live-sidebar" data-card-id="live-control-panel">
     <button class="live-sidebar-toggle" id="live-sidebar-toggle"
             title="Collapse / expand control panel"
             aria-label="toggle control panel"></button>
     <h2>Yb Control<span class="grow"></span></h2>
-    <div class="not-wired-banner">scaffolding · not wired (Phase 5.5)</div>
+    <!-- Live runner status, mirroring the Tkinter window's status label
+         (Idle / Running / Paused / Pausing… / Stopped, with the dummy
+         sub-states). Colour-coded via the data-state attribute. -->
+    <div class="ctrl-status" id="ctrl-status-banner" data-state="unknown">
+      <span class="ctrl-status-dot"></span>
+      <span class="ctrl-status-text" id="ctrl-status-text">—</span>
+    </div>
+    <div class="ctrl-banner" id="ctrl-disabled-banner" hidden>
+      remote controls disabled on this interface
+    </div>
 
     <div class="ctrl-row">
-      <button class="ctrl-btn" data-kind="start"   disabled title="Phase 5.5 — Start">Start</button>
-      <button class="ctrl-btn" data-kind="pause"   disabled title="Phase 5.5 — Pause">Pause</button>
+      <button class="ctrl-btn" data-kind="start"   title="Start / resume the sequence">Start</button>
+      <button class="ctrl-btn" data-kind="pause"   title="Pause the sequence">Pause</button>
     </div>
     <div class="ctrl-row">
-      <button class="ctrl-btn" data-kind="abort"   disabled title="Phase 5.5 — Abort (1s hold)">Abort</button>
-      <button class="ctrl-btn" data-kind="restart-dash" disabled title="Phase 5.5 — Restart Dash">Restart Dash</button>
+      <button class="ctrl-btn ctrl-danger" data-kind="abort"
+              data-confirm-action="abort"
+              title="Abort the running scan — stops after the current shot (a shot in progress can't be interrupted)">Abort</button>
+      <button class="ctrl-btn" data-kind="restart-dash" title="Restart the dashboard subprocess">Restart Dash</button>
     </div>
     <div class="ctrl-row">
-      <button class="ctrl-btn" data-kind="restart-all" disabled title="Phase 5.5 — Restart All (3s hold)" style="grid-column: span 2;">Restart All</button>
+      <button class="ctrl-btn ctrl-hold ctrl-warn" data-kind="restart-all"
+              data-confirm-action="restart_all"
+              title="Respawn run_monitor (drops the camera) — hold 1 s"
+              style="grid-column: span 2;">
+        <span class="hold-bar"></span><span class="ctrl-btn-label">Restart All</span>
+      </button>
+    </div>
+
+    <!-- Sequence backend toggle: MATLAB <-> pyctrl. Switching relaunches the
+         monitor on the chosen backend (a Restart-All handoff), so each is a
+         hold-to-confirm. The active backend's button is highlighted (and
+         switching to it is a no-op). -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Sequence backend
+        <span class="ctrl-backend-active" id="ctrl-backend-active">—</span>
+      </div>
+      <div class="ctrl-row backend-toggle">
+        <button class="ctrl-btn ctrl-hold backend-btn" data-kind="set-backend"
+                data-backend-target="matlab"
+                data-confirm-action="set_backend"
+                title="Switch the sequence backend to MATLAB — hold 1 s">
+          <span class="hold-bar"></span><span class="ctrl-btn-label">MATLAB</span>
+        </button>
+        <button class="ctrl-btn ctrl-hold backend-btn" data-kind="set-backend"
+                data-backend-target="pyctrl"
+                data-confirm-action="set_backend"
+                title="Switch the sequence backend to pyctrl — hold 1 s">
+          <span class="hold-bar"></span><span class="ctrl-btn-label">pyctrl</span>
+        </button>
+      </div>
+      <div class="hint">Switching restarts the monitor on the chosen backend.</div>
     </div>
 
     <div class="ctrl-section">
       <div class="ctrl-section-label">Dummy mode</div>
       <div class="ctrl-row dummy-mode">
-        <label><input type="radio" name="dummy-mode-ph5" value="off"     disabled> Off</label>
-        <label><input type="radio" name="dummy-mode-ph5" value="default" disabled> Default dummy</label>
-        <label><input type="radio" name="dummy-mode-ph5" value="last"    disabled checked> Last seq</label>
+        <label><input type="radio" name="dummy-mode-ph5" value="off"> Off</label>
+        <label><input type="radio" name="dummy-mode-ph5" value="default"> Default dummy</label>
+        <label><input type="radio" name="dummy-mode-ph5" value="last" checked> Last seq</label>
       </div>
+      <div class="hint" id="ctrl-dummy-last">Last: —</div>
+    </div>
+
+    <!-- SeqPlotter auto-dump toggle: write one .seq per compiled sequence into
+         the scan folder for the Sequence tab. Rides the pyctrl runtime_state mmap
+         flag (offset 8) via /api/sequence/dump_toggle. -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Sequence dumps</div>
+      <label class="switch">
+        <input type="checkbox" id="seq-autosave">
+        <span class="track"></span>
+        <span>Auto-save during scans</span>
+      </label>
+      <div class="hint">Off = compile + run as usual (no .seq written).</div>
+    </div>
+
+    <!-- Camera: mirror of the Tkinter CameraPane (status + ROI + exposure
+         + Connect/Disconnect/Apply). ROI/exposure changes round-trip to
+         the runner AND persist to expConfig.m exactly like the local
+         pane, because they're dispatched to it via web_control. -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">Camera</div>
+      <div class="cam-status" id="cam-status" data-state="unknown">
+        <span class="cam-status-dot"></span>
+        <span id="cam-status-text">—</span>
+      </div>
+      <!-- Extended Orca telemetry (pyctrl backend only). Hidden unless the
+           backend publishes trigger / cooling / temperature in camera_status. -->
+      <div class="cam-telemetry" id="cam-telemetry" hidden>
+        <div class="cam-tele-row"><span class="cam-tele-label">Trigger</span><span id="cam-trigger">—</span></div>
+        <div class="cam-tele-row"><span class="cam-tele-label">Cooling</span><span id="cam-cooler">—</span></div>
+        <div class="cam-tele-row"><span class="cam-tele-label">Sensor temp</span><span id="cam-temperature">—</span></div>
+      </div>
+      <div class="cam-roi-grid">
+        <label>X<input type="number" id="cam-roi-x" class="ctrl-input cam-num" step="1"></label>
+        <label>Y<input type="number" id="cam-roi-y" class="ctrl-input cam-num" step="1"></label>
+        <label>W<input type="number" id="cam-roi-w" class="ctrl-input cam-num" step="1"></label>
+        <label>H<input type="number" id="cam-roi-h" class="ctrl-input cam-num" step="1"></label>
+      </div>
+      <label class="cam-exposure">Exposure (s)
+        <input type="text" id="cam-exposure" class="ctrl-input cam-num" placeholder="0.1">
+      </label>
+      <div class="ctrl-row cam-btn-row">
+        <button class="ctrl-btn" data-cam="connect" title="Initialize the camera with these settings">Connect</button>
+        <button class="ctrl-btn" data-cam="disconnect" title="Close the camera">Disconnect</button>
+      </div>
+      <div class="ctrl-row">
+        <button class="ctrl-btn" data-cam="apply" style="grid-column: span 2;"
+                title="Apply ROI + exposure to the running camera">Apply settings</button>
+      </div>
+      <div class="ctrl-cam-err" id="cam-error" hidden></div>
     </div>
 
     <div class="ctrl-section">
       <div class="ctrl-section-label">Init folder</div>
-      <button class="ctrl-btn" data-kind="init-folder" disabled
-              title="Phase 5.5 — Load init folder" style="width:100%;">
-        Load init folder…
+      <input type="text" id="ctrl-init-path" class="ctrl-input"
+             placeholder="lab-PC path to calibration folder"
+             title="Absolute path on the lab PC (the dashboard host)">
+      <button class="ctrl-btn" data-kind="init-folder" style="width:100%;"
+              title="Load this calibration / init folder">
+        Load init folder
       </button>
     </div>
 
@@ -154,6 +246,24 @@
         <dt>state</dt> <dd id="ctrl-runner-state">—</dd>
       </dl>
     </div>
+
+    <!-- Scan-queue preview: a compact mirror of the Tkinter queue pane
+         (running + next-up + recent history). The full table with
+         move/cancel lives in the Queue tab. -->
+    <div class="ctrl-section">
+      <div class="ctrl-section-label">
+        Queue<span class="grow"></span>
+        <a class="ctrl-queue-link" data-goto-tab="queue"
+           title="Open the full queue">full ›</a>
+      </div>
+      <div class="ctrl-queue-active" id="ctrl-queue-active" data-state="idle">
+        <span class="ctrl-queue-active-dot"></span>
+        <span class="ctrl-queue-active-text" id="ctrl-queue-active-text">(idle)</span>
+      </div>
+      <ul class="ctrl-queue-list" id="ctrl-queue-list">
+        <li class="ctrl-queue-empty">queue empty</li>
+      </ul>
+    </div>
   </aside>
 
   <!-- Compressed top-of-tab: img1 + img2 + scan curve share one row
@@ -162,32 +272,49 @@
        row + the intensities/loading row below all fit on a 1080p
        viewport without scrolling. -->
   <section class="card col-4 array-card" id="card-array1" data-card-id="live-array1">
-    <h2>Tweezer array — img 1<span class="grow"></span>
-        <label class="switch" style="font-size:11px">
-          <input type="checkbox" id="downsample-live" checked>
-          <span class="track"></span>
-          <span>Downsample</span>
-        </label>
-    </h2>
+    <h2>Tweezer array — img 1<span class="grow"></span></h2>
+    <!-- Switch overlaid on the plot's top-right corner (NOT inside h2),
+         so this card's header height matches its switch-less neighbours
+         and the top row of image plots stays vertically aligned. -->
+    <label class="switch card-switch" id="downsample-switch"
+           title="Downsample the live frame so the browser doesn't choke on full-sensor images. OFF = full resolution (heavier; momentary inspection only).">
+      <input type="checkbox" id="downsample-live" checked>
+      <span class="track"></span>
+      <span>Downsample</span>
+    </label>
     <div class="plot-container" id="plot-array1" style="height: 320px;"></div>
   </section>
 
   <section class="card col-3 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
-    <h2>Tweezer array — middle<span class="grow"></span>
-        <span class="hint">NumImages ≥ 3</span>
-    </h2>
+    <h2>Tweezer array — middle<span class="grow"></span></h2>
     <div class="plot-container" id="plot-array-mid" style="height: 320px;"></div>
   </section>
 
   <section class="card col-4 array-card" id="card-array2" data-card-id="live-array2">
-    <h2>Tweezer array — img 2<span class="grow"></span>
-        <span id="array2-info" class="hint"></span>
-    </h2>
+    <h2>Tweezer array — img 2<span class="grow"></span></h2>
+    <!-- Middle-frame show/hide switch (mirrors the legacy Dash toggle).
+         Only has an effect when NumImages >= 3; default ON. -->
+    <label class="switch card-switch" id="show-mid-switch"
+           title="Show / hide the middle-frame panel (only applies when NumImages ≥ 3). Hiding it expands img1 / img2 / scan to fill the row.">
+      <input type="checkbox" id="show-mid-live" checked>
+      <span class="track"></span>
+      <span>Middle frame</span>
+    </label>
+    <span id="array2-info" class="hint"></span>
     <div class="plot-container" id="plot-array2" style="height: 320px;"></div>
   </section>
 
   <section class="card col-4" id="card-scan-curve" data-card-id="live-scan-curve">
     <h2>Scan curve<span class="grow"></span></h2>
+    <!-- Colorbar autoscale switch for 2-D scan heatmaps (mirrors the legacy
+         Dash "Autoscale" toggle). OFF = colorbar pinned 0–1; ON = autoscale
+         to the data range. No effect on 1-D scan curves. Default OFF. -->
+    <label class="switch card-switch" id="scan-autoscale-switch"
+           title="Autoscale the 2-D scan colorbar to the data range. OFF pins it to 0–1 (the survival/loading default). No effect on 1-D scans.">
+      <input type="checkbox" id="scan-autoscale-live">
+      <span class="track"></span>
+      <span>Autoscale</span>
+    </label>
     <div class="plot-container" id="plot-scan" style="height: 320px;"></div>
   </section>
 
@@ -361,22 +488,19 @@
     <div id="analysis-detail-body">
       <div class="hint">Click a row in Runs above (or paste a scan_id) to load analysis.</div>
     </div>
-  </section>
-
-  <!-- ===== Calibration: global SLM->camera affine + loading patterns ==
-       The loading-pattern affine migration: trap positions are simulated
-       on the SLM (FFT) per loading pattern and mapped to camera pixels by
-       a single global affine that auto-updates from recent scans. -->
-  <section class="card col-12" data-card-id="analysis-calibration">
-    <h2>Calibration<span class="grow"></span>
+    <!-- Calibration (global SLM->camera affine + loading patterns). Folded
+         into the run summary, collapsed by default. -->
+    <details id="calib-details" class="calib-details">
+      <summary>Calibration — SLM&rarr;camera affine + loading patterns
         <span class="hint mono" id="calib-status"></span>
-        <button class="ghost flex-fixed" id="calib-rollback"
+      </summary>
+      <div class="calib-actions">
+        <button class="ghost" id="calib-rollback"
                 title="Restore the previous affine">Rollback</button>
-        <button class="ghost flex-fixed" id="calib-refresh">Refresh</button>
-    </h2>
-    <div id="calib-body">
-      <div class="hint">Loading SLM&rarr;camera affine + patterns&hellip;</div>
-    </div>
+        <button class="ghost" id="calib-refresh">Refresh</button>
+      </div>
+      <div id="calib-body"><div class="hint">Loading SLM&rarr;camera affine + patterns&hellip;</div></div>
+    </details>
   </section>
 
   <!-- ===== 3. Filters ================================================
@@ -411,7 +535,36 @@
     <h2>Sweep visualization<span class="grow"></span>
         <span class="hint mono" id="analysis-scan-info"></span>
     </h2>
+    <!-- Error-metric dropdown (all sweeps) + 2D view / swap / square
+         controls (mirrors the SLM dashboard's sweep controls). The 2D
+         block is hidden for 0D/1D sweeps. Box-zoom on either plot sets
+         the filter (zoom-to-filter); double-click clears it. -->
+    <div id="sweep-controls" class="sweep-controls" hidden>
+      <label>Errors:
+        <select id="sweep-err" title="SEM/STD across shots (default) or per-site binomial SEM (counts every atom)">
+          <option value="sem_pershot">SEM (per-shot)</option>
+          <option value="std_pershot">STD (per-shot)</option>
+          <option value="sem_site">SEM (per-site binom.)</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+      <span class="only-2d">
+        <label>2D view:
+          <select id="sweep-view">
+            <option value="both">Heatmap + lines</option>
+            <option value="lines">Lines only</option>
+            <option value="heatmap">Heatmap only</option>
+          </select>
+        </label>
+        <button class="ghost" id="sweep-swap" title="Swap which swept param is on X vs Y / lines">↔ Swap axes</button>
+        <label class="chk"><input type="checkbox" id="sweep-square"> square cells</label>
+      </span>
+    </div>
     <div class="plot-container" id="plot-analysis-scan" style="height:420px;"></div>
+    <!-- Second container: 2D line facets when view = "both". Hidden
+         otherwise. -->
+    <div class="plot-container" id="plot-analysis-scan-lines"
+         style="height:340px;margin-top:8px;" hidden></div>
   </section>
 
   <!-- ===== 5. Per-site maps ==========================================
@@ -452,6 +605,44 @@
     </h2>
     <div class="plot-container" id="plot-site-fp" style="height:360px;"></div>
   </section>
+  <!-- Per-site discrimination infidelity (data-quality). Shown when the
+       "per-site discrimination map" switch is on (default ON for 1-image
+       loading scans). Log colour scale, matching the live view. -->
+  <section class="card col-4" data-card-id="analysis-site-infid"
+           id="analysis-site-infid-card" hidden>
+    <h2>Per-site discrimination<span class="grow"></span>
+        <span class="hint mono" id="site-infid-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-site-infid" style="height:360px;"></div>
+  </section>
+  <!-- Avg camera-intensity histogram (pooled over all sites), like live
+       view. Threshold marker(s) drawn on top: scan-start always, plus the
+       this-run value when discrimination is recomputed. -->
+  <section class="card col-4" data-card-id="analysis-site-inthist"
+           id="analysis-site-inthist-card" hidden>
+    <h2>Avg intensity histogram<span class="grow"></span>
+        <span class="hint mono" id="site-inthist-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-site-inthist" style="height:360px;"></div>
+  </section>
+
+  <!-- ===== 5b. Survival vs transit distance (Phase 5.5 Track B) ======
+       Lab-side aggregate: pairs binned by ||target - init||, per-bin
+       survival at the target from logic2. Hidden until run_analysis
+       emits survival_vs_distance (rearrangement runs only). -->
+  <section class="card col-6" data-card-id="analysis-svd"
+           id="analysis-svd-card" hidden>
+    <h2>Survival vs distance<span class="grow"></span>
+        <label class="svd-mode-ctl" title="Bin by total transit distance, or per-step (total / nsteps)">dist:
+          <select id="svd-mode">
+            <option value="total">total</option>
+            <option value="per_step">per-step</option>
+          </select>
+        </label>
+        <span class="hint mono" id="svd-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-svd" style="height:340px;"></div>
+  </section>
 
   <!-- ===== 6. Per-iteration time-series ==============================
        One chart, X = shot index. Toggle which metrics are visible as
@@ -464,6 +655,14 @@
          style="margin-bottom:10px;">
       <span class="muted">load a run to populate metric toggles</span>
     </div>
+    <!-- Rearrangement only: overlay any per-shot numeric diag column on a
+         second (right) Y axis with its own units. Hidden when no diag. -->
+    <label class="svd-mode-ctl" id="per-iter-diag-wrap"
+           style="display:none;margin-bottom:10px;"
+           title="Overlay a per-shot diag metric on the right axis (its own units)">
+      overlay diag (right axis):
+      <select id="per-iter-diag-select"><option value="">none</option></select>
+    </label>
     <div class="plot-container" id="plot-per-iter" style="height:380px;"></div>
     <!-- Phase 5a: histogram of the same per-shot metric values
          (0.5% bins, frac axis 0..1). Same toggle chips drive both. -->
@@ -471,14 +670,43 @@
          style="height:260px;margin-top:8px;"></div>
   </section>
 
-  <!-- ===== 7. Sequence-specific (blank for now) ===================== -->
-  <section class="card col-12" data-card-id="analysis-seq-specific">
+  <!-- ===== 7. Sequence-specific (half row) ========================= -->
+  <section class="card col-6" data-card-id="analysis-seq-specific">
     <h2>Sequence-specific analysis<span class="grow"></span>
         <span class="hint mono" id="seq-specific-name">—</span>
     </h2>
     <div id="seq-specific-body" class="hint" style="padding:24px 8px;">
       (placeholder — per-Seq custom analyses will live here)
     </div>
+  </section>
+
+  <!-- ===== 7b. Averaged image (zoomable, half row) ================= -->
+  <section class="card col-6" data-card-id="analysis-avg-image"
+           id="analysis-avg-image-card" hidden>
+    <h2>Averaged image<span class="grow"></span>
+        <span class="hint mono" id="avg-image-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-avg-image" style="height:360px;"></div>
+  </section>
+
+  <!-- ===== 7c. Rearrangement scatter (protocol-specific) ==========
+       Rearrangement only: scatter ANY two per-shot quantities (loading,
+       TP, FP, or any numeric diag) against each other. Filter-aware (the
+       per_iteration arrays are already sliced by the active sweep filter).
+       Hidden unless the run has rearrangement paths. -->
+  <section class="card col-12" data-card-id="analysis-rearrange-scatter"
+           id="analysis-rearrange-scatter-card" hidden>
+    <h2>Rearrangement scatter<span class="grow"></span>
+        <label class="svd-mode-ctl">y:
+          <select id="scatter-y"></select>
+        </label>
+        <label class="svd-mode-ctl">x:
+          <select id="scatter-x"></select>
+        </label>
+        <span class="hint mono" id="scatter-info"></span>
+    </h2>
+    <div class="plot-container" id="plot-rearrange-scatter"
+         style="height:420px;"></div>
   </section>
 
   <section class="card col-12" data-card-id="analysis-protocol-src">
@@ -553,10 +781,10 @@
         <tr>
           <th>id</th><th>kind</th><th>name</th>
           <th>status</th><th>file_id</th>
-          <th>built_job_id</th><th>error</th>
+          <th>built_job_id</th><th>error</th><th></th>
         </tr>
       </thead>
-      <tbody><tr><td colspan="7" class="muted">loading…</td></tr></tbody>
+      <tbody><tr><td colspan="8" class="muted">loading…</td></tr></tbody>
     </table>
   </section>
 
@@ -715,12 +943,131 @@
 
 </section>
 
+<!-- ============================ SEQUENCE TAB ========================= -->
+<!-- Flattened-sequence viewer (merged from the standalone SeqPlotter).
+     Reads .seq files written into <scan_folder>/sequence/ (auto-dump) or
+     any folder of .seq files, via /api/sequence/*. On-demand (no polling). -->
+<section id="tab-sequence" class="tab-pane" hidden>
+
+  <section class="card col-12" data-card-id="sequence-source">
+    <h2>Sequence source<span class="grow"></span>
+        <span class="hint flex-fixed">pick a scan in the floating
+          <b>Scans</b> tab&nbsp;←</span>
+        <span id="seq-source-status" class="hint flex-fixed">no scan loaded</span>
+    </h2>
+    <!-- Compact controls: scan-point + basic-sequence selectors packed with the
+         two action buttons. The scan list lives in the floating "Scans" tab. -->
+    <div class="row" style="gap:12px;align-items:flex-end;">
+      <div class="flex-fixed" style="min-width:300px;">
+        <label>Scan point</label>
+        <select id="seq-point-select"><option value="">— pick a scan —</option></select>
+      </div>
+      <div class="flex-fixed" style="min-width:240px;">
+        <label>Basic sequence</label>
+        <select id="seq-seq-select"></select>
+      </div>
+      <button class="ghost flex-fixed" id="seq-browse-btn"
+              style="font-size:11px;padding:6px 14px;"
+              title="Pick a folder of .seq files (native dialog on the lab PC)">Browse…</button>
+      <button class="flex-fixed" id="seq-load-btn"
+              style="font-size:11px;padding:6px 14px;"
+              title="Load the running / most-recent scan">Load current</button>
+      <button class="ghost flex-fixed" id="seq-rebuild-xref-btn"
+              style="font-size:11px;padding:6px 14px;"
+              title="Force-rebuild the param↔channel map + formulas (xref.json) for the loaded scan">Rebuild&nbsp;⟳</button>
+      <div class="hint flex-fixed" id="seq-scanned-axes"></div>
+    </div>
+    <!-- Internal staging field for Browse… (no visible text box). -->
+    <input type="hidden" id="seq-folder">
+  </section>
+
+  <section class="card col-12" data-card-id="sequence-plot">
+    <h2>Channels<span class="grow"></span>
+        <span class="hint flex-fixed">pick channels in the floating
+          <b>Channels</b> tab&nbsp;→</span>
+    </h2>
+    <div id="plot-sequence" class="plot-container"></div>
+  </section>
+
+  <section class="card col-12" data-card-id="sequence-params">
+    <h2>Parameters<span class="grow"></span>
+        <input type="text" id="seq-param-search" class="flex-fixed seq-param-search"
+               placeholder="filter params…">
+        <!-- The legend doubles as show/hide filters (config / modified / scanned). -->
+        <span class="hint flex-fixed seq-param-filters">
+          <label class="seq-filter seq-config"><input type="checkbox" id="seq-filter-config" checked> config</label>
+          <label class="seq-filter seq-modified"><input type="checkbox" id="seq-filter-modified" checked> modified</label>
+          <label class="seq-filter seq-scanned"><input type="checkbox" id="seq-filter-scanned" checked> scanned</label>
+        </span>
+    </h2>
+    <!-- Selection focus: gathered params + derivation formula + driven channels for the
+         clicked point/param, with a Clear button. Hidden until something is selected. -->
+    <div id="seq-focus" class="seq-focus" hidden></div>
+    <div class="scrollable" style="max-height:560px;">
+      <div id="seq-params" class="seq-tree mono">No sequence loaded.</div>
+    </div>
+  </section>
+
+</section>
+
 <!-- Floating overlay host: only used when FLOATING_ANALYSIS_CARDS=true.
      dashboard.js reparents the Runs picker + Filter cards into here on
      load. Sits fixed top-right; auto-hidden when the active tab isn't
      Analysis. Empty / display:none-by-default so it costs nothing if
      the feature is disabled. -->
 <div id="floating-analysis-host" class="floating-analysis-host" hidden></div>
+
+<!-- Floating pickers for the Sequence tab. Two SEPARATE hover-driven hosts:
+       * Scans  -> docked LEFT  (its own host #floating-seqscan-host)
+       * Channels -> docked RIGHT (#floating-sequence-host)
+     so neither crowds the other (they were briefly stacked on the right; too
+     tight). Each card is an edge tab that expands on hover; the plot stays
+     full-width underneath. dashboard.js wires each + toggles both hosts
+     `hidden` per tab. -->
+<div id="floating-seqscan-host" class="floating-analysis-host" hidden>
+  <!-- Scans picker (LEFT): the Analysis-style scan list (search + date +
+       clickable rows; scans without a dump are grayed/inert). -->
+  <section class="card" id="seqscan-card" data-float-count="0">
+    <div class="seqscan-header">
+      <input type="text" id="seq-scan-search" placeholder="search scan_id or name…">
+      <select id="seq-scan-date" class="flex-fixed"><option value="">All dates</option></select>
+      <button class="ghost flex-fixed" id="seq-scan-refresh"
+              style="font-size:11px;padding:5px 10px;">Refresh</button>
+      <span class="badge mono flex-fixed" id="seq-scan-count">—</span>
+    </div>
+    <div id="seq-scan-table" class="seq-scan-table run-picker"></div>
+  </section>
+</div>
+<div id="floating-sequence-host" class="floating-analysis-host" hidden>
+  <!-- Channels picker (RIGHT). -->
+  <section class="card" id="sequence-chn-card" data-float-count="0">
+    <div class="chn-header">
+      <div class="chn-header-title">Channels</div>
+      <div class="hint chn-header-hint">ctrl/⌘-click for multiple</div>
+    </div>
+    <div class="chn-picker-body">
+      <select id="seq-chn-select" multiple size="16"></select>
+    </div>
+  </section>
+</div>
+
+<!-- Shot-image popup: opened by clicking a point in the Analysis tab's
+     Per-iteration metrics chart. Shows the actual camera frame(s) for
+     that shot, labelled by shot number + sweep param values. Medium
+     size; dismiss by clicking the backdrop, the ×, or pressing Esc. -->
+<div id="shot-modal" class="shot-modal" hidden>
+  <div class="shot-modal-backdrop" data-shot-close></div>
+  <div class="shot-modal-box" role="dialog" aria-modal="true"
+       aria-labelledby="shot-modal-title">
+    <div class="shot-modal-header">
+      <span class="shot-modal-title" id="shot-modal-title">Shot</span>
+      <button class="shot-modal-close" id="shot-modal-close"
+              data-shot-close aria-label="Close">×</button>
+    </div>
+    <div class="shot-modal-sub" id="shot-modal-sub"></div>
+    <div class="shot-modal-body" id="shot-modal-body"></div>
+  </div>
+</div>
 
 <div id="toast" class="toast"></div>
 

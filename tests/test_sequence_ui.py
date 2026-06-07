@@ -67,13 +67,22 @@ def test_dashboard_js_wires_sequence():
         'function seqReconstruct',
         '/api/sequence/reconstruct',
         'has_snapshot',
+        'has_descriptor',       # Reconstructable requires a descriptor too (no dead button)
         'seq-row-working',      # the in-flight reconstruct row class (literal in JS)
         # Req 1/2/3: last-30 scans, params filter tree, param<->channel xref.
         'SEQ_SCANS_LIMIT',
         'function seqRenderParamTree',
         'function seqOnParamChannels',
-        'function seqHighlightParamsForChannel',
+        'function seqFocusPoint',        # point-click -> segment-specific params + formula
+        'function seqSelectParam',       # param-click -> promote channels + emphasize regions
+        'function seqSetFocus',          # the selection focus region (top of params panel)
+        'seqMaybeBuildXref',             # background build/upgrade of xref.json
+        'function seqForceRebuildXref',  # the "Rebuild ⟳" button handler
+        'seq-rebuild-xref-btn',
+        'function seqWirePlotHover',     # hover -> thick-line pulse highlight (2c)
+        'time_regions',                  # wait/timing param -> shaded time bands (point 3)
         '/api/sequence/xref',
+        '/api/sequence/build_xref',
     ]:
         assert marker in js, "missing JS wiring: " + marker
 
@@ -87,5 +96,8 @@ def test_dashboard_css_has_sequence_styles():
                    ".seq-row-reconstructable",        # three-state picker
                    ".seq-row-unrecoverable",
                    ".seq-param-filters",              # params category toggles
-                   ".seq-leaf-xref-hit"]:             # channel->param highlight
+                   ".seq-leaf-xref-hit",              # channel->param highlight
+                   ".seq-focus",                      # selection focus region
+                   ".seq-chip",                       # focus param/channel chips
+                   ".seq-chip-val"]:                  # lifted parameter value
         assert marker in css, "missing CSS: " + marker

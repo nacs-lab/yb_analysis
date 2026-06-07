@@ -15,6 +15,7 @@ import math
 import os
 import pickle
 import time
+import threading
 import multiprocessing
 import tempfile
 import logging
@@ -354,6 +355,12 @@ _HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri',
 _SNAPSHOT_HEAVY_KEYS = ('_img_data_uri', '_img2_data_uri', '_img_mid_data_uri')
 
 
+# In-flight xref builds (scan dir -> Popen), so a scan loaded repeatedly in the
+# Sequence tab spawns at most one background provenance build at a time.
+_XREF_BUILDS = {}
+_XREF_BUILD_LOCK = threading.Lock()
+
+
 def _resolve_scan_dir(scan_id):
     """Map a 14-digit scan_id to its data directory on disk.
 
@@ -368,6 +375,53 @@ def _resolve_scan_dir(scan_id):
         return dname
     except Exception:
         return None
+
+
+def _parse_reconstruct_result(stdout):
+    """Extract the offline reconstruct driver's ``RECONSTRUCT_RESULT:{json}`` line.
+
+    The engine prints its own chatter; the driver emits exactly one result line. Scans from
+    the end (the result is last). Returns the parsed dict, or None if absent/unparseable.
+    """
+    import json as _json
+    prefix = 'RECONSTRUCT_RESULT:'
+    for line in reversed((stdout or '').splitlines()):
+        i = line.find(prefix)
+        if i != -1:
+            try:
+                return _json.loads(line[i + len(prefix):])
+            except ValueError:
+                return None
+    return None
+
+
+def _shot_frame_png_bytes(h5_path, row):
+    """Return PNG bytes for a single camera frame (``/imgs[row]``).
+
+    Frames are min-max normalized to uint8 (same contrast treatment as
+    the averaged-image card). ``/imgs`` is chunked one-frame-per-chunk,
+    so this reads exactly one chunk. Returns None when the row is out of
+    range or there's no usable ``/imgs`` dataset.
+    """
+    import io as _io
+    import h5py
+    from PIL import Image
+    with h5py.File(h5_path, 'r') as f:
+        d = f.get('imgs')
+        if d is None or d.ndim != 3:
+            return None
+        if row < 0 or row >= d.shape[0]:
+            return None
+        frame = d[row].astype(np.float64)
+    lo = float(np.nanmin(frame))
+    hi = float(np.nanmax(frame))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        scaled = np.zeros(frame.shape, dtype=np.uint8)
+    else:
+        scaled = ((frame - lo) / (hi - lo) * 255.0).astype(np.uint8)
+    buf = _io.BytesIO()
+    Image.fromarray(scaled).save(buf, format='PNG')
+    return buf.getvalue()
 
 
 def _runs_diag_response(scan_id):
@@ -520,9 +574,19 @@ def _register_api_routes(server):
         '/api/runs/<scan_id>/grid':     'per-scan grid sidecar (init/target knm coords + grid_rotation): synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/analysis': 'lab-side per-scan analysis: survival, loading, diag aggregate, sweep description, code/grid pointers',
         '/api/runs/<scan_id>/avg_image': 'PNG of mean image across all shots (single-image scans only; computed on first call, cached as avg_image.png next to data_*.h5)',
+        '/api/sequence/list':   'flattened-sequence index for a scan: ?scan_id= or ?folder= -> {files, points, scanned_axes}',
+        '/api/sequence/figure': 'Plotly figure for selected channels: ?scan_id=|folder= &file= &seq= &chns=a,b,c',
+        '/api/sequence/params': 'parameters tree (+ scanned_paths) for a scan, from the .json sidecar (expConfig+base.params+base.vars), else .seq-embedded: ?scan_id=|folder=',
+        '/api/sequence/xref':   'param<->channel PROVENANCE (build-time, from sequence/xref.json) for the loaded .seq: -> {available, param_to_channels, channel_to_params}',
+        '/api/sequence/build_xref': 'POST ?scan_id=|folder=: build sequence/xref.json in the BACKGROUND (live-lib provenance_scan.py subprocess) for a scan with a .seq but no xref; -> {ok,started} / {ok,available} / {ok:False}',
+        '/api/sequence/reconstruct': 'POST ?scan_id=: regenerate a scan\'s missing .seq via the engine-python driver (use_dummy_device subprocess); -> {ok,n_seq,approximate} or {deferred}',
+        '/api/sequence/dump_toggle': 'GET/POST the "save sequence dumps" toggle (pyctrl runtime_state flag); POST ?on=1|0',
+        '/api/sequence/scans':  'all scans (Analysis-picker list) flagged with has_seq + has_snapshot + has_descriptor (three-state picker): -> {scans:[{scan_id,name,swept,has_seq,n_seq,has_snapshot,has_descriptor}]}',
+        '/api/sequence/pick_folder': 'POST: open a native folder picker on the lab PC desktop -> {path}',
         '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
         '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
         '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its kind',
+        '/api/queue/requeue/<int:entry_id>':              'POST: re-submit an existing entry\'s original descriptor (same params) as a new descriptor',
         '/api/affine/current':       'current global SLM->camera affine (2x3 + rotation/scale/rms/coverage/last_scan_id)',
         '/api/affine/history':       'bounded history of past affines + current',
         '/api/affine/rollback':      'POST: restore the most recent history affine',
@@ -735,6 +799,33 @@ def _register_api_routes(server):
         """
         return _runs_diag_response(scan_id)
 
+    @server.route('/api/runs/<scan_id>/diag_live')
+    def _api_runs_diag_live(scan_id):
+        """Incremental live-diag pull-poll (Phase 5.5 Track D).
+
+        While a scan is in flight its synced sidecar doesn't exist yet, so
+        this always goes live to the SLM PC's incremental diag endpoint
+        (``?since_seq_id=N``) and returns only rows newer than ``since``.
+        The browser keeps its own ring buffer and stops polling when the
+        scan finishes (post-scan sync then writes the final sidecar). 503
+        when the SLM PC is unreachable — the caller just retries next tick.
+        """
+        from flask import jsonify, request
+        try:
+            since = request.args.get('since_seq_id')
+            since = int(since) if since not in (None, '') else None
+        except ValueError:
+            return jsonify({'error': 'since_seq_id must be an int'}), 400
+        try:
+            from yb_analysis.slm_sync import SlmSyncClient
+            data = SlmSyncClient().get_diag(scan_id, since_seq_id=since)
+            if data is None:
+                return jsonify({'error': 'slm offline'}), 503
+            return jsonify(data)
+        except Exception as e:
+            logger.debug('runs_diag_live passthrough failed: %s', e)
+            return jsonify({'error': str(e)}), 503
+
     @server.route('/api/runs/<scan_id>/code')
     def _api_runs_code(scan_id):
         """Return the code-snapshot manifest for `scan_id`.
@@ -774,8 +865,18 @@ def _register_api_routes(server):
                     raise ValueError('filter must be a JSON object')
             except (ValueError, json.JSONDecodeError) as ex:
                 return jsonify({'error': f'invalid filter: {ex}'}), 400
+        # Optional: refit discrimination infidelity from this run's own
+        # intensities instead of the stored scan-start calibration
+        # (non-destructive). Driven by the dashboard's "recompute" button.
+        recompute = request.args.get('recompute_infidelity', '0') not in (
+            '0', '', 'false', 'False')
+        # "Re-analyze" button: drop the cached expensive results and recompute.
+        force_recache = request.args.get('force_recache', '0') not in (
+            '0', '', 'false', 'False')
         try:
-            result = analyze_scan(scan_id, filters=filters)
+            result = analyze_scan(scan_id, filters=filters,
+                                  recompute_infidelity=recompute,
+                                  force_recache=force_recache)
         except RunAnalysisError as ex:
             msg = str(ex).lower()
             if 'must be 14 digits' in msg or 'must pass scan_id' in msg:
@@ -797,6 +898,345 @@ def _register_api_routes(server):
         `/slm/runs/<scan_id>/grid_sidecar`. Returns 404 if neither.
         """
         return _runs_grid_response(scan_id)
+
+    # ---- Sequence plotter: flattened .seq from a scan's sequence/ dir ----
+    def _open_seq_folder():
+        """Resolve a SequenceFolder from ``?scan_id=`` or ``?folder=``.
+
+        Returns ``(folder, None)`` on success, or ``(None, (response, code))``
+        — a ready-to-return error tuple — on failure.
+        """
+        from flask import request, jsonify
+        from yb_analysis.sequence import manifest as _seqman
+        scan_id = request.args.get('scan_id')
+        folder = request.args.get('folder')
+        if scan_id:
+            base = _resolve_scan_dir(scan_id)
+            if not base:
+                return None, (jsonify({'error': 'bad scan_id: %s' % scan_id}), 400)
+        elif folder:
+            base = folder
+        else:
+            return None, (jsonify({'error': 'pass scan_id or folder'}), 400)
+        sf = _seqman.SequenceFolder.open(base)
+        if sf is None:
+            return None, (jsonify({'error': 'no .seq files found', 'folder': base}), 404)
+        return sf, None
+
+    def _pick_sequence(dump, sel):
+        """Choose a Sequence in a dump by name or seq_idx; default the first."""
+        if not dump.sequences:
+            return None
+        if sel:
+            for s in dump.sequences:
+                if s.name == sel or str(s.seq_idx) == str(sel):
+                    return s
+        return dump.sequences[0]
+
+    def _load_selected_seq():
+        """Shared (folder -> file -> sequence) resolution for figure/params."""
+        from flask import request, jsonify
+        sf, err = _open_seq_folder()
+        if err:
+            return None, None, err
+        fname = request.args.get('file')
+        if not fname:
+            files = sf.seq_files()
+            if not files:
+                return None, None, (jsonify({'error': 'no .seq files'}), 404)
+            fname = files[0]
+        try:
+            dump = sf.load(fname)
+        except (OSError, ValueError, FileNotFoundError) as ex:
+            return None, None, (jsonify({'error': str(ex)}), 404)
+        seq = _pick_sequence(dump, request.args.get('seq'))
+        if seq is None:
+            return None, None, (jsonify({'error': 'no sequence in file'}), 404)
+        return sf, seq, None
+
+    @server.route('/api/sequence/list')
+    def _api_sequence_list():
+        sf, err = _open_seq_folder()
+        if err:
+            return err
+        return jsonify(_to_jsonable(sf.index()))
+
+    @server.route('/api/sequence/figure')
+    def _api_sequence_figure():
+        from flask import request, Response
+        import plotly.utils as _putils
+        from yb_analysis.sequence import figure as _seqfig
+        sf, seq, err = _load_selected_seq()
+        if err:
+            return err
+        raw = request.args.get('chns', '')
+        chns = [c for c in raw.split(',') if c]
+        fig = _seqfig.build_sequence_figure(seq, chns)
+        body = json.dumps(fig.to_dict(), cls=_putils.PlotlyJSONEncoder,
+                          allow_nan=False, default=str)
+        return Response(body, mimetype='application/json')
+
+    def _seq_scan_base():
+        """Scan folder (where ``data_<stamp>.json`` lives) from ?scan_id= or ?folder=."""
+        from flask import request
+        scan_id = request.args.get('scan_id')
+        folder = request.args.get('folder')
+        if scan_id:
+            return _resolve_scan_dir(scan_id)
+        if folder:
+            return folder
+        return None
+
+    @server.route('/api/sequence/params')
+    def _api_sequence_params():
+        """Parameters card for one scan.
+
+        Prefers the scan's ``.json`` sidecar (§12.2: ``expConfig`` baseline +
+        ``base.params`` overrides + ``base.vars`` scanned axes -> the viewer's
+        status-code tree) -- the always-available, engine-free source that works
+        with or without a ``.seq``. Falls back to the ``.seq``-embedded params for a
+        raw folder of ``.seq`` files that has no sidecar.
+        """
+        from yb_analysis.sequence import params_from_config as _pfc
+        base = _seq_scan_base()
+        built = _pfc.build_params_tree_for_folder(base) if base else None
+        if built and built.get('has_params'):
+            return jsonify(_to_jsonable({
+                'params': built['params'],
+                'has_params': True,
+                'scanned_paths': built['scanned_paths'],
+                'stats': built.get('stats'),
+                'source': 'config',
+            }))
+        # Fallback: the params block embedded in the selected .seq file.
+        sf, seq, err = _load_selected_seq()
+        if err:
+            return err
+        scanned_paths = [a.get('path') for a in sf.scanned_axes() if a.get('path')]
+        return jsonify(_to_jsonable({
+            'seq_name': seq.name,
+            'seq_idx': seq.seq_idx,
+            'params': seq.params,
+            'has_params': seq.params is not None,
+            'scanned_paths': scanned_paths,
+            'source': 'seq',
+        }))
+
+    @server.route('/api/sequence/xref')
+    def _api_sequence_xref():
+        """Param<->channel PROVENANCE for the loaded .seq (gated behind the engine build).
+
+        Reads the ``sequence/xref.json`` provenance artifact (which param's SeqVal flows
+        into which channel) for the selected ``file``. Returns ``{available,
+        param_to_channels, channel_to_params}`` -- ``available`` is False (feature dormant)
+        until the engine-side builder (reconstruction / B3) has written that artifact.
+        """
+        from flask import request
+        from yb_analysis.sequence import xref as _xref
+        sf, err = _open_seq_folder()
+        if err:
+            return err
+        fname = request.args.get('file')
+        if not fname:
+            files = sf.seq_files()
+            fname = files[0] if files else None
+        return jsonify(_to_jsonable(_xref.load_xref(sf.dir, fname)))
+
+    @server.route('/api/sequence/build_xref', methods=['POST'])
+    def _api_sequence_build_xref():
+        """Build a loaded scan's param<->channel ``xref.json`` in the BACKGROUND.
+
+        For a scan that already has a ``.seq`` (live auto-dump) but no provenance yet:
+        spawns ``pyctrl/tools/provenance_scan.py`` (the LIVE-lib, engine-free producer) as a
+        detached subprocess and returns immediately, so the Sequence tab can show the ``.seq``
+        first and light up the param<->channel affordance once the build lands (the JS polls
+        ``/api/sequence/xref``). Idempotent: at most one build per scan dir runs at a time.
+        Returns ``{ok, started}`` / ``{ok, available}`` (already built) / ``{ok:False, ...}``.
+        """
+        import os
+        import json as _json
+        import subprocess
+        from flask import request, jsonify
+        from yb_analysis.sequence import xref as _xref
+        from yb_analysis.sequence import manifest as _seqman
+        from yb_analysis.sequence.params_from_config import find_config_sidecar
+        from yb_analysis import config as _cfg
+
+        base = _seq_scan_base()
+        if not base or not os.path.isdir(base):
+            return jsonify({'ok': False, 'error': 'pass scan_id or folder'}), 400
+        sf = _seqman.SequenceFolder.open(base)
+        seq_dir = sf.dir if sf is not None else os.path.join(base, 'sequence')
+        # ?force=1 rebuilds even when an artifact exists (e.g. to UPGRADE a pre-region
+        # xref.json that lacks per-pulse maps). Without force, an existing artifact wins.
+        force = str(request.args.get('force', '')).lower() in ('1', 'true', 'yes', 'on')
+        if not force and _xref.load_xref(seq_dir).get('available'):
+            return jsonify({'ok': True, 'available': True})        # already built
+        # Rebuilding the ScanGroup needs the self-contained descriptor in the sidecar.
+        sidecar = find_config_sidecar(base)
+        has_desc = False
+        if sidecar:
+            try:
+                with open(sidecar, encoding='utf-8') as fh:
+                    has_desc = bool(_json.load(fh).get('descriptor'))
+            except (OSError, ValueError):
+                has_desc = False
+        if not has_desc:
+            return jsonify({'ok': False, 'error': 'scan has no descriptor; cannot build xref'}), 200
+        py = getattr(_cfg, 'PYCTRL_PYTHON', None)
+        tool = os.path.join(getattr(_cfg, 'PYCTRL_CWD', '') or '', 'tools', 'provenance_scan.py')
+        if not py or not os.path.exists(py) or not os.path.exists(tool):
+            return jsonify({'ok': False, 'error': 'pyctrl python or provenance tool not found'}), 500
+        key = os.path.abspath(base)
+        with _XREF_BUILD_LOCK:
+            running = _XREF_BUILDS.get(key)
+            if running is not None and running.poll() is None:
+                return jsonify({'ok': True, 'started': True, 'already': True})
+            try:
+                _XREF_BUILDS[key] = subprocess.Popen(
+                    [py, tool, '--scan-dir', base],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as ex:  # noqa: BLE001
+                return jsonify({'ok': False, 'error': 'spawn failed: %s' % ex}), 500
+        return jsonify({'ok': True, 'started': True})
+
+    @server.route('/api/sequence/reconstruct', methods=['POST'])
+    def _api_sequence_reconstruct():
+        """Regenerate a scan's missing .seq waveforms offline (engine-python subprocess).
+
+        For a Reconstructable scan (code snapshot present, no .seq): runs
+        ``pyctrl/tools/reconstruct_scan.py`` in the py3.8+libnacs venv
+        (``use_dummy_device``) as a SEPARATE process -- it binds no port, drives no hardware,
+        and never writes the ``runtime_state`` mmap (it ``set_global``s in its own pyseq).
+        Deferred while a scan is running (CPU contention). Returns the driver's parsed result:
+        ``{ok, n_seq, n_points, approximate, ...}`` or ``{deferred, reason}``.
+        """
+        import os
+        import subprocess
+        from flask import request, jsonify
+        from yb_analysis import config as _cfg
+        scan_id = request.args.get('scan_id')
+        if not scan_id:
+            return jsonify({'ok': False, 'error': 'pass scan_id'}), 400
+        scan_dir = _resolve_scan_dir(scan_id)
+        if not scan_dir or not os.path.isdir(scan_dir):
+            return jsonify({'ok': False, 'error': 'bad scan_id: %s' % scan_id}), 400
+        # Defer while a scan runs: the dummy subprocess would contend for CPU with the live
+        # compile/eval. Best-effort -- allow if the queue can't be read.
+        try:
+            q = _read_queue_data()
+            running = bool(q and q.get('running') and q['running'].get('id') is not None)
+        except Exception:  # noqa: BLE001
+            running = False
+        if running:
+            return jsonify({'ok': False, 'deferred': True,
+                            'reason': 'a scan is running -- retry when idle'}), 200
+        py = getattr(_cfg, 'PYCTRL_PYTHON', None)
+        driver = os.path.join(getattr(_cfg, 'PYCTRL_CWD', '') or '',
+                              'tools', 'reconstruct_scan.py')
+        if not py or not os.path.exists(py) or not os.path.exists(driver):
+            return jsonify({'ok': False,
+                            'error': 'engine python or reconstruct driver not found'}), 500
+        try:
+            proc = subprocess.run([py, driver, '--scan-dir', scan_dir],
+                                  capture_output=True, text=True, timeout=900)
+        except Exception as ex:  # noqa: BLE001
+            return jsonify({'ok': False, 'error': 'driver spawn failed: %s' % ex}), 500
+        result = _parse_reconstruct_result(proc.stdout or '')
+        if result is None:
+            return jsonify({'ok': False, 'error': 'reconstruct driver produced no result',
+                            'stderr': (proc.stderr or '')[-1500:]}), 500
+        return jsonify(_to_jsonable(result)), (200 if result.get('ok') else 500)
+
+    @server.route('/api/sequence/dump_toggle', methods=['GET', 'POST'])
+    def _api_sequence_dump_toggle():
+        """Read (GET) or set (POST ?on=1|0) the auto-dump toggle.
+
+        The flag rides the pyctrl backend's mmap runtime-state store (offset 8);
+        the runner reads it at scan start. Always returns ``{"on": <bool>}``.
+        """
+        from flask import request, jsonify
+        from yb_analysis.sequence import dump_toggle
+        if request.method == 'POST':
+            raw = request.args.get('on')
+            if raw is None:
+                body = request.get_json(silent=True) or {}
+                raw = body.get('on')
+            on = str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+            try:
+                dump_toggle.set_save_sequence_dumps(on)
+            except Exception as ex:  # noqa: BLE001
+                return jsonify({'error': str(ex)}), 500
+        return jsonify({'on': dump_toggle.get_save_sequence_dumps(False)})
+
+    @server.route('/api/sequence/scans')
+    def _api_sequence_scans():
+        """Scans for the Sequence-tab picker -- the SAME set the Analysis runs
+        picker shows (``runs_list.list_runs`` with meta), each flagged with
+        whether it carries a ``sequence/`` dump.
+
+        Scans WITHOUT a dump are returned too (``has_seq=False``) so the UI can
+        GRAY them out instead of hiding them (parity with the Analysis picker).
+        Newest first.
+        """
+        import os
+        from flask import request, jsonify
+        from yb_analysis.analysis.runs_list import list_runs
+        from yb_analysis.sequence.manifest import find_sequence_dir
+        since_days = request.args.get('since_days', type=int)
+        max_count = request.args.get('max', type=int, default=500)
+        scans = []
+        for r in list_runs(since_days=since_days, max_count=max_count, with_meta=True):
+            seq_dir = find_sequence_dir(r['scan_dir'])
+            n = 0
+            if seq_dir:
+                try:
+                    n = sum(1 for f in os.listdir(seq_dir) if f.endswith('.seq'))
+                except OSError:
+                    n = 0
+            scans.append({
+                'scan_id': r['scan_id'],
+                'scan_dir': r['scan_dir'],
+                'name': r.get('name'),
+                'swept': r.get('swept'),
+                'has_seq': n > 0,
+                'n_seq': n,
+                # Three-state picker (§12.4): has_seq -> Ready; else
+                # (has_snapshot AND has_descriptor) -> Reconstructable; else
+                # Unrecoverable. A snapshot WITHOUT a descriptor (scans predating
+                # self-contained reconstruction) is NOT reconstructable.
+                'has_snapshot': bool(r.get('has_snapshot')),
+                'has_descriptor': bool(r.get('has_descriptor')),
+            })
+        return jsonify({'scans': scans})
+
+    @server.route('/api/sequence/pick_folder', methods=['POST'])
+    def _api_sequence_pick_folder():
+        """Open a NATIVE folder picker on the lab PC and return the chosen path.
+
+        Runs Tk's ``askdirectory`` in a short-lived CHILD PROCESS, so it never
+        blocks this server's threads and never touches the main run_monitor
+        process (whose Tk loop carries the safety-critical abort path). The
+        dialog appears on the lab PC's desktop -- this is for local use. Returns
+        ``{'path': ''}`` on cancel, ``{'error': ...}`` if Tk/display is absent.
+        """
+        import sys
+        import subprocess
+        from flask import jsonify
+        code = (
+            "import sys, tkinter as tk\n"
+            "from tkinter import filedialog\n"
+            "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
+            "p = filedialog.askdirectory(title='Pick a folder of .seq files')\n"
+            "r.destroy()\n"
+            "sys.stdout.write(p or '')\n"
+        )
+        try:
+            res = subprocess.run([sys.executable, '-c', code],
+                                 capture_output=True, text=True, timeout=300)
+        except Exception as ex:  # noqa: BLE001 - no display / Tk missing / timeout
+            return jsonify({'error': str(ex)}), 500
+        return jsonify({'path': (res.stdout or '').strip()})
 
     @server.route('/api/runs/<scan_id>/avg_image')
     def _api_runs_avg_image(scan_id):
@@ -829,6 +1269,51 @@ def _register_api_routes(server):
         # raw imgs, which never change for a completed scan.
         resp = send_file(str(png_path), mimetype='image/png')
         resp.headers['Cache-Control'] = 'public, max-age=86400'
+        return resp
+
+    @server.route('/api/runs/<scan_id>/shot_image')
+    def _api_runs_shot_image(scan_id):
+        """PNG of one camera frame from a single shot (per-iteration popup).
+
+        Query params:
+          shot        — 1-indexed shot number (matches
+                        per_iteration.shot_index; = storage order in /imgs)
+          frame       — 0-indexed frame within the shot (0 .. num_images-1)
+          num_images  — frames per shot (from per_iteration.num_images)
+
+        /imgs stores frames interleaved, so the row is
+        ``(shot - 1) * num_images + frame``. The frame is min-max
+        normalized to uint8. 404 when the scan/imgs/row is missing.
+        """
+        from flask import request, jsonify, Response
+        from pathlib import Path as _P
+        from yb_analysis.analysis.run_analysis import _scan_data_h5
+        sd = _resolve_scan_dir(scan_id)
+        if sd is None or not _P(sd).is_dir():
+            return jsonify({'error': f'scan_dir not found for {scan_id}'}), 404
+        h5 = _scan_data_h5(_P(sd))
+        if h5 is None:
+            return jsonify({'error': 'no data_*.h5 in scan_dir'}), 404
+        try:
+            shot = int(request.args.get('shot', '1'))
+            frame = int(request.args.get('frame', '0'))
+            num_images = int(request.args.get('num_images', '1'))
+        except ValueError:
+            return jsonify({'error': 'shot/frame/num_images must be ints'}), 400
+        if shot < 1 or num_images < 1 or frame < 0 or frame >= num_images:
+            return jsonify({'error': 'bad shot/frame/num_images'}), 400
+        row = (shot - 1) * num_images + frame
+        try:
+            png = _shot_frame_png_bytes(str(h5), row)
+        except Exception as ex:
+            logger.warning('shot_image(%s shot=%s frame=%s) failed: %s',
+                           scan_id, shot, frame, ex)
+            return jsonify({'error': str(ex)}), 500
+        if png is None:
+            return jsonify({'error': 'frame out of range or no /imgs'}), 404
+        # The raw frame never changes for a completed scan -> cache it.
+        resp = Response(png, mimetype='image/png')
+        resp.headers['Cache-Control'] = 'public, max-age=3600'
         return resp
 
     # ---- Programmatic scan submission (Phase 3) ------------------------
@@ -900,6 +1385,37 @@ def _register_api_routes(server):
                             'direction': direction})
         return jsonify({'ok': False, 'id': int(entry_id),
                         'error': 'cannot move (at edge or unknown id)'}), 400
+
+    @server.route('/api/queue/requeue/<int:entry_id>', methods=['POST'])
+    def _api_queue_requeue(entry_id):
+        """Re-queue an existing entry: re-submit the original descriptor it
+        was queued with, producing a NEW descriptor with byte-identical
+        parameters. Works for any running/queued/history entry that still
+        carries its descriptor.
+
+        `?code=1` ALSO pins the new descriptor to the source run's captured
+        code snapshot (reproducibility), so the pyctrl run loop replays the
+        exact experiment source that ran originally. Returns
+        `{descriptor_id: N, source_id: entry_id, with_code: bool}` or an error."""
+        with_code = request.args.get('code', '0') in ('1', 'true', 'yes')
+        try:
+            from yb_analysis.scans.client import requeue
+            from yb_analysis.scans.descriptor import DescriptorError
+        except Exception as ex:
+            return jsonify({'error': f'scans package import failed: {ex}'}), 500
+        try:
+            did = requeue(int(entry_id), with_code=with_code)
+        except LookupError as ex:
+            return jsonify({'error': str(ex)}), 404
+        except DescriptorError as ex:
+            return jsonify({'error': f'descriptor invalid: {ex}'}), 400
+        except TimeoutError as ex:
+            return jsonify({'error': f'runner unreachable: {ex}'}), 503
+        except Exception as ex:
+            logger.exception('requeue callback failed')
+            return jsonify({'error': f'requeue failed: {ex}'}), 500
+        return jsonify({'descriptor_id': int(did), 'source_id': int(entry_id),
+                        'with_code': bool(with_code), 'kind': 'descriptor'})
 
     # ---- Phase 4: runs list / groups / seqs ---------------------------
     @server.route('/api/runs/list')
@@ -1101,8 +1617,13 @@ def _register_api_routes(server):
                     return _fig_array(d, img_key='_img2_data_uri',
                                       shape_key='_img2_shape',
                                       vlo_key='_img2_vlo', vhi_key='_img2_vhi',
-                                      logicals_key=('logicals2'
-                                          if d.get('is_two_array') else 'logicals'),
+                                      # img2 panel ALWAYS shows the final frame's
+                                      # own logicals (_display_logicals2 is set for
+                                      # every is_last frame, two-array or not). The
+                                      # old `else 'logicals'` fell back to frame-0's
+                                      # logicals in single-array NumImages=2 mode,
+                                      # making img2 render identically to img1.
+                                      logicals_key='logicals2',
                                       grid_key=('grid_locations_img2'
                                           if d.get('is_two_array') else 'grid_locations'),
                                       title='Tweezer Array (img 2)')
@@ -1150,6 +1671,413 @@ def _register_api_routes(server):
         body = json.dumps({'figures': out}, cls=_putils.PlotlyJSONEncoder,
                           allow_nan=False, default=str)
         return Response(body, mimetype='application/json')
+
+    # ====================================================================
+    # CONTROL endpoints (Phase 5.5 Track A) — the dashboard mirrors the
+    # Tkinter control panel so an operator on another machine has the same
+    # authority. Pause/Start/Abort write the MATLAB MemoryMap directly (the
+    # file is local to this PC). dummy_mode / init_dir / restart_* require
+    # the main run_monitor process, so they're spooled to it via
+    # yb_analysis.control.web_control and executed by ControlPanel.
+    #
+    # Safety: a remote-exposure gate (loopback always; tailscale in 'auto';
+    # other LAN only when explicitly enabled) plus single-use confirmation
+    # tokens for the two destructive ops (Abort, Restart All).
+    # ====================================================================
+    from yb_analysis.control import memmap_signal as _mm
+    from yb_analysis.control import web_control as _wc
+
+    def _current_backend():
+        """Active backend for control routing, from YB_BACKEND — which
+        run_monitor sets at dashboard spawn and is FIXED for this subprocess's
+        lifetime (a backend switch restarts the whole monitor). Using the env,
+        not the published status file, avoids a stale-status race where a fresh
+        pyctrl session's dashboard could read the *previous* MATLAB session's
+        status and wrongly poke a stale memmap. Unset defaults to 'matlab'
+        (legacy / standalone dashboard); an unexpected value is logged and
+        treated as non-matlab so routing fails CLOSED to ZMQ (never memmap)."""
+        b = os.environ.get('YB_BACKEND', 'matlab')
+        if b not in ('matlab', 'pyctrl'):
+            logger.warning('YB_BACKEND=%r is not matlab|pyctrl; routing '
+                           'control via ZMQ (no memmap) to be safe', b)
+        return b
+
+    def _backend_uses_memmap():
+        """True iff the live backend is MATLAB (the only one with a local
+        MemoryMap). Strict equality => any other value (incl. a misconfigured
+        one) routes via ZMQ, never the local memmap."""
+        return _current_backend() == 'matlab'
+
+    _LOOPBACK = {'127.0.0.1', '::1', 'localhost', None, ''}
+
+    def _is_tailscale(addr):
+        # Tailscale CGNAT range 100.64.0.0/10.
+        try:
+            import ipaddress
+            return ipaddress.ip_address(addr) in ipaddress.ip_network(
+                '100.64.0.0/10')
+        except Exception:
+            return False
+
+    def _controls_allowed():
+        """Exposure policy. YB_DASH_REMOTE_CONTROLS = auto|on|off.
+
+        Loopback is always allowed. 'auto' (default) also allows the
+        tailnet; 'on' allows any remote; 'off' allows loopback only.
+        """
+        from flask import request
+        addr = request.remote_addr
+        if addr in _LOOPBACK:
+            return True
+        policy = os.environ.get('YB_DASH_REMOTE_CONTROLS', 'auto').lower()
+        if policy == 'on':
+            return True
+        if policy == 'off':
+            return False
+        return _is_tailscale(addr)
+
+    def _gate():
+        """Return a 403 Response when controls aren't allowed, else None."""
+        from flask import jsonify
+        if _controls_allowed():
+            return None
+        resp = jsonify({'error': 'remote controls disabled on this interface'})
+        resp.status_code = 403
+        return resp
+
+    # --- single-use confirmation tokens for destructive ops -------------
+    # In-process (this Dash subprocess). The client requests a token, then
+    # POSTs it back within the TTL; the server consumes it once. Pairs with
+    # the click-and-hold UX but is independently enforced server-side.
+    _CONFIRM_TTL_S = 30.0
+    _confirm_tokens = {}     # token -> (issued_at, action)
+    _confirm_counter = [0]
+
+    def _issue_confirm_token(action):
+        _confirm_counter[0] += 1
+        # Unique, non-guessable-enough for a loopback safety interlock.
+        tok = '%s-%d-%d' % (action, _confirm_counter[0], int(time.time() * 1000))
+        _confirm_tokens[tok] = (time.monotonic(), action)
+        # Opportunistic GC of stale tokens.
+        now = time.monotonic()
+        for k, (t0, _a) in list(_confirm_tokens.items()):
+            if now - t0 > _CONFIRM_TTL_S:
+                _confirm_tokens.pop(k, None)
+        return tok
+
+    def _consume_confirm_token(tok, action):
+        rec = _confirm_tokens.get(tok)
+        if rec is None:
+            return False
+        issued, act = rec
+        _confirm_tokens.pop(tok, None)     # single use
+        if act != action:
+            return False
+        return (time.monotonic() - issued) <= _CONFIRM_TTL_S
+
+    @server.route('/api/control/status')
+    def _api_control_status():
+        # Full-fidelity control state published by the main process
+        # (dummy mode string, last-seq meta, scan/seq/state) + whether
+        # remote controls are allowed on this interface (drives the
+        # sidebar's enabled/disabled rendering).
+        from flask import jsonify
+        st = _wc.read_status() or {}
+        st['controls_allowed'] = _controls_allowed()
+        return jsonify(st)
+
+    @server.route('/api/control/confirm_token')
+    def _api_control_confirm_token():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        action = (request.args.get('action') or '').lower()
+        if action not in ('abort', 'restart_all', 'set_backend'):
+            return jsonify(
+                {'error': 'action must be abort|restart_all|set_backend'}), 400
+        return jsonify({'token': _issue_confirm_token(action),
+                        'ttl_s': _CONFIRM_TTL_S})
+
+    @server.route('/api/control/pause', methods=['POST'])
+    def _api_control_pause():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        if _backend_uses_memmap():
+            # Pass the backend explicitly so safety doesn't rest on the guard
+            # alone — signal_pause() with a non-matlab backend is a no-op even
+            # if this branch were ever reached by mistake (defense in depth).
+            wrote = _mm.signal_pause(_current_backend())
+            return jsonify({'ok': True,
+                            'via': 'memmap' if wrote else 'unavailable',
+                            'memmap_present': wrote})
+        # pyctrl: no local memmap — route to the main process's ZMQ client.
+        _wc.enqueue('pause')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/start', methods=['POST'])
+    def _api_control_start():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        if _backend_uses_memmap():
+            wrote = _mm.signal_start(_current_backend())
+            return jsonify({'ok': True,
+                            'via': 'memmap' if wrote else 'unavailable',
+                            'memmap_present': wrote})
+        _wc.enqueue('start')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/abort', methods=['POST'])
+    def _api_control_abort():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        # Token is consumed BEFORE the backend branch so BOTH paths require it.
+        tok = request.args.get('confirm') or (request.get_json(silent=True)
+                                              or {}).get('confirm')
+        if not _consume_confirm_token(tok or '', 'abort'):
+            return jsonify({'error': 'abort requires a valid confirm token'}), 400
+        if _backend_uses_memmap():
+            wrote = _mm.signal_abort(_current_backend())
+            return jsonify({'ok': True,
+                            'via': 'memmap' if wrote else 'unavailable',
+                            'memmap_present': wrote})
+        _wc.enqueue('abort')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/dummy_mode', methods=['POST'])
+    def _api_control_dummy_mode():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        body = request.get_json(silent=True) or {}
+        mode = (body.get('mode') or '').lower()
+        if mode not in ('off', 'default', 'last'):
+            return jsonify({'error': 'mode must be off|default|last'}), 400
+        _wc.enqueue('dummy_mode', mode=mode)
+        return jsonify({'ok': True, 'mode': mode, 'via': 'run_monitor'})
+
+    @server.route('/api/control/init_dir', methods=['POST'])
+    def _api_control_init_dir():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        body = request.get_json(silent=True) or {}
+        path = body.get('path') or ''
+        if not path or not os.path.isdir(path):
+            return jsonify({'error': 'path must be an existing directory'}), 400
+        _wc.enqueue('init_dir', path=path)
+        return jsonify({'ok': True, 'path': path, 'via': 'run_monitor'})
+
+    @server.route('/api/control/restart_dash', methods=['POST'])
+    def _api_control_restart_dash():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        _wc.enqueue('restart_dash')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/restart_all', methods=['POST'])
+    def _api_control_restart_all():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        tok = request.args.get('confirm') or (request.get_json(silent=True)
+                                              or {}).get('confirm')
+        if not _consume_confirm_token(tok or '', 'restart_all'):
+            return jsonify(
+                {'error': 'restart_all requires a valid confirm token'}), 400
+        _wc.enqueue('restart_all')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/set_backend', methods=['POST'])
+    def _api_control_set_backend():
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        body = request.get_json(silent=True) or {}
+        target = (request.args.get('target') or body.get('target') or '').lower()
+        if target not in ('matlab', 'pyctrl'):
+            return jsonify({'error': 'target must be matlab|pyctrl'}), 400
+        tok = request.args.get('confirm') or body.get('confirm')
+        if not _consume_confirm_token(tok or '', 'set_backend'):
+            return jsonify(
+                {'error': 'set_backend requires a valid confirm token'}), 400
+        _wc.enqueue('set_backend', target=target)
+        return jsonify({'ok': True, 'target': target, 'via': 'run_monitor'})
+
+    @server.route('/api/control/downsample', methods=['POST'])
+    def _api_control_downsample():
+        # Live-image downsample toggle: render preference, not a runner
+        # action. Writes the browser->main reverse-channel control file the
+        # main process reads when encoding the next frame. No exposure gate
+        # (purely cosmetic, no authority over the experiment).
+        from flask import jsonify, request
+        body = request.get_json(silent=True) or {}
+        on = bool(body.get('on', True))
+        _write_control({'downsample': on})
+        return jsonify({'ok': True, 'downsample': on})
+
+    # ---- Camera control mirror (Phase 5.5) ----------------------------
+    # Mirror of the Tkinter CameraPane. Status is published by the main
+    # process (CameraPane._publish_web_status); connect/disconnect/apply
+    # are spooled to it via web_control because the dashboard subprocess
+    # has no ZMQ socket to the runner. Same exposure gate as the other
+    # control ops — camera reconfig drops frames, so it's privileged.
+
+    @server.route('/api/control/camera/status')
+    def _api_control_camera_status():
+        from flask import jsonify
+        st = _wc.read_camera_status() or {}
+        st['controls_allowed'] = _controls_allowed()
+        return jsonify(st)
+
+    def _parse_camera_body():
+        """Pull (roi, exposure) from the request JSON, validating shape.
+
+        Returns (roi, exposure, error_response). roi is a 4-int list or
+        None; exposure is a float or None. error_response is a (json, code)
+        tuple when validation fails, else None."""
+        from flask import jsonify, request
+        body = request.get_json(silent=True) or {}
+        roi = body.get('roi')
+        exposure = body.get('exposure')
+        if roi is not None:
+            try:
+                roi = [int(v) for v in roi]
+                if len(roi) != 4:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return None, None, (jsonify(
+                    {'error': 'roi must be [x, y, w, h] integers'}), 400)
+        if exposure is not None:
+            try:
+                exposure = float(exposure)
+                if not (exposure > 0):
+                    raise ValueError
+            except (TypeError, ValueError):
+                return None, None, (jsonify(
+                    {'error': 'exposure must be a positive number (s)'}), 400)
+        return roi, exposure, None
+
+    @server.route('/api/control/camera/connect', methods=['POST'])
+    def _api_control_camera_connect():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        roi, exposure, err = _parse_camera_body()
+        if err is not None:
+            return err
+        if roi is None or exposure is None:
+            return jsonify({'error': 'connect requires roi + exposure'}), 400
+        _wc.enqueue('camera_connect', roi=roi, exposure=exposure)
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/camera/apply', methods=['POST'])
+    def _api_control_camera_apply():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        roi, exposure, err = _parse_camera_body()
+        if err is not None:
+            return err
+        if roi is None or exposure is None:
+            return jsonify({'error': 'apply requires roi + exposure'}), 400
+        _wc.enqueue('camera_apply', roi=roi, exposure=exposure)
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/camera/disconnect', methods=['POST'])
+    def _api_control_camera_disconnect():
+        from flask import jsonify
+        g = _gate()
+        if g is not None:
+            return g
+        _wc.enqueue('camera_disconnect')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+
+def _aggregate_focus_metrics(results):
+    """Combine seq-specific focus metrics across group members.
+
+    Aligns members by swept-VALUE (not index), so runs with different /
+    overlapping defocus sweeps still merge where their x values match. Each
+    metric is averaged across members weighted by that point's detected spot
+    count (more spots -> more weight); n_spots are summed. Returns None when
+    no member has focus metrics. This is why "combine runs" now actually
+    pools the defocus optimisation curve across repeats."""
+    members = [r.get('seq_specific') for r in results
+               if isinstance(r.get('seq_specific'), dict)
+               and r['seq_specific'].get('type') == 'focus_metrics']
+    if not members:
+        return None
+
+    def _key(v):
+        return round(float(v), 6)
+
+    xmap = {}
+    for ss in members:
+        for v in ss.get('x') or []:
+            xmap.setdefault(_key(v), float(v))
+    xkeys = sorted(xmap)
+    xs = [xmap[k] for k in xkeys]
+
+    meta = {}
+    for ss in members:
+        for mk, m in (ss.get('metrics') or {}).items():
+            meta.setdefault(mk, {'label': m.get('label'), 'unit': m.get('unit'),
+                                 'higher_better': m.get('higher_better', True)})
+
+    metrics_out = {}
+    for mk, mm in meta.items():
+        wsum = {k: 0.0 for k in xkeys}
+        wtot = {k: 0.0 for k in xkeys}
+        for ss in members:
+            mx = ss.get('x') or []
+            vals = (ss.get('metrics') or {}).get(mk, {}).get('values') or []
+            nsp = ss.get('n_spots') or []
+            for i, xv in enumerate(mx):
+                k = _key(xv)
+                if k not in wsum or i >= len(vals) or vals[i] is None:
+                    continue
+                w = float(nsp[i]) if (i < len(nsp) and nsp[i]) else 1.0
+                wsum[k] += w * float(vals[i])
+                wtot[k] += w
+        metrics_out[mk] = {
+            'values': [(wsum[k] / wtot[k]) if wtot[k] > 0 else None
+                       for k in xkeys],
+            'label': mm['label'], 'unit': mm['unit'],
+            'higher_better': mm['higher_better'],
+        }
+
+    nsp_out = []
+    for k in xkeys:
+        tot = 0
+        for ss in members:
+            mx = ss.get('x') or []
+            nsp = ss.get('n_spots') or []
+            for i, xv in enumerate(mx):
+                if _key(xv) == k and i < len(nsp) and nsp[i]:
+                    tot += int(nsp[i])
+        nsp_out.append(tot)
+
+    return {
+        'type': 'focus_metrics', 'source': 'images (combined)',
+        'calibration_free': True, 'x': xs,
+        'x_label': members[0].get('x_label') or 'param',
+        'n_spots': nsp_out, 'metrics': metrics_out, 'n_members': len(members),
+    }
 
 
 def _aggregate_group_analysis(results, *, group, errors):
@@ -1224,6 +2152,10 @@ def _aggregate_group_analysis(results, *, group, errors):
         'survival_vs_distance': None,
         'survival_vs_distance_per_step': None,
         'per_shot_extra': None,
+        # Seq-specific focus metrics pooled across members (the defocus
+        # optimisation curve combined over repeats); None when no member
+        # has them.
+        'seq_specific': _aggregate_focus_metrics(results),
         # Group metadata: useful to the dashboard.
         'group': {
             'id': group.get('id'),
@@ -1270,6 +2202,15 @@ def _decode_plotly_bdata(obj):
         return {k: _decode_plotly_bdata(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_decode_plotly_bdata(v) for v in obj]
+    # NaN/Inf are not JSON-valid and json.dumps(allow_nan=False) raises on
+    # them. The bdata branch above already coerces non-finite values inside
+    # typed-array blobs, but figures often carry plain Python-float lists
+    # (e.g. marker.color built via ndarray.tolist()), which Plotly emits
+    # verbatim. Coerce those to None here so the whole tree is JSON-safe.
+    # np.float64 is a subclass of float; np.float32 is not, hence the extra
+    # np.floating check.
+    if isinstance(obj, (float, np.floating)):
+        return obj if math.isfinite(obj) else None
     return obj
 
 

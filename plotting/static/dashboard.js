@@ -49,6 +49,59 @@
     ? "—" : v.toFixed(n || 2);
   const setText = (id, t) => { const el = $(id); if (el) el.textContent = t; };
 
+  // ---- Discrimination-infidelity formatting (matches the LIVE view:
+  // infidelity as a raw fraction in scientific notation, color-coded
+  // green<1% / yellow<5% / red). See dashboard.py:_fig_infid. ----
+  const fmtInfid = (v) => (v == null || Number.isNaN(v))
+    ? "—" : Number(v).toExponential(1);
+  const infidColor = (v) => (v == null || Number.isNaN(v)) ? "var(--text-dim)"
+    : (v < 0.01 ? "#4cc762" : v < 0.05 ? "#d29922" : "#f85149");
+
+  // 14-digit scan_id (YYYYMMDDHHMMSS) -> "2026-05-29 · 02:50:15".
+  function scanIdToDate(scanId) {
+    const s = String(scanId || "");
+    if (!/^\d{14}$/.test(s)) return null;
+    return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)} · `
+         + `${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)}`;
+  }
+  const hasFinite = (arr) => Array.isArray(arr)
+    && arr.some((v) => v != null && !Number.isNaN(v) && isFinite(v));
+
+  // ---- Sweep-visualization prefs (mirrors the SLM dashboard's
+  // sweepPrefs): error metric + 2D view/swap/square cells, persisted to
+  // localStorage so they survive reloads + scan switches. ----
+  const SWEEP_PREFS_KEY = "yb_dash_analysis_sweep_prefs";
+  const sweepPrefs = (() => {
+    const defaults = { errMode: "sem_pershot", view: "both",
+                       axisSwap: false, square: false };
+    try {
+      const saved = JSON.parse(localStorage.getItem(SWEEP_PREFS_KEY) || "{}");
+      return Object.assign(defaults, saved || {});
+    } catch { return defaults; }
+  })();
+  function saveSweepPrefs() {
+    try { localStorage.setItem(SWEEP_PREFS_KEY, JSON.stringify(sweepPrefs)); }
+    catch { /* private mode */ }
+  }
+  let recomputeInfid = false;       // refit discrimination from this run's data
+  let svdMode = "total";            // survival-vs-distance x-axis: total|per_step
+
+  // Shrink the font of each top-row status value until it fits its tile
+  // (no ellipsis). Resets to the stylesheet base first so values that got
+  // shorter grow back. Skips hidden/unlaid-out tiles (clientWidth 0).
+  function fitStatValues() {
+    $$(".status-strip .stat-value").forEach((el) => {
+      el.style.fontSize = "";                      // back to stylesheet base
+      if (!el.clientWidth) return;                 // hidden / not laid out
+      const base = parseFloat(getComputedStyle(el).fontSize) || 20;
+      let size = base, guard = 0;
+      while (el.scrollWidth > el.clientWidth && size > 8 && guard++ < 48) {
+        size -= 1;
+        el.style.fontSize = size + "px";
+      }
+    });
+  }
+
   function toast(msg, kind) {
     const t = $("toast");
     if (!t) return;
@@ -74,7 +127,7 @@
   }
 
   // ---- Tab switching ----
-  const TABS = ["live", "hardware", "analysis", "queue", "diag"];
+  const TABS = ["live", "hardware", "analysis", "queue", "diag", "sequence"];
   let activeTab = "live";
 
   function setTab(tab) {
@@ -90,6 +143,13 @@
     // FLOATING_ANALYSIS_CARDS=false: the host stays hidden anyway.
     const floatHost = document.getElementById("floating-analysis-host");
     if (floatHost) floatHost.hidden = (tab !== "analysis");
+    // The Sequence tab's floating pickers live in TWO hosts now: Channels
+    // docked right (#floating-sequence-host), Scans docked left
+    // (#floating-seqscan-host). Both track the Sequence tab.
+    const seqFloatHost = document.getElementById("floating-sequence-host");
+    if (seqFloatHost) seqFloatHost.hidden = (tab !== "sequence");
+    const seqScanHost = document.getElementById("floating-seqscan-host");
+    if (seqScanHost) seqScanHost.hidden = (tab !== "sequence");
     if (location.hash !== "#" + tab) location.hash = "#" + tab;
     // Render once on tab switch in case the poll interval hasn't fired.
     pollOnceForTab(tab);
@@ -168,6 +228,14 @@
     // no lab-side polling needed -- the iframe drives its own.
     if (tab === "queue")    return pollQueue();
     if (tab === "diag")     return pollDiag();
+    if (tab === "sequence") return loadSequence();
+    // Analysis: the top-right Refresh re-fetches the runs list and reloads
+    // the current analysis (otherwise it's a no-op on this tab).
+    if (tab === "analysis") {
+      loadRunsList();
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+      return;
+    }
   }
 
   // Hook the iframe reload button now that the DOM is ready (wired
@@ -194,6 +262,18 @@
     updateConnStatus();
   }
 
+  // On viewport resize, re-fit the top-row status fonts and re-size the
+  // per-site map dots (pixels-per-data-unit changes with the container).
+  // Debounced so a drag-resize doesn't thrash restyles.
+  let _resizeFitTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(_resizeFitTimer);
+    _resizeFitTimer = setTimeout(() => {
+      fitStatValues();
+      if (window.Plotly) LIVE_AUTOSIZE_PANELS.forEach(autoFitDotSize);
+    }, 200);
+  });
+
   $("auto-refresh").addEventListener("change", (e) => {
     autoRefresh = e.target.checked;
   });
@@ -214,6 +294,16 @@
               r && r.ok ? "warn" : "err");
       } catch (e) { toast("Rollback failed: " + (e.message || e), "err"); }
       loadCalibration();
+    });
+  })();
+
+  // Survival-vs-distance x-axis mode (total | per-step). Re-render from the
+  // already-loaded analysis (both curves are in the payload — no refetch).
+  (function wireSvdMode() {
+    const sel = document.getElementById("svd-mode");
+    if (sel) sel.addEventListener("change", () => {
+      svdMode = sel.value;
+      if (activeAnalysis) renderSurvivalVsDistance(activeAnalysis);
     });
   })();
 
@@ -294,6 +384,54 @@
   // Currently-selected site for the per-site histogram panel.
   let selectedSiteIdx = 1;
 
+  // Live top-row state: last-seen NumImages and the operator's "Middle
+  // frame" switch preference (persisted; default ON). applyMidVisibility()
+  // reconciles the two to show/hide the middle card and swap col widths.
+  let lastNumImages = 0;
+  let showMidFrame = (() => {
+    try { return localStorage.getItem("yb-dash-show-mid") !== "0"; }
+    catch { return true; }
+  })();
+
+  // Scan-curve colorbar autoscale switch (2-D heatmaps only): OFF pins the
+  // Survival/Loading colorbar to 0–1, ON lets it autoscale to the data range
+  // (sent as ?cbar_scale=auto to the figures endpoint). Persisted; default
+  // OFF — 0–1 is the right reference frame for survival/loading.
+  let scanAutoscale = (() => {
+    try { return localStorage.getItem("yb-dash-scan-autoscale") === "1"; }
+    catch { return false; }
+  })();
+
+  function applyMidVisibility() {
+    const cardMid  = $("card-array-mid");
+    const card1    = $("card-array1");
+    const card2    = $("card-array2");
+    const cardScan = $("card-scan-curve");
+    if (!cardMid || !card1 || !card2) return;
+    const hasMid = lastNumImages >= 3 && showMidFrame;
+    const _swapCol = (el, from, to) => {
+      if (!el) return;
+      el.classList.remove(from);
+      el.classList.add(to);
+    };
+    if (hasMid) {
+      cardMid.hidden = false;
+      _swapCol(card1,    "col-4", "col-3");
+      _swapCol(cardMid,  "col-4", "col-3");
+      _swapCol(card2,    "col-4", "col-3");
+      _swapCol(cardScan, "col-4", "col-3");
+    } else {
+      cardMid.hidden = true;
+      _swapCol(card1,    "col-3", "col-4");
+      _swapCol(card2,    "col-3", "col-4");
+      _swapCol(cardScan, "col-3", "col-4");
+    }
+    // The "Middle frame" switch is meaningless when the scan has < 3
+    // images; dim it so the operator knows it has no effect right now.
+    const midSwitch = $("show-mid-switch");
+    if (midSwitch) midSwitch.style.opacity = lastNumImages >= 3 ? "" : "0.45";
+  }
+
   async function pollLive() {
     // Status card uses /api/snapshot (small fields).
     let snap = null;
@@ -311,35 +449,12 @@
         const cur = snap.n_accum_shots || 0;
         $("scan-progress").textContent = `${cur} shots`;
       }
-      // Show/hide the middle-image card based on NumImages. The
-      // compressed top row holds {img1, [mid?], img2, scan curve}
-      // — col-4 each when 2 images (img1/img2/scan), or col-3 each
-      // when 3 (img1/mid/img2/scan).
-      const nImg = snap.num_images != null ? Number(snap.num_images) : 0;
-      const hasMid = nImg >= 3;
-      const cardMid    = $("card-array-mid");
-      const card1      = $("card-array1");
-      const card2      = $("card-array2");
-      const cardScan   = $("card-scan-curve");
-      const _swapCol = (el, from, to) => {
-        if (!el) return;
-        el.classList.remove(from);
-        el.classList.add(to);
-      };
-      if (cardMid && card1 && card2) {
-        if (hasMid) {
-          cardMid.hidden = false;
-          _swapCol(card1,   "col-4", "col-3");
-          _swapCol(cardMid, "col-4", "col-3");
-          _swapCol(card2,   "col-4", "col-3");
-          _swapCol(cardScan,"col-4", "col-3");
-        } else {
-          cardMid.hidden = true;
-          _swapCol(card1,   "col-3", "col-4");
-          _swapCol(card2,   "col-3", "col-4");
-          _swapCol(cardScan,"col-3", "col-4");
-        }
-      }
+      // Show/hide the middle-image card. It appears only when the scan
+      // produces a middle frame (NumImages >= 3) AND the operator hasn't
+      // turned it off via the "Middle frame" switch. applyMidVisibility()
+      // owns the actual DOM/col-swap so the switch handler can reuse it.
+      lastNumImages = snap.num_images != null ? Number(snap.num_images) : 0;
+      applyMidVisibility();
       // Site picker bounds + info block.
       const ns = Math.max(1, Number(snap.num_sites || 1));
       const picker = $("site-pick");
@@ -348,54 +463,96 @@
         if (Number(picker.value) > ns) picker.value = String(ns);
       }
       renderSiteInfo(snap, selectedSiteIdx);
+      renderControlSidebar(snap);
     }
-    // Mini queue: glanceable "what's running + what's next" tiles in
-    // the Live status strip. Same /api/queue source as the Queue tab,
-    // but only the bare facts.
+    // Queue preview in the Yb Control sidebar (running + next-up + recent
+    // history). Same /api/queue source as the Queue tab. Sets
+    // queueActiveRunning, which pollLiveDiag relies on below.
     try {
       const q = await api("/api/queue");
-      renderMiniQueue(q);
+      renderSidebarQueue(q);
     } catch (e) { /* keep last-known state on transient error */ }
+    // Live diag pull-poll (after the queue render: needs queueActiveRunning).
+    await pollLiveDiag(snap);
+    // Auto-shrink the top-row status values to fit their tiles (the diag
+    // readout is set inside pollLiveDiag above, so fit after it).
+    fitStatValues();
+    // Control-sidebar state (dummy mode, last seq, runner state, exposure
+    // gate) from the main process.
+    await pollControlStatus();
+    // Camera card (status + ROI + exposure) from the main process.
+    await pollCameraStatus();
     // Plots come pre-built from the server's /api/live/figures.
     await pollLiveFigures();
     // Per-site hist refreshes too (separate endpoint with site index).
     await pollSiteHist();
   }
 
-  function renderMiniQueue(q) {
+  // Compact queue preview in the Yb Control sidebar — mirrors the Tkinter
+  // queue pane (running + next-up + recent history). The full table with
+  // move/cancel lives in the Queue tab. Fed by the same /api/queue source.
+  const SIDEBAR_QUEUE_MAX = 5;     // queued rows shown
+  const SIDEBAR_HISTORY_MAX = 5;   // recent-history rows shown
+
+  function renderSidebarQueue(q) {
     if (!q) return;
     const running = q.running;
     const queued  = q.queued || [];
-    const aTile = $("mini-queue-active-tile");
-    const nTile = $("mini-queue-next-tile");
-    if (!aTile || !nTile) return;
-    // Reset state classes.
-    aTile.classList.remove("idle", "running", "loading");
-    nTile.classList.remove("empty", "has-queue");
-    if (running) {
-      const label = running.label || running.seqName || `job #${running.id}`;
-      let state = "running";
-      if ((running.state || "").toLowerCase() === "building" ||
-          (running.kind === "descriptor" && running.state !== "running")) {
-        state = "loading";
+    const history = q.history || [];
+
+    // --- Active line ---
+    const actEl = $("ctrl-queue-active");
+    const actText = $("ctrl-queue-active-text");
+    if (actEl && actText) {
+      if (running) {
+        const label = running.label || running.seqName || `job #${running.id}`;
+        let state = "running";
+        if ((running.state || "").toLowerCase() === "building" ||
+            (running.kind === "descriptor" && running.state !== "running")) {
+          state = "loading";
+        }
+        actEl.dataset.state = state;
+        actText.textContent =
+          `${state === "loading" ? "loading… " : ""}${label}`;
+        queueActiveRunning = (state === "running");
+      } else {
+        actEl.dataset.state = "idle";
+        actText.textContent = "(idle)";
+        queueActiveRunning = false;
       }
-      aTile.classList.add(state);
-      setText("mini-queue-active",
-        `${state === "loading" ? "loading… " : ""}${label}`);
-    } else {
-      aTile.classList.add("idle");
-      setText("mini-queue-active", "(idle)");
     }
-    if (!queued.length) {
-      nTile.classList.add("empty");
-      setText("mini-queue-next", "(empty)");
-    } else {
-      nTile.classList.add("has-queue");
-      const first = queued[0];
-      const firstLabel = first.label || first.seqName || `#${first.id}`;
-      const more = queued.length > 1 ? ` (+${queued.length - 1})` : "";
-      setText("mini-queue-next", `${firstLabel}${more}`);
+
+    // --- Preview list: next-up queued + recent history ---
+    const listEl = $("ctrl-queue-list");
+    if (!listEl) return;
+    const rows = [];
+    queued.slice(0, SIDEBAR_QUEUE_MAX).forEach((e) => {
+      const label = e.label || e.seqName || `#${e.id}`;
+      rows.push(
+        `<li class="q-queued"><span class="q-mark">·</span>` +
+        `<span class="q-name">${escHtml(label)}</span>` +
+        `<span class="q-status">#${e.id}</span></li>`);
+    });
+    if (queued.length > SIDEBAR_QUEUE_MAX) {
+      rows.push(`<li class="q-sep">+${queued.length - SIDEBAR_QUEUE_MAX} more queued</li>`);
     }
+    if (history.length) {
+      rows.push(`<li class="q-sep">recent</li>`);
+      history.slice(0, SIDEBAR_HISTORY_MAX).forEach((e) => {
+        const label = e.label || e.seqName || `#${e.id}`;
+        const ok = (e.status || e.state) === "ok";
+        const mark = ok ? "+" : "×";
+        const statusTxt = ok ? "ok" : (e.status || e.state || "err");
+        rows.push(
+          `<li class="q-history ${ok ? "q-ok" : "q-err"}">` +
+          `<span class="q-mark">${mark}</span>` +
+          `<span class="q-name">${escHtml(label)}</span>` +
+          `<span class="q-status">${escHtml(statusTxt)}</span></li>`);
+      });
+    }
+    listEl.innerHTML = rows.length
+      ? rows.join("")
+      : `<li class="ctrl-queue-empty">queue empty</li>`;
   }
 
   function renderSiteInfo(snap, idx1) {
@@ -412,6 +569,216 @@
       `infidelity = ${inf != null ? inf.toExponential(2) : "—"}`,
     ];
     info.innerHTML = lines.map(escHtml).join("<br>");
+  }
+
+  // --- Control sidebar (Phase 5.5 Track A) ---------------------------
+  // Timestamp of the operator's last dummy-radio click, so a status poll
+  // arriving mid-flight doesn't yank the radio back before the change has
+  // round-tripped through the main process.
+  let lastDummyUserChangeMs = 0;
+  let controlsAllowed = true;
+  // Active sequence backend ('matlab' | 'pyctrl'), published by the main
+  // process. Drives the backend-toggle highlight and blocks switching to the
+  // already-active backend.
+  let currentBackend = null;
+  // True while a job is actively running (not just building/loading). Set by
+  // renderSidebarQueue; read by pollLiveDiag (which used to read the now-
+  // removed mini-queue tile's CSS class).
+  let queueActiveRunning = false;
+  // Timestamp of the operator's last camera-field edit, so a status poll
+  // doesn't overwrite a value they're about to apply (4 s grace).
+  let camFieldsTouched = 0;
+
+  function renderControlSidebar(snap) {
+    if (!snap) return;
+    setText("ctrl-scan-id",
+            snap.scan_id != null ? String(snap.scan_id) : "—");
+    setText("ctrl-scan-file",
+            snap.scan_filename || snap.scan_name || "—");
+  }
+
+  async function pollControlStatus() {
+    let st = null;
+    try { st = await api("/api/control/status"); }
+    catch (e) { return; }   // keep last-known on transient error
+    if (!st) return;
+
+    // Remote-exposure gate: hide/disable controls when the server says so.
+    controlsAllowed = st.controls_allowed !== false;
+    const banner = $("ctrl-disabled-banner");
+    if (banner) banner.hidden = controlsAllowed;
+    document.querySelectorAll(".live-sidebar .ctrl-btn").forEach((b) => {
+      b.classList.toggle("is-disabled", !controlsAllowed);
+    });
+
+    if (st.seq_id != null) setText("ctrl-seq-id", String(st.seq_id));
+    if (st.state) setText("ctrl-runner-state", String(st.state));
+    renderRunnerStatusBanner(st.state);
+
+    // Backend toggle: highlight the active backend and disable its button
+    // (switching to the already-active backend is a no-op).
+    if (st.backend) {
+      currentBackend = st.backend;
+      const labels = {matlab: "MATLAB", pyctrl: "pyctrl"};
+      setText("ctrl-backend-active", labels[st.backend] || st.backend);
+      document.querySelectorAll(
+        ".backend-btn[data-backend-target]").forEach((b) => {
+        const isActive = b.dataset.backendTarget === st.backend;
+        b.classList.toggle("is-active", isActive);
+      });
+    }
+
+    // Dummy-mode radio sync (unless the operator just clicked one).
+    if (st.dummy_mode && Date.now() - lastDummyUserChangeMs > 4000) {
+      const r = document.querySelector(
+        `input[name="dummy-mode-ph5"][value="${st.dummy_mode}"]`);
+      if (r) r.checked = true;
+    }
+    // Last-seq label, mirroring the Tkinter window's wording.
+    const ls = st.last_seq || {};
+    const lastEl = $("ctrl-dummy-last");
+    if (lastEl) {
+      const name = ls.name || "(unnamed)";
+      const fid = ls.file_id ? ` (${ls.file_id})` : "";
+      if (st.dummy_mode === "last") {
+        lastEl.textContent = ls.available
+          ? `Replaying: ${name}${fid}`
+          : "Running default (no last seq cached)";
+      } else {
+        lastEl.textContent = ls.available ? `Cached: ${name}${fid}` : "Cached: —";
+      }
+    }
+  }
+
+  // Map a runner-status string to a data-state class. Mirrors
+  // control_panel.py's _STATUS_COLORS (Idle (last seq) → blue,
+  // Idle (last fallback) → amber, plain Idle → gray, Running → green,
+  // Paused/Pausing… → amber, Stopped → red).
+  function statusToState(s) {
+    const t = (s || "").toLowerCase();
+    if (t.includes("running")) return "running";
+    if (t.includes("paus")) return "paused";          // Paused / Pausing...
+    if (t.includes("stopped")) return "stopped";
+    if (t.includes("last seq")) return "idleblue";
+    if (t.includes("fallback")) return "idlewarn";
+    if (t.includes("idle")) return "idle";
+    return "unknown";
+  }
+
+  function renderRunnerStatusBanner(state) {
+    const banner = $("ctrl-status-banner");
+    const text = $("ctrl-status-text");
+    if (!banner || !text) return;
+    text.textContent = state || "—";
+    banner.dataset.state = statusToState(state);
+  }
+
+  // --- Camera card (Phase 5.5) — mirrors the Tkinter CameraPane --------
+  async function pollCameraStatus() {
+    let st = null;
+    try { st = await api("/api/control/camera/status"); }
+    catch (e) { return; }   // keep last-known on transient error
+    if (st) renderCameraStatus(st);
+  }
+
+  function setCamField(id, val) {
+    const el = $(id);
+    if (el && String(el.value) !== String(val)) el.value = String(val);
+  }
+
+  function renderCameraStatus(st) {
+    const box = $("cam-status");
+    const txt = $("cam-status-text");
+    if (box && txt) {
+      txt.textContent = st.status_text ||
+        (st.connected ? "Connected" : "Disconnected");
+      let state = "disconnected";
+      if (st.busy) state = "busy";
+      else if (st.connected) state = "connected";
+      else if (st.error) state = "error";
+      box.dataset.state = state;
+    }
+    const errEl = $("cam-error");
+    if (errEl) {
+      if (st.error) { errEl.textContent = st.error; errEl.hidden = false; }
+      else { errEl.textContent = ""; errEl.hidden = true; }
+    }
+    // Extended Orca telemetry (pyctrl backend only). The MATLAB backend never
+    // sends these keys, so the block stays hidden there.
+    renderCameraTelemetry(st);
+    // Sync ROI/exposure fields from the server unless the operator is
+    // editing them or edited them in the last 4 s (about to Apply).
+    if (Date.now() - camFieldsTouched < 4000) return;
+    const active = document.activeElement;
+    if (active && active.classList &&
+        active.classList.contains("cam-num")) return;
+    if (Array.isArray(st.roi) && st.roi.length === 4) {
+      setCamField("cam-roi-x", st.roi[0]);
+      setCamField("cam-roi-y", st.roi[1]);
+      setCamField("cam-roi-w", st.roi[2]);
+      setCamField("cam-roi-h", st.roi[3]);
+    }
+    if (st.exposure_time != null) setCamField("cam-exposure", st.exposure_time);
+  }
+
+  function renderCameraTelemetry(st) {
+    const box = $("cam-telemetry");
+    if (!box) return;
+    const hasTrigger = st.trigger != null && st.trigger !== "";
+    const hasCooler = st.cooler != null && st.cooler !== "";
+    const hasTemp = st.temperature != null && st.temperature !== "";
+    // Only the pyctrl backend reports these; hide the block entirely otherwise.
+    if (!hasTrigger && !hasCooler && !hasTemp) { box.hidden = true; return; }
+    box.hidden = false;
+    const trig = $("cam-trigger");
+    if (trig) trig.textContent = hasTrigger ? st.trigger : "—";
+    const cool = $("cam-cooler");
+    if (cool) {
+      let txt = hasCooler ? String(st.cooler) : "—";
+      if (st.cooler_status) txt += ` (${st.cooler_status})`;
+      cool.textContent = txt;
+    }
+    const temp = $("cam-temperature");
+    if (temp) temp.textContent = hasTemp ? `${Number(st.temperature).toFixed(1)} °C` : "—";
+  }
+
+  // --- Live diag pull-poll (Phase 5.5 Track D) -----------------------
+  // While a scan is running, incrementally pull SLM per-shot diag rows
+  // (~2 s cadence) and show a glanceable count + last seq. Stops when the
+  // scan is no longer the active job; post-scan sync writes the sidecar.
+  const liveDiag = {scanId: null, lastSeqId: null, count: 0, lastFetchMs: 0};
+
+  async function pollLiveDiag(snap) {
+    const tile = $("live-diag-tile");
+    if (!tile) return;
+    const scanId = snap && snap.scan_id != null ? String(snap.scan_id) : null;
+    const isLive = !!scanId && queueActiveRunning;
+    if (!isLive) return;     // not live: leave last readout, stop polling
+    if (scanId !== liveDiag.scanId) {     // new scan -> reset the buffer
+      liveDiag.scanId = scanId;
+      liveDiag.lastSeqId = null;
+      liveDiag.count = 0;
+    }
+    const now = Date.now();
+    if (now - liveDiag.lastFetchMs < 1800) return;   // throttle to ~2 s
+    liveDiag.lastFetchMs = now;
+    let url = `/api/runs/${scanId}/diag_live`;
+    if (liveDiag.lastSeqId != null) url += `?since_seq_id=${liveDiag.lastSeqId}`;
+    let d = null;
+    try { d = await api(url); }
+    catch (e) { return; }     // SLM offline -> retry next tick
+    if (!d) return;
+    const entries = d.entries || [];
+    if (entries.length) {
+      const seqs = entries.map((e) => e.seq_id)
+        .filter((s) => typeof s === "number");
+      if (seqs.length) liveDiag.lastSeqId = Math.max(...seqs);
+    }
+    if (d.count != null) liveDiag.count = d.count;
+    else liveDiag.count += entries.length;
+    tile.hidden = false;
+    setText("live-diag-readout",
+            `${liveDiag.count} rows · seq ${liveDiag.lastSeqId ?? "—"}`);
   }
 
   async function pollSiteHist() {
@@ -448,6 +815,102 @@
     document.body.appendChild(bar);
   }
 
+  // ---- Auto-fit dot size for the Live per-site maps ------------------
+  // The Loading-rate + Discrimination-infidelity panels are server-rendered
+  // Scattergl traces (one marker per tweezer site) on a square (scaleanchor)
+  // axis. Plotly marker sizes are in SCREEN PIXELS, so the right
+  // non-overlapping size depends on both the site pitch (data units) and
+  // the current zoom (pixels per data unit). We size each dot to ~the
+  // nearest-neighbor pitch so dots nearly touch without overlapping, and
+  // re-fit on zoom / pan / resize. This overrides the server's default
+  // marker.size for these two panels only.
+  const LIVE_AUTOSIZE_PANELS = ["plot-load-map", "plot-infid-map"];
+  const _autoSizeNN = {};   // divId -> {len, nn}  (nn = median pitch, data units)
+
+  // Median nearest-neighbor distance via a uniform spatial hash (O(n) for a
+  // lattice; the array is roughly regular). Returns null for < 2 points.
+  function _medianNearestNeighbor(xs, ys) {
+    const n = Math.min(xs.length, ys.length);
+    if (n < 2) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (xs[i] < minX) minX = xs[i];
+      if (xs[i] > maxX) maxX = xs[i];
+      if (ys[i] < minY) minY = ys[i];
+      if (ys[i] > maxY) maxY = ys[i];
+    }
+    const w = Math.max(maxX - minX, 1e-9), h = Math.max(maxY - minY, 1e-9);
+    // Cell ~ expected pitch so each cell holds ~1 site; a 3x3 neighbor
+    // sweep then finds the true nearest neighbor for a regular lattice.
+    const cell = Math.max(Math.sqrt((w * h) / n), 1e-9);
+    const buckets = new Map();
+    const ci = (v, lo) => Math.floor((v - lo) / cell);
+    const key = (cx, cy) => cx + "," + cy;
+    for (let i = 0; i < n; i++) {
+      const k = key(ci(xs[i], minX), ci(ys[i], minY));
+      let b = buckets.get(k);
+      if (!b) { b = []; buckets.set(k, b); }
+      b.push(i);
+    }
+    const dists = [];
+    for (let i = 0; i < n; i++) {
+      const gx = ci(xs[i], minX), gy = ci(ys[i], minY);
+      let best = Infinity;
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          const b = buckets.get(key(gx + ox, gy + oy));
+          if (!b) continue;
+          for (let t = 0; t < b.length; t++) {
+            const j = b[t];
+            if (j === i) continue;
+            const dx = xs[i] - xs[j], dy = ys[i] - ys[j];
+            const d2 = dx * dx + dy * dy;
+            if (d2 < best) best = d2;
+          }
+        }
+      }
+      if (best < Infinity) dists.push(Math.sqrt(best));
+    }
+    if (!dists.length) return null;
+    dists.sort((a, b) => a - b);
+    return dists[dists.length >> 1];
+  }
+
+  function autoFitDotSize(divId) {
+    const el = $(divId);
+    if (!el || !window.Plotly || !el._fullLayout || !el.data || !el.data[0]) return;
+    const tr = el.data[0];
+    if (!tr.x || !tr.x.length) return;
+    const xa = el._fullLayout.xaxis;
+    if (!xa || !xa.range || !xa._length) return;
+    const span = Math.abs(xa.range[1] - xa.range[0]);
+    if (!span) return;
+    const pxPerData = xa._length / span;
+    if (!isFinite(pxPerData)) return;
+    let st = _autoSizeNN[divId];
+    if (!st || st.len !== tr.x.length) {
+      st = { len: tr.x.length, nn: _medianNearestNeighbor(tr.x, tr.y) };
+      _autoSizeNN[divId] = st;
+    }
+    if (!st.nn) return;
+    // 0.85 leaves a hairline gap (and absorbs the 0.5px white outline).
+    let sz = st.nn * pxPerData * 0.85;
+    sz = Math.max(2, Math.min(60, sz));
+    const cur = (tr.marker && tr.marker.size) || 0;
+    if (Math.abs(cur - sz) > 0.3) {
+      try { Plotly.restyle(el, { "marker.size": sz }, [0]); } catch (e) {}
+    }
+  }
+
+  // Re-fit on zoom / pan / dblclick-reset. Restyle does NOT fire
+  // plotly_relayout, so there's no feedback loop. Wired once per panel.
+  function wireLiveMapAutoFit(divId) {
+    const el = $(divId);
+    if (!el || el._autofitWired) return;
+    el._autofitWired = true;
+    el.on("plotly_relayout", () => autoFitDotSize(divId));
+  }
+
   async function pollLiveFigures() {
     // Set "waiting..." placeholders FIRST so we have visible state
     // regardless of whether Plotly loaded. Old code did this AFTER the
@@ -466,7 +929,12 @@
       return;
     }
     let resp = null;
-    try { resp = await api("/api/live/figures"); }
+    // Autoscale switch (scan card) rides on the batch fetch: the /api/live/
+    // figures endpoint reads cbar_scale and applies it to the scan figure.
+    const figUrl = scanAutoscale
+      ? "/api/live/figures?cbar_scale=auto"
+      : "/api/live/figures";
+    try { resp = await api(figUrl); }
     catch (e) {
       console.warn("figures fetch failed", e);
       LIVE_FIG_PANELS.forEach(([name, divId]) => {
@@ -499,6 +967,13 @@
         Plotly.react(el, f.data, f.layout || {}, {
           displayModeBar: false, responsive: true,
         });
+        // Loading-rate + infidelity site maps: size dots to the tweezer
+        // pitch so they nearly touch without overlapping, and keep them
+        // correctly sized on zoom/pan (rAF lets Plotly finish layout first).
+        if (name === "load" || name === "infid") {
+          wireLiveMapAutoFit(divId);
+          requestAnimationFrame(() => autoFitDotSize(divId));
+        }
       } catch (err) {
         console.error("plot render failed for", name, err);
         el.innerHTML =
@@ -1435,23 +1910,36 @@
       renderRunsTable();
       populateDateFilter();
       setText("runs-count", String(runsCache.length));
-      // Auto-pick a run for first paint: prefer the localStorage-remembered
-      // selection (so a page refresh holds steady), fall back to the most
-      // recent complete run. Only fires if no run is currently selected.
-      if (!selectedScanId) {
-        const remembered = (() => {
-          try { return localStorage.getItem("yb_dashboard_selected_scan"); }
-          catch { return null; }
-        })();
+      // Auto-pick a run for first paint. Only fires if no run is currently
+      // selected. Priority:
+      //   1. A saved MULTI-run tray -> restore every chip + re-run the
+      //      group analysis (so a refresh holds the whole selection, not
+      //      one of them).
+      //   2. The localStorage-remembered single selection.
+      //   3. The most recent complete run.
+      if (!selectedScanId && traySet.size === 0) {
         const exists = (sid) => runsCache.some((r) => r.scan_id === sid);
-        let pick = remembered && exists(remembered) ? remembered : null;
-        if (!pick && runsCache.length) {
-          // List is newest-first.
-          pick = runsCache[0].scan_id;
-        }
-        if (pick) {
-          trayReplace(pick);
-          loadAnalysis(pick);
+        const savedTray = savedTrayAtLoad.filter(exists);
+        if (savedTray.length > 1) {
+          traySet.clear();
+          savedTray.forEach((s) => traySet.add(s));
+          renderTray();
+          analyzeTrayGroup();
+        } else {
+          const remembered = (() => {
+            try { return localStorage.getItem("yb_dashboard_selected_scan"); }
+            catch { return null; }
+          })();
+          let pick = savedTray[0]
+            || (remembered && exists(remembered) ? remembered : null);
+          if (!pick && runsCache.length) {
+            // List is newest-first.
+            pick = runsCache[0].scan_id;
+          }
+          if (pick) {
+            trayReplace(pick);
+            loadAnalysis(pick);
+          }
         }
       }
     } catch (e) {
@@ -1541,7 +2029,10 @@
   }
   $("runs-search").addEventListener("input", renderRunsTable);
   $("runs-date-filter").addEventListener("change", renderRunsTable);
-  $("runs-refresh").addEventListener("click", loadRunsList);
+  $("runs-refresh").addEventListener("click", () => {
+    loadRunsList();
+    toast("Runs refreshed", "warn");
+  });
 
   // Click-to-copy on scan_id tiles (Analysis tab + anywhere else
   // the .scan-id-copy class is dropped). Delegated so it picks up
@@ -1585,6 +2076,17 @@
   let activeAnalysis = null;       // last loaded analysis result
   let activeFilters  = {};         // {axis_name: [allowed values]}
   let perIterToggles = {};         // {metric_key: bool} -- legend on/off
+  let perIterDiagKey = "";         // diag column overlaid on the right axis ("" = none)
+  // Rearrangement scatter axis picks (persisted), keys into the scatter
+  // variable list: "loaded_frac" | "survival_frac" | "fp_frac" | "diag:<col>".
+  const scatterAxes = (() => {
+    try { return JSON.parse(localStorage.getItem("yb_scatter_axes")) || {}; }
+    catch (e) { return {}; }
+  })();
+  function saveScatterAxes() {
+    try { localStorage.setItem("yb_scatter_axes", JSON.stringify(scatterAxes)); }
+    catch (e) {}
+  }
 
   // Plotly.purge throws "DOM element provided is null or undefined" if
   // its arg is null, which rejects the whole async loadAnalysis promise
@@ -1623,16 +2125,22 @@
     // Persist so refresh keeps you on the same scan.
     try { localStorage.setItem("yb_dashboard_selected_scan", scanId || ""); }
     catch { /* private mode */ }
-    if (!opts.keepFilters) activeFilters = {};
+    if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; }
     const body = $("analysis-detail-body");
     body.innerHTML = '<div class="hint">loading…</div>';
-    ["plot-analysis-scan", "plot-site-loading", "plot-site-survival",
-     "plot-site-fp", "plot-per-iter", "plot-per-iter-hist"].forEach(safePurge);
+    ["plot-analysis-scan", "plot-analysis-scan-lines", "plot-site-loading",
+     "plot-site-survival", "plot-site-fp", "plot-site-infid",
+     "plot-site-inthist", "plot-per-iter", "plot-per-iter-hist",
+     "plot-svd", "plot-avg-image", "plot-rearrange-scatter"].forEach(safePurge);
     try {
       let url = `/api/runs/${scanId}/analysis`;
+      const qs = [];
       if (Object.keys(activeFilters).length) {
-        url += '?filter=' + encodeURIComponent(JSON.stringify(activeFilters));
+        qs.push('filter=' + encodeURIComponent(JSON.stringify(activeFilters)));
       }
+      if (recomputeInfid) qs.push('recompute_infidelity=1');
+      if (opts.forceRecache) qs.push('force_recache=1');
+      if (qs.length) url += '?' + qs.join('&');
       const r = await api(url);
       if (!r || typeof r !== "object") {
         throw new Error("server returned non-object response");
@@ -1641,8 +2149,11 @@
       renderAnalysisDetail(r);
       renderAnalysisFilters(r);
       renderPerSiteMaps(r);
+      renderSurvivalVsDistance(r);
       renderPerIteration(r);
       renderSeqSpecific(r);
+      renderAvgImage(r);
+      renderRearrangeScatter(r);
       // Status: analyzed · N shots (green). Falls back to n_params if
       // n_shots is missing (e.g. 0d aggregate scan).
       const ns = (typeof r.n_shots === "number" && r.n_shots > 0)
@@ -1671,6 +2182,90 @@
     }
   }
 
+  // Survival-vs-transit-distance panel (Phase 5.5 Track B). Hidden unless
+  // run_analysis emitted a curve; shows a badge if the lab couldn't match
+  // target coords to its own lattice ('lattice_mismatch').
+  function renderSurvivalVsDistance(r) {
+    const card = $("analysis-svd-card");
+    if (!card) return;
+    const root = r && r.survival_vs_distance;
+    const reason = r && r.survival_vs_distance_skipped_reason;
+    if (!root && !reason) { card.hidden = true; return; }
+    card.hidden = false;
+    // Total (top-level) vs per-step (root.per_step). Default total. Falls
+    // back to total when per-step isn't available (diag had no nsteps).
+    const perStepAvail = !!(root && root.per_step);
+    const modeSel = $("svd-mode");
+    if (modeSel) {
+      const ps = modeSel.querySelector('option[value="per_step"]');
+      if (ps) {
+        ps.disabled = !perStepAvail;
+        ps.text = perStepAvail ? "per-step" : "per-step (n/a)";
+      }
+      if (svdMode === "per_step" && !perStepAvail) modeSel.value = "total";
+      else modeSel.value = svdMode;
+    }
+    const usePerStep = svdMode === "per_step" && perStepAvail;
+    const svd = usePerStep ? root.per_step : root;
+    const distKind = usePerStep ? "per-step distance" : "transit distance";
+    const info = $("svd-info");
+    const el = $("plot-svd");
+    if (reason) {
+      if (el) {
+        safePurge("plot-svd");
+        el.innerHTML =
+          '<div class="hint" style="padding:24px;text-align:center;">' +
+          'not computable — ' + escHtml(reason) + '</div>';
+      }
+      if (info) info.textContent = reason;
+      return;
+    }
+    const centers = svd.centers || [];
+    const mean = svd.survival_mean || [];
+    const sem = svd.survival_sem || [];
+    const counts = svd.n_pairs_per_bin || [];
+    // Drop empty bins so the line connects only populated points.
+    const X = [], Y = [], E = [], C = [];
+    for (let i = 0; i < centers.length; i++) {
+      if (mean[i] == null) continue;
+      X.push(centers[i]); Y.push(mean[i]);
+      E.push(sem[i] || 0); C.push(counts[i] || 0);
+    }
+    if (info) {
+      const units = svd.distance_units || "px";
+      // Pair counts live on the root (total) payload.
+      info.textContent =
+        `${root.n_total_pairs} pairs · ${root.n_unmatched} unmatched · ${units}`;
+    }
+    if (!window.Plotly || !el) return;
+    if (!X.length) {
+      safePurge("plot-svd");
+      el.innerHTML =
+        '<div class="hint" style="padding:24px;text-align:center;">no pairs</div>';
+      return;
+    }
+    const trace = {
+      x: X, y: Y, type: "scatter", mode: "lines+markers",
+      marker: {size: 7, color: "#58a6ff"},
+      line: {color: "#58a6ff"},
+      error_y: {type: "data", array: E, visible: true, color: "#58a6ff"},
+      hovertext: C.map((n, i) => `n=${n}`),
+      hoverinfo: "x+y+text",
+      name: "survival",
+    };
+    const units = svd.distance_units === "camera_pixels" ? "camera px"
+      : svd.distance_units === "knm_pixels" ? "knm px" : "distance";
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+      font: {color: "#c9d1d9", size: 11},
+      margin: {l: 48, r: 12, t: 8, b: 42},
+      xaxis: {title: `${distKind} (${units})`, gridcolor: "#1a1a30"},
+      yaxis: {title: "survival", range: [0, 1.02], gridcolor: "#1a1a30"},
+      showlegend: false,
+    };
+    Plotly.react(el, [trace], layout, {displayModeBar: false, responsive: true});
+  }
+
   function renderAnalysisDetail(r) {
     const body = $("analysis-detail-body");
     const sweep = r.sweep || {};
@@ -1683,9 +2278,26 @@
     // from paths_per_shot), the "survival" curve is actually the TP
     // (target-aware) survival, not per-site survival. Surface that
     // distinction in labels + extra TP/FP stat tiles.
-    const ta = r.target_aware || null;
-    const targetAware = !!(summary.survival_source
+    // Headline tiles read the GLOBAL (filter-independent) block so the
+    // top bar never moves when a filter is applied (operator request).
+    const sg = r.summary_global || summary || {};
+    const ta = r.target_aware_global || r.target_aware || null;
+    const targetAware = !!(sg.survival_source
                             || (ta && ta.overall_mean != null));
+    const disc = r.discrimination || null;
+    const imf = r.imaging_fidelity || null;   // only set when recompute pressed
+    // 1-image (loading-only) scans have no img2 → no survival. Show
+    // loading as the headline and turn the discrimination map on by
+    // default (the "is this data trash?" check).
+    // 1-image (loading-only) scans have no img2 → survival is all-NaN.
+    // (Don't key off avg_image — it's now present for every scan.)
+    const oneImg = !hasFinite(sg.survival_mean);
+    const sweepG = r.sweep_all || sweep || {};
+    const nDims = sweepG.n_dims != null ? sweepG.n_dims
+                  : (sweepG.dims || []).filter((d) => d > 1).length;
+    const nPts = r.n_params_global != null ? r.n_params_global : r.n_params;
+    const dateStr = scanIdToDate(r.scan_id);
+    const ti = r.thresholds_info || null;
     // Surface unpack errors prominently so empty charts have a reason.
     let warnHtml = "";
     if (r.unpack_error) {
@@ -1720,7 +2332,54 @@
             </div>` : ""}
         </div>`;
     }
+    // Survival/TP headline tile — only for 2-image scans (1-image has
+    // no img2). Source badge marks lab-computed vs SLM-cache.
+    const survTile = oneImg ? "" : `
+        <div class="stat-tile">
+          <span class="stat-label">${targetAware ? "TP (target)" : "survival"}${
+            targetAware && sg.survival_source
+              ? ` <span class="src-badge src-${
+                  sg.survival_source.startsWith("lab") ? "lab" : "slm"
+                }">${sg.survival_source.startsWith("lab") ? "lab" : "SLM cache"}</span>`
+              : ""
+          }</span>
+          <span class="stat-value" title="whole-scan (filter-independent)">${
+            targetAware && ta && ta.overall_mean != null
+              ? fmtPct(ta.overall_mean)
+              : fmtPct(avg(sg.survival_mean))
+          }</span>
+        </div>`;
+    // Discrimination infidelity — shown for ANY scan (data-quality signal).
+    // Use the MEDIAN site (robust: the mean is dragged up by a few junk/edge
+    // sites whose double-Gaussian fit is meaningless). Lower = better.
+    const discVal = disc
+      ? (disc.median_infidelity != null ? disc.median_infidelity : disc.mean_infidelity)
+      : null;
+    const discFromRun = !!(disc && disc.source === "recomputed_from_run");
+    const discSrc = discFromRun ? "this run" : "scan-start";
+    const calAge = ti && ti.calibration_age_human ? ti.calibration_age_human : null;
+    // Only color-code (green/red) when it's the RUN's actual value. For the
+    // stored scan-start calibration, stay NEUTRAL — it may be stale and must
+    // not falsely read as "great" (operator request).
+    const discColor = discFromRun ? infidColor(discVal) : "var(--text-dim)";
+    const discTitle = discFromRun
+      ? `median per-site infidelity from THIS run's data. Lower is better. mean=${fmtInfid(disc.mean_infidelity)}, max=${fmtInfid(disc.max_infidelity)}.`
+      : `STORED scan-start calibration infidelity${calAge ? ` — calibrated ${calAge} before this run` : ""}. MAY BE STALE: the run's actual value can differ — click "recompute from this run". mean=${fmtInfid(disc.mean_infidelity)}.`;
+    const discTile = disc ? `
+        <div class="stat-tile" title="${discTitle}">
+          <span class="stat-label">infidelity&darr; <span class="src-badge src-${discFromRun ? "lab" : "slm"}">${discSrc}</span></span>
+          <span class="stat-value" style="color:${discColor}">${fmtInfid(discVal)}${
+            discFromRun ? "" : ` <span class="muted" style="font-size:10px;">cal${calAge ? " · " + escHtml(calAge) : ""}</span>`
+          }</span>
+        </div>` : "";
+    const params = r.run_parameters || [];
     body.innerHTML = warnHtml + `
+      <div class="run-head">
+        <span class="run-name" title="${escHtml(r.scan_filename || "")}">${escHtml(r.scan_name || "(unnamed scan)")}</span>
+        ${dateStr ? `<span class="run-date mono">${dateStr}</span>` : ""}
+      </div>
+      ${r.scan_description ? `<div class="run-desc">${escHtml(r.scan_description)}</div>` : ""}
+      <div class="run-head-body">
       <div class="stat-grid">
         <div class="stat-tile">
           <span class="stat-label">scan_id</span>
@@ -1729,35 +2388,24 @@
                 title="Click to copy">${r.scan_id}</span>
         </div>
         <div class="stat-tile">
-          <span class="stat-label">params</span>
-          <span class="stat-value">${r.n_params}</span>
+          <span class="stat-label">sweep</span>
+          <span class="stat-value" title="${escHtml((sweepG.cols || []).join(', '))}">${nDims}D · ${nPts} pts</span>
         </div>
         <div class="stat-tile">
           <span class="stat-label">shots</span>
-          <span class="stat-value">${r.n_shots}</span>
-        </div>
-        <div class="stat-tile">
-          <span class="stat-label">${targetAware ? "TP (target)" : "survival"}${
-            targetAware && summary.survival_source
-              ? ` <span class="src-badge src-${
-                  summary.survival_source.startsWith("lab") ? "lab" : "slm"
-                }">${
-                  summary.survival_source.startsWith("lab")
-                    ? "lab"
-                    : "SLM cache"
-                }</span>`
-              : ""
-          }</span>
-          <span class="stat-value" title="${targetAware ? "eligibility-weighted across all shots in the current filter" : "arithmetic mean over scan points"}">${
-            targetAware && ta && ta.overall_mean != null
-              ? fmtPct(ta.overall_mean)
-              : fmtPct(avg(summary.survival_mean))
+          <span class="stat-value" title="actual recorded shots${
+            r.n_shots_scheduled != null ? ` · scheduled ${r.n_shots_scheduled}` : ""
+          }">${r.n_shots}${
+            r.n_shots_scheduled != null && r.n_shots_scheduled !== r.n_shots
+              ? ` <span class="muted" style="font-size:11px;">/ ${r.n_shots_scheduled}</span>` : ""
           }</span>
         </div>
+        ${survTile}
         <div class="stat-tile">
           <span class="stat-label">loading</span>
-          <span class="stat-value">${fmtPct(avg(summary.loading_rate))}</span>
+          <span class="stat-value">${fmtPct(avg(sg.loading_rate))}</span>
         </div>
+        ${discTile}
         ${targetAware && ta && ta.fp_overall != null ? `
         <div class="stat-tile">
           <span class="stat-label">FP</span>
@@ -1773,20 +2421,96 @@
           <span class="stat-value">${diag.aborted_count}</span>
         </div>` : ""}
       </div>
-      <div style="margin-top:12px;font-size:12px;color:var(--text-dim);">
-        sweep cols: <span class="mono">${(sweep.cols || []).join(", ") || "(none)"}</span>
-        · code snapshot: <span class="${code.present ? "ok" : "muted"}">${code.present ? code.n_files + " files" : "none"}</span>
-        · grid sidecar: <span class="${grid.present ? "ok" : "muted"}">${grid.present ? grid.n_sites + " sites" : "none"}</span>
+      <div class="run-meta">
+        <div>swept: <span class="mono">${(sweepG.cols || []).join(", ") || "(none)"}</span></div>
+        ${ti ? `<div title="${escHtml(ti.source_note || "")}">thresholds: <span class="mono">${ti.source || "?"}</span>${
+          (ti.patterns && ti.patterns.length) ? ` · pattern${ti.patterns.length === 1 ? "" : "s"}: <span class="mono">${escHtml(ti.patterns.join(", "))}</span>` : ""
+        } · mean ${fmtNum(ti.mean, 1)} (${ti.n} sites)${
+          ti.mean_infidelity != null ? ` · mean infid <span class="muted">${fmtInfid(ti.mean_infidelity)} (cal)</span>` : ""
+        }${
+          ti.calibration_age_human ? ` · <span style="color:${(ti.calibration_age_s || 0) > 86400 ? "#d29922" : "var(--text-dim)"}" title="calibration source: ${escHtml(ti.calibration_source || "")}${ti.calibration_age_basis === "file_mtime" ? " (from file mtime — approximate)" : ""}">calibrated ${escHtml(ti.calibration_age_human)} before run${ti.calibration_age_basis === "file_mtime" ? "~" : ""}</span>` : ""
+        }</div>` : ""}
+        <div>
+          code snapshot: <span class="${code.present ? "ok" : "muted"}">${code.present ? code.n_files + " files" : "none"}</span>
+          · grid sidecar: <span class="${grid.present ? "ok" : "muted"}">${grid.present ? grid.n_sites + " sites" : "none"}</span>
+          ${disc ? `· discrimination: <span class="src-badge src-${discFromRun ? "lab" : "slm"}">${discSrc}</span>
+            <button class="ghost" id="recompute-infid"
+                title="Refit per-site discrimination from THIS run's intensities (also computes imaging fidelity at the used thresholds). Non-destructive; cached after the first run; default uses the scan-start calibration.">${
+              discFromRun ? "✓ using this run (click for scan-start)" : "recompute from this run"
+            }</button>` : ""}
+          · <button class="ghost" id="reanalyze-btn"
+              title="Clear this run's cached analysis (double-Gaussian fits, focus metrics) and recompute from scratch.">↻ re-analyze</button>
+        </div>
+        ${imf ? `<div title="Discrimination fidelity at the ACTUALLY-USED thresholds (initThresholds), measured on THIS run's intensities — i.e. how trustworthy the bitstrings/logicals the run actually produced were. 1 − infidelity at the used cut, averaged over sites.">
+          imaging fidelity (used thresholds, this run):
+          <span style="color:${infidColor(1 - (imf.mean_fidelity || 0))};font-weight:600;">${fmtPct(imf.mean_fidelity)}</span>
+          mean · ${fmtPct(imf.median_fidelity)} median
+          <span class="muted">(${imf.n_sites} sites)</span>
+        </div>` : ""}
       </div>
+      </div>
+      ${params.length ? `
+      <details class="calib-details run-params-details">
+        <summary>Details — ${params.length} parameter${params.length === 1 ? "" : "s"} set this run
+          <span class="hint">(swept params highlighted)</span>
+        </summary>
+        <table class="run-params-table mono">
+          ${params.map((p) => {
+            const swept = p.group === "swept";
+            return `<tr class="${swept ? "rp-swept" : ""}">
+            <td class="rp-name">${escHtml(p.name)}</td>
+            <td class="rp-val">${escHtml(Array.isArray(p.value)
+              ? "[" + p.value.join(", ") + "]"
+              : typeof p.value === "object"
+                ? JSON.stringify(p.value) : String(p.value))}</td>
+            <td class="rp-grp">${escHtml(swept ? "swept" : p.group)}</td></tr>`;
+          }).join("")}
+        </table>
+      </details>` : ""}
     `;
+    // Recompute-from-this-run toggle (non-destructive; re-fetches analysis
+    // with recompute_infidelity so the discrimination metric reflects the
+    // run's own data instead of the scan-start calibration).
+    const recompBtn = document.getElementById("recompute-infid");
+    if (recompBtn) recompBtn.addEventListener("click", () => {
+      recomputeInfid = !recomputeInfid;
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+    });
+    // Re-analyze: invalidate the on-disk analysis cache + recompute.
+    const reanBtn = document.getElementById("reanalyze-btn");
+    if (reanBtn) reanBtn.addEventListener("click", () => {
+      if (selectedScanId)
+        loadAnalysis(selectedScanId, {keepFilters: true, forceRecache: true});
+    });
     // The dedicated Survival / Loading cards were replaced by the
     // per-site maps + per-iteration chart further down the tab. Only
     // the sweep visualization needs to render here.
     plotAnalysisScanCurve(r);
   }
 
+  // Sanitize an error array to plain finite numbers (Plotly error_y needs
+  // numbers; nulls/NaN → 0 = "no bar at this point").
+  function _cleanErr(arr) {
+    if (!Array.isArray(arr)) return null;
+    return arr.map((v) => (v == null || !isFinite(v)) ? 0 : v);
+  }
+  // Pick the per-param error array for the chosen metric + signal.
+  //   sem_pershot (default) | std_pershot | sem_site | none
+  function _errArray(summary, isSurv, mode) {
+    if (mode === "none") return null;
+    if (mode === "std_pershot")
+      return _cleanErr(summary[isSurv ? "survival_std_pershot" : "loading_std_pershot"]);
+    if (mode === "sem_site")
+      return _cleanErr(summary[isSurv ? "survival_sem" : "loading_rate_sem"]);
+    return _cleanErr(summary[isSurv ? "survival_sem_pershot" : "loading_sem_pershot"]);
+  }
+  const _errLabel = (m) => ({sem_pershot: "SEM (per-shot)",
+    std_pershot: "STD (per-shot)", sem_site: "SEM (per-site)",
+    none: "no errors"})[m] || m;
+
   function plotAnalysisScanCurve(r) {
     const el = $("plot-analysis-scan");
+    const elLines = $("plot-analysis-scan-lines");
     if (!el || !window.Plotly) return;
     const sweep = r.sweep || {};
     const summary = r.summary || {};
@@ -1794,34 +2518,46 @@
     const cols = sweep.cols || [];
     const sm = summary.survival_mean || [];
     const lr = summary.loading_rate  || [];
-    const useY = sm.length ? sm : lr;
-    const useE = sm.length ? (summary.survival_sem || [])
-                           : (summary.loading_rate_sem || []);
-    // Phase 5a: relabel as "TP" (target-aware) when the survival
-    // curve was overridden by the SLM cache / lab paths join.
+    // 1-image (loading-only) scans show LOADING as the main signal; all
+    // others default to survival/TP (already TP-overridden in summary).
+    const oneImg = !hasFinite(sm);
+    const isSurv = !oneImg && sm.length > 0;
+    const useY = isSurv ? sm : lr;
+    const useE = _errArray(summary, isSurv, sweepPrefs.errMode);
     const targetAware = !!summary.survival_source;
-    const yLabel = sm.length
+    const yLabel = isSurv
         ? (targetAware ? "TP (target survival)" : "survival")
         : "loading rate";
-    // Inset margins so plots breathe inside their card without
-    // touching the borders (user asked for side padding).
     const baseMargin = {l: 70, r: 50, t: 14, b: 56};
-    // 0d (no swept axis): aggregate line + annotation.
-    if (dims.length === 0 || (dims.length === 1 && dims[0] === 1)) {
+    const nDimsReal = dims.filter((d) => d > 1).length;
+
+    // Controls bar: show error dropdown for everything; 2D block only
+    // for 2D sweeps.
+    const ctrls = $("sweep-controls");
+    if (ctrls) {
+      ctrls.hidden = false;
+      const only2d = ctrls.querySelector(".only-2d");
+      if (only2d) only2d.style.display = (nDimsReal >= 2) ? "" : "none";
+    }
+    // Lines container only used for 2D "both"/"lines".
+    const showLines = (nDimsReal >= 2)
+      && (sweepPrefs.view === "both" || sweepPrefs.view === "lines");
+    const showHeat = (nDimsReal < 2)
+      || (sweepPrefs.view === "both" || sweepPrefs.view === "heatmap");
+    if (elLines) elLines.hidden = !showLines;
+    el.hidden = (nDimsReal >= 2 && !showHeat);
+
+    // ---- 0D (single point) ----
+    if (nDimsReal === 0) {
       const yMean = useY.length ? useY[0] : null;
-      const yErr  = useE.length ? useE[0] : null;
+      const yErr  = useE && useE.length ? useE[0] : null;
       Plotly.react(el, [{
-        x: [0, r.n_shots || 1],
-        y: [yMean, yMean],
-        mode: "lines",
-        line: {color: "#58a6ff", width: 2, dash: "dash"},
-        name: yLabel,
+        x: [0, r.n_shots || 1], y: [yMean, yMean], mode: "lines",
+        line: {color: "#58a6ff", width: 2, dash: "dash"}, name: yLabel,
       }], plotLayoutFlush({
         margin: baseMargin,
-        xaxis: { title: { text: "shot # (0d, single point)" },
-                 tickformat: ".0f" },
-        yaxis: { title: { text: yLabel }, range: [-0.05, 1.05],
-                 tickformat: ".2f" },
+        xaxis: { title: { text: "shot # (0d, single point)" }, tickformat: ".0f" },
+        yaxis: { title: { text: yLabel }, range: [-0.05, 1.05], tickformat: ".2f" },
         annotations: [{
           text: `${yLabel} = ${fmtNum(yMean, 3)}${yErr != null ? " ± " + fmtNum(yErr, 3) : ""}`,
           xref: "paper", yref: "paper", x: 0.5, y: 0.5,
@@ -1829,59 +2565,213 @@
           bgcolor: "rgba(20,20,40,0.7)",
         }],
       }), plotConfig());
-      setText("analysis-scan-info",
-        `0d · ${r.n_shots || 0} shots aggregated`);
+      setText("analysis-scan-info", `0d · ${r.n_shots || 0} shots · ${_errLabel(sweepPrefs.errMode)}`);
       return;
     }
-    // 1d: scatter with errors against the swept-param values.
-    if (dims.length === 1) {
-      const xs = (sweep.values && sweep.values[0]) || useY.map((_, i) => i + 1);
-      const xLabel = cols[0] || "scan param";
+
+    // ---- 1D ----
+    if (nDimsReal === 1) {
+      // The single real axis may not be axis 0 (e.g. a 2-axis scan
+      // filtered to one value on the other axis). Find it.
+      const axisIdx = Math.max(0, dims.findIndex((d) => d > 1));
+      const xs = (sweep.values && sweep.values[axisIdx]) || useY.map((_, i) => i + 1);
+      const xLabel = cols[axisIdx] || "scan param";
       Plotly.react(el, [{
         x: xs, y: useY,
-        error_y: useE.length ? {type: "data", array: useE, visible: true,
-                                color: "#1f6feb"} : undefined,
+        error_y: useE ? {type: "data", array: useE, visible: true, color: "#1f6feb"} : undefined,
         mode: "markers+lines",
-        marker: {size: 8, color: "#58a6ff"},
-        line:   {color: "#1f6feb", width: 2},
+        marker: {size: 8, color: "#58a6ff"}, line: {color: "#1f6feb", width: 2},
         hovertemplate: `${xLabel}=%{x:.4g}<br>${yLabel}=%{y:.3f}<extra></extra>`,
       }], plotLayoutFlush({
         margin: baseMargin,
         xaxis: { title: { text: xLabel } },
-        yaxis: { title: { text: yLabel }, range: [-0.05, 1.05],
-                 tickformat: ".2f" },
+        yaxis: { title: { text: yLabel }, range: [-0.05, 1.05], tickformat: ".2f" },
       }), plotConfig());
       setText("analysis-scan-info",
-        `1d · ${xLabel} · ${dims[0]} pts`);
+        `1d · ${xLabel} · ${dims[axisIdx]} pts · ${_errLabel(sweepPrefs.errMode)}`);
+      _wireSweepZoomFilter(el, r, [{prefix: "xaxis", col: axisIdx}]);
       return;
     }
-    // 2d: heatmap on (dim0, dim1) grid.
-    if (dims.length >= 2) {
-      const xVals = (sweep.values || [[]])[0] || [];
-      const yVals = (sweep.values || [[],[]])[1] || [];
-      const n = dims[0] * dims[1];
+
+    // ---- 2D (or higher; >2 reduced via the Filter card) ----
+    // Identify the first two real (size>1) axes.
+    const realAxes = dims.map((d, i) => [d, i]).filter(([d]) => d > 1).map(([, i]) => i);
+    if (realAxes.length > 2) {
+      Plotly.purge(el);
+      if (elLines) { Plotly.purge(elLines); elLines.hidden = true; }
+      el.hidden = false;
+      el.innerHTML = `<div class="hint" style="padding:32px;text-align:center;">
+        ${realAxes.length}D sweep (${realAxes.map((i) => cols[i]).join(" × ")}).<br>
+        Pin extra axes to a single value in the <b>Filter</b> card to reduce to a 2-D view.</div>`;
+      setText("analysis-scan-info", `${realAxes.length}d · use the Filter card to reduce`);
+      return;
+    }
+    let ax0 = realAxes[0], ax1 = realAxes[1];
+    if (sweepPrefs.axisSwap) { const t = ax0; ax0 = ax1; ax1 = t; }
+    const xVals = (sweep.values || [])[ax0] || [];
+    const yVals = (sweep.values || [])[ax1] || [];
+    const nx = xVals.length, ny = yVals.length;
+    const xLabel = cols[ax0] || "x", yLabel2 = cols[ax1] || "y";
+    // useY is flattened in column-major over the original axes; map by
+    // (i over ax0, j over ax1) -> original linear index.
+    const dim0orig = dims[realAxes[0]];
+    const swap = sweepPrefs.axisSwap;
+    const valAt = (ix, jy) => {
+      // ix indexes the displayed-x axis (ax0), jy the displayed-y (ax1).
+      const i0 = swap ? jy : ix;   // index along original realAxes[0]
+      const i1 = swap ? ix : jy;   // index along original realAxes[1]
+      const lin = i1 * dim0orig + i0;   // column-major over (axis0, axis1)
+      return useY[lin] ?? null;
+    };
+
+    if (showHeat) {
       const z = [];
-      for (let j = 0; j < dims[1]; j++) {
+      for (let jy = 0; jy < ny; jy++) {
         const row = [];
-        for (let i = 0; i < dims[0]; i++) {
-          row.push(useY[j * dims[0] + i] ?? null);
-        }
+        for (let ix = 0; ix < nx; ix++) row.push(valAt(ix, jy));
         z.push(row);
       }
-      Plotly.react(el, [{
-        z, x: xVals, y: yVals,
-        type: "heatmap", colorscale: "Viridis", zmin: 0, zmax: 1,
+      // Square cells = categorical equal spacing; default = numeric
+      // coords (cells sized by the separation between sweep values).
+      const sq = sweepPrefs.square;
+      const trace = {
+        z, type: "heatmap", colorscale: "Viridis", zmin: 0, zmax: 1,
         colorbar: {title: {text: yLabel}, len: 0.9, tickformat: ".2f"},
-      }], plotLayoutFlush({
+        x: sq ? xVals.map((v) => Number(v).toPrecision(4)) : xVals,
+        y: sq ? yVals.map((v) => Number(v).toPrecision(4)) : yVals,
+      };
+      Plotly.react(el, [trace], plotLayoutFlush({
         margin: baseMargin,
-        xaxis: { title: { text: cols[0] || "x" } },
-        yaxis: { title: { text: cols[1] || "y" } },
+        xaxis: { title: { text: xLabel }, type: sq ? "category" : undefined },
+        yaxis: { title: { text: yLabel2 }, type: sq ? "category" : undefined },
       }), plotConfig());
-      setText("analysis-scan-info",
-        `2d · ${cols.slice(0, 2).join(" × ")} · ${dims[0]}×${dims[1]} = ${n} pts`);
-      return;
+      // Box-zoom filters in both numeric (value range) and square
+      // (category-index range) modes.
+      _wireSweepZoomFilter(el, r, sq
+        ? [{prefix: "xaxis", col: ax0, cats: xVals},
+           {prefix: "yaxis", col: ax1, cats: yVals}]
+        : [{prefix: "xaxis", col: ax0}, {prefix: "yaxis", col: ax1}]);
     }
+
+    if (showLines && elLines) {
+      // One trace per displayed-y value; X = displayed-x axis.
+      const traces = [];
+      for (let jy = 0; jy < ny; jy++) {
+        const yy = [];
+        for (let ix = 0; ix < nx; ix++) yy.push(valAt(ix, jy));
+        traces.push({
+          x: xVals, y: yy, mode: "markers+lines",
+          name: `${yLabel2}=${Number(yVals[jy]).toPrecision(4)}`,
+          marker: {size: 6}, line: {width: 1.5},
+          hovertemplate: `${xLabel}=%{x:.4g}<br>${yLabel}=%{y:.3f}<extra>${yLabel2}=${Number(yVals[jy]).toPrecision(4)}</extra>`,
+        });
+      }
+      Plotly.react(elLines, traces, plotLayoutFlush({
+        margin: {l: 70, r: 16, t: 14, b: 56},
+        xaxis: { title: { text: xLabel } },
+        yaxis: { title: { text: yLabel }, range: [-0.05, 1.05], tickformat: ".2f" },
+        showlegend: true, legend: {font: {size: 9}},
+      }), plotConfig());
+      _wireSweepZoomFilter(elLines, r, [{prefix: "xaxis", col: ax0}]);
+    }
+    setText("analysis-scan-info",
+      `2d · ${xLabel} × ${yLabel2} · ${nx}×${ny}${sweepPrefs.square ? " · square" : ""}`);
   }
+
+  // Zoom-to-filter: box-zoom on a sweep plot maps the visible range of each
+  // mapped axis to the swept values inside it and commits them to the same
+  // activeFilters the chip UI uses. Double-click (autorange) clears those
+  // axes. `specs` is a list of {prefix:'xaxis'|'yaxis', col:<sweep col idx>,
+  // cats?:<displayed numeric values>}. When `cats` is set the axis is
+  // CATEGORICAL (square-cells heatmap) and the relayout range is in index
+  // space; otherwise it's numeric data space.
+  function _wireSweepZoomFilter(el, r, specs) {
+    if (!el || !el.on) return;
+    const sweepAll = r.sweep_all || r.sweep || {};
+    try { el.removeAllListeners && el.removeAllListeners("plotly_relayout"); }
+    catch { /* not a plotly gd yet */ }
+    el.on("plotly_relayout", (ev) => {
+      if (!ev) return;
+      const updates = {};   // axisName -> array | null (clear)
+      for (const spec of specs) {
+        const name = (sweepAll.cols || [])[spec.col];
+        if (!name) continue;
+        const pfx = spec.prefix;
+        if (ev[pfx + ".autorange"]) { updates[name] = null; continue; }
+        // Range comes as indexed keys OR a single array (varies by
+        // interaction / trace type — heatmaps often use the array form).
+        let r0 = ev[pfx + ".range[0]"], r1 = ev[pfx + ".range[1]"];
+        const ra = ev[pfx + ".range"];
+        if ((r0 == null || r1 == null) && Array.isArray(ra) && ra.length === 2) {
+          r0 = ra[0]; r1 = ra[1];
+        }
+        if (r0 == null || r1 == null) continue;
+        const lo = Math.min(Number(r0), Number(r1));
+        const hi = Math.max(Number(r0), Number(r1));
+        let sel;
+        if (spec.cats) {
+          // Categorical axis: range is in category-index space.
+          const cats = spec.cats;
+          const i0 = Math.max(0, Math.ceil(lo));
+          const i1 = Math.min(cats.length - 1, Math.floor(hi));
+          sel = [];
+          for (let i = i0; i <= i1; i++) sel.push(Number(cats[i]));
+          if (sel.length && sel.length < cats.length) updates[name] = sel;
+        } else {
+          const allVals = (sweepAll.values || [])[spec.col] || [];
+          sel = allVals.filter((v) => Number(v) >= lo && Number(v) <= hi);
+          if (sel.length && sel.length < allVals.length)
+            updates[name] = sel.map(Number);
+        }
+      }
+      if (!Object.keys(updates).length) return;
+      let changed = false;
+      for (const [name, sel] of Object.entries(updates)) {
+        if (sel == null) {
+          if (activeFilters[name]) { delete activeFilters[name]; changed = true; }
+        } else {
+          const prev = activeFilters[name] || [];
+          if (prev.length !== sel.length
+              || sel.some((v, i) => Number(v) !== Number(prev[i]))) {
+            activeFilters[name] = sel.map(Number);
+            changed = true;
+          }
+        }
+      }
+      if (changed && selectedScanId)
+        loadAnalysis(selectedScanId, {keepFilters: true});
+    });
+  }
+
+  // Wire the sweep-control bar (error metric + 2D view / swap / square).
+  // State lives in sweepPrefs (persisted); each change just re-renders
+  // the current analysis (no refetch needed — all data is already local).
+  (function wireSweepControls() {
+    const elErr = $("sweep-err"), elView = $("sweep-view"),
+          elSwap = $("sweep-swap"), elSq = $("sweep-square");
+    const rerender = () => { if (activeAnalysis) plotAnalysisScanCurve(activeAnalysis); };
+    if (elErr) {
+      elErr.value = sweepPrefs.errMode;
+      elErr.addEventListener("change", () => {
+        sweepPrefs.errMode = elErr.value; saveSweepPrefs(); rerender();
+      });
+    }
+    if (elView) {
+      elView.value = sweepPrefs.view;
+      elView.addEventListener("change", () => {
+        sweepPrefs.view = elView.value; saveSweepPrefs(); rerender();
+      });
+    }
+    if (elSwap) elSwap.addEventListener("click", () => {
+      sweepPrefs.axisSwap = !sweepPrefs.axisSwap; saveSweepPrefs(); rerender();
+    });
+    if (elSq) {
+      elSq.checked = !!sweepPrefs.square;
+      elSq.addEventListener("change", () => {
+        sweepPrefs.square = elSq.checked; saveSweepPrefs(); rerender();
+      });
+    }
+  })();
 
   // =====================================================================
   // FILTER PANEL — one chip-row per swept-param axis. Clicking a chip
@@ -2084,13 +2974,96 @@
     shotIdx: 0,       // index into payload.shot_indices
   };
 
+  function _siteCard(cardId) {
+    return document.querySelector(`[data-card-id="${cardId}"]`);
+  }
+
+  // Pooled camera-intensity histogram (data-quality), with the median
+  // detection threshold(s) marked: scan-start always, plus this-run when
+  // discrimination was recomputed (so both cuts are visible). The infidelity
+  // metric itself is threshold-independent (optimal-cut); these are
+  // reference lines for the empty/atom split.
+  function plotIntensityHist(r) {
+    const card = $("analysis-site-inthist-card");
+    const el = $("plot-site-inthist");
+    const ih = r && r.intensity_hist;
+    if (!card || !el) return;
+    if (!ih || !Array.isArray(ih.counts) || !ih.counts.length) {
+      card.hidden = true;
+      if (el) Plotly.purge(el);
+      return;
+    }
+    card.hidden = false;
+    if (!window.Plotly) return;
+    const trace = {
+      x: ih.bin_centers, y: ih.counts, type: "bar",
+      marker: {color: "#58a6ff"}, hoverinfo: "x+y", name: "intensity",
+    };
+    const markers = ih.threshold_markers || [];
+    const shapes = markers.map((m) => ({
+      type: "line", x0: m.value, x1: m.value, yref: "paper", y0: 0, y1: 1,
+      line: {color: m.source === "recomputed_from_run" ? "#4cc762" : "#f0883e",
+             width: 1.5, dash: "dash"},
+    }));
+    const annos = markers.map((m, i) => ({
+      x: m.value, yref: "paper", y: 1 - i * 0.07, text: m.label,
+      showarrow: false, font: {size: 9,
+        color: m.source === "recomputed_from_run" ? "#4cc762" : "#f0883e"},
+      xanchor: "left", bgcolor: "rgba(20,20,40,0.6)",
+    }));
+    Plotly.react(el, [trace], plotLayoutFlush({
+      margin: {l: 48, r: 14, t: 10, b: 40},
+      xaxis: {title: {text: "camera intensity"}},
+      yaxis: {title: {text: "count"}, type: "linear"},
+      shapes, annotations: annos, bargap: 0.02, showlegend: false,
+    }), plotConfig());
+    const srcTxt = markers.length
+      ? markers.map((m) => `${m.label.split(" ")[0]} ${fmtNum(m.value, 0)}`).join(" · ")
+      : "";
+    setText("site-inthist-info",
+      `${(ih.n_samples || 0).toLocaleString()} samples${srcTxt ? " · thr " + srcTxt : ""}`);
+  }
+
   function renderPerSiteMaps(r) {
     const ps = r.per_site;
+    const infidCard = $("analysis-site-infid-card");
     if (!ps) {
-      ["plot-site-loading", "plot-site-survival", "plot-site-fp"].forEach((id) => {
+      ["plot-site-loading", "plot-site-survival", "plot-site-fp",
+       "plot-site-infid", "plot-site-inthist"].forEach((id) => {
         const el = $(id);
         if (el) Plotly.purge(el);
       });
+      if (infidCard) infidCard.hidden = true;
+      const ihc = $("analysis-site-inthist-card");
+      if (ihc) ihc.hidden = true;
+      setupPathsOverlay(null);
+      return;
+    }
+    // 1-image (loading-only) scans have no img2 → survival / FP are empty.
+    // Hide those two cards and lead with loading + discrimination.
+    const oneImg = !hasFinite(ps.survival_mean);
+    const survCard = _siteCard("analysis-site-survival");
+    const fpCard   = _siteCard("analysis-site-fp");
+    if (survCard) survCard.hidden = oneImg;
+    if (fpCard)   fpCard.hidden   = oneImg;
+    // Per-site discrimination-infidelity map (data-quality) — always shown.
+    const haveInfid = Array.isArray(ps.infidelity) && ps.infidelity.length > 0;
+    if (infidCard) infidCard.hidden = !haveInfid;
+    if (haveInfid) {
+      plotSiteMap("plot-site-infid", "site-infid-info",
+        ps.x, ps.y, ps.infidelity, "Magma", "infidelity", {mode: "infid"});
+    } else {
+      const ie = $("plot-site-infid");
+      if (ie) Plotly.purge(ie);
+    }
+    // Avg camera-intensity histogram (pooled over sites) next to it.
+    plotIntensityHist(r);
+    if (oneImg) {
+      ["plot-site-survival", "plot-site-fp"].forEach((id) => {
+        const el = $(id); if (el) Plotly.purge(el);
+      });
+      plotSiteMap("plot-site-loading", "site-loading-info",
+        ps.x, ps.y, ps.loading_rate, "Cividis", "loading", {});
       setupPathsOverlay(null);
       return;
     }
@@ -2206,6 +3179,291 @@
     apply();
   })();
 
+  // Live-tab image-row switches: Downsample (img1) + Middle frame (img2).
+  (function wireLiveImageSwitches() {
+    // Downsample toggle -> POST to the server, which writes the
+    // browser->main reverse-channel control file; the main process reads
+    // it when encoding the next live frame. Default ON (full-sensor
+    // frames are ~12 MB of base64 and choke the browser).
+    const ds = document.getElementById("downsample-live");
+    if (ds) {
+      ds.addEventListener("change", async () => {
+        try {
+          await api("/api/control/downsample", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({on: ds.checked}),
+          });
+        } catch (e) {
+          console.warn("downsample toggle failed", e);
+          toast("Downsample toggle failed: " + (e.message || e), "bad");
+          ds.checked = !ds.checked;   // revert on failure
+        }
+      });
+    }
+
+    // Middle-frame toggle -> pure client-side show/hide (persisted).
+    const mid = document.getElementById("show-mid-live");
+    if (mid) {
+      mid.checked = showMidFrame;
+      mid.addEventListener("change", () => {
+        showMidFrame = mid.checked;
+        try { localStorage.setItem("yb-dash-show-mid", showMidFrame ? "1" : "0"); }
+        catch {}
+        applyMidVisibility();
+      });
+    }
+
+    // Scan-curve colorbar autoscale toggle -> client-side (changes the query
+    // param the next figures fetch sends); re-poll immediately so the scan
+    // plot reflects the change without waiting for the next tick.
+    const auto = document.getElementById("scan-autoscale-live");
+    if (auto) {
+      auto.checked = scanAutoscale;
+      auto.addEventListener("change", () => {
+        scanAutoscale = auto.checked;
+        try { localStorage.setItem("yb-dash-scan-autoscale", scanAutoscale ? "1" : "0"); }
+        catch {}
+        pollLiveFigures();
+      });
+    }
+  })();
+
+  // Control sidebar buttons (Phase 5.5 Track A). Mirrors control_panel.py.
+  (function wireControlSidebar() {
+    const sidebar = document.querySelector(".live-sidebar");
+    if (!sidebar) return;
+    const JSON_HDR = {"Content-Type": "application/json"};
+    // Single knob for every hold-to-confirm button (Restart All + the
+    // MATLAB/pyctrl backend switches). Change this one value to retune the
+    // hold duration for all of them at once.
+    const HOLD_MS = 1000;
+
+    async function postControl(path, body) {
+      if (!controlsAllowed) {
+        toast("Remote controls disabled on this interface", "bad");
+        return null;
+      }
+      const opts = {method: "POST"};
+      if (body !== undefined) {
+        opts.headers = JSON_HDR;
+        opts.body = JSON.stringify(body);
+      }
+      return api(path, opts);
+    }
+
+    // --- single-click actions ---
+    const SIMPLE = {
+      start: "/api/control/start",
+      pause: "/api/control/pause",
+      "restart-dash": "/api/control/restart_dash",
+    };
+    Object.entries(SIMPLE).forEach(([kind, path]) => {
+      const btn = sidebar.querySelector(`.ctrl-btn[data-kind="${kind}"]`);
+      if (!btn) return;
+      btn.addEventListener("click", async () => {
+        try { await postControl(path); toast(btn.textContent.trim() + " sent"); }
+        catch (e) { toast(e.message || "control failed", "bad"); }
+      });
+    });
+
+    // --- Abort: immediate single click (no hold-to-confirm — aborting a
+    //     scan isn't destructive and should be instantly available). Still
+    //     fetches the one-shot confirm token the server requires before
+    //     POSTing /api/control/abort. ---
+    const abortBtn = sidebar.querySelector('.ctrl-btn[data-kind="abort"]');
+    if (abortBtn) {
+      abortBtn.addEventListener("click", async () => {
+        if (!controlsAllowed) {
+          toast("Remote controls disabled on this interface", "bad");
+          return;
+        }
+        try {
+          const tok = await api("/api/control/confirm_token?action=abort");
+          await api(`/api/control/abort?confirm=${encodeURIComponent(tok.token)}`,
+                    {method: "POST"});
+          toast("Abort sent");
+        } catch (e) {
+          toast(e.message || "abort failed", "bad");
+        }
+      });
+    }
+
+    // --- init folder ---
+    const initBtn = sidebar.querySelector('.ctrl-btn[data-kind="init-folder"]');
+    const initInput = document.getElementById("ctrl-init-path");
+    if (initBtn && initInput) {
+      initBtn.addEventListener("click", async () => {
+        const path = initInput.value.trim();
+        if (!path) { toast("Enter a folder path first", "bad"); return; }
+        try {
+          await postControl("/api/control/init_dir", {path});
+          toast("Init folder load requested");
+        } catch (e) { toast(e.message || "init load failed", "bad"); }
+      });
+    }
+
+    // --- dummy-mode radios ---
+    sidebar.querySelectorAll('input[name="dummy-mode-ph5"]').forEach((r) => {
+      r.addEventListener("change", async () => {
+        if (!r.checked) return;
+        lastDummyUserChangeMs = Date.now();
+        try { await postControl("/api/control/dummy_mode", {mode: r.value}); }
+        catch (e) { toast(e.message || "dummy mode failed", "bad"); }
+      });
+    });
+
+    // --- hold-to-confirm destructive ops (Restart All + backend switch,
+    //     all HOLD_MS). Abort is handled above as an immediate single
+    //     click. ---
+    sidebar.querySelectorAll(".ctrl-hold").forEach((btn) => {
+      const bar = btn.querySelector(".hold-bar");
+      const holdMs = HOLD_MS;
+      const action = btn.dataset.confirmAction;
+      let raf = null, downAt = 0, firing = false;
+
+      const reset = () => {
+        if (raf) cancelAnimationFrame(raf);
+        raf = null; downAt = 0;
+        if (bar) {
+          bar.style.transition = "transform 200ms ease-out";
+          bar.style.transform = "scaleX(0)";
+        }
+      };
+      const fire = async () => {
+        if (firing) return;
+        firing = true;
+        if (raf) cancelAnimationFrame(raf);
+        raf = null;
+        if (!controlsAllowed) {
+          toast("Remote controls disabled on this interface", "bad");
+          firing = false; reset(); return;
+        }
+        // Backend switch to the already-active backend is a no-op.
+        const target = btn.dataset.backendTarget;
+        if (action === "set_backend" && target && target === currentBackend) {
+          toast(`${target} already active`);
+          firing = false; reset(); return;
+        }
+        try {
+          const tok = await api(
+            `/api/control/confirm_token?action=${action}`);
+          let path, label;
+          if (action === "abort") {
+            path = "/api/control/abort";
+            label = "Abort";
+          } else if (action === "set_backend") {
+            path = `/api/control/set_backend?target=${encodeURIComponent(target)}`;
+            label = `Switch to ${target}`;
+          } else {
+            path = "/api/control/restart_all";
+            label = "Restart All";
+          }
+          const sep = path.includes("?") ? "&" : "?";
+          await api(`${path}${sep}confirm=${encodeURIComponent(tok.token)}`,
+                    {method: "POST"});
+          toast(label + " sent");
+        } catch (e) {
+          toast(e.message || "action failed", "bad");
+        } finally {
+          firing = false; reset();
+        }
+      };
+      const tick = () => {
+        const frac = Math.min(1, (performance.now() - downAt) / holdMs);
+        if (bar) {
+          bar.style.transition = "none";
+          bar.style.transform = `scaleX(${frac})`;
+        }
+        if (frac >= 1) { fire(); return; }
+        raf = requestAnimationFrame(tick);
+      };
+      const begin = (e) => {
+        if (firing || downAt) return;
+        if (e && e.preventDefault) e.preventDefault();
+        downAt = performance.now();
+        raf = requestAnimationFrame(tick);
+      };
+      const cancel = () => { if (!firing) reset(); };
+
+      btn.addEventListener("pointerdown", begin);
+      btn.addEventListener("pointerup", cancel);
+      btn.addEventListener("pointerleave", cancel);
+      btn.addEventListener("keydown", (e) => {
+        if (e.key === " " || e.key === "Enter") begin(e);
+      });
+      btn.addEventListener("keyup", (e) => {
+        if (e.key === " " || e.key === "Enter") cancel();
+      });
+    });
+  })();
+
+  // Camera controls (Phase 5.5) — mirror of the Tkinter CameraPane's
+  // Connect / Disconnect / Apply buttons. ROI/exposure are POSTed to the
+  // server, which spools them to the main process (it owns the ZMQ client
+  // + expConfig.m persistence). Gated by the same controlsAllowed policy.
+  (function wireCameraControls() {
+    const sidebar = document.querySelector(".live-sidebar");
+    if (!sidebar) return;
+
+    function readCamFields() {
+      const num = (id) => {
+        const v = parseFloat($(id).value);
+        return Number.isFinite(v) ? v : null;
+      };
+      return {
+        roi: [num("cam-roi-x"), num("cam-roi-y"),
+              num("cam-roi-w"), num("cam-roi-h")],
+        exposure: num("cam-exposure"),
+      };
+    }
+
+    // Mark fields touched so the status poll doesn't clobber a pending edit.
+    sidebar.querySelectorAll(".cam-num").forEach((el) => {
+      el.addEventListener("input", () => { camFieldsTouched = Date.now(); });
+    });
+
+    sidebar.querySelectorAll("[data-cam]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (!controlsAllowed) {
+          toast("Remote controls disabled on this interface", "bad");
+          return;
+        }
+        const action = btn.dataset.cam;
+        try {
+          if (action === "disconnect") {
+            await api("/api/control/camera/disconnect", {method: "POST"});
+            toast("Camera disconnect sent");
+            return;
+          }
+          const {roi, exposure} = readCamFields();
+          if (roi.some((v) => v == null)) {
+            toast("Bad ROI values", "bad"); return;
+          }
+          if (exposure == null || !(exposure > 0)) {
+            toast("Bad exposure value", "bad"); return;
+          }
+          const path = action === "connect"
+            ? "/api/control/camera/connect" : "/api/control/camera/apply";
+          await api(path, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({roi, exposure}),
+          });
+          toast(action === "connect"
+            ? "Camera connect sent" : "Camera settings applied");
+        } catch (e) {
+          toast(e.message || "camera command failed", "bad");
+        }
+      });
+    });
+  })();
+
+  // "full ›" link (and any other data-goto-tab element): jump to a tab.
+  document.querySelectorAll("[data-goto-tab]").forEach((el) => {
+    el.addEventListener("click", () => setTab(el.dataset.gotoTab));
+  });
+
   (function wirePathsOverlayHandlers() {
     const toggle = document.getElementById("paths-overlay-toggle");
     const sel    = document.getElementById("paths-overlay-shot");
@@ -2265,11 +3523,14 @@
         xIn.push(x[k]); yIn.push(y[k]); vIn.push(values[k]); iIn.push(k);
       }
     }
+    const infid = !!(opts && opts.mode === "infid");
     const finite = vIn.filter((v) => v != null && isFinite(v));
     const vmin = 0;
     const vmax = 1;
     const mean = finite.length ? finite.reduce((a, b) => a + b, 0) / finite.length : null;
-    let infoTxt = mean != null ? `mean ${fmtNum(mean, 3)}` : "";
+    let infoTxt = mean != null
+      ? (infid ? `mean ${fmtInfid(mean)}` : `mean ${fmtNum(mean, 3)}`)
+      : "";
     if (mask && mask.length === n) {
       infoTxt += ` · ${xIn.length}/${n} ${maskLabel || "marked"}`;
     }
@@ -2299,17 +3560,36 @@
         name: "non-marked",
       });
     }
-    traces.push({
-      x: xIn, y: yIn, type: "scattergl", mode: "markers",
-      marker: {
-        size: siteDotSize, color: vIn, colorscale,
-        cmin: vmin, cmax: vmax,
-        line: {width: 0},
-        colorbar: {title: {text: label}, len: 0.9, tickformat: ".2f"},
-      },
-      hovertemplate: "site %{pointNumber}: %{marker.color:.3f}<extra></extra>",
-      name: maskLabel || label,
-    });
+    if (infid) {
+      // Log-scale infidelity (matches the live view _fig_infid): color by
+      // log10 of the clipped infidelity, Magma_r, range [-4, -0.3];
+      // raw value shown via customdata in scientific notation.
+      const logv = vIn.map((v) => Math.log10(
+        Math.min(1, Math.max(1e-6, (v == null || !isFinite(v)) ? 1e-6 : v))));
+      traces.push({
+        x: xIn, y: yIn, type: "scattergl", mode: "markers",
+        customdata: vIn,
+        marker: {
+          size: siteDotSize, color: logv, colorscale: "Magma",
+          reversescale: true, cmin: -4, cmax: -0.3, line: {width: 0},
+          colorbar: {title: {text: "log10 infid"}, len: 0.9},
+        },
+        hovertemplate: "site %{pointNumber}: %{customdata:.2e}<extra></extra>",
+        name: label,
+      });
+    } else {
+      traces.push({
+        x: xIn, y: yIn, type: "scattergl", mode: "markers",
+        marker: {
+          size: siteDotSize, color: vIn, colorscale,
+          cmin: vmin, cmax: vmax,
+          line: {width: 0},
+          colorbar: {title: {text: label}, len: 0.9, tickformat: ".2f"},
+        },
+        hovertemplate: "site %{pointNumber}: %{marker.color:.3f}<extra></extra>",
+        name: maskLabel || label,
+      });
+    }
     // Phase 5a: paths overlay — NaN-separated polyline drawn on top
     // of the markers. Light cyan with low opacity so the underlying
     // colormap stays legible.
@@ -2381,7 +3661,8 @@
     siteSizeInput.addEventListener("input", () => {
       siteDotSize = Number(siteSizeInput.value);
       if (!window.Plotly) return;
-      ["plot-site-loading", "plot-site-survival", "plot-site-fp"]
+      ["plot-site-loading", "plot-site-survival", "plot-site-fp",
+       "plot-site-infid"]
         .forEach((id) => {
           const el = $(id);
           if (el && el.data) {
@@ -2417,13 +3698,23 @@
     fp_frac:        "#f85149",
   };
 
+  // Context for the shot-image popup: the current per-iteration payload,
+  // its scan_id, and frames-per-shot. Set on every per-iteration render so
+  // the plotly_click handler can map a clicked point to its camera frames.
+  let perIterCtx = null;
+
   function renderPerIteration(r) {
     const pi = r.per_iteration;
+    perIterCtx = pi && pi.shot_index
+      ? {pi, scanId: r.scan_id, numImages: pi.num_images || 1}
+      : null;
     const toggleWrap = $("per-iter-toggles");
     if (!pi || !pi.shot_index || !pi.shot_index.length) {
       toggleWrap.innerHTML = '<span class="muted">no per-shot data</span>';
       Plotly.purge($("plot-per-iter"));
       setText("per-iter-info", "");
+      const dw = $("per-iter-diag-wrap");
+      if (dw) dw.style.display = "none";
       return;
     }
     // Available metrics.
@@ -2465,7 +3756,34 @@
         renderPerIterHist(pi, metrics);
       });
     });
-    setText("per-iter-info", `${pi.shot_index.length} shots`);
+    // Rearrangement-only: dropdown to overlay a numeric diag column on the
+    // right axis (its own units). Populated from pi.diag_series.
+    const diagSel = $("per-iter-diag-select");
+    const diagWrap = $("per-iter-diag-wrap");
+    const diagSeries = pi.diag_series || {};
+    const diagKeys = Object.keys(diagSeries);
+    if (diagSel && diagWrap) {
+      if (diagKeys.length) {
+        diagWrap.style.display = "";
+        diagSel.innerHTML = '<option value="">none</option>' +
+          diagKeys.map((k) => {
+            const d = diagSeries[k];
+            const u = d.unit ? ` (${d.unit})` : "";
+            return `<option value="${escHtml(k)}">${escHtml(d.label || k)}${u}</option>`;
+          }).join("");
+        if (!(perIterDiagKey in diagSeries)) perIterDiagKey = "";
+        diagSel.value = perIterDiagKey;
+        diagSel.onchange = () => {
+          perIterDiagKey = diagSel.value;
+          renderPerIterPlot(pi, metrics);
+        };
+      } else {
+        diagWrap.style.display = "none";
+        perIterDiagKey = "";
+      }
+    }
+    setText("per-iter-info",
+            `${pi.shot_index.length} shots · click a point to view its image`);
     renderPerIterPlot(pi, metrics);
     renderPerIterHist(pi, metrics);
   }
@@ -2537,20 +3855,40 @@
         connectgaps: false,
       });
     });
+    // Rearrangement diag overlay (right axis, its own units). Added on top
+    // of whatever fraction/param traces are toggled on.
+    let rightUnit = null;
+    const diagSeries = pi.diag_series || {};
+    if (perIterDiagKey && diagSeries[perIterDiagKey]) {
+      const d = diagSeries[perIterDiagKey];
+      needsRightAxis = true;
+      rightUnit = d.unit || "";
+      traces.push({
+        x: x, y: d.values || [], name: d.label || perIterDiagKey,
+        type: "scattergl", mode: "lines+markers",
+        line: {width: 1.2, color: "#ffdd44", dash: "dot"},
+        marker: {size: 4, color: "#ffdd44"},
+        yaxis: "y2", connectgaps: false,
+      });
+    }
     if (!traces.length) {
       Plotly.purge(el);
       el.innerHTML =
         '<div class="hint" style="padding:24px;text-align:center;">enable a metric to plot</div>';
       return;
     }
-    // Find the swept-param NAME (if any toggled-on metric is a param)
-    // so the right Y axis can be labeled with the actual parameter.
+    // Right Y axis label: the diag overlay's label+unit takes precedence
+    // (it's the explicit pick); else the toggled-on swept-param name.
     let rightLabel = "sweep value";
     metrics.forEach((m) => {
       if (perIterToggles[m.key] && m.key.startsWith("param:")) {
         rightLabel = m.paramName || rightLabel;
       }
     });
+    if (perIterDiagKey && diagSeries[perIterDiagKey]) {
+      const d = diagSeries[perIterDiagKey];
+      rightLabel = (d.label || perIterDiagKey) + (rightUnit ? ` (${rightUnit})` : "");
+    }
     // Generous right margin so the right-Y axis label has room AND
     // wide-format frequency ticks (e.g. "1.057×10^8") aren't clipped.
     const layout = plotLayoutFlush({
@@ -2577,7 +3915,244 @@
       };
     }
     Plotly.react(el, traces, layout, plotConfig());
+    // Click a point -> open the shot-image popup. Rebind each render
+    // (removeAllListeners avoids stacking duplicate handlers across
+    // re-renders / metric toggles). p.x is the shot_index value;
+    // p.pointNumber indexes the per-iteration arrays for param lookups.
+    if (el.removeAllListeners) el.removeAllListeners("plotly_click");
+    if (el.on) {
+      el.on("plotly_click", (data) => {
+        if (!data || !data.points || !data.points.length) return;
+        const p = data.points[0];
+        openShotModal(p.pointNumber, p.x);
+      });
+    }
+    el.style.cursor = "pointer";
   }
+
+  // =====================================================================
+  // REARRANGEMENT SCATTER (protocol-specific) — scatter ANY two per-shot
+  // quantities (loading / TP / FP / numeric diag). Reads the SAME
+  // per_iteration arrays as the per-iteration plot, so it's filter-aware
+  // for free (they're already sliced by the active sweep filter). Points
+  // are colored by shot # so temporal drift is visible. Rearrangement only.
+  // =====================================================================
+  function scatterVarList(pi) {
+    const vars = [];
+    if (pi.loaded_frac)   vars.push({key: "loaded_frac",   label: "loading",                     unit: "", frac: true});
+    if (pi.survival_frac) vars.push({key: "survival_frac", label: pi.survival_label || "survival", unit: "", frac: true});
+    if (pi.fp_frac)       vars.push({key: "fp_frac",       label: "FP rate",                     unit: "", frac: true});
+    const ds = pi.diag_series || {};
+    Object.keys(ds).forEach((k) => vars.push({
+      key: "diag:" + k, label: ds[k].label || k, unit: ds[k].unit || "", frac: false}));
+    return vars;
+  }
+  function scatterArr(pi, key) {
+    if (key && key.indexOf("diag:") === 0) {
+      const d = (pi.diag_series || {})[key.slice(5)];
+      return d ? (d.values || []) : [];
+    }
+    return pi[key] || [];
+  }
+  function renderRearrangeScatter(r) {
+    const card = $("analysis-rearrange-scatter-card");
+    const el = $("plot-rearrange-scatter");
+    const xs = $("scatter-x");
+    const ys = $("scatter-y");
+    if (!card || !el || !xs || !ys) return;
+    const pi = r && r.per_iteration;
+    const isRearrange = pi && pi.shot_index && pi.shot_index.length
+      && (r.paths_n_shots_with_pairing || 0) > 0;
+    if (!isRearrange) {
+      card.hidden = true;
+      if (window.Plotly) Plotly.purge(el);
+      return;
+    }
+    const vars = scatterVarList(pi);
+    if (vars.length < 2) { card.hidden = true; return; }
+    card.hidden = false;
+    const byKey = {};
+    vars.forEach((v) => { byKey[v.key] = v; });
+    const opts = vars.map((v) =>
+      `<option value="${escHtml(v.key)}">${escHtml(v.label)}${v.unit ? ` (${v.unit})` : ""}</option>`).join("");
+    let xk = scatterAxes.x, yk = scatterAxes.y;
+    if (!byKey[xk]) xk = vars[0].key;
+    if (!byKey[yk]) yk = (vars[1] || vars[0]).key;
+    xs.innerHTML = opts; ys.innerHTML = opts;
+    xs.value = xk; ys.value = yk;
+
+    const grid = {gridcolor: "#2a3242", zerolinecolor: "#2a3242"};
+    const draw = () => {
+      if (!window.Plotly) return;
+      const vx = byKey[xs.value] || vars[0];
+      const vy = byKey[ys.value] || vars[0];
+      const ax = scatterArr(pi, xs.value);
+      const ay = scatterArr(pi, ys.value);
+      const si = pi.shot_index || [];
+      const X = [], Y = [], C = [];
+      const n = Math.min(ax.length, ay.length);
+      for (let i = 0; i < n; i++) {
+        const a = ax[i], b = ay[i];
+        if (a == null || b == null || !isFinite(a) || !isFinite(b)) continue;
+        X.push(a); Y.push(b); C.push(si[i] != null ? si[i] : i);
+      }
+      setText("scatter-info", `${X.length} shots`);
+      Plotly.react(el, [{
+        x: X, y: Y, mode: "markers", type: "scattergl",
+        marker: {size: 6, color: C, colorscale: "Viridis", showscale: true,
+                 colorbar: {title: {text: "shot #", side: "right"},
+                            thickness: 12, len: 0.9}},
+        hovertemplate: `${escHtml(vx.label)}: %{x}<br>${escHtml(vy.label)}: %{y}`
+                       + `<br>shot %{marker.color}<extra></extra>`,
+      }], plotLayoutFlush({
+        margin: {l: 78, r: 20, t: 14, b: 60},
+        xaxis: Object.assign({title: {text: vx.label + (vx.unit ? ` (${vx.unit})` : "")}},
+                             grid, vx.frac ? {tickformat: ".0%"} : {}),
+        yaxis: Object.assign({title: {text: vy.label + (vy.unit ? ` (${vy.unit})` : "")}},
+                             grid, vy.frac ? {tickformat: ".0%"} : {}),
+        showlegend: false,
+      }), plotConfig());
+    };
+    xs.onchange = () => { scatterAxes.x = xs.value; saveScatterAxes(); draw(); };
+    ys.onchange = () => { scatterAxes.y = ys.value; saveScatterAxes(); draw(); };
+    draw();
+  }
+
+  // ---- Shot-image popup (click a per-iteration point) ----------------
+  function openShotModal(pointIdx, shotNum) {
+    const ctx = perIterCtx;
+    if (!ctx || !ctx.pi) return;
+    const pi = ctx.pi;
+    let shot = shotNum;
+    if (shot == null && Array.isArray(pi.shot_index)) {
+      shot = pi.shot_index[pointIdx];
+    }
+    if (shot == null) return;
+    const numImages = ctx.numImages || 1;
+    const scanId = ctx.scanId;
+
+    setText("shot-modal-title", `Shot ${shot}`);
+
+    // Subtitle line 1: sweep param values for this shot. Line 2: metrics.
+    const pv = pi.param_values || {};
+    const paramBits = Object.keys(pv)
+      .map((name) => {
+        const v = (pv[name] || [])[pointIdx];
+        return v != null ? `${name} = ${fmtNum(v)}` : null;
+      })
+      .filter(Boolean);
+    const metricBits = [];
+    if (pi.loaded_frac && pi.loaded_frac[pointIdx] != null) {
+      metricBits.push(`loaded ${fmtPct(pi.loaded_frac[pointIdx])}`);
+    }
+    if (pi.survival_frac && pi.survival_frac[pointIdx] != null) {
+      metricBits.push(
+        `${pi.survival_label || "survival"} ${fmtPct(pi.survival_frac[pointIdx])}`);
+    }
+    if (pi.fp_frac && pi.fp_frac[pointIdx] != null) {
+      metricBits.push(`FP ${fmtPct(pi.fp_frac[pointIdx])}`);
+    }
+    $("shot-modal-sub").innerHTML =
+      [paramBits.join("  ·  "), metricBits.join("  ·  ")]
+        .filter(Boolean).map(escHtml).join("<br>");
+
+    // Body: one camera frame per NumImages. Each frame is a Plotly figure
+    // (PNG as a layout image + scaleanchor axes) so it zooms/pans exactly
+    // like the live-view array images — drag a box to zoom, scroll to zoom,
+    // double-click to reset.
+    const frameLabel = (j) => {
+      if (numImages === 1) return "image";
+      if (j === 0) return "img 1 (initial)";
+      if (j === numImages - 1) return "img 2 (final)";
+      return `img ${j + 1}`;
+    };
+    const body = $("shot-modal-body");
+    body.innerHTML = "";
+    body.classList.toggle("multi", numImages > 1);
+    for (let j = 0; j < numImages; j++) {
+      const src = `/api/runs/${encodeURIComponent(scanId)}/shot_image`
+        + `?shot=${shot}&frame=${j}&num_images=${numImages}`;
+      const fig = document.createElement("figure");
+      fig.className = "shot-frame";
+      const plot = document.createElement("div");
+      plot.className = "shot-frame-plot";
+      const cap = document.createElement("figcaption");
+      cap.textContent = frameLabel(j);
+      fig.appendChild(plot);
+      fig.appendChild(cap);
+      body.appendChild(fig);
+      renderShotFramePlot(plot, src, `shot ${shot} ${frameLabel(j)}`);
+    }
+    $("shot-modal").hidden = false;
+  }
+
+  // Render one shot frame into `container` as a zoomable Plotly image,
+  // mirroring _fig_array's layout-image + scaleanchor approach. Falls back
+  // to a plain <img> if Plotly didn't load.
+  function renderShotFramePlot(container, src, altText) {
+    if (!window.Plotly) {
+      container.innerHTML =
+        `<img src="${src}" alt="${escHtml(altText)}" class="shot-frame-img" ` +
+        `onerror="this.replaceWith(document.createTextNode('frame unavailable'));">`;
+      return;
+    }
+    // Preload to learn the pixel dims, then size the axes to the image so
+    // aspect ratio is locked (scaleanchor) and zoom maps to real pixels.
+    const probe = new Image();
+    probe.onload = () => {
+      const W = probe.naturalWidth || 1;
+      const H = probe.naturalHeight || 1;
+      const layout = {
+        paper_bgcolor: "#0d1220", plot_bgcolor: "#000",
+        margin: {l: 0, r: 0, t: 0, b: 0},
+        xaxis: {visible: false, range: [0, W], showgrid: false,
+                zeroline: false, constrain: "domain"},
+        yaxis: {visible: false, range: [H, 0], scaleanchor: "x",
+                scaleratio: 1, showgrid: false, zeroline: false,
+                constrain: "domain"},
+        images: [{source: src, xref: "x", yref: "y", x: 0, y: 0,
+                  sizex: W, sizey: H, sizing: "stretch", layer: "below"}],
+        uirevision: "shot",
+      };
+      // scrollZoom on top of the live-view defaults (box-zoom + dblclick
+      // reset). No modebar, matching the live array panels.
+      Plotly.newPlot(container, [], layout,
+                     {displayModeBar: false, responsive: true,
+                      scrollZoom: true});
+    };
+    probe.onerror = () => {
+      container.innerHTML =
+        '<div class="shot-frame-err">frame unavailable</div>';
+    };
+    probe.src = src;
+  }
+
+  function closeShotModal() {
+    const m = $("shot-modal");
+    if (m) m.hidden = true;
+    // Purge Plotly instances + clear the body so image loads stop and
+    // memory frees.
+    const body = $("shot-modal-body");
+    if (body) {
+      if (window.Plotly) {
+        body.querySelectorAll(".shot-frame-plot").forEach((el) => {
+          try { Plotly.purge(el); } catch (e) {}
+        });
+      }
+      body.innerHTML = "";
+    }
+  }
+
+  (function wireShotModal() {
+    const modal = $("shot-modal");
+    if (!modal) return;
+    modal.querySelectorAll("[data-shot-close]").forEach((el) => {
+      el.addEventListener("click", closeShotModal);
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !modal.hidden) closeShotModal();
+    });
+  })();
 
   // =====================================================================
   // SEQUENCE-SPECIFIC ANALYSIS (placeholder).
@@ -2589,42 +4164,29 @@
     const body = $("seq-specific-body");
     if (!body) return;
 
-    // Phase 5a: single-image scans (NumImages=1) get an averaged
-    // camera image card. The per-site survival + paths panels are
-    // empty for these scans (no second image), but the averaged
-    // loading frame IS what the experimenter wants to see.
-    const ai = r.avg_image;
+    // (The averaged-image card lives in its own section after this one —
+    // see renderAvgImage / #analysis-avg-image-card.)
     let html = '';
-    if (ai && (ai.available || ai.computable)) {
-      const sh = ai.image_shape || [];
-      const dims = sh.length === 2 ? `${sh[0]}×${sh[1]}` : '';
-      // Append the scan_id query so the browser refreshes when the
-      // operator switches scans (and bypasses cache on the new run).
-      const src = `/api/runs/${encodeURIComponent(r.scan_id || '')}`
-                  + `/avg_image?v=${encodeURIComponent(r.scan_id || '')}`;
-      const hint = ai.available
-        ? `cached · ${ai.n_shots} shots averaged · ${dims}`
-        : `will compute on first load (~${Math.round(0.03 * (ai.n_shots || 1))} s) ·`
-          + ` ${ai.n_shots} shots · ${dims}`;
+
+    // Focus / discrimination metrics vs the swept param (LoadingDefocus):
+    // several spot-count-robust per-site metrics so the operator can pick
+    // the best SLM defocus by whichever metric they trust.
+    const ss = r.seq_specific;
+    const hasFocus = ss && ss.type === "focus_metrics" && ss.metrics;
+    if (hasFocus) {
       html += `
-        <div class="avg-image-card" style="padding:8px 0;">
-          <h3 style="margin:0 0 8px;font-size:13px;color:var(--text-dim);
+        <div style="padding:8px 0;">
+          <h3 style="margin:0 0 4px;font-size:13px;color:var(--text-dim);
                      text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">
-            Averaged loading image
+            Focus / discrimination vs ${escHtml(ss.x_label || "param")}
             <span class="muted mono" style="text-transform:none;margin-left:8px;
-                                              letter-spacing:0;font-weight:400;">
-              ${hint}
+                  letter-spacing:0;font-weight:400;">
+              per-site, spot-count-robust · each curve normalised 0–1 · ★ = optimum
             </span>
           </h3>
-          <div style="position:relative;background:#000;border-radius:4px;
-                       overflow:hidden;max-width:780px;">
-            <img src="${src}" alt="averaged loading image"
-                 style="display:block;width:100%;height:auto;image-rendering:pixelated;"
-                 onerror="this.style.display='none';this.nextElementSibling.style.display='block';">
-            <div class="hint" style="display:none;padding:24px;text-align:center;">
-              avg image fetch failed
-            </div>
-          </div>
+          <div class="plot-container" id="plot-focus-metrics"
+               style="height:360px;"></div>
+          <div class="hint mono" id="focus-metrics-info" style="margin-top:6px;"></div>
         </div>`;
     }
 
@@ -2635,9 +4197,134 @@
       <div style="padding:8px 0;font-family:var(--mono);font-size:11px;
                   color:var(--text-dim);">
         scan_name = ${escHtml(r.scan_name || "(none)")}
-        ${ai ? '' : '· (no Seq-specific panel for this scan type yet)'}
+        ${hasFocus ? '' : '· (no Seq-specific panel for this scan type yet)'}
       </div>`;
     body.innerHTML = html;
+
+    if (hasFocus) renderFocusMetrics(ss);
+  }
+
+  // Averaged camera image — shown for ANY scan with an /imgs dataset (its
+  // own half-row section after Sequence-specific). Mean of the FIRST image of
+  // each shot; the PNG is computed lazily + cached by /api/runs/<id>/avg_image
+  // on first request. Rendered as a Plotly image so it ZOOMS/pans like the
+  // other image panels (box-zoom drag; double-click resets).
+  function renderAvgImage(r) {
+    const card = $("analysis-avg-image-card");
+    const el = $("plot-avg-image");
+    if (!card || !el) return;
+    const ai = r && r.avg_image;
+    if (!ai || !(ai.available || ai.computable)) {
+      card.hidden = true;
+      if (window.Plotly) Plotly.purge(el);
+      setText("avg-image-info", "");
+      return;
+    }
+    card.hidden = false;
+    const sh = ai.image_shape || [];
+    const H = sh.length === 2 ? sh[0] : 0;
+    const W = sh.length === 2 ? sh[1] : 0;
+    const navg = ai.n_avg || ai.n_shots || 0;
+    const sampNote = ai.sampled ? ` (sampled of ${ai.n_shots})` : "";
+    setText("avg-image-info", ai.available
+      ? `cached · mean of ${navg} first-images${sampNote} · ${H}×${W}`
+      : `computes on first load (~${Math.max(1, Math.round(0.025 * navg))} s, one-time) · `
+        + `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+    if (!window.Plotly || !W || !H) return;
+    const src = `/api/runs/${encodeURIComponent(r.scan_id || "")}`
+              + `/avg_image?v=${encodeURIComponent(r.scan_id || "")}`;
+    // Transparent corner trace establishes the axes (so box-zoom works);
+    // the PNG is a below-layer layout image filling the pixel extent.
+    Plotly.react(el, [{
+      x: [0, W], y: [0, H], mode: "markers",
+      marker: {opacity: 0}, hoverinfo: "skip", showlegend: false,
+    }], plotLayoutFlush({
+      margin: {l: 0, r: 0, t: 0, b: 0},
+      xaxis: {visible: false, range: [0, W], constrain: "domain"},
+      yaxis: {visible: false, range: [H, 0], scaleanchor: "x", scaleratio: 1},
+      images: [{
+        source: src, xref: "x", yref: "y",
+        x: 0, y: 0, sizex: W, sizey: H,
+        xanchor: "left", yanchor: "top", sizing: "stretch", layer: "below",
+      }],
+    }), plotConfig());
+  }
+
+  // Overlay each focus metric. The metrics have DIFFERENT UNITS (px,
+  // counts, ratio) so they can't share a real y-axis: each is min–max
+  // normalised AND oriented so "up = better" for every curve (lower-is-
+  // better metrics like spot width are flipped). Real value + unit are
+  // always on hover and in the info line; the y-axis label says so
+  // explicitly so the normalisation is never mistaken for real units.
+  // Each curve's optimum defocus is starred.
+  function renderFocusMetrics(ss) {
+    if (!window.Plotly) return;
+    const el = $("plot-focus-metrics");
+    if (!el) return;
+    const x = ss.x || [];
+    const COLORS = {
+      spot_width: "#58a6ff", spot_peak: "#3fb950",
+      spot_contrast: "#d29922", n_spots: "#8b949e",
+    };
+    const traces = [];
+    const stars = {x: [], y: [], text: [], type: "scatter", mode: "markers",
+      marker: {symbol: "star", size: 15, color: "#f0f6fc",
+               line: {color: "#000", width: 1}},
+      name: "optimum", hoverinfo: "text", showlegend: false};
+    const infoBits = [];
+    Object.entries(ss.metrics).forEach(([key, m], ci) => {
+      const vals = (m.values || []).map((v) => (v == null ? NaN : v));
+      const finite = vals.filter((v) => isFinite(v));
+      if (!finite.length) return;
+      const lo = Math.min(...finite), hi = Math.max(...finite);
+      const span = hi - lo;
+      const higherBetter = m.higher_better !== false;
+      const unit = m.unit ? ` ${m.unit}` : "";
+      // Normalise to [0,1]; flip lower-is-better so up = better everywhere.
+      const norm = vals.map((v) => {
+        if (!isFinite(v)) return NaN;
+        const n = span > 0 ? (v - lo) / span : 0.5;
+        return higherBetter ? n : 1 - n;
+      });
+      const color = COLORS[key] || `hsl(${(ci * 70) % 360},60%,60%)`;
+      const label = `${m.label || key} (${higherBetter ? "↑" : "↓"} better, ${m.unit || "a.u."})`;
+      traces.push({
+        x: x, y: norm, type: "scatter", mode: "lines+markers",
+        name: label, line: {color}, marker: {color, size: 6},
+        text: vals.map((v) => isFinite(v) ? `${v.toPrecision(4)}${unit}` : "—"),
+        hovertemplate: `${m.label || key}: %{text}<br>${escHtml(ss.x_label || "x")}=%{x}<extra></extra>`,
+      });
+      // Optimum = best raw value (min for lower-better, max otherwise).
+      let bi = -1, bv = higherBetter ? -Infinity : Infinity;
+      vals.forEach((v, i) => {
+        if (!isFinite(v)) return;
+        if (higherBetter ? v > bv : v < bv) { bv = v; bi = i; }
+      });
+      if (bi >= 0) {
+        stars.x.push(x[bi]); stars.y.push(norm[bi]);
+        stars.text.push(`${m.label || key} best @ ${escHtml(ss.x_label || "x")}=${x[bi]} (${bv.toPrecision(4)}${unit})`);
+        infoBits.push(`${m.label || key}: best @ ${x[bi]} (${bv.toPrecision(4)}${unit})`);
+      }
+    });
+    if (!traces.length) {
+      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">no spots detected / no metric data</div>';
+      setText("focus-metrics-info", "");
+      return;
+    }
+    traces.push(stars);
+    const layout = {
+      paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+      font: {color: "#c9d1d9", size: 11},
+      margin: {l: 56, r: 12, t: 8, b: 42},
+      xaxis: {title: ss.x_label || "param", gridcolor: "#1a1a30"},
+      yaxis: {title: "normalised, ↑=better (units differ — hover for real values)",
+              range: [-0.05, 1.08], gridcolor: "#1a1a30"},
+      legend: {orientation: "h", y: 1.14, font: {size: 10}},
+    };
+    Plotly.react(el, traces, layout, {displayModeBar: false, responsive: true});
+    setText("focus-metrics-info",
+            "⚠ curves min–max normalised, different units (px / counts / ratio); "
+            + "raw values on hover.  " + infoBits.join("  ·  "));
   }
 
   function avg(arr) {
@@ -2679,6 +4366,27 @@
   // so it can be reloaded later. Selecting from "Load saved group..."
   // overwrites the tray with that group's members.
   const traySet = new Set();   // scan_id strings, insertion-ordered
+  const TRAY_LS_KEY = "yb_dashboard_tray";   // persists the full multi-run tray
+
+  // Persist the whole tray (not just the single selected scan) so a page
+  // reload restores every chip, not one of them. Called from renderTray —
+  // the single choke point every mutation funnels through.
+  function persistTray() {
+    try {
+      localStorage.setItem(TRAY_LS_KEY, JSON.stringify(Array.from(traySet)));
+    } catch (e) { /* storage full / disabled — non-fatal */ }
+  }
+  function loadSavedTray() {
+    try {
+      const raw = localStorage.getItem(TRAY_LS_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.map(String) : [];
+    } catch (e) { return []; }
+  }
+  // Snapshot the persisted tray at script-init, BEFORE the DOMContentLoaded
+  // renderTray() (empty set) can overwrite it with []. Used once by the
+  // first loadRunsList to restore the multi-run selection.
+  const savedTrayAtLoad = loadSavedTray();
 
   function syncTrayHighlight() {
     // Highlight rows in the SLM-style .run-picker that are in the tray.
@@ -2692,6 +4400,7 @@
   function renderTray() {
     const wrap = $("tray-chips");
     if (!wrap) return;
+    persistTray();
     setText("tray-count", String(traySet.size));
     // Push the count onto the runs card so the edge-tab indicator
     // reflects the current selection at a glance.
@@ -2734,23 +4443,12 @@
     renderTray();
   });
 
-  $("tray-analyze").addEventListener("click", async () => {
-    // Paste-box takes precedence: if a 14-digit scan_id is sitting
-    // there AND doesn't match the current selection, treat Analyze as
-    // "load that scan into the tray then analyze it".
-    const pasted = ($("manual-scan-id").value || "").trim();
-    if (/^\d{14}$/.test(pasted) && pasted !== selectedScanId) {
-      trayReplace(pasted);
-      loadAnalysis(pasted);
-      return;
-    }
-    if (!traySet.size) { toast("tray is empty", "warn"); return; }
-    if (traySet.size === 1) {
-      loadAnalysis(Array.from(traySet)[0]);
-      return;
-    }
-    // Multi-run: use an ephemeral group through the existing
-    // /api/runs/groups/<id>/analysis aggregator. Create -> add -> analyze -> delete.
+  // Multi-run tray analysis: use an ephemeral group through the existing
+  // /api/runs/groups/<id>/analysis aggregator. Create -> add -> analyze ->
+  // delete. Extracted so restore-on-reload can re-run it (not just the
+  // Analyze button).
+  async function analyzeTrayGroup() {
+    if (traySet.size < 2) return;
     const name = '__tray_' + Date.now();
     const body = $("analysis-detail-body");
     body.innerHTML = '<div class="hint">running tray analysis (' +
@@ -2767,7 +4465,17 @@
         await api(`/api/runs/groups/${gid}/add/${sid}`, {method: "POST"});
       }
       const r2 = await api(`/api/runs/groups/${gid}/analysis`);
+      // Render the FULL panel suite (not just the detail header) so the
+      // combined view shows per-site maps, survival-vs-distance, and the
+      // pooled seq-specific focus curve -- same as a single-run load.
+      activeAnalysis = r2;
       renderAnalysisDetail(r2);
+      renderPerSiteMaps(r2);
+      renderSurvivalVsDistance(r2);
+      renderPerIteration(r2);
+      renderSeqSpecific(r2);
+      renderAvgImage(r2);   // hides the card for group views (no avg_image)
+      renderRearrangeScatter(r2);
       setText("selected-scan-id", `tray:${traySet.size} runs`);
     } catch (e) {
       body.innerHTML = `<div class="hint bad">tray analysis failed: ${escHtml(e.message)}</div>`;
@@ -2777,6 +4485,24 @@
         loadGroups();
       }
     }
+  }
+
+  $("tray-analyze").addEventListener("click", async () => {
+    // Paste-box takes precedence: if a 14-digit scan_id is sitting
+    // there AND doesn't match the current selection, treat Analyze as
+    // "load that scan into the tray then analyze it".
+    const pasted = ($("manual-scan-id").value || "").trim();
+    if (/^\d{14}$/.test(pasted) && pasted !== selectedScanId) {
+      trayReplace(pasted);
+      loadAnalysis(pasted);
+      return;
+    }
+    if (!traySet.size) { toast("tray is empty", "warn"); return; }
+    if (traySet.size === 1) {
+      loadAnalysis(Array.from(traySet)[0]);
+      return;
+    }
+    await analyzeTrayGroup();
   });
 
   $("tray-save").addEventListener("click", async () => {
@@ -2935,6 +4661,7 @@
             <button class="ghost" data-move-up="${r.id}" style="font-size:10px;padding:2px 8px;">↑</button>
             <button class="ghost" data-move-down="${r.id}" style="font-size:10px;padding:2px 8px;">↓</button>
           ` : ""}
+          ${r.descriptor ? `<button class="ghost" data-requeue="${r.id}" title="Queue a new copy with exactly the same parameters" style="font-size:10px;padding:2px 8px;">re-queue</button>` : ""}
         </td>
       </tr>
     `).join("");
@@ -2966,8 +4693,30 @@
           <td class="mono">${r.file_id || ""}</td>
           <td class="mono">${r.built_job_id != null ? r.built_job_id : ""}</td>
           <td class="muted">${escHtml((r.error_message || "").slice(0, 80))}</td>
+          <td>${r.descriptor ? `<button class="ghost" data-requeue="${r.id}" title="Queue a new copy with exactly the same parameters (uses today's code)" style="font-size:10px;padding:2px 8px;">re-queue</button>${r.file_id ? `<button class="ghost" data-requeue-code="${r.id}" title="Re-queue with the EXACT code that ran originally — replays this run's code snapshot (YbSeqs/YbSteps/YbScans)" style="font-size:10px;padding:2px 6px;">+code</button>` : ""}` : ""}</td>
         </tr>`).join("")
-      || '<tr><td colspan="7" class="muted">empty</td></tr>';
+      || '<tr><td colspan="8" class="muted">empty</td></tr>';
+    // Re-queue buttons live in both the queue and history tables: replay the original
+    // descriptor (same params). "+code" also pins the source run's code snapshot so the
+    // runner replays the EXACT experiment source that ran originally (reproducibility).
+    async function doRequeue(btn, id, withCode) {
+      btn.disabled = true;
+      try {
+        const r = await api(`/api/queue/requeue/${id}${withCode ? "?code=1" : ""}`,
+                            {method: "POST"});
+        toast(`Re-queued #${id} → #${r.descriptor_id}${withCode ? " (orig code)" : ""}`);
+        pollQueue();
+      } catch (e) {
+        toast("Re-queue failed: " + (e.message || e), "bad");
+        btn.disabled = false;
+      }
+    }
+    $$("[data-requeue]").forEach((btn) => {
+      btn.addEventListener("click", () => doRequeue(btn, btn.dataset.requeue, false));
+    });
+    $$("[data-requeue-code]").forEach((btn) => {
+      btn.addEventListener("click", () => doRequeue(btn, btn.dataset.requeueCode, true));
+    });
   }
 
   $("queue-refresh-btn").addEventListener("click", pollQueue);
@@ -3313,7 +5062,7 @@
       // header empty space, filter-peek-area padding, the float-toggle
       // button, the card's own padding -- all collapse to peek. Only
       // clicks INSIDE the picker body / chip grid keep the card open.
-      const inBody = t.closest(".runs-picker-body, .filter-body");
+      const inBody = t.closest(".runs-picker-body, .filter-body, .chn-picker-body");
       if (!inBody) _setFloatState(card, "peek");
     });
   }
@@ -3424,8 +5173,964 @@
     host.hidden = (activeTab !== "analysis");
   }
 
+  // ===================== Sequence tab (flattened .seq viewer) ==========
+  // Reads .seq files from a scan's sequence/ folder (auto-dump) or any
+  // folder of .seq files via /api/sequence/*. On-demand; no polling.
+  const seqState = { index: null, query: null, file: null };
+  let seqScansCache = [];   // scans with sequence dumps (the picker list)
+
+  function seqFmt(v) {
+    if (typeof v === "number") {
+      if (v !== 0 && (Math.abs(v) >= 1e4 || Math.abs(v) < 1e-3))
+        return v.toExponential(3);
+      return String(+v.toPrecision(6));
+    }
+    return String(v);
+  }
+
+  function seqEsc(s) {
+    return String(s).replace(/[&<>]/g,
+      (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  }
+
+  function seqQueryString(extra) {
+    const p = new URLSearchParams(seqState.query || {});
+    if (extra) for (const k in extra) p.set(k, extra[k]);
+    return p.toString();
+  }
+
+  async function seqLoad(query) {
+    const status = $("seq-source-status");
+    try {
+      if (status) status.textContent = "loading…";
+      const idx = await api("/api/sequence/list?" +
+                            new URLSearchParams(query).toString());
+      seqState.index = idx;
+      seqState.query = query;
+      seqPopulate(idx);
+      if (status) {
+        const nf = (idx.files || []).length, np = (idx.points || []).length;
+        status.textContent = `${np} point(s), ${nf} file(s)` +
+          (idx.has_manifest ? "" : "  (no manifest)");
+      }
+    } catch (e) {
+      seqState.index = null;
+      if (status) status.textContent = "load failed: " + (e.message || e);
+      toast("Sequence load failed: " + (e.message || e), "err");
+    }
+  }
+
+  // ---- Scan picker (modeled on the Analysis runs picker) --------------------
+  // Only the most-recent N scans (Refresh re-fetches): keeps the list light and the
+  // per-scan config read (has_seq / has_snapshot) fast.
+  const SEQ_SCANS_LIMIT = 30;
+  async function loadSeqScans() {
+    const wrap = $("seq-scan-table");
+    try {
+      const data = await api("/api/sequence/scans?max=" + SEQ_SCANS_LIMIT);
+      seqScansCache = data.scans || [];
+      seqPopulateScanDate();
+      renderSeqScans();           // also updates the dumps/total count badge
+    } catch (e) {
+      if (wrap) wrap.innerHTML =
+        `<div class="run-row"><div class="run-info muted">${seqEsc(e.message || e)}</div></div>`;
+    }
+  }
+
+  function seqPopulateScanDate() {
+    const sel = $("seq-scan-date");
+    if (!sel) return;
+    const dates = Array.from(new Set(
+      seqScansCache.map((s) => (s.scan_id || "").slice(0, 8))
+    )).filter(Boolean).sort().reverse();
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All dates</option>' +
+      dates.map((d) => `<option value="${d}">${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}</option>`).join("");
+    sel.value = cur;
+  }
+
+  function renderSeqScans() {
+    const wrap = $("seq-scan-table");
+    if (!wrap) return;
+    const nSeq = seqScansCache.filter((s) => s.has_seq).length;
+    setText("seq-scan-count", `${nSeq}/${seqScansCache.length}`);
+    const search = ($("seq-scan-search").value || "").toLowerCase();
+    const date = $("seq-scan-date").value || "";
+    const filtered = seqScansCache.filter((s) => {
+      if (date && (s.scan_id || "").slice(0, 8) !== date) return false;
+      if (search) {
+        const blob = ((s.scan_id || "") + " " + (s.name || "")).toLowerCase();
+        if (!blob.includes(search)) return false;
+      }
+      return true;
+    });
+    if (!filtered.length) {
+      wrap.innerHTML =
+        '<div class="run-row"><div class="run-info muted">no scans match</div></div>';
+      return;
+    }
+    const cur = (seqState.query && seqState.query.scan_id) || "";
+    // Same row layout as the Analysis picker, with THREE states (§12.4):
+    //   Ready          -- has a .seq dump            -> click plots it.
+    //   Reconstructable -- no .seq but a code snapshot -> dark; click reconstructs
+    //                      offline from the snapshot (+ captured runtime globals).
+    //   Unrecoverable  -- no .seq and no snapshot     -> grayed, inert.
+    wrap.innerHTML = filtered.map((s) => {
+      const id = s.scan_id || "";
+      const idShort = id.length === 14
+        ? `${id.slice(4,6)}/${id.slice(6,8)} ${id.slice(8,10)}:${id.slice(10,12)}:${id.slice(12,14)}`
+        : id;
+      let state, tag, title;
+      if (s.has_seq) {
+        state = "ready"; tag = `${s.n_seq} seq`; title = id;
+      } else if (s.has_snapshot && s.has_descriptor) {
+        state = "reconstructable"; tag = "reconstruct ⟳";
+        title = id + " — no .seq; click to reconstruct from the code snapshot";
+      } else if (s.has_snapshot) {
+        // Has a code snapshot but no descriptor -> predates self-contained
+        // reconstruction; the ScanGroup/seq can't be rebuilt, so NOT a dead button.
+        state = "unrecoverable"; tag = "no descriptor";
+        title = id + " — has a code snapshot but predates self-contained " +
+                "reconstruction (no descriptor); cannot rebuild the ScanGroup";
+      } else {
+        state = "unrecoverable"; tag = "no dump";
+        title = id + " — no .seq and no code snapshot; cannot reconstruct";
+      }
+      return `
+        <div class="run-row seq-row-${state} ${id === cur ? "in-tray" : ""}"
+             data-scan-id="${id}" data-state="${state}" title="${seqEsc(title)}">
+          <div class="run-info">
+            ${idShort}
+            <span class="run-dim"> · ${seqEsc(s.name || "—")}</span>
+            <span class="run-dim"> · ${seqEsc(s.swept || "—")}</span>
+            <span class="seq-row-tag"> · ${tag}</span>
+          </div>
+        </div>`;
+    }).join("");
+    $$(".run-row", wrap).forEach((row) => {
+      if (!row.dataset.scanId) return;
+      const state = row.dataset.state;
+      if (state === "ready") {
+        row.addEventListener("click", () => {
+          const fin = $("seq-folder"); if (fin) fin.value = "";
+          seqLoad({ scan_id: row.dataset.scanId }).then(renderSeqScans);
+        });
+      } else if (state === "reconstructable") {
+        row.addEventListener("click", () => seqReconstruct(row.dataset.scanId, row));
+      }
+      // unrecoverable: inert (no handler)
+    });
+  }
+
+  // Reconstruct a scan's missing .seq(s) offline: the dashboard POSTs to
+  // /api/sequence/reconstruct, which spawns the engine-python (py3.8 + libnacs,
+  // use_dummy_device) driver. It replays the run's code snapshot + captured
+  // runtime globals, regenerates the .seq(s) into <scan>/sequence/, and the row
+  // flips to Ready. CPU-heavy + may be deferred while a live scan runs.
+  async function seqReconstruct(scanId, rowEl) {
+    if (!scanId || seqState._reconstructing) return;
+    seqState._reconstructing = true;
+    if (rowEl) rowEl.classList.add("seq-row-working");
+    toast("Reconstructing " + scanId + "… (engine subprocess, may take a while)", "");
+    try {
+      const r = await api("/api/sequence/reconstruct?scan_id=" +
+                          encodeURIComponent(scanId), { method: "POST" });
+      if (r && r.deferred) {
+        toast("Reconstruct deferred: " + (r.reason || "a scan is running"), "warn");
+        return;
+      }
+      toast("Reconstructed " +
+            (r && r.n_seq != null ? r.n_seq + " sequence(s)" : "") +
+            (r && r.approximate ? " (some channels approximate)" : ""), "ok");
+      await loadSeqScans();                      // the row flips to Ready
+      await seqLoad({ scan_id: scanId });        // load + plot the regenerated .seq
+      renderSeqScans();
+    } catch (e) {
+      toast("Reconstruct failed: " + (e.message || e), "err");
+    } finally {
+      seqState._reconstructing = false;
+      if (rowEl) rowEl.classList.remove("seq-row-working");
+    }
+  }
+
+  function seqPopulate(idx) {
+    const axEl = $("seq-scanned-axes");
+    if (axEl) {
+      const ax = idx.scanned_axes || [];
+      axEl.textContent = ax.length
+        ? "scanned: " + ax.map((a) => a.path).join(", ") : "";
+    }
+    const psel = $("seq-point-select");
+    if (psel) {
+      psel.innerHTML = "";
+      (idx.points || []).forEach((pt, i) => {
+        const o = document.createElement("option");
+        o.value = String(i);
+        const sc = pt.scanned && Object.keys(pt.scanned).length
+          ? "  " + Object.entries(pt.scanned)
+              .map(([k, v]) => `${k}=${seqFmt(v)}`).join(", ")
+          : "";
+        o.textContent = `#${pt.n != null ? pt.n : i + 1}${sc}`;
+        psel.appendChild(o);
+      });
+      if ((idx.points || []).length) { psel.selectedIndex = 0; seqOnPoint(); }
+    }
+  }
+
+  function seqCurrentPoint() {
+    const idx = seqState.index;
+    if (!idx) return null;
+    const psel = $("seq-point-select");
+    const i = psel ? parseInt(psel.value, 10) : 0;
+    const pts = idx.points || [];
+    return pts[isNaN(i) ? 0 : i] || pts[0] || null;
+  }
+
+  function seqOnPoint() {
+    const pt = seqCurrentPoint();
+    if (!pt) return;
+    seqState.file = pt.file;
+    const fileEntry = (seqState.index.files || []).find((f) => f.file === pt.file);
+    const ssel = $("seq-seq-select");
+    if (ssel) {
+      ssel.innerHTML = "";
+      const seqs = (fileEntry && fileEntry.sequences) || [];
+      seqs.forEach((s) => {
+        const o = document.createElement("option");
+        o.value = String(s.seq_idx);
+        o.textContent = `${s.name} (idx ${s.seq_idx}, ${s.nchns} ch)`;
+        ssel.appendChild(o);
+      });
+      if (seqs.length) ssel.selectedIndex = 0;
+    }
+    seqOnSeq();
+  }
+
+  function seqOnSeq() {
+    const fileEntry = (seqState.index.files || []).find((f) => f.file === seqState.file);
+    const ssel = $("seq-seq-select");
+    const seqIdx = ssel ? ssel.value : null;
+    const seqs = (fileEntry && fileEntry.sequences) || [];
+    const seq = seqs.find((s) => String(s.seq_idx) === String(seqIdx)) || seqs[0];
+    const csel = $("seq-chn-select");
+    const prev = csel ? new Set(Array.from(csel.selectedOptions).map((o) => o.value))
+                      : new Set();
+    if (csel && seq) {
+      csel.innerHTML = "";
+      (seq.channels || []).forEach((name) => {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = name;
+        if (prev.has(name)) o.selected = true;
+        csel.appendChild(o);
+      });
+    }
+    seqUpdateChnCount();
+    seqRenderPlot();
+    seqRenderParams();
+  }
+
+  function seqSelectedChannels() {
+    const csel = $("seq-chn-select");
+    return csel ? Array.from(csel.selectedOptions).map((o) => o.value) : [];
+  }
+
+  // Reflect the # of selected channels on the floating card (drives the
+  // edge-tab count badge + the active accent palette).
+  function seqUpdateChnCount() {
+    const card = document.getElementById("sequence-chn-card");
+    if (card) card.dataset.floatCount = String(seqSelectedChannels().length);
+  }
+
+  // Hover-driven floating card: edge (minimized) -> expanded on mouseenter ->
+  // edge on mouseleave, after a 400 ms grace. Never collapses while the mouse
+  // is still over it OR while a field inside has focus (so typing in the scan
+  // search box holds the panel open even if the cursor drifts off).
+  function _wireSeqFloatCard(card) {
+    if (!card) return;
+    _setFloatState(card, "edge");
+    let timer = null;
+    card.addEventListener("mouseenter", () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      _setFloatState(card, "expanded");
+    });
+    card.addEventListener("mouseleave", () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (!card.matches(":hover") && !card.contains(document.activeElement))
+          _setFloatState(card, "edge");
+        timer = null;
+      }, 400);
+    });
+  }
+
+  async function seqRenderPlot() {
+    const el = $("plot-sequence");
+    if (!el || !seqState.index || !seqState.file || !window.Plotly) return;
+    const ssel = $("seq-seq-select");
+    const q = seqQueryString({
+      file: seqState.file,
+      seq: ssel ? ssel.value : "",
+      chns: seqSelectedChannels().join(","),
+    });
+    try {
+      const fig = await fetch("/api/sequence/figure?" + q).then((r) => r.json());
+      await Plotly.react(el, fig.data || [], fig.layout || {},
+                         { responsive: true, displayModeBar: true });
+      seqWirePlotClick(el);          // click point -> segment params + formula
+      seqWirePlotHover(el);          // hover point -> SVG-overlay highlight of the pulse
+      const _hp = _seqHoverPath(el, true);
+      if (_hp) _hp.setAttribute("points", "");     // clear stale hover line after a rebuild
+      if (seqState._emphParam) seqEmphasizeParamRegion(seqState._emphParam);  // survive rebuild
+    } catch (e) { console.warn("seq figure", e); }
+  }
+
+  // Click a point in the plot -> highlight the params whose value appears in that
+  // channel's waveform (option 3). Bound once; survives Plotly.react re-renders.
+  function seqWirePlotClick(el) {
+    if (el._seqClickWired) return;
+    el._seqClickWired = true;
+    el.on("plotly_click", (data) => {
+      const pt = data && data.points && data.points[0];
+      const chn = pt && pt.data && pt.data.name;
+      if (!chn || chn === "Selected") return;
+      // The clicked point's customdata IS its pulse id: prefer per-pulse (segment-specific)
+      // provenance so we focus ONLY the params that derive THIS segment, not every param
+      // that touches the channel anywhere. Falls back to whole-channel.
+      seqFocusPoint(chn, pt.customdata, pt.y, pt.x);
+    });
+  }
+
+  async function seqRenderParams() {
+    const box = $("seq-params");
+    if (!box || !seqState.index || !seqState.file) return;
+    seqClearFocus();                 // selection context changes when params reload
+    const ssel = $("seq-seq-select");
+    const qs = seqQueryString({ file: seqState.file, seq: ssel ? ssel.value : "" });
+    let r;
+    try {
+      r = await api("/api/sequence/params?" + qs);
+    } catch (e) {
+      box.innerHTML = '<span class="muted">params unavailable: ' +
+                      seqEsc(e.message || e) + "</span>";
+      seqState.params = null; return;
+    }
+    if (!r.has_params || !r.params) {
+      box.innerHTML = '<span class="muted">No parameters for this scan.</span>';
+      seqState.params = null; seqState.scannedPaths = new Set(); seqState.xref = null;
+      return;
+    }
+    seqState.params = r.params;
+    seqState.scannedPaths = new Set(r.scanned_paths || []);
+    // Param<->channel cross-reference (build-time provenance). Best-effort.
+    try { seqState.xref = await api("/api/sequence/xref?" + qs); }
+    catch (e) { seqState.xref = null; }
+    seqRenderParamTree();
+    // No xref yet (or a pre-region one)? Kick a BACKGROUND build/upgrade (non-blocking) and
+    // light up the affordance once it lands. The .seq plot is already shown.
+    seqMaybeBuildXref(qs);
+  }
+
+  // Build (or upgrade) sequence/xref.json in the background for the loaded scan, then poll
+  // until it lands and re-render the param tree. Non-blocking; bails if the user navigates
+  // away mid-build. Only for scan_id loads (a folder load may lack the descriptor).
+  //   * no xref        -> build.
+  //   * pre-region xref (available but no per-pulse `pulses`) -> force-UPGRADE once/session.
+  //   * region-ready xref -> nothing.
+  async function seqMaybeBuildXref(qs) {
+    const scanId = seqState.query && seqState.query.scan_id;
+    if (!scanId || seqState._xrefBuilding === scanId) return;
+    const xr = seqState.xref;
+    if (seqXrefComplete(xr)) return;                  // already has per-pulse maps + formulas
+    const stale = !!(xr && xr.available);             // exists but older schema -> upgrade
+    if (stale) {
+      seqState._xrefUpgraded = seqState._xrefUpgraded || new Set();
+      if (seqState._xrefUpgraded.has(scanId)) return; // upgrade at most once per session
+      seqState._xrefUpgraded.add(scanId);
+    }
+    seqState._xrefBuilding = scanId;
+    try {
+      let r;
+      try {
+        r = await api("/api/sequence/build_xref?scan_id=" + encodeURIComponent(scanId) +
+                      (stale ? "&force=1" : ""), { method: "POST" });
+      } catch (e) { return; }                         // best-effort: stay dormant on failure
+      if (!r || (!r.started && !r.available)) return; // e.g. scan has no descriptor
+      if (r.started) toast((stale ? "Upgrading" : "Building") + " param↔channel map…", "");
+      for (let i = 0; i < 40; i++) {                  // ~60 s budget (provenance is quick)
+        if ((seqState.query && seqState.query.scan_id) !== scanId) return;  // navigated away
+        let x = null;
+        try { x = await api("/api/sequence/xref?" + qs); } catch (e) {}
+        // When upgrading, wait for the COMPLETE artifact; otherwise accept availability.
+        if (x && (stale ? seqXrefComplete(x) : x.available)) {
+          seqState.xref = x;
+          seqRenderParamTree();                       // affordance lights up
+          if (r.started) toast("param↔channel map ready", "ok");
+          return;
+        }
+        await new Promise((res) => setTimeout(res, 1500));
+      }
+    } finally {
+      if (seqState._xrefBuilding === scanId) seqState._xrefBuilding = null;
+    }
+  }
+
+  // The current xref schema/format version the viewer expects. Older artifacts (aggregate
+  // only, per-pulse without formulas, or verbose pre-cleanup formulas) carry a lower/absent
+  // version and are rebuilt in place on load. Keep in lock-step with XREF_VERSION in
+  // pyctrl/tools/provenance_scan.py.
+  const SEQ_XREF_VERSION = 4;
+  function seqXrefComplete(xr) {
+    return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
+  }
+
+  // "Rebuild ⟳" button: force-regenerate xref.json for the loaded scan, even if one already
+  // exists (e.g. to pick up new formulas), then re-render the param tree when it lands.
+  async function seqForceRebuildXref() {
+    const scanId = seqState.query && seqState.query.scan_id;
+    if (!scanId) { toast("Load a scan from the Scans picker first", "warn"); return; }
+    if (seqState._xrefBuilding === scanId) { toast("Already rebuilding…", ""); return; }
+    seqState._xrefBuilding = scanId;
+    const ssel = $("seq-seq-select");
+    const qs = seqQueryString({ file: seqState.file || "", seq: ssel ? ssel.value : "" });
+    try {
+      let r;
+      try {
+        r = await api("/api/sequence/build_xref?scan_id=" + encodeURIComponent(scanId) +
+                      "&force=1", { method: "POST" });
+      } catch (e) { toast("Rebuild failed: " + (e.message || e), "err"); return; }
+      if (!r || r.ok === false) {
+        toast("Rebuild: " + ((r && r.error) || "no descriptor / unavailable"), "warn");
+        return;
+      }
+      toast("Rebuilding param↔channel map…", "");
+      for (let i = 0; i < 60; i++) {                 // ~90 s (a multi-point scan is slower)
+        if ((seqState.query && seqState.query.scan_id) !== scanId) return;  // navigated away
+        let x = null;
+        try { x = await api("/api/sequence/xref?" + qs); } catch (e) {}
+        if (x && seqXrefComplete(x)) {
+          seqState.xref = x;
+          seqRenderParamTree();
+          toast("param↔channel map rebuilt", "ok");
+          return;
+        }
+        await new Promise((res) => setTimeout(res, 1500));
+      }
+      toast("Rebuild timed out", "warn");
+    } finally {
+      if (seqState._xrefBuilding === scanId) seqState._xrefBuilding = null;
+    }
+  }
+
+  // Re-render the param tree applying the search box + the config/modified/scanned
+  // show-hide toggles. Cheap (client-side) so it runs on every keystroke / toggle.
+  function seqRenderParamTree() {
+    const box = $("seq-params");
+    if (!box || !seqState.params) return;
+    const search = (($("seq-param-search") || {}).value || "").trim().toLowerCase();
+    const filters = {
+      config:   seqFilterOn("seq-filter-config"),
+      modified: seqFilterOn("seq-filter-modified"),
+      scanned:  seqFilterOn("seq-filter-scanned"),
+    };
+    const html = seqParamTree(seqState.params, seqState.scannedPaths || new Set(),
+                              "", search, filters);
+    box.innerHTML = html || '<span class="muted">no parameters match the filter.</span>';
+  }
+  function seqFilterOn(id) {
+    const el = $(id);
+    return el ? el.checked : true;
+  }
+
+  function seqIsLeaf(v) {
+    return v && typeof v === "object" && !Array.isArray(v) &&
+      Object.prototype.hasOwnProperty.call(v, "value") &&
+      Object.prototype.hasOwnProperty.call(v, "type");
+  }
+
+  function seqLeafClass(leaf, isScanned) {
+    const hasCfg = leaf.config_value !== undefined && leaf.config_value !== null;
+    const modified = leaf.type === 2 || leaf.type === 3 ||
+                     (hasCfg && leaf.config_value !== leaf.value);
+    if (isScanned) return "seq-scanned";
+    if (modified) return "seq-modified";
+    if (hasCfg) return "seq-config";
+    return "seq-default";
+  }
+
+  // Show a leaf iff its category toggle is on AND it matches the search. "default"
+  // leaves (type 0, non-scanned) aren't governed by the three category toggles.
+  function seqParamPass(cls, path, search, filters) {
+    if (cls === "seq-scanned"  && !filters.scanned)  return false;
+    if (cls === "seq-modified" && !filters.modified) return false;
+    if (cls === "seq-config"   && !filters.config)   return false;
+    if (search && !path.toLowerCase().includes(search)) return false;
+    return true;
+  }
+
+  function seqParamTree(node, scanned, prefix, search, filters) {
+    let html = "";
+    for (const key of Object.keys(node)) {
+      const v = node[key];
+      const path = prefix ? prefix + "." + key : key;
+      if (seqIsLeaf(v)) {
+        const isScanned = scanned.has(path);
+        const cls = seqLeafClass(v, isScanned);
+        if (seqParamPass(cls, path, search, filters))
+          html += seqParamLeaf(key, path, v, isScanned, cls);
+      } else if (v && typeof v === "object" && !Array.isArray(v)) {
+        const inner = seqParamTree(v, scanned, path, search, filters);
+        if (inner)                       // drop branches with no surviving leaves
+          html += `<details open><summary>${seqEsc(key)}</summary>` +
+                  `<div class="seq-indent">${inner}</div></details>`;
+      } else if (!search || path.toLowerCase().includes(search)) {
+        html += `<div class="seq-leaf">${seqEsc(key)}: ${seqEsc(String(v))}</div>`;
+      }
+    }
+    return html;
+  }
+
+  function seqParamLeaf(key, path, leaf, isScanned, cls) {
+    const hasCfg = leaf.config_value !== undefined && leaf.config_value !== null;
+    let rhs = seqEsc(seqFmt(leaf.value));
+    if (cls === "seq-modified" && hasCfg) {
+      rhs = `<span class="seq-config">${seqEsc(seqFmt(leaf.config_value))}</span> ⇒ ${rhs}`;
+    }
+    const badge = isScanned ? ' <span class="seq-scanned-badge">scanned</span>' : '';
+    // Param<->channel matching is GATED behind real build-time provenance (xref.json,
+    // produced by the engine build). When absent (available=false) leaves are NOT
+    // clickable and no channel reveal is shown -- value-coincidence matching was
+    // dropped as inaccurate (plan §8).
+    const xrefOn = !!(seqState.xref && seqState.xref.available);
+    const chns = xrefOn && seqState.xref.param_to_channels
+      ? seqState.xref.param_to_channels[path] : null;
+    const reveal = chns
+      ? ` <span class="seq-leaf-chns">→ ${seqEsc(chns.join(", "))}</span>` : "";
+    const clickable = xrefOn
+      ? ` data-param-path="${seqEsc(path)}"${chns ? ' data-has-xref="1"' : ''}` : "";
+    return `<div class="seq-leaf ${cls}"${clickable}>` +
+           `<b>${seqEsc(key)}</b>: ${rhs}${badge}${reveal}</div>`;
+  }
+
+  // Select + PROMOTE the channels a param drives: mark them selected and move them to the
+  // TOP of the channel list (front), then re-render so the regions exist before emphasis.
+  async function seqOnParamChannels(path) {
+    if (!seqState.xref || !seqState.xref.available) return;
+    const chns = (seqState.xref.param_to_channels &&
+                  seqState.xref.param_to_channels[path]) || [];
+    if (!chns.length) return;
+    const csel = $("seq-chn-select");
+    if (!csel) return;
+    const want = new Set(chns);
+    const opts = Array.from(csel.options);
+    const driven = opts.filter((o) => want.has(o.value));
+    const rest = opts.filter((o) => !want.has(o.value));
+    driven.forEach((o) => { o.selected = true; });
+    driven.concat(rest).forEach((o) => csel.appendChild(o));   // reorder: driven to front
+    seqUpdateChnCount();
+    await seqRenderPlot();
+  }
+
+  // Param click (leaf or focus chip) -> promote its channels, emphasize its regions, and
+  // fill the focus panel with the gathered params + formula.
+  async function seqSelectParam(path) {
+    const pbox = $("seq-params");
+    if (pbox) {
+      $$(".seq-leaf.seq-leaf-active", pbox).forEach((el) =>
+        el.classList.remove("seq-leaf-active"));
+      const row = pbox.querySelector('.seq-leaf[data-param-path="' +
+                                     path.replace(/"/g, '\\"') + '"]');
+      if (row) row.classList.add("seq-leaf-active");
+    }
+    await seqOnParamChannels(path);
+    seqEmphasizeParamRegion(path);
+    seqFocusParam(path);
+  }
+
+  // Click a channel chip -> ensure that channel is shown (select + render), keeping any
+  // active param's region emphasis.
+  async function seqShowChannel(name) {
+    const csel = $("seq-chn-select");
+    if (!csel) return;
+    let changed = false;
+    Array.from(csel.options).forEach((o) => {
+      if (o.value === name && !o.selected) { o.selected = true; changed = true; }
+    });
+    if (changed) { seqUpdateChnCount(); await seqRenderPlot();
+                   if (seqState._emphParam) seqEmphasizeParamRegion(seqState._emphParam); }
+  }
+
+  // Overlay (not marker-resize) emphasis: a thicker LINE drawn on top of the matched pulse
+  // segments. Distinct reserved trace names so the param-selection and the hover overlays
+  // don't clobber each other or the base channel traces.
+  const SEQ_HILITE = "·param-region";
+
+  // Build thick-line overlay trace(s) over the points whose pid is in `pidSet`, grouped by
+  // y-axis (primary/secondary), with null breaks between non-contiguous runs so each pulse
+  // segment is its own polyline.
+  function _seqOverlayTraces(el, pidSet, name, color, width) {
+    const byAxis = {};
+    el.data.forEach((tr) => {
+      if (!tr.customdata || tr.name === SEQ_HILITE || tr.name === "Selected") return;
+      const ax = tr.yaxis || "y";
+      const acc = byAxis[ax] || (byAxis[ax] = { x: [], y: [] });
+      let inRun = false;
+      for (let k = 0; k < tr.customdata.length; k++) {
+        if (pidSet.has(Number(tr.customdata[k]))) {
+          acc.x.push(tr.x[k]); acc.y.push(tr.y[k]); inRun = true;
+        } else if (inRun) { acc.x.push(null); acc.y.push(null); inRun = false; }
+      }
+      if (inRun) { acc.x.push(null); acc.y.push(null); }
+    });
+    const traces = [];
+    Object.keys(byAxis).forEach((ax) => {
+      const a = byAxis[ax];
+      if (!a.x.length) return;
+      const t = { x: a.x, y: a.y, mode: "lines", name: name,
+                  line: { color: color, width: width }, hoverinfo: "skip",
+                  showlegend: false, cliponaxis: false };
+      if (ax !== "y") t.yaxis = ax;
+      traces.push(t);
+    });
+    return traces;
+  }
+
+  function _seqRemoveTraces(el, name) {
+    if (!el || !el.data) return;
+    const idx = [];
+    el.data.forEach((tr, i) => { if (tr.name === name) idx.push(i); });
+    if (idx.length) Plotly.deleteTraces(el, idx);
+  }
+
+  // Param-region highlight: a thick line over the channel segments the param drives, plus
+  // shaded time bands for any wait/timing regions it controls (waits have no channel output).
+  function seqEmphasizeParamRegion(path) {
+    seqClearEmphasis();
+    const el = $("plot-sequence");
+    if (!el || !el.data || !window.Plotly) return;
+    const xr = seqState.xref;
+    if (!xr || !xr.available) return;
+    const pids = new Set(((xr.param_to_pids || {})[path] || []).map(Number));
+    const overlays = pids.size ? _seqOverlayTraces(el, pids, SEQ_HILITE, "#ffd166", 6) : [];
+    if (overlays.length) Plotly.addTraces(el, overlays);
+    const regions = (xr.time_regions || {})[path] || [];
+    if (regions.length) {
+      Plotly.relayout(el, { shapes: regions.map(([t0, t1]) => ({
+        type: "rect", xref: "x", yref: "paper", x0: t0, x1: t1, y0: 0, y1: 1,
+        fillcolor: "rgba(255,209,102,0.13)", line: { width: 0 }, layer: "below" })) });
+    }
+    seqState._emphParam = path;
+    const bits = [];
+    if (overlays.length) bits.push("waveform region");
+    if (regions.length) bits.push(regions.length + " time band(s)");
+    toast(bits.length ? (path + " → " + bits.join(" + ")) : ("No region for " + path),
+          bits.length ? "ok" : "");
+  }
+
+  // Remove the param-selection overlay + its time bands.
+  function seqClearEmphasis() {
+    seqState._emphParam = null;
+    const el = $("plot-sequence");
+    if (!el || !el.data || !window.Plotly) return;
+    _seqRemoveTraces(el, SEQ_HILITE);
+    if (el.layout && el.layout.shapes && el.layout.shapes.length)
+      Plotly.relayout(el, { shapes: [] });
+  }
+
+  // Hover highlight (2c): a thick line over the pulse under the cursor, drawn on a plain SVG
+  // overlay ON TOP of the plot -- NOT a Plotly trace. So hovering triggers ZERO Plotly work
+  // (no redraw, no autorange recompute); it just sets one <polyline points="..."> attribute.
+  // Pixels are computed by linear interpolation from each axis' data range + pixel geometry
+  // (correct for the linear sequence axes), so primary/secondary channels both map right.
+  function seqWirePlotHover(el) {
+    if (el._seqHoverWired) return;
+    el._seqHoverWired = true;
+    el.on("plotly_hover", (data) => {
+      const pt = data && data.points && data.points[0];
+      const tr = pt && pt.data;
+      if (!tr || !tr.customdata || pt.customdata == null) return;
+      if (tr.name === SEQ_HILITE || tr.name === "Selected") return;
+      const xa = pt.xaxis, ya = pt.yaxis;          // the hovered point's own axes (handles y2)
+      if (!xa || !ya || !xa.range || !ya.range) return;
+      const key = String(pt.customdata) + "@" + tr.name;
+      if (el._seqHoverPid === key) return;          // still on the same pulse -> nothing to do
+      el._seqHoverPid = key;
+      const x0 = xa.range[0], xw = xa.range[1] - xa.range[0], xoff = xa._offset, xl = xa._length;
+      const y0 = ya.range[0], yw = ya.range[1] - ya.range[0], yoff = ya._offset, yl = ya._length;
+      const pid = Number(pt.customdata), out = [];
+      for (let k = 0; k < tr.customdata.length; k++) {   // scan ONLY the hovered channel
+        if (Number(tr.customdata[k]) !== pid) continue;
+        const px = xoff + (tr.x[k] - x0) / xw * xl;
+        const py = yoff + (1 - (tr.y[k] - y0) / yw) * yl;
+        if (isFinite(px) && isFinite(py)) out.push(px.toFixed(1) + "," + py.toFixed(1));
+      }
+      _seqHoverPath(el).setAttribute("points", out.join(" "));
+    });
+    el.on("plotly_unhover", () => { el._seqHoverPid = null; _seqClearHover(el); });
+    el.on("plotly_relayout", () => { el._seqHoverPid = null; _seqClearHover(el); });
+  }
+
+  // The transient hover line is a plain SVG <polyline> overlaid on the plot div (created once,
+  // pointer-events:none), so updating it never touches Plotly.
+  function _seqHoverPath(el, existingOnly) {
+    let ov = el.querySelector(":scope > svg.seq-hover-ov");
+    if (!ov) {
+      if (existingOnly) return null;
+      const NS = "http://www.w3.org/2000/svg";
+      ov = document.createElementNS(NS, "svg");
+      ov.setAttribute("class", "seq-hover-ov");
+      ov.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;" +
+                         "pointer-events:none;z-index:6;overflow:hidden;";
+      const pl = document.createElementNS(NS, "polyline");
+      pl.setAttribute("fill", "none");
+      pl.setAttribute("stroke", "#7ee787");
+      pl.setAttribute("stroke-width", "5");
+      pl.setAttribute("stroke-linejoin", "round");
+      pl.setAttribute("stroke-linecap", "round");
+      ov.appendChild(pl);
+      if (getComputedStyle(el).position === "static") el.style.position = "relative";
+      el.appendChild(ov);
+    }
+    return ov.firstChild;
+  }
+
+  function _seqClearHover(el) {
+    const p = _seqHoverPath(el, true);
+    if (p) p.setAttribute("points", "");
+  }
+
+  // ---- Selection focus region (top of the Parameters panel) -----------------
+  // Render the gathered params + derivation formula + driven channels for the current
+  // selection, with a Clear button. opts: {title, formula?, params:[], channels:[]}.
+  function seqSetFocus(opts) {
+    const box = $("seq-focus");
+    if (!box) return;
+    const chip = (txt, kind, data) =>
+      '<span class="seq-chip' + (kind === "chan" ? " chan" : "") + '" ' + data + ">" +
+      seqEsc(txt) + "</span>";
+    const parts = [
+      '<div class="seq-focus-head"><span>' + seqEsc(opts.title || "selection") +
+      '</span><span class="grow"></span>' +
+      '<span class="seq-focus-clear" id="seq-focus-clear">clear ✕</span></div>',
+    ];
+    if (opts.formula)
+      parts.push('<div class="seq-focus-formula">= ' + seqEsc(opts.formula) + "</div>");
+    if (opts.params && opts.params.length)
+      parts.push('<div class="seq-focus-row"><span class="lbl">params</span>' +
+        opts.params.map((p) => {
+          const path = (typeof p === "string") ? p : p.path;
+          const v = (typeof p === "object" && p.value != null) ? seqFmt(p.value) : null;
+          return '<span class="seq-chip" data-focus-param="' + seqEsc(path) + '">' +
+            seqEsc(path) + (v != null ? ' <span class="seq-chip-val">' + seqEsc(v) +
+            "</span>" : "") + "</span>";
+        }).join("") + "</div>");
+    if (opts.channels && opts.channels.length)
+      parts.push('<div class="seq-focus-row"><span class="lbl">channels</span>' +
+        opts.channels.map((c) => chip(c, "chan", 'data-focus-chan="' + seqEsc(c) + '"'))
+          .join("") + "</div>");
+    box.innerHTML = parts.join("");
+    box.hidden = false;
+  }
+
+  // The current value of a dotted param path, from the loaded params tree (for the focus chips).
+  function seqParamValue(path) {
+    let node = seqState.params;
+    if (!node || !path) return undefined;
+    for (const k of path.split(".")) {
+      if (node && typeof node === "object" &&
+          Object.prototype.hasOwnProperty.call(node, k)) node = node[k];
+      else return undefined;
+    }
+    return (node && typeof node === "object" && "value" in node) ? node.value : undefined;
+  }
+
+  function seqClearFocus() {
+    const box = $("seq-focus");
+    if (box) { box.innerHTML = ""; box.hidden = true; }
+    const pbox = $("seq-params");
+    if (pbox) {
+      $$(".seq-leaf.seq-leaf-xref-hit", pbox).forEach((el) =>
+        el.classList.remove("seq-leaf-xref-hit"));
+      $$(".seq-leaf.seq-leaf-active", pbox).forEach((el) =>
+        el.classList.remove("seq-leaf-active"));
+    }
+    seqClearEmphasis();
+  }
+
+  // Click a plot point -> focus the params that derive THAT segment (per-pulse), with the
+  // formula; falls back to whole-channel for idle/default (pid=-1) points.
+  function seqFocusPoint(chn, pid, value, time) {
+    const xr = seqState.xref;
+    if (!xr || !xr.available) return;
+    const box = $("seq-params");
+    if (box) $$(".seq-leaf.seq-leaf-xref-hit", box).forEach((el) =>
+      el.classList.remove("seq-leaf-xref-hit"));
+    const pulse = (pid != null && xr.pulses) ? xr.pulses[String(pid)] : null;
+    let params, formula = null, idle = false;
+    if (pulse) {
+      params = pulse.params || []; formula = pulse.expr || null;
+    } else {
+      params = (xr.channel_to_params && xr.channel_to_params[chn]) || [];
+      idle = true;                                  // pid=-1 / no per-pulse data
+    }
+    let first = null;
+    if (box) params.forEach((p) => {
+      const row = box.querySelector('.seq-leaf[data-param-path="' +
+                                    p.replace(/"/g, '\\"') + '"]');
+      if (row) { row.classList.add("seq-leaf-xref-hit"); if (!first) first = row; }
+    });
+    if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
+    const tStr = (time != null && isFinite(time)) ? Number(time).toFixed(3) + " ms" : "";
+    const vStr = (value != null && isFinite(value)) ? seqFmt(value) : "";
+    let title = chn + (tStr ? " @ " + tStr : "") + (vStr ? " = " + vStr : "");
+    if (idle && !params.length) title += "  (idle / no pulse here)";
+    else if (idle) title += "  (whole channel)";
+    seqSetFocus({ title, formula, channels: [chn],
+                  params: params.map((p) => ({ path: p, value: seqParamValue(p) })) });
+  }
+
+  // Click a param -> gather the params co-deriving its segments + the formula + driven
+  // channels into the focus region. (Channel promotion + region emphasis happen in
+  // seqSelectParam, which calls this.)
+  function seqFocusParam(path) {
+    const xr = seqState.xref;
+    if (!xr || !xr.available) return;
+    const pids = (xr.param_to_pids && xr.param_to_pids[path]) || [];
+    const channels = new Set((xr.param_to_channels && xr.param_to_channels[path]) || []);
+    const related = new Set([path]);
+    const exprs = new Set();
+    pids.forEach((p) => {
+      const pu = xr.pulses && xr.pulses[String(p)];
+      if (!pu) return;
+      (pu.params || []).forEach((x) => related.add(x));
+      if (pu.channel) channels.add(pu.channel);
+      if (pu.expr) exprs.add(pu.expr);
+    });
+    const ex = Array.from(exprs);
+    const formula = ex.length === 1 ? ex[0]
+      : (ex.length > 1 ? ex.length + " formulas (varies by segment)" : null);
+    const tr = (xr.time_regions && xr.time_regions[path]) || [];
+    const pv = seqParamValue(path);
+    let title = path + (pv != null ? " = " + seqFmt(pv) : "");
+    if (!channels.size && tr.length) title += "  (" + tr.length + " wait region(s))";
+    seqSetFocus({ title, formula, channels: Array.from(channels),
+                  params: Array.from(related).map((p) => ({ path: p, value: seqParamValue(p) })) });
+  }
+
+  function loadSequence() {
+    if (seqState._refreshToggle) seqState._refreshToggle();
+    // Load the scan list once (it carries Analysis-style meta, so it's a touch
+    // heavy); the Refresh button re-fetches on demand.
+    if (!seqScansCache.length) loadSeqScans();
+    if (seqState.index) seqRenderPlot();
+  }
+
+  function initSequenceTab() {
+    // "Load current" -> the running / most-recent scan's sequence dump.
+    // (seq-folder is now a hidden staging field for Browse…; there is no
+    // typed-path box anymore.)
+    const loadCurBtn = $("seq-load-btn");
+    if (loadCurBtn) loadCurBtn.addEventListener("click", async () => {
+      try {
+        const st = await api("/api/status");
+        const sid = st && (st.scan_id || st.scanId);
+        if (sid) seqLoad({ scan_id: String(sid) });
+        else toast("No current scan_id", "warn");
+      } catch (e) { toast("status failed: " + (e.message || e), "err"); }
+    });
+    const rebuildBtn = $("seq-rebuild-xref-btn");
+    if (rebuildBtn) rebuildBtn.addEventListener("click", seqForceRebuildXref);
+    const psel = $("seq-point-select");
+    if (psel) psel.addEventListener("change", seqOnPoint);
+    const ssel = $("seq-seq-select");
+    if (ssel) ssel.addEventListener("change", seqOnSeq);
+    const csel = $("seq-chn-select");
+    if (csel) csel.addEventListener("change", () => { seqUpdateChnCount(); seqRenderPlot(); });
+
+    // Params card: search box + config/modified/scanned toggles re-render the tree.
+    const pSearch = $("seq-param-search");
+    if (pSearch) pSearch.addEventListener("input", seqRenderParamTree);
+    ["seq-filter-config", "seq-filter-modified", "seq-filter-scanned"].forEach((id) => {
+      const el = $(id);
+      if (el) el.addEventListener("change", seqRenderParamTree);
+    });
+    // Click a param leaf -> promote its channels, emphasize its regions, fill the focus
+    // panel. Click the same (active) leaf again to clear. Delegated (the tree's innerHTML
+    // is rebuilt on every filter change).
+    const pbox = $("seq-params");
+    if (pbox) pbox.addEventListener("click", (e) => {
+      const row = e.target.closest(".seq-leaf[data-param-path]");
+      if (!row || !pbox.contains(row)) return;
+      if (row.classList.contains("seq-leaf-active")) { seqClearFocus(); return; }  // toggle off
+      seqSelectParam(row.dataset.paramPath);
+    });
+    // Focus region: Clear button + clickable param/channel chips.
+    const fbox = $("seq-focus");
+    if (fbox) fbox.addEventListener("click", (e) => {
+      if (e.target.closest("#seq-focus-clear")) { seqClearFocus(); return; }
+      const pc = e.target.closest("[data-focus-param]");
+      if (pc) { seqSelectParam(pc.dataset.focusParam); return; }
+      const cc = e.target.closest("[data-focus-chan]");
+      if (cc) { seqShowChannel(cc.dataset.focusChan); }
+    });
+
+    // Floating pickers (Channels on the right, Scans on the left): hover-driven,
+    // like the Analysis selector -- a thin edge tab that expands on hover and
+    // auto-minimizes on leave (see _wireSeqFloatCard).
+    _wireSeqFloatCard(document.getElementById("sequence-chn-card"));
+    _wireSeqFloatCard(document.getElementById("seqscan-card"));
+
+    // Scan picker (Analysis-style): search / date filter / refresh.
+    const scanSearch = $("seq-scan-search");
+    if (scanSearch) scanSearch.addEventListener("input", renderSeqScans);
+    const scanDate = $("seq-scan-date");
+    if (scanDate) scanDate.addEventListener("change", renderSeqScans);
+    const scanRefresh = $("seq-scan-refresh");
+    if (scanRefresh) scanRefresh.addEventListener("click", loadSeqScans);
+
+    // Browse: native OS folder picker on the lab PC (server-side Tk subprocess).
+    const browseBtn = $("seq-browse-btn");
+    if (browseBtn) browseBtn.addEventListener("click", async () => {
+      const label = browseBtn.textContent;
+      browseBtn.textContent = "Picking…"; browseBtn.disabled = true;
+      try {
+        const r = await api("/api/sequence/pick_folder", { method: "POST" });
+        if (r && r.path) {
+          const fin = $("seq-folder"); if (fin) fin.value = r.path;
+          seqLoad({ folder: r.path });
+        }
+      } catch (e) {
+        toast("Folder picker failed: " + (e.message || e), "err");
+      } finally {
+        browseBtn.textContent = label; browseBtn.disabled = false;
+      }
+    });
+
+    // Auto-dump toggle: rides the pyctrl runtime_state mmap flag via /api/sequence/dump_toggle.
+    const autosave = $("seq-autosave");
+    if (autosave) {
+      const refresh = async () => {
+        try { const r = await api("/api/sequence/dump_toggle"); autosave.checked = !!r.on; }
+        catch (e) { /* backend store not present yet -> leave unchecked */ }
+      };
+      autosave.addEventListener("change", async () => {
+        try {
+          const r = await api("/api/sequence/dump_toggle?on=" + (autosave.checked ? 1 : 0),
+                              { method: "POST" });
+          autosave.checked = !!r.on;
+          toast("Sequence auto-dump " + (r.on ? "ON" : "OFF"), r.on ? "ok" : "");
+        } catch (e) {
+          toast("toggle failed: " + (e.message || e), "err");
+          refresh();   // revert the checkbox to the real state
+        }
+      });
+      seqState._refreshToggle = refresh;
+      refresh();
+    }
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     initTabs();
+    initSequenceTab();
     setupFloatingAnalysisCards();
     startPolling();
     loadRunsList();

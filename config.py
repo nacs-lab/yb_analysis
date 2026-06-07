@@ -60,6 +60,56 @@ MATLAB_ROOT = os.environ.get(
 RUNNER_QUEUE_PATH = os.path.join(
     tempfile.gettempdir(), 'nacsctl', 'runner_queue.json')
 
+# ---- Sequence backend selection ---------------------------------------------
+# The monitor is a backend-agnostic ZMQ client: it talks to whichever backend
+# hosts the ExptServer at MATLAB_URL. Two backends exist:
+#   'matlab'  -> matlab_new/YbExptCtrl/SequenceRunner.m (legacy production)
+#   'pyctrl'  -> the pyctrl Python front-end run loop (now the default)
+# Switching is done live from the monitor GUI (a "Restart All"-style handoff
+# that relaunches run_monitor with the new --backend). The two never run at
+# once (one DCAM camera handle, one ZMQ port), so the handoff in run_monitor
+# tears the old backend down before the new one binds.
+DEFAULT_BACKEND = os.environ.get('YB_BACKEND', 'pyctrl')
+VALID_BACKENDS = ('matlab', 'pyctrl')
+
+# pyctrl backend launch. PYCTRL_PYTHON is the interpreter that has a libnacs
+# build (NOT the yb_analysis env — that one lacks the engine). PYCTRL_MODULE is
+# the run-loop entry point spawned as `python -m <module> <url>`; it hosts the
+# same ExptServer the MATLAB runner does. PYCTRL_CWD is the pyctrl package root
+# placed on sys.path. These are Phase-5 deliverables; until the module exists,
+# switching to pyctrl simply brings up a backend-down GUI you can switch back
+# from (run_monitor degrades gracefully when the backend fails to boot).
+def _default_pyctrl_python():
+    override = os.environ.get('YB_PYCTRL_PYTHON')
+    if override:
+        return override
+    # Prefer the pyctrl engine venv: it has BOTH the libnacs engine AND pylablib
+    # (the Orca camera dependency). The bare Python38 fallbacks below have the
+    # engine but NOT pylablib, so a backend spawned with them boots camera-less
+    # and the monitor's Camera card shows "camera unavailable (pylablib not opened)".
+    pyctrl_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), '..', 'pyctrl'))
+    if os.name == 'nt':
+        venv = os.path.join(pyctrl_root, '.venv-engine', 'Scripts', 'python.exe')
+        if os.path.exists(venv):
+            return venv
+        for p in (r'C:\Users\Ybtweezer-PC2\AppData\Local\Programs\Python\Python38\python.exe',
+                  r'C:\Python38\python.exe'):
+            if os.path.exists(p):
+                return p
+        return r'C:\Python38\python.exe'
+    venv = os.path.join(pyctrl_root, '.venv-engine', 'bin', 'python')
+    if os.path.exists(venv):
+        return venv
+    return 'python3'
+
+
+PYCTRL_PYTHON = _default_pyctrl_python()
+PYCTRL_MODULE = os.environ.get('YB_PYCTRL_MODULE', 'launcher.run_loop.runner')
+PYCTRL_CWD = os.environ.get(
+    'YB_PYCTRL_CWD',
+    os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'pyctrl')))
+
 # ---- Orca camera config (read from / written to expConfig.m) ----
 
 _EXPCONFIG_PATH = os.path.join(MATLAB_ROOT, 'expConfig.m')
