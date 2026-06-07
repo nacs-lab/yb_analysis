@@ -5987,14 +5987,10 @@
   async function seqLiveLoop(qs, gen) {
     const scanId = seqState.query && seqState.query.scan_id;
     const qsList = new URLSearchParams(seqState.query || {}).toString();
-    const sz = (xr) => (((xr && xr.steps) || []).length +
-                        Object.keys((xr && xr.time_regions) || {}).length);
-    const pc = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
     let endedPolls = 0;
     for (let i = 0; i < 1440; i++) {                // ~2 h cap at 5 s; bails when the run ends
       await new Promise((res) => setTimeout(res, 5000));
-      if (seqState._xrefPollGen !== gen) return;                          // superseded
-      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      if (seqPollSuperseded(scanId, gen)) return;   // newer load / navigated away
       let x = null;
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
       if (!x) continue;
@@ -6008,10 +6004,9 @@
       }
       // Re-render the viewed point's ruler/bands if its xref grew (it resolves once its seqid
       // ran) or pending dropped.
-      if (x.available && (pc(x) > pc(seqState.xref) || sz(x) > sz(seqState.xref))) {
-        seqState.xref = x;
-        seqRenderParamTree();
-        seqRenderStepRuler($("plot-sequence"));
+      if (x.available && (seqXrefParamCount(x) > seqXrefParamCount(seqState.xref) ||
+                          seqXrefSize(x) > seqXrefSize(seqState.xref))) {
+        seqApplyXref(x);
       }
       seqLiveBanner(x);
       if (!x.running) {
@@ -6085,6 +6080,27 @@
     (((xr && xr.steps) || []).length > 0) ||
     (Object.keys((xr && xr.time_regions) || {}).length > 0);
 
+  // Shared xref-shape accessors used by every poll loop below.
+  const seqXrefSize = (xr) => (((xr && xr.steps) || []).length +
+                               Object.keys((xr && xr.time_regions) || {}).length);
+  const seqXrefParamCount = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
+  const seqXrefPending = (xr) => (xr && xr.pending_globals) || 0;
+
+  // Adopt a freshly-fetched xref and re-render the param tree + step ruler -- the common tail
+  // of every poll loop when the artifact has grown.
+  function seqApplyXref(x) {
+    seqState.xref = x;
+    seqRenderParamTree();
+    seqRenderStepRuler($("plot-sequence"));
+  }
+
+  // A poll loop must stop when a newer seqRenderParams superseded it (the token moved) or the
+  // user navigated to a different scan. Snapshot scanId/gen at loop entry; check each tick.
+  function seqPollSuperseded(scanId, gen) {
+    return seqState._xrefPollGen !== gen ||
+           ((seqState.query && seqState.query.scan_id) !== scanId);
+  }
+
   // The server kicked off a background xref (re)build for the loaded scan -- poll until the
   // artifact GROWS (steps / time_regions appear, or the version bumps), then re-render.
   // Handles the case the version check alone misses: a current-version xref that was built
@@ -6096,21 +6112,16 @@
     // complete and the ruler already rendered. Nothing to poll for: clear and bail, else
     // `size(x) > start` never trips (start == final size) and the banner sticks ~40 s.
     if (seqXrefHasTimingMap(seqState.xref)) { seqSetXrefNotice(null); return; }
-    const size = (xr) => (((xr && xr.steps) || []).length +
-                          Object.keys((xr && xr.time_regions) || {}).length);
-    const start = size(seqState.xref);
+    const start = seqXrefSize(seqState.xref);
     const startV = (seqState.xref && seqState.xref.version) || 0;
     for (let i = 0; i < 25; i++) {                  // ~40 s (engine-free build is quick)
       await new Promise((res) => setTimeout(res, 1600));
-      if (seqState._xrefPollGen !== gen) return;                          // superseded
-      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      if (seqPollSuperseded(scanId, gen)) return;   // newer load / navigated away
       let x = null;
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
       if (x && x.build_error) { seqSetXrefNotice("error", x.build_error); return; }  // crashed
-      if (x && (size(x) > start || (x.version || 0) > startV)) {
-        seqState.xref = x;
-        seqRenderParamTree();
-        seqRenderStepRuler($("plot-sequence"));
+      if (x && (seqXrefSize(x) > start || (x.version || 0) > startV)) {
+        seqApplyXref(x);
         seqSetXrefNotice(null);                     // built -> clear the banner
         return;
       }
@@ -6125,18 +6136,13 @@
   // only once globals arrive). Renders the param map / steps as they grow; bails on navigation.
   async function seqAwaitGlobals(qs, gen) {
     const scanId = seqState.query && seqState.query.scan_id;
-    const pc = (xr) => Object.keys((xr && xr.param_to_channels) || {}).length;
-    const sz = (xr) => (((xr && xr.steps) || []).length +
-                        Object.keys((xr && xr.time_regions) || {}).length);
-    const pend = (xr) => (xr && xr.pending_globals) || 0;
     // Fully resolved already (map present, nothing pending) -> nothing to wait for.
-    if (seqXrefHasTimingMap(seqState.xref) && pend(seqState.xref) === 0) {
+    if (seqXrefHasTimingMap(seqState.xref) && seqXrefPending(seqState.xref) === 0) {
       seqSetXrefNotice(null); return;
     }
     for (let i = 0; i < 150; i++) {                 // ~12 min cap (5 s poll)
       await new Promise((res) => setTimeout(res, 5000));
-      if (seqState._xrefPollGen !== gen) return;                          // superseded
-      if ((seqState.query && seqState.query.scan_id) !== scanId) return;   // navigated away
+      if (seqPollSuperseded(scanId, gen)) return;   // newer load / navigated away
       let x = null;
       try { x = await api("/api/sequence/xref?" + qs); } catch (e) { continue; }
       if (!x) continue;
@@ -6144,16 +6150,15 @@
       // Re-render when the artifact GREW (param map / steps / bands) or pending dropped --
       // the param map renders the moment it exists (it needs no globals); steps + bands fill
       // in once globals land and the build re-resolves them.
-      if (x.available && (pc(x) > pc(seqState.xref) || sz(x) > sz(seqState.xref) ||
-                          pend(x) < pend(seqState.xref))) {
-        seqState.xref = x;
-        seqRenderParamTree();
-        seqRenderStepRuler($("plot-sequence"));
+      if (x.available && (seqXrefParamCount(x) > seqXrefParamCount(seqState.xref) ||
+                          seqXrefSize(x) > seqXrefSize(seqState.xref) ||
+                          seqXrefPending(x) < seqXrefPending(seqState.xref))) {
+        seqApplyXref(x);
       }
       const hasMap = seqXrefHasTimingMap(x);
-      if (hasMap && pend(x) === 0) { seqSetXrefNotice(null); return; }    // fully placed -> done
-      if (!hasMap && x.awaiting_globals) seqSetXrefNotice("awaiting", pend(x));  // nothing placed yet
-      else if (pend(x) > 0) seqSetXrefNotice("pending", pend(x));         // partial -> N pending
+      if (hasMap && seqXrefPending(x) === 0) { seqSetXrefNotice(null); return; }  // fully placed
+      if (!hasMap && x.awaiting_globals) seqSetXrefNotice("awaiting", seqXrefPending(x));
+      else if (seqXrefPending(x) > 0) seqSetXrefNotice("pending", seqXrefPending(x));
       else if (x.building) seqSetXrefNotice("building");
       else { seqSetXrefNotice(null); return; }             // nothing pending
     }

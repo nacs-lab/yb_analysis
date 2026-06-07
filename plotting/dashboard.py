@@ -378,19 +378,25 @@ _XREF_BUILD_ERRORS = {}
 _XREF_GLOBALS_REBUILT_COUNT = {}
 
 
+def _read_seq_json(seq_dir, name):
+    """Parse a JSON file in ``seq_dir`` (e.g. ``globals.json`` / ``xref.json``); ``{}`` if
+    absent or unreadable. The sequence/ dir is OneDrive-synced, so a partially-written or
+    missing file is normal mid-run -- callers treat ``{}`` as 'nothing captured yet'."""
+    import os
+    import json as _json
+    try:
+        with open(os.path.join(seq_dir, name), encoding='utf-8') as fh:
+            return _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
 def _globals_seqid_count(seq_dir):
     """Number of seqids captured in ``seq_dir/globals.json`` (0 if absent/unreadable).
 
     Content-based (``len(doc["globals"])``), NOT mtime -- mtime churns on the OneDrive-synced
     data folder, which would falsely look like growth and crash-loop the rebuild gate."""
-    import os
-    import json as _json
-    try:
-        with open(os.path.join(seq_dir, 'globals.json'), encoding='utf-8') as fh:
-            doc = _json.load(fh)
-        return len(doc.get('globals') or {})
-    except (OSError, ValueError):
-        return 0
+    return len(_read_seq_json(seq_dir, 'globals.json').get('globals') or {})
 
 
 def _spawn_xref_build(key, py, tool, base):
@@ -650,14 +656,8 @@ def _xref_scan_pending(seq_dir):
     together), so this scan-wide count -- not the per-file one -- is what the progress banner
     shows. All-zero (or no xref) -> nothing pending. Best-effort; never raises.
     """
-    import os
-    import json as _json
     out = {'pending_points': 0, 'total_points': 0, 'pending_bands': 0}
-    try:
-        with open(os.path.join(seq_dir, 'xref.json'), encoding='utf-8') as fh:
-            by_file = _json.load(fh).get('by_file') or {}
-    except (OSError, ValueError):
-        return out
+    by_file = _read_seq_json(seq_dir, 'xref.json').get('by_file') or {}
     for e in by_file.values():
         p = int((e or {}).get('pending_globals') or 0)
         if p > 0:
