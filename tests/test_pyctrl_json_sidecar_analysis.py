@@ -38,7 +38,8 @@ SWEPT_VALUES = [10.0, 20.0, 30.0]
 SCAN_NAME = "FakePyctrlScan"
 
 
-def _write_pyctrl_scan(root, scan_id="20990101120000", n_reps=4):
+def _write_pyctrl_scan(root, scan_id="20990101120000", n_reps=4,
+                       extra_cfg=None):
     """Create ``<root>/Data/<day>/data_<stamp>/{.json,.h5}`` (no .mat).
 
     Mirrors what pyctrl's scan_prep.write_scan_config + the monitor's HDF5
@@ -83,6 +84,8 @@ def _write_pyctrl_scan(root, scan_id="20990101120000", n_reps=4):
             },
         },
     }
+    if extra_cfg:
+        cfg.update(extra_cfg)
     with open(os.path.join(scan_dir, f"{base}.json"), "w") as f:
         json.dump(cfg, f)
 
@@ -128,6 +131,46 @@ def test_analyze_scan_dir_on_json_sidecar(tmp_path):
     assert all(0.0 <= x <= 1.0 for x in lr)
 
 
+def test_pyctrl_json_with_calibration_populates_persite(tmp_path):
+    """When pyctrl bakes the day-folder calibration into its json (the new
+    scan_prep behavior), the offline analysis gets per-site coords +
+    thresholds + discrimination — same as a MATLAB .mat run."""
+    n_sites = 5
+    calib = {
+        "initGridLocationsX": [float(20 + i) for i in range(n_sites)],
+        "initGridLocationsY": [float(10 + i) for i in range(n_sites)],
+        "initThresholds":     [100.0 + i for i in range(n_sites)],
+        "initInfidelities":   [1e-3 * (i + 1) for i in range(n_sites)],
+        "boxSize": 9, "maskSigma": 2,
+    }
+    scan_dir, _ = _write_pyctrl_scan(str(tmp_path), extra_cfg=calib)
+    res = analyze_scan_dir(scan_dir)
+    ps = res.get("per_site") or {}
+    assert len(ps.get("x") or []) == n_sites      # per-site maps now render
+    assert len(ps.get("infidelity") or []) == n_sites
+    disc = res.get("discrimination")
+    assert disc is not None and disc["n_sites"] == n_sites
+    ti = res.get("thresholds_info")
+    assert ti is not None and ti["n"] == n_sites and ti["source"] == "scan_init"
+
+
+def test_pyctrl_run_parameters_from_scangroup_base_params(tmp_path):
+    """pyctrl fixed params (ScanGroup.base.params) show up in Details, not just
+    the swept axis."""
+    extra = {"ScanGroup": {"version": 1, "base": {
+        "vars": {"params": [{"Pushout": {"Green": {"Freq": SWEPT_VALUES}}}],
+                 "size": [len(SWEPT_VALUES)]},
+        "params": {"Pushout": {"Green": {"Amp": 0.18}, "Time": 0.02}},
+    }}}
+    scan_dir, _ = _write_pyctrl_scan(str(tmp_path), extra_cfg=extra)
+    res = analyze_scan_dir(scan_dir)
+    rp = res.get("run_parameters") or []
+    base = {p["name"]: p["value"] for p in rp if p["group"] == "base"}
+    assert base.get("Pushout.Green.Amp") == 0.18
+    assert base.get("Pushout.Time") == 0.02
+    assert any(p["group"] == "swept" for p in rp)
+
+
 def test_str_or_none_decodes_float_char_codes():
     # _config_arrays floats numeric JSON lists, so a scanname stored as char
     # codes arrives as a float ndarray; _str_or_none must still decode it.
@@ -141,3 +184,33 @@ def test_str_or_none_leaves_real_float_arrays_alone():
     decoded = RA._str_or_none(np.array([0.1, 0.2, 0.3]))
     # Non-integral -> not treated as char codes (no chr() of fractional values).
     assert decoded is None or not decoded.startswith("\x00")
+
+
+def test_extract_scan_dims_resolves_list_and_bool_axes():
+    """pyctrl JSON sidecars store swept values as plain Python lists --
+    numeric ([50,100]) AND boolean ([False,True], e.g. model_bookend_pre).
+    Both must resolve their dotted name + size, not fall back to 'axisN'.
+    Regression for the model_bookend 2-D sweep showing as a 1-D 'axis0'.
+    """
+    from yb_analysis.detection.scan_analysis import (
+        extract_scan_dims, _find_first_numeric)
+
+    # bool + numeric Python lists both coerce to a numeric vector
+    v, p = _find_first_numeric({"a": {"b": [False, True]}}, [])
+    assert v is not None and p == ["a", "b"] and list(v) == [0.0, 1.0]
+    v, p = _find_first_numeric({"a": {"b": [50, 100]}}, [])
+    assert v is not None and p == ["a", "b"] and list(v) == [50.0, 100.0]
+
+    # a 2-D boolean sweep (the model_bookend pre x post case)
+    cfg = {"ScanGroup": {"base": {"vars": {
+        "params": [
+            {"rearrange_kwargs": {"extras": {"model_bookend_pre": [False, True]}}},
+            {"rearrange_kwargs": {"extras": {"model_bookend_post": [False, True]}}},
+        ],
+        "size": [2, 2],
+    }}}}
+    dims = extract_scan_dims(cfg)
+    assert dims is not None and len(dims) == 2
+    assert dims[0]["name"] == "rearrange_kwargs.extras.model_bookend_pre"
+    assert dims[1]["name"] == "rearrange_kwargs.extras.model_bookend_post"
+    assert [d["size"] for d in dims] == [2, 2]

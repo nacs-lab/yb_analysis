@@ -70,6 +70,31 @@ def _validate_handrolled(desc: Mapping[str, Any]) -> None:
         raise DescriptorError(
             f"label must be a string, got {type(desc['label']).__name__}")
 
+    if 'code_snapshot' in desc:
+        _check_code_snapshot(desc['code_snapshot'])
+
+
+def _check_code_snapshot(cs: Any) -> None:
+    """Validate the optional ``code_snapshot`` pin (#3 reproducibility).
+
+    ``{"scan_id": <int>, "data_root"?: <str>}`` -- the source run whose snapshotted
+    experiment code the runner should replay. Inert for normal runs (omitted); the
+    pyctrl run loop honors it, the MATLAB backend ignores it.
+    """
+    if not isinstance(cs, Mapping):
+        raise DescriptorError(
+            f"code_snapshot must be an object, got {type(cs).__name__}")
+    if 'scan_id' not in cs:
+        raise DescriptorError("code_snapshot must set 'scan_id'")
+    sid = cs['scan_id']
+    if isinstance(sid, bool) or not isinstance(sid, (int, float)):
+        raise DescriptorError(
+            f"code_snapshot.scan_id must be a number, got {type(sid).__name__}")
+    if 'data_root' in cs and not isinstance(cs['data_root'], str):
+        raise DescriptorError(
+            f"code_snapshot.data_root must be a string, got "
+            f"{type(cs['data_root']).__name__}")
+
 
 def _check_seq(seq: Any) -> None:
     if isinstance(seq, str):

@@ -127,7 +127,7 @@
   }
 
   // ---- Tab switching ----
-  const TABS = ["live", "hardware", "analysis", "queue", "diag", "sequence"];
+  const TABS = ["live", "hardware", "analysis", "queue", "sequence", "logs"];
   let activeTab = "live";
 
   function setTab(tab) {
@@ -227,7 +227,7 @@
     // Hardware tab is just an iframe wrapping the SLM dashboard;
     // no lab-side polling needed -- the iframe drives its own.
     if (tab === "queue")    return pollQueue();
-    if (tab === "diag")     return pollDiag();
+    if (tab === "logs")     return pollLogs();
     if (tab === "sequence") return loadSequence();
     // Analysis: the top-right Refresh re-fetches the runs list and reloads
     // the current analysis (otherwise it's a no-op on this tab).
@@ -257,6 +257,9 @@
     // get null-querySelector crashes against UI elements that only
     // existed in the old manual-port version of this tab.
     loop("queue",    pollQueue,    POLL.queue);
+    // Logs tab: re-list + refresh the open file every 5 s so an open log
+    // "follows" a running server (tail mode auto-scrolls to the bottom).
+    loop("logs",     pollLogs,     5000);
     // Connection-status pill polls every 5s regardless of active tab.
     setInterval(updateConnStatus, 5000);
     updateConnStatus();
@@ -373,7 +376,6 @@
     ["loadlive",  "plot-loading-live"],
     ["load",      "plot-load-map"],
     ["infid",     "plot-infid-map"],
-    ["shift",     "plot-shift"],
     ["avghist",   "plot-hist-avg"],
     ["rep0",      "plot-hist-rep0"],
     ["rep1",      "plot-hist-rep1"],
@@ -486,6 +488,8 @@
     await pollLiveFigures();
     // Per-site hist refreshes too (separate endpoint with site index).
     await pollSiteHist();
+    // Affine-alignment card (small JSON; re-renders only when it changes).
+    await pollAffine();
   }
 
   // Compact queue preview in the Yb Control sidebar — mirrors the Tkinter
@@ -499,6 +503,22 @@
     const running = q.running;
     const queued  = q.queued || [];
     const history = q.history || [];
+
+    // Abort-button indicator: a next scan is waiting → arrow (abort advances
+    // to it); nothing queued → red ✗ (abort fully stops the experiment).
+    const abInd = $("abort-ind");
+    if (abInd) {
+      const n = queued.length;
+      if (n > 0) {
+        abInd.textContent = "↪";
+        abInd.className = "abort-ind ind-next";
+        abInd.title = `${n} scan${n > 1 ? "s" : ""} queued — abort advances to the next`;
+      } else {
+        abInd.textContent = "✗";
+        abInd.className = "abort-ind ind-stop";
+        abInd.title = "Nothing queued — abort stops the experiment";
+      }
+    }
 
     // --- Active line ---
     const actEl = $("ctrl-queue-active");
@@ -1428,43 +1448,239 @@
     }), plotConfig());
   }
 
-  // Grid-shift heatmap — port of _fig_shift.
-  function renderShiftHeatmap(snap) {
-    if (!window.Plotly) return;
-    const el = $("plot-shift");
-    if (!el) return;
-    const hm = snap.grid_shift_heatmap;
-    if (!hm || !hm.length || !hm[0] || !hm[0].length) {
-      Plotly.purge(el);
-      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">no shift data yet</div>';
+  // =====================================================================
+  // AFFINE ALIGNMENT (replaced Grid-shift). Visualizes the global
+  // SLM(knm)→camera(px) affine: how well aligned RIGHT NOW (current-fit RMS
+  // + coverage + freshness badges), how the affine has drifted over its
+  // update history (trend + translation-drift scatter), and a version table
+  // with rollback. Data: GET /api/affine/history → {current, history}.
+  // =====================================================================
+  // Trend dropdown: ONLY the quantities that actually move under our normal
+  // (drift/translation) updates — translation + the full-refit RMS. Scale /
+  // rotation / det are fixed by the geometry, so they don't belong in a
+  // time-trend (they're still shown in the badges + the history table).
+  const AFFINE_METRICS = [
+    {key: "rms_px", label: "alignment RMS", unit: "px"},
+    {key: "tx",     label: "translation x", unit: "px"},
+    {key: "ty",     label: "translation y", unit: "px"},
+  ];
+  // Guardrail thresholds (mirror affine_transform.py): rms ceiling 2.0 px,
+  // coverage floor 0.85. We add a tighter "good" band for the badge colors.
+  let affineData = null;        // {current, timeline:[...]}
+  let affineRenderedTs = null;  // dedupe re-renders (current.updated_iso)
+
+  async function pollAffine() {
+    let resp = null;
+    try { resp = await api("/api/affine/history"); }
+    catch (e) { return; }
+    const current = resp && resp.current;
+    const history = (resp && resp.history) || [];
+    // Timeline oldest→newest = history (older) then current (latest).
+    const raw = current ? history.concat([current]) : history.slice();
+    const timeline = raw.map((e) => {
+      const A = e.A;
+      const ty = (A && A[0] && A[0][2] != null) ? A[0][2] : null;  // A row0 → Y
+      const tx = (A && A[1] && A[1][2] != null) ? A[1][2] : null;  // A row1 → X
+      return Object.assign({}, e, {tx: tx, ty: ty});
+    });
+    affineData = {current: current, timeline: timeline};
+    const ts = current ? (current.updated_iso || "") : "";
+    if (ts === affineRenderedTs) { return; }   // unchanged → skip re-render
+    affineRenderedTs = ts;
+    renderAffine();
+  }
+
+  function _affineBadge(label, valHtml, cls, title) {
+    return `<span class="affine-badge ${cls}" ${title ? `title="${escHtml(title)}"` : ""}>`
+         + `<span class="ab-label">${escHtml(label)}</span>`
+         + `<span class="ab-val">${valHtml}</span></span>`;
+  }
+
+  function renderAffine() {
+    const qWrap = $("affine-quality");
+    if (!qWrap) return;
+    const cur = affineData && affineData.current;
+    if (!cur) {
+      qWrap.innerHTML = '<span class="muted">no affine calibrated yet</span>';
+      setText("affine-info", "");
+      ["plot-affine-trend", "plot-affine-drift"].forEach((id) => {
+        const el = $(id); if (el && window.Plotly) Plotly.purge(el);
+      });
+      const t = $("affine-table"); if (t) t.innerHTML = "";
       return;
     }
-    const R = Math.floor((hm.length - 1) / 2);
-    const xs = Array.from({length: hm[0].length}, (_, i) => i - R);
-    const ys = Array.from({length: hm.length},    (_, i) => i - R);
-    const traces = [{
-      z: hm, x: xs, y: ys, type: "heatmap",
-      colorscale: "Viridis", showscale: true,
-      colorbar: { len: 0.9 },
-    }];
-    let titleText = "Grid Shift Heatmap";
-    const histArr = snap.grid_shift_history || [];
-    if (histArr.length) {
-      const last = histArr[histArr.length - 1];
-      const dy = last[0], dx = last[1];
-      traces.push({
-        x: [dx], y: [dy], mode: "markers", type: "scatter",
-        marker: { symbol: "x", size: 14, color: "red",
-                  line: { width: 2, color: "red" }},
-        showlegend: false, hoverinfo: "skip",
-      });
-      titleText = `Grid Shift (dy=${dy}, dx=${dx})`;
+    // ---- current-alignment quality badges ----
+    // rms_px / coverage / n_pairs are only recorded on FULL refits; live drift
+    // (translation) updates leave them null. Fall back to the most recent entry
+    // that has them so "how aligned right now" still shows the last fit.
+    const fmt = (v, d) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+    const tl0 = affineData.timeline || [];
+    const lastFit = tl0.slice().reverse().find(
+      (e) => e.rms_px != null && isFinite(e.rms_px));
+    const rms = cur.rms_px != null ? cur.rms_px : (lastFit ? lastFit.rms_px : null);
+    const cov = cur.coverage != null ? cur.coverage : (lastFit ? lastFit.coverage : null);
+    const npairs = cur.n_pairs != null ? cur.n_pairs : (lastFit ? lastFit.n_pairs : null);
+    // rms/cov are carried forward from the last FULL fit through drift updates;
+    // tag them "(last fit)" when they didn't come from the current entry's scan.
+    const carried = (cur.fit_scan_id && cur.fit_scan_id !== cur.last_scan_id)
+                    || (cur.rms_px == null && rms != null);
+    const fitSfx = carried ? " (last fit)" : "";
+    const rmsCls = rms == null ? "ab-neutral"
+      : rms <= 0.5 ? "ab-good" : rms <= 2.0 ? "ab-warn" : "ab-bad";
+    const covCls = cov == null ? "ab-neutral"
+      : cov >= 0.85 ? "ab-good" : cov >= 0.5 ? "ab-warn" : "ab-bad";
+    const A = cur.A || null;
+    const tx = (A && A[1]) ? A[1][2] : null;   // A row1 → X translation
+    const ty = (A && A[0]) ? A[0][2] : null;   // A row0 → Y translation
+    const badges = [
+      _affineBadge("alignment RMS" + fitSfx, rms == null ? "—" : `${fmt(rms, 3)} px`, rmsCls,
+                   "Affine fit residual (recorded on full refits). ≤0.5 good · ≤2 ok · >2 poor. "
+                   + "Live drift updates don't measure it — this shows the last full fit."),
+      _affineBadge("coverage" + fitSfx, cov == null ? "—" : fmtPct(cov), covCls,
+                   "Fraction of pattern sites matched in the last full fit (≥85% good)."),
+      _affineBadge("pairs", npairs == null ? "—" : String(npairs), "ab-neutral"),
+      _affineBadge("offset x,y", (tx == null || ty == null) ? "—" : `${fmt(tx, 1)}, ${fmt(ty, 1)}`,
+                   "ab-neutral", "Affine translation in camera px — live drift tracks this."),
+      _affineBadge("scale", `${fmt(cur.scale_x, 3)} × ${fmt(cur.scale_y, 3)}`, "ab-neutral",
+                   "px per knm pixel (x × y)."),
+      _affineBadge("rotation", `${fmt(cur.rotation_deg, 3)}°`, "ab-neutral"),
+      _affineBadge("det", fmt(cur.det, 2), "ab-neutral"),
+    ];
+    qWrap.innerHTML = badges.join("");
+    // Freshness: how recent the current affine is + which scan set it.
+    const age = cur.updated_iso ? isoAgeHuman(cur.updated_iso) : null;
+    const sid = cur.last_scan_id ? ` · from scan ${escHtml(String(cur.last_scan_id))}` : "";
+    const stale = cur.rolled_back ? " · rolled back" : "";
+    setText("affine-info",
+            (age ? `updated ${age} ago` : "") + sid + stale
+            + ` · ${(affineData.timeline || []).length} versions`);
+    // ---- ensure the trend-metric dropdown is populated ----
+    const sel = $("affine-metric");
+    if (sel && !sel.options.length) {
+      sel.innerHTML = AFFINE_METRICS.map((m) =>
+        `<option value="${m.key}">${escHtml(m.label)}${m.unit ? ` (${m.unit})` : ""}</option>`).join("");
+      // Default to the first metric that actually has values — drift updates
+      // record translation/scale but not rms/coverage, so rms_px is often all
+      // null and would otherwise show an empty chart.
+      const withData = AFFINE_METRICS.find(
+        (m) => tl0.some((e) => e[m.key] != null && isFinite(e[m.key])));
+      sel.value = (withData && withData.key) || "rms_px";
+      sel.onchange = drawAffineTrend;
     }
-    Plotly.react(el, traces, plotLayout({
-      title: { text: titleText, font: { size: 12 }},
-      xaxis: { title: "dx" },
-      yaxis: { title: "dy", autorange: "reversed" },
+    drawAffineTrend();
+    drawAffineDrift();
+    renderAffineTable();
+  }
+
+  // Approx "2.3 h" / "4 days" from an ISO timestamp to now.
+  function isoAgeHuman(iso) {
+    const t = Date.parse(iso);
+    if (!isFinite(t)) return null;
+    let s = Math.max(0, (Date.now() - t) / 1000);
+    if (s < 90) return `${Math.round(s)} s`;
+    if (s < 5400) return `${Math.round(s / 60)} min`;
+    if (s < 172800) return `${(s / 3600).toFixed(1)} h`;
+    return `${(s / 86400).toFixed(1)} days`;
+  }
+
+  function drawAffineTrend() {
+    if (!window.Plotly) return;
+    const el = $("plot-affine-trend");
+    if (!el || !affineData) return;
+    const tl = affineData.timeline || [];
+    const sel = $("affine-metric");
+    const key = (sel && sel.value) || "rms_px";
+    const meta = AFFINE_METRICS.find((m) => m.key === key) || AFFINE_METRICS[0];
+    const x = tl.map((e, i) => e.updated_iso || String(i));
+    const y = tl.map((e) => {
+      const v = e[key];
+      return (v == null || !isFinite(v)) ? null : Number(v);
+    });
+    if (!y.some((v) => v != null)) {
+      Plotly.purge(el);
+      const msg = tl.length
+        ? `no ${escHtml(meta.label)} values (drift updates don't record it — try another metric)`
+        : "no affine history yet";
+      el.innerHTML = `<div class="hint" style="padding:24px;text-align:center;">${msg}</div>`;
+      return;
+    }
+    const traces = [{
+      x: x, y: y, mode: "lines+markers", type: "scatter",
+      line: {width: 1.6, color: "#58a6ff"}, marker: {size: 6, color: "#58a6ff"},
+      connectgaps: false, name: meta.label,
+    }];
+    // rms guardrail line for context.
+    const layout = plotLayoutFlush({
+      margin: {l: 64, r: 16, t: 26, b: 60},
+      title: {text: `${meta.label} over affine updates`, font: {size: 12}},
+      xaxis: {title: {text: "affine version (time)"}, type: "category",
+              gridcolor: "#2a3242"},
+      yaxis: {title: {text: meta.unit || meta.label}, gridcolor: "#2a3242"},
+      showlegend: false,
+    });
+    if (key === "rms_px") {
+      layout.shapes = [{type: "line", xref: "paper", x0: 0, x1: 1,
+                        yref: "y", y0: 2.0, y1: 2.0,
+                        line: {color: "#f85149", width: 1, dash: "dash"}}];
+    }
+    Plotly.react(el, traces, layout, plotConfig());
+  }
+
+  function drawAffineDrift() {
+    if (!window.Plotly) return;
+    const el = $("plot-affine-drift");
+    if (!el || !affineData) return;
+    const tl = (affineData.timeline || []).filter(
+      (e) => e.tx != null && e.ty != null && isFinite(e.tx) && isFinite(e.ty));
+    if (!tl.length) {
+      Plotly.purge(el);
+      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">no translation history</div>';
+      return;
+    }
+    const X = tl.map((e) => e.tx), Y = tl.map((e) => e.ty);
+    const C = tl.map((e, i) => i);
+    Plotly.react(el, [{
+      x: X, y: Y, mode: "lines+markers", type: "scatter",
+      line: {width: 1, color: "#2a3242"},
+      marker: {size: 9, color: C, colorscale: "Viridis", showscale: true,
+               colorbar: {title: {text: "version", side: "right"},
+                          thickness: 10, len: 0.9}},
+      text: tl.map((e) => e.last_scan_id ? `scan ${e.last_scan_id}` : ""),
+      hovertemplate: "x=%{x:.1f} px<br>y=%{y:.1f} px<br>%{text}<extra></extra>",
+    }], plotLayoutFlush({
+      margin: {l: 64, r: 16, t: 26, b: 50},
+      title: {text: "translation drift (camera px)", font: {size: 12}},
+      xaxis: {title: {text: "X offset (px)"}, gridcolor: "#2a3242"},
+      yaxis: {title: {text: "Y offset (px)"}, gridcolor: "#2a3242",
+              scaleanchor: "x", scaleratio: 1},
+      showlegend: false,
     }), plotConfig());
+  }
+
+  function renderAffineTable() {
+    const wrap = $("affine-table");
+    if (!wrap || !affineData) return;
+    const tl = (affineData.timeline || []).slice().reverse();   // newest first
+    if (!tl.length) { wrap.innerHTML = ""; return; }
+    const fmt = (v, d) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+    const rows = tl.map((e, i) => {
+      const isCur = (i === 0);
+      const when = e.updated_iso ? escHtml(e.updated_iso.replace("T", " ").slice(0, 19)) : "—";
+      return `<tr class="${isCur ? "af-cur" : ""}">
+        <td>${isCur ? "● current" : "history"}</td>
+        <td class="mono">${when}</td>
+        <td class="mono">${e.last_scan_id ? escHtml(String(e.last_scan_id)) : "—"}</td>
+        <td class="mono">${fmt(e.rms_px, 3)}</td>
+        <td class="mono">${e.coverage == null ? "—" : fmtPct(e.coverage)}</td>
+        <td class="mono">${e.n_pairs == null ? "—" : e.n_pairs}</td>
+        <td class="mono">${fmt(e.scale_x, 3)}×${fmt(e.scale_y, 3)}</td>
+        <td class="mono">${fmt(e.rotation_deg, 3)}°</td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table class="af-table"><thead><tr>
+      <th></th><th>updated</th><th>scan</th><th>RMS px</th><th>cov</th>
+      <th>pairs</th><th>scale x×y</th><th>rot</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
   }
 
   // Avg histogram — port of _fig_avghist (live bars + fit curves).
@@ -1593,7 +1809,6 @@
     pollHwLocks();
     pollHwClients();
     pollHwLogs();
-    pollHwRearrangeDiag();
     // Phase + camera PNGs (cache-busted via t param)
     const ts = Date.now();
     refreshImg("phase-wrap", "phase-placeholder",
@@ -1824,15 +2039,6 @@
     }
   }
 
-  async function pollHwRearrangeDiag() {
-    try {
-      const rd = await api("/api/slm/rearrange/diag");
-      renderRearrangeDiag(rd);
-    } catch {
-      $("rearrange-diag-body").innerHTML =
-        '<div class="hint">SLM offline</div>';
-    }
-  }
 
   function refreshImg(wrapId, phId, url, tsId) {
     const wrap = $(wrapId);
@@ -1856,32 +2062,6 @@
       wrap.appendChild(img);
     }
     img.src = url;
-  }
-
-  function renderRearrangeDiag(rd) {
-    const body = $("rearrange-diag-body");
-    if (!body) return;
-    const entries = (rd && rd.entries) || [];
-    if (!entries.length) {
-      body.innerHTML = '<div class="hint">no recent rearrange shots</div>';
-      return;
-    }
-    const rows = entries.slice(-10).map((e) => {
-      const d = e.diag || {};
-      return `<tr>
-        <td class="mono">${escHtml(e.ts_iso || "")}</td>
-        <td class="mono">${escHtml(String(e.scan_id || ""))}</td>
-        <td class="right">${e.seq_id != null ? e.seq_id : ""}</td>
-        <td class="right">${d.total_ms != null ? d.total_ms.toFixed(1) : ""}</td>
-        <td class="right">${d.n_loaded != null ? d.n_loaded : ""}</td>
-        <td>${d.aborted ? '<span class="bad">yes</span>' : ""}</td>
-      </tr>`;
-    }).join("");
-    body.innerHTML = `
-      <table class="dense">
-        <thead><tr><th>ts</th><th>scan_id</th><th>seq</th>
-          <th>total_ms</th><th>n_loaded</th><th>aborted</th></tr></thead>
-        <tbody>${rows}</tbody></table>`;
   }
 
   function escHtml(s) {
@@ -3355,6 +3535,9 @@
           } else if (action === "set_backend") {
             path = `/api/control/set_backend?target=${encodeURIComponent(target)}`;
             label = `Switch to ${target}`;
+          } else if (action === "shutdown") {
+            path = "/api/control/shutdown";
+            label = "Shutdown";
           } else {
             path = "/api/control/restart_all";
             label = "Restart All";
@@ -3568,25 +3751,30 @@
         Math.min(1, Math.max(1e-6, (v == null || !isFinite(v)) ? 1e-6 : v))));
       traces.push({
         x: xIn, y: yIn, type: "scattergl", mode: "markers",
-        customdata: vIn,
+        // customdata[k] = [canonical bitstring site index, raw value]. Use the
+        // CANONICAL index (iIn) for the hover, not %{pointNumber} — the latter
+        // is the position within the plotted subset, which differs between maps
+        // when target/non-target masks hide sites.
+        customdata: vIn.map((v, j) => [iIn[j], v]),
         marker: {
           size: siteDotSize, color: logv, colorscale: "Magma",
           reversescale: true, cmin: -4, cmax: -0.3, line: {width: 0},
           colorbar: {title: {text: "log10 infid"}, len: 0.9},
         },
-        hovertemplate: "site %{pointNumber}: %{customdata:.2e}<extra></extra>",
+        hovertemplate: "site %{customdata[0]}: %{customdata[1]:.2e}<extra></extra>",
         name: label,
       });
     } else {
       traces.push({
         x: xIn, y: yIn, type: "scattergl", mode: "markers",
+        customdata: iIn,   // canonical bitstring site index (shared everywhere)
         marker: {
           size: siteDotSize, color: vIn, colorscale,
           cmin: vmin, cmax: vmax,
           line: {width: 0},
           colorbar: {title: {text: label}, len: 0.9, tickformat: ".2f"},
         },
-        hovertemplate: "site %{pointNumber}: %{marker.color:.3f}<extra></extra>",
+        hovertemplate: "site %{customdata}: %{marker.color:.3f}<extra></extra>",
         name: maskLabel || label,
       });
     }
@@ -4913,77 +5101,97 @@
   });
 
   // =====================================================================
-  // DIAG TAB
+  // LOGS TAB  — browse + view the server/monitor/backend log files on disk
   // =====================================================================
-  async function pollDiag() {
-    // Just refreshes the live rearrange-diag rollup; the per-scan
-    // ledger lookup is on-demand via the Load button.
+  let logsSelected = null;     // {category, name} of the open file, or null
+  let logsListCache = null;    // last /api/logs/list payload (for re-highlight)
+
+  function fmtBytes(n) {
+    if (n == null) return "—";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  async function pollLogs() {
+    // Refresh the file list; if a file is open, refresh its contents too so
+    // an open log "follows" a running server (tail mode auto-scrolls).
     try {
-      const rd = await api("/api/slm/rearrange/diag");
-      renderRearrangeDiag(rd);
-      setText("diag-rearrange-count",
-        ((rd && rd.entries) || []).length + " entries");
+      logsListCache = await api("/api/logs/list");
+      renderLogsList();
     } catch (e) {
-      $("rearrange-diag-body").innerHTML =
-        '<div class="hint">SLM offline (' + escHtml(e.message || "") + ')</div>';
+      const el = $("logs-list");
+      if (el) el.innerHTML = '<div class="hint">log list unavailable (' +
+        escHtml(e.message || "") + ')</div>';
+    }
+    if (logsSelected) { try { await loadLogFile({keepScroll: true}); } catch (e) {} }
+  }
+
+  function renderLogsList() {
+    const el = $("logs-list");
+    if (!el) return;
+    const groups = (logsListCache && logsListCache.groups) || [];
+    if (!groups.length) { el.innerHTML = '<div class="hint">no log files found</div>'; return; }
+    let html = "";
+    for (const g of groups) {
+      html += `<div class="logs-group-label">${escHtml(g.label)} ` +
+        `<span class="muted">(${(g.files || []).length})</span></div>`;
+      if (!g.files || !g.files.length) {
+        html += '<div class="hint" style="padding:2px 10px;">— none —</div>';
+        continue;
+      }
+      for (const f of g.files) {
+        const on = (logsSelected && logsSelected.category === g.category &&
+                    logsSelected.name === f.name) ? " active" : "";
+        html += `<div class="logs-file${on}" data-cat="${escHtml(g.category)}" ` +
+          `data-name="${escHtml(f.name)}" title="${escHtml(f.name)}">` +
+          `<span class="logs-file-name mono">${escHtml(f.name)}</span>` +
+          `<span class="logs-file-meta muted">${fmtBytes(f.size)} · ` +
+          `${escHtml(f.mtime_iso || "")}</span></div>`;
+      }
+    }
+    el.innerHTML = html;
+    el.querySelectorAll(".logs-file").forEach((row) => {
+      row.addEventListener("click", () => {
+        logsSelected = {category: row.dataset.cat, name: row.dataset.name};
+        renderLogsList();
+        loadLogFile({keepScroll: false});
+      });
+    });
+  }
+
+  async function loadLogFile(opts) {
+    opts = opts || {};
+    const view = $("logs-view");
+    if (!view || !logsSelected) return;
+    const tail = $("logs-tail-toggle") ? $("logs-tail-toggle").checked : true;
+    const q = new URLSearchParams({
+      category: logsSelected.category, name: logsSelected.name,
+      tail: tail ? "1" : "0"});
+    const wasBottom = (view.scrollTop + view.clientHeight >= view.scrollHeight - 40);
+    try {
+      const r = await api("/api/logs/file?" + q.toString());
+      const meta = r.truncated
+        ? `tail ${fmtBytes(r.returned_bytes)} of ${fmtBytes(r.total_bytes)}`
+        : fmtBytes(r.total_bytes);
+      setText("logs-view-title", logsSelected.name + "  (" + meta + ")");
+      const raw = "/api/logs/file?" + q.toString() + "&raw=1";
+      const dl = $("logs-download"); if (dl) dl.href = raw;
+      view.textContent = r.text || "(empty)";
+      if (!opts.keepScroll || wasBottom) view.scrollTop = view.scrollHeight;
+    } catch (e) {
+      setText("logs-view-title", logsSelected.name);
+      view.textContent = "(failed to load: " + (e.message || e) + ")";
     }
   }
 
-  $("ledger-load-btn").addEventListener("click", loadLedger);
-  $("ledger-scan-id").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); loadLedger(); }
-  });
-
-  async function loadLedger() {
-    const id = ($("ledger-scan-id").value || "").trim();
-    if (!id) { toast("scan_id required", "warn"); return; }
-    setText("ledger-status", "loading…");
-    try {
-      const r = await api(`/api/runs/${id}/diag`);
-      const entries = (r && r.entries) || [];
-      setText("ledger-rows-count", entries.length + " rows");
-      // Summary
-      let totalMs = [], nLoaded = [], aborted = 0;
-      entries.forEach((e) => {
-        const d = e.diag || {};
-        if (typeof d.total_ms === "number") totalMs.push(d.total_ms);
-        if (typeof d.n_loaded === "number") nLoaded.push(d.n_loaded);
-        if (d.aborted) aborted += 1;
-      });
-      const mean = (a) => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null;
-      renderKv("ledger-summary", [
-        ["scan_id",       id],
-        ["total rows",    entries.length],
-        ["mean total_ms", mean(totalMs) != null ? fmtNum(mean(totalMs)) : "—"],
-        ["mean n_loaded", mean(nLoaded) != null ? fmtNum(mean(nLoaded), 1) : "—"],
-        ["aborted",       aborted,
-          aborted > 0 ? "warn" : "ok"],
-        ["source",        r.source || "—"],
-      ]);
-      // Rows table
-      const tbody = $("ledger-table").querySelector("tbody");
-      if (!entries.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="muted">no rows</td></tr>';
-      } else {
-        tbody.innerHTML = entries.slice(0, 500).map((e) => {
-          const d = e.diag || {};
-          return `<tr>
-            <td class="mono">${escHtml(e.ts_iso || "")}</td>
-            <td class="right">${e.seq_id != null ? e.seq_id : ""}</td>
-            <td class="right">${e.retry_count != null ? e.retry_count : ""}</td>
-            <td class="right">${d.total_ms != null ? d.total_ms.toFixed(1) : ""}</td>
-            <td class="right">${d.n_loaded != null ? d.n_loaded : ""}</td>
-            <td>${d.aborted ? '<span class="bad">yes</span>' : ""}</td>
-            <td class="mono muted">${escHtml(d.two_round_phase || "")}</td>
-          </tr>`;
-        }).join("");
-      }
-      setText("ledger-status", `loaded ${entries.length} rows`);
-    } catch (e) {
-      setText("ledger-status", "failed: " + (e.message || e));
-      $("ledger-table").querySelector("tbody").innerHTML =
-        `<tr><td colspan="7" class="muted">${escHtml(e.message || "fetch failed")}</td></tr>`;
-    }
+  if ($("logs-tail-toggle")) {
+    $("logs-tail-toggle").addEventListener("change", () => {
+      if (logsSelected) loadLogFile({keepScroll: false});
+    });
+  }
+  if ($("logs-refresh-btn")) {
+    $("logs-refresh-btn").addEventListener("click", () => pollLogs());
   }
 
   // =====================================================================
@@ -5747,13 +5955,33 @@
     return ov;
   }
 
+  // seq_idx of the basic sequence currently shown in the plot (the dropdown's value), or
+  // null if there's no selector. Used to filter the per-bseq step ruler / wait bands so a
+  // multi-basic-sequence scan (e.g. SLM rearrangement) shows only the displayed bseq's steps.
+  function seqCurrentSeqIdx() {
+    const ssel = $("seq-seq-select");
+    const v = ssel ? ssel.value : null;
+    return (v === null || v === undefined || v === "") ? null : v;
+  }
+
+  // Keep only the entries belonging to the displayed basic sequence. Backward-compatible:
+  // entries with no seq_idx (pre-v9 artifacts, or a single-bseq build) are always kept.
+  function seqForCurrentBseq(items, idxOf) {
+    const cur = seqCurrentSeqIdx();
+    if (cur == null) return items;
+    return items.filter((it) => { const s = idxOf(it); return s == null || String(s) === String(cur); });
+  }
+
   function seqRenderStepRuler(el) {
     if (!el) return;
     const on = seqState._stepsOn !== false;        // default ON
     const ov = _seqStepOv(el, !on);
     if (ov) ov.innerHTML = "";
     if (!on || !ov) return;
-    const steps = (seqState.xref && seqState.xref.steps) || [];
+    // Only the displayed basic sequence's steps (each bseq's time frame restarts at 0, so
+    // an unfiltered list would overlay every bseq's phases on whichever one is shown).
+    const steps = seqForCurrentBseq((seqState.xref && seqState.xref.steps) || [],
+                                    (s) => s.seq_idx);
     const fl = el._fullLayout;
     if (!steps.length || !fl || !fl.xaxis || !fl.yaxis) return;
     const xa = fl.xaxis, ya = fl.yaxis;
@@ -6214,8 +6442,10 @@
   // only, per-pulse without formulas, or verbose pre-cleanup formulas) carry a lower/absent
   // version and are rebuilt in place on load. Keep in lock-step with XREF_VERSION in
   // pyctrl/tools/provenance_scan.py (7 = + per-pulse source backtraces, read by the
-  // /api/sequence/backtrace route's xref fallback; 8 = + pending_globals count).
-  const SEQ_XREF_VERSION = 8;
+  // /api/sequence/backtrace route's xref fallback; 8 = + pending_globals count;
+  // 9 = + per-basic-sequence tagging of steps/time_regions so a multi-bseq scan shows only
+  // the displayed basic sequence's phase ruler / wait bands).
+  const SEQ_XREF_VERSION = 9;
   function seqXrefComplete(xr) {
     return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
   }
@@ -6499,7 +6729,11 @@
     const xr = seqState.xref;
     if (!el || !el.data || !window.Plotly || !xr || !xr.available) return;
     const pids = new Set(((xr.param_to_pids || {})[path] || []).map(Number));
-    const regions = (xr.time_regions || {})[path] || [];
+    // Wait bands for THIS basic sequence only (v9 bands carry a 3rd seq_idx element);
+    // strip it back to [t0, t1] for seqEmphasize, which expects 2-element regions.
+    const regions = seqForCurrentBseq((xr.time_regions || {})[path] || [],
+                                      (r) => (r.length > 2 ? r[2] : null))
+      .map((r) => [r[0], r[1]]);
     const r = seqEmphasize(pids, regions, { kind: "param", path }) || {};
     const bits = [];
     if (r.overlays) bits.push("waveform region");
@@ -6771,7 +7005,8 @@
     const ex = Array.from(exprs);
     const formula = ex.length === 1 ? ex[0]
       : (ex.length > 1 ? ex.length + " formulas (varies by segment)" : null);
-    const tr = (xr.time_regions && xr.time_regions[path]) || [];
+    const tr = seqForCurrentBseq((xr.time_regions && xr.time_regions[path]) || [],
+                                 (r) => (r.length > 2 ? r[2] : null));
     const pv = seqParamValue(path);
     let title = path + (pv != null ? " = " + seqFmt(pv) : "");
     if (!channels.size && tr.length) title += "  (" + tr.length + " wait region(s))";
@@ -6922,10 +7157,102 @@
     }
   }
 
+  // =====================================================================
+  // CARD EXPAND — blow a Live-tab card up into a centered overlay (rest of
+  // the screen dimmed); click the backdrop, the ⤢ button again, or press Esc
+  // to contract. In the live-flat layout the card <h2> headers are collapsed
+  // to 0px (titles are painted inside each plot), so a clickable header is
+  // impossible — instead every eligible card gets a corner ⤢ button. The
+  // header-click is kept as a bonus for any card that DOES show a header.
+  // =====================================================================
+  function initCardExpand() {
+    const tab = $("tab-live");
+    if (!tab) return;
+    let backdrop = document.getElementById("card-expand-backdrop");
+    if (!backdrop) {
+      backdrop = document.createElement("div");
+      backdrop.id = "card-expand-backdrop";
+      document.body.appendChild(backdrop);
+    }
+    let expanded = null;
+    const resizeSoon = (card) => {
+      if (!window.Plotly || !card) return;
+      [80, 280].forEach((ms) => setTimeout(() => {
+        card.querySelectorAll(".plot-container").forEach((el) => {
+          try { if (el.querySelector(".plotly")) Plotly.Plots.resize(el); }
+          catch (e) {}
+        });
+      }, ms));
+    };
+    const contract = () => {
+      if (!expanded) return;
+      const c = expanded;
+      expanded = null;
+      c.classList.remove("card-expanded");
+      backdrop.classList.remove("show");
+      resizeSoon(c);
+    };
+    const expand = (card) => {
+      if (expanded === card) { contract(); return; }
+      if (expanded) expanded.classList.remove("card-expanded");
+      expanded = card;
+      card.classList.add("card-expanded");
+      backdrop.classList.add("show");
+      resizeSoon(card);
+    };
+    // Inject a corner ⤢ button into each eligible card.
+    tab.querySelectorAll(".card:not(.live-sidebar):not(.status-strip)")
+      .forEach((card) => {
+        if (card.querySelector(":scope > .card-expand-btn")) return;
+        if (getComputedStyle(card).position === "static") {
+          card.style.position = "relative";
+        }
+        const btn = document.createElement("button");
+        btn.className = "card-expand-btn";
+        btn.type = "button";
+        btn.title = "Expand / collapse this panel";
+        btn.setAttribute("aria-label", "expand panel");
+        btn.textContent = "⤢";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          expand(card);
+        });
+        card.appendChild(btn);
+      });
+    // Bonus: clicking a (visible) card header also toggles expand.
+    tab.addEventListener("click", (e) => {
+      const h2 = e.target.closest("h2");
+      if (!h2) return;
+      const card = h2.closest(".card");
+      if (!card || card.classList.contains("live-sidebar")
+          || card.classList.contains("status-strip")) return;
+      if (e.target.closest("input, button, select, label, a, option")) return;
+      e.preventDefault();
+      expand(card);
+    });
+    backdrop.addEventListener("click", contract);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") contract();
+    });
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
     initTabs();
     initSequenceTab();
     setupFloatingAnalysisCards();
+    initCardExpand();
+    // Affine card: rollback button (mint nothing — direct POST).
+    const afRoll = document.getElementById("affine-rollback");
+    if (afRoll) afRoll.addEventListener("click", async () => {
+      if (!confirm("Roll the global affine back to the previous version?")) return;
+      try {
+        await api("/api/affine/rollback", {method: "POST"});
+        affineRenderedTs = null;   // force re-render
+        await pollAffine();
+        toast("Affine rolled back");
+      } catch (e) { toast("Rollback failed: " + (e.message || e)); }
+    });
     startPolling();
     loadRunsList();
     loadGroups();

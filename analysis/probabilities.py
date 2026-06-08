@@ -281,6 +281,85 @@ def loading_rate(logic1, reps_per_param=None):
     return mean, sem
 
 
+def per_shot_rate_stats(logic1, logic2=None, reps_per_param=None):
+    """Per-parameter statistics computed ACROSS SHOTS (not across sites).
+
+    For each shot the survival rate is ``(#sites loaded AND survived) /
+    (#sites loaded)`` over that shot's sites, and the loading rate is
+    ``(#sites loaded) / nSites``. We then take the mean / sample-std
+    (ddof=1) / SEM (= std/√n) across the *eligible* shots of each scan
+    parameter. This is the "per-shot" error convention (treat each shot
+    as one sample of the array-averaged rate), distinct from the per-site
+    binomial SEM that ``prob11`` / ``loading_rate`` return.
+
+    Parameters
+    ----------
+    logic1 : ndarray (nSites, nParams, nReps) bool
+    logic2 : ndarray (nSites, nParams, nReps) bool, optional
+        When omitted, only loading stats are returned.
+    reps_per_param : ndarray (nParams,) int, optional
+        Real rep count per param (padded reps are all-False and would
+        otherwise be counted as genuine zero-loading shots). Pass the
+        value from ``unpack_scan_logicals`` for scrambled / aborted scans.
+
+    Returns
+    -------
+    dict with keys (each a list of length nParams, NaN where undefined):
+      ``loading_mean`` ``loading_std_pershot`` ``loading_sem_pershot``
+      ``loading_n_shots`` and, when ``logic2`` given, the same with the
+      ``survival_`` prefix.
+    """
+    if logic1 is None or logic1.ndim != 3 or logic1.size == 0:
+        return {}
+    n_sites, n_params, max_reps = logic1.shape
+    if reps_per_param is None:
+        reps = np.full(n_params, max_reps, dtype=int)
+    else:
+        reps = np.clip(np.asarray(reps_per_param, dtype=int), 0, max_reps)
+
+    nan = float('nan')
+    out = {k: [nan] * n_params for k in (
+        'loading_mean', 'loading_std_pershot', 'loading_sem_pershot')}
+    out['loading_n_shots'] = [0] * n_params
+    have2 = logic2 is not None and logic2.size
+    if have2:
+        for k in ('survival_mean', 'survival_std_pershot',
+                  'survival_sem_pershot'):
+            out[k] = [nan] * n_params
+        out['survival_n_shots'] = [0] * n_params
+
+    for p in range(n_params):
+        R = int(reps[p])
+        if R <= 0:
+            continue
+        l1 = logic1[:, p, :R]
+        loaded_per_shot = l1.sum(axis=0).astype(float)   # (R,)
+        load_rates = loaded_per_shot / max(n_sites, 1)
+        out['loading_mean'][p] = float(load_rates.mean())
+        out['loading_n_shots'][p] = R
+        if R > 1:
+            s = float(load_rates.std(ddof=1))
+            out['loading_std_pershot'][p] = s
+            out['loading_sem_pershot'][p] = s / np.sqrt(R)
+        else:
+            out['loading_std_pershot'][p] = 0.0
+        if have2:
+            joint = (l1 & logic2[:, p, :R]).sum(axis=0).astype(float)
+            elig = loaded_per_shot > 0
+            n_el = int(elig.sum())
+            if n_el > 0:
+                sr = joint[elig] / loaded_per_shot[elig]
+                out['survival_mean'][p] = float(sr.mean())
+                out['survival_n_shots'][p] = n_el
+                if n_el > 1:
+                    s = float(sr.std(ddof=1))
+                    out['survival_std_pershot'][p] = s
+                    out['survival_sem_pershot'][p] = s / np.sqrt(n_el)
+                else:
+                    out['survival_std_pershot'][p] = 0.0
+    return out
+
+
 def rearrangement_success_rate(logic2, reps_per_param=None):
     """Per-parameter average of ``logic2`` over array-2 sites and reps.
 

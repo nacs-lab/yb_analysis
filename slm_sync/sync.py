@@ -69,6 +69,13 @@ _STRING_DIAG_COLUMNS = (
     'protocol', 'handoff_reason', 'handoff_idle_reason',
     # Phase 5a — "initial" / "final" / "" for non-two-round shots.
     'two_round_phase',
+    # Phase 5.5 Track E — the canonical RECEIVED bitstring the SLM
+    # server decoded for this shot ('0'/'1' chars, length ==
+    # n_init_sites). Lets analysts diff SLM-side vs lab-side bitstrings
+    # (different gridLocations / threshold pipelines). OPTIONAL: empty
+    # string for legacy shots that predate the field (the surfacing
+    # machinery already defaults missing string columns to '').
+    'received_bits',
 )
 
 # Phase 5a — per-shot rearrangement PATHS, stamped by SLMnet via
@@ -82,11 +89,15 @@ _VLEN_INT_PATH_COLUMNS = (
     'target_paired',   # idx into target_grid; target_paired[i] -> bit-k target site
 )
 
-# Schema version: bumped 1 -> 2 in Phase 5a when the path vlen columns
-# and two_round disambiguation columns landed. Readers MUST consult
-# /meta/schema_version (or fall back to `'two_round_idx' in /diag`) and
-# fall through to `diag_json` JSON-decode for v1 files.
-SCHEMA_VERSION = 2
+# Schema version history:
+#   1 -> 2  (Phase 5a): per-shot path vlen columns + two_round columns.
+#   2 -> 3  (Phase 5.5 Track E): /diag/received_bits vlen-string column.
+# Readers MUST consult /meta/schema_version (or fall back to feature
+# probes like `'two_round_idx' in /diag` / `'received_bits' in /diag`)
+# and fall through to `diag_json` JSON-decode for older files. The v2->v3
+# upgrade is purely additive: the column is backfilled with '' for rows
+# written before the column existed, so legacy files keep working.
+SCHEMA_VERSION = 3
 
 
 def sync_scan(scan_id, scan_dir, *, client=None, sync_code=True,

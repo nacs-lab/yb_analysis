@@ -52,7 +52,7 @@ CAMERA_STATUS_FILE = os.path.join(tempfile.gettempdir(), 'nacsctl',
 #: The ``camera_*`` commands carry a roi (``[x,y,w,h]``) and/or exposure (s)
 #: and are dispatched to the Tkinter CameraPane, which owns the ZMQ client.
 VALID_CMDS = ('dummy_mode', 'init_dir', 'restart_dash', 'restart_all',
-              'set_backend',
+              'set_backend', 'shutdown',
               # Sequence control via ZMQ (pyctrl backend has no local memmap).
               'pause', 'start', 'abort',
               'camera_connect', 'camera_disconnect', 'camera_apply')

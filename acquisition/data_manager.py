@@ -16,6 +16,9 @@ from yb_analysis.config import (
     UPDATE_GRID_INTERVAL, UPDATE_GRID_BATCH_SIZE,
     UPDATE_THRES_INTERVAL, UPDATE_THRES_BATCH_SIZE,
     UPDATE_LOADING_INTERVAL, UPDATE_HIST_BATCH_SIZE,
+    AFFINE_LIVE_INTERVAL, AFFINE_LIVE_BATCH, AFFINE_LIVE_SEARCH_RANGE,
+    AFFINE_LIVE_EMA, THRES_LIVE_INTERVAL, THRES_LIVE_WINDOW,
+    THRES_LIVE_EMA, THRES_LIVE_MIN_PER_SIDE,
 )
 from yb_analysis.detection.detect_atom import detect_atom
 from yb_analysis.detection.scan_analysis import (
@@ -26,7 +29,7 @@ from yb_analysis.detection.locate_atom import locate_atom_update
 from yb_analysis.detection.buffers import RingBuffer
 from yb_analysis.io.scan_directory import make_scan_dir, make_scan_fname, scan_id_to_stamps
 from yb_analysis.io.hdf5_store import create_scan_file, append_block
-from yb_analysis.io.mat_reader import load_scan_config_from_mat
+from yb_analysis.io.mat_reader import load_scan_config
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,13 @@ _cache = {}
 _cache_lock = threading.Lock()
 # Serialises post-scan affine updates (one global affine file).
 _AFFINE_UPDATE_LOCK = threading.Lock()
+
+# Live target-aware survival: how often (shots) to refresh the per-shot diag
+# targets from the SLM, and how many consecutive empty pulls before giving up
+# (a non-rearrangement run has no SLM diag → stop polling, ~zero cost). Kept
+# small so short / single-point (0d) rearrangement scans pull targets early.
+DIAG_PULL_INTERVAL = 5
+DIAG_PULL_MAX_EMPTY = 4
 
 # Per-shot mean loading rate (img1), held at module scope so it survives
 # scan transitions — the DataManager (and its log_buffer) is recreated on
@@ -166,6 +176,7 @@ class DataManager:
         # day-folder-grid behaviour, unchanged).
         self._pattern_grids = None      # {frame_idx: cropped grid [Y,X]}
         self._pattern_names = {}        # {frame_idx: pattern name}
+        self._pattern_knm = {}          # {frame_idx: knm [y,x]} (for the live affine update)
         self._roi = None                # [Xoff, Yoff, W, H] for this scan
         self._affine_grid0 = None       # frame-0 affine-predicted grid (pre-drift)
 
@@ -177,7 +188,7 @@ class DataManager:
         self._day_dir = os.path.dirname(self.dname)  # Data/YYYYMMDD/
 
         # Load scan config
-        self.config = load_scan_config_from_mat(mat_fname)
+        self.config = load_scan_config(mat_fname)       # JSON sidecar (pyctrl) or .mat (MATLAB)
         fs = _vector(self.config.get('frameSize', [0, 0]))
         # MATLAB frameSize = [W, H]; after transpose in zmq_client, images are (H, W)
         self.frame_size = (int(fs[1]), int(fs[0]))  # (H, W)
@@ -238,8 +249,22 @@ class DataManager:
         self._img_cnt_grid = 0
         self._img_cnt_refit = 0             # counts toward 200-shot Gaussian refit
         self._img_cnt_loading = 0
+        self._img_cnt_affine = 0            # counts toward the live affine (position) update
+        self._img_cnt_thres_live = 0        # counts toward the cheap threshold EWMA update
+        self._seq_total = 0                 # cumulative completed seqs this run (= shot stamp)
+        # Frame-drop safety: sequences the camera/compute stall delivered with
+        # != pSeq frames. We drop them whole (see store_new_data) so they can't
+        # phase-flip the img1/img2 parity demux for the rest of the run.
+        self._dropped_seqs = 0              # count of incomplete sequences dropped
+        self._dropped_seq_ids = []          # their seq_ids (for diagnostics)
         self._hist_version = 0              # incremented on each Gaussian refit
         self._hist_rep_sites = self._pick_rep_sites()
+        # Live self-calibration helpers (loading-pattern scans). Placement ratio
+        # r = (thr - mu_empty)/(mu_atom - mu_empty) per site from the last full
+        # Gaussian fit; the cheap inter-fit threshold tracker keeps the threshold
+        # at this ratio between the (drifting) empty/atom population means.
+        self._thr_place_ratio = None        # (num_sites,) or None -> default 0.5
+        self._affine_update_running = False  # guard: one background affine thread at a time
 
         # --- Buffers ---
         buf_size = max(UPDATE_THRES_BATCH_SIZE, UPDATE_GRID_BATCH_SIZE)
@@ -267,6 +292,17 @@ class DataManager:
         self._plot_scale = float(_scalar(self.config.get('PlotScale', 1)))
         self._scan_logicals = []  # list of (seq_id, logic1, logic2_or_None)
         self._last_batch_seq_ids = []  # seq_ids added in the most recent batch
+
+        # Live target-aware survival: per-shot target site sets pulled from the
+        # SLM diag during the scan (seq_id -> np.ndarray of lab-site indices).
+        # Lets the live scan curve show TP (target survival), matching the
+        # Analysis tab. Empty -> per-site survival (unchanged). Populated by a
+        # guarded background pull (_pull_live_targets); reset per scan.
+        self._seq_targets = {}
+        self._diag_since = 0          # last seq_id pulled (incremental)
+        self._diag_pull_cnt = 0       # shots since the last pull
+        self._diag_pull_running = False
+        self._diag_empty_streak = 0   # consecutive empty pulls (back-off)
 
         # --- Other state ---
         self.loading_rates = np.zeros(self.num_sites)
@@ -352,6 +388,10 @@ class DataManager:
         self.grid_shift_heatmap = None
         self._scan_logicals = []
         self._last_batch_seq_ids = []
+        self._seq_targets = {}
+        self._diag_since = 0
+        self._diag_pull_cnt = 0
+        self._diag_empty_streak = 0
         self._param_indices = None
         self._scan_params = None
         self._scan_dims = None
@@ -591,12 +631,20 @@ class DataManager:
         return None
 
     def _default_thresholds(self, n):
-        """Length-n initial thresholds when no per-pattern thresholds exist
-        yet (a new pattern with a different site count). Broadcasts the median
-        of the loaded thresholds; live Gaussian refitting replaces these
-        within ~200 shots. Per-pattern stored thresholds are a follow-up."""
+        """Per-site initial thresholds when a pattern has no saved per-pattern
+        thresholds yet.
+
+        If the loaded thresholds already have the right site count, KEEP them
+        PER-SITE (a same-count warm start) — this is the common case where the
+        day-folder / frame-0 thresholds match the pattern, and it must NOT be
+        flattened (flattening to the median was the bug that made img1 and img2
+        diverge for the same pattern). Only when the site count genuinely
+        differs (a different grid) fall back to broadcasting the median. Live
+        Gaussian refitting refines per-site within ~200 shots either way."""
         base = np.asarray(self.loaded_thresholds, dtype=np.float64).ravel()
         base = base[np.isfinite(base)]
+        if base.size == int(n):
+            return base.copy()   # same site count -> keep PER-SITE thresholds
         val = float(np.median(base)) if base.size else 0.0
         return np.full(int(n), val, dtype=np.float64)
 
@@ -607,6 +655,7 @@ class DataManager:
         the final frame -> grid_locations_img2 so the EXISTING per-frame
         selection + live drift correction apply unchanged. No-ops (keeps the
         day grid) if no pattern/ROI/affine is available."""
+        self._pattern_knm = {}   # (re)populated below; the live affine update reads it
         roi = self.config.get('roi')
         roi = _vector(roi) if roi is not None else None
         if roi is None or roi.size < 4:
@@ -647,6 +696,7 @@ class DataManager:
                 logger.warning('no registry record for pattern %s', s['name'])
                 continue
             knm = np.asarray(rec['knm'], dtype=np.float64)
+            self._pattern_knm[k] = knm
             grids[k] = aff.apply_affine_cropped(aff._knm_to_xy(knm), A, self._roi)
         if not grids:
             return
@@ -734,11 +784,275 @@ class DataManager:
             logger.warning('Affine update failed for scan %s: %s',
                            self.scan_id, e)
 
+    # --- Live target-aware survival: pull per-shot diag target sets ---
+
+    def _per_shot_survival_series(self, max_shots=400):
+        """Per-shot SURVIVAL in time order, for the 0d Scan-Curve timeseries
+        (which otherwise shows loading). Target-aware (TP at this run's diag
+        targets) when targets are known for the shot, else per-site survival
+        (matched-index logic1&logic2 / loaded). None for 1-image scans (no
+        img2). Bounded to the last ``max_shots`` so the snapshot stays small."""
+        # Survival only when there's a 2nd image (NumImages >= 2 AND logic2
+        # present); 1-image scans keep the loading timeseries.
+        if self.num_images_per_seq < 2:
+            return None
+        sl = self._scan_logicals
+        if not sl or sl[0][2] is None:
+            return None
+        st = self._seq_targets
+        recent = sl[-max_shots:]
+        vals = []
+        target_aware = False
+        for seq_id, l1, l2 in recent:
+            if l2 is None:
+                vals.append(None)
+                continue
+            a1 = np.asarray(l1, dtype=bool)
+            a2 = np.asarray(l2, dtype=bool)
+            tgt = st.get(int(seq_id))
+            if tgt is not None and len(tgt):
+                t = np.asarray(tgt, dtype=int)
+                t = t[(t >= 0) & (t < a2.shape[0])]
+                vals.append(float(a2[t].sum()) / t.size if t.size else None)
+                if t.size:
+                    target_aware = True
+            else:
+                loaded = int(a1.sum())
+                vals.append(float((a1 & a2).sum()) / loaded if loaded > 0 else None)
+        if not any(v is not None for v in vals):
+            return None
+        return {'values': vals, 'target_aware': target_aware}
+
+    def _pull_live_targets(self):
+        """Background: refresh ``self._seq_targets`` (seq_id → target lab-site
+        indices) from the SLM diag for this scan, incrementally. Fully guarded:
+        any failure / SLM-offline is a no-op (the live curve falls back to
+        per-site survival). Never blocks acquisition (own daemon thread)."""
+        try:
+            from yb_analysis.slm_sync.client import SlmSyncClient
+            cli = SlmSyncClient()
+            diag = cli.get_diag(str(self.scan_id),
+                                since_seq_id=(self._diag_since or None))
+            # None = SLM unreachable / busy (gate 503) / timeout — TRANSIENT
+            # during an active rearrangement scan. Do NOT count it toward the
+            # give-up streak; just retry next interval.
+            if diag is None:
+                return
+            entries = diag.get('entries') or []
+            if not entries:
+                # Only give up when the SLM AFFIRMATIVELY has no diag for this
+                # scan_id (count==0) and we've never seen any — i.e. a genuine
+                # non-rearrangement run. An empty incremental page when we
+                # already have targets is normal (no new shots yet).
+                if int(diag.get('count', 0)) == 0 and not self._seq_targets:
+                    self._diag_empty_streak += 1
+                return
+            new_targets = dict(self._seq_targets)
+            last = self._diag_since or 0
+            added = 0
+            for r in entries:
+                sid = r.get('seq_id')
+                if sid is None:
+                    continue
+                d = r.get('diag') or {}
+                idx = d.get('target_site_indices')
+                if not idx:
+                    idx = d.get('target_paired')
+                if idx:
+                    arr = np.asarray(idx, dtype=np.int64).ravel()
+                    new_targets[int(sid)] = np.unique(arr[arr >= 0])
+                    added += 1
+                last = max(last, int(sid))
+            # Atomic ref swap (readers use .get(), safe under the GIL).
+            self._seq_targets = new_targets
+            self._diag_since = last
+            self._diag_empty_streak = 0
+            if added:
+                logger.info('live target-aware survival: %d/%d shots have diag '
+                            'targets (scan %s)', len(new_targets),
+                            len(self._scan_logicals), self.scan_id)
+        except Exception as e:
+            logger.debug('live target pull failed (scan %s): %s', self.scan_id, e)
+        finally:
+            self._diag_pull_running = False
+
+    # --- Live per-N-shots self-calibration (loading-pattern scans) ---
+
+    def _schedule_affine_live(self):
+        """Every N loading shots, kick a background thread that nudges the GLOBAL
+        affine TRANSLATION toward the recent atoms (EWMA) and re-derives the live
+        detection grid from it. Background so the ~0.5-1 s cross-correlation never
+        stalls the acquisition loop; a guard prevents overlapping runs."""
+        if not getattr(type(self), 'affine_autoupdate', True):
+            return
+        if self._affine_update_running:
+            return
+        knm = self._pattern_knm.get(0)
+        name = self._pattern_names.get(0)
+        if name is None or knm is None or self.img_buffer is None:
+            return
+        if self.img_buffer.size() < min(AFFINE_LIVE_BATCH, 5):
+            return
+        try:
+            n = min(self.img_buffer.size(), AFFINE_LIVE_BATCH)
+            imgs = self.img_buffer.get_last_n(n).astype(np.float64)
+        except Exception:
+            return
+        self._affine_update_running = True
+        threading.Thread(
+            target=self._affine_live_worker,
+            args=(name, np.asarray(knm, dtype=np.float64), imgs, int(self._seq_total)),
+            name='affine-live-%s' % self.scan_id, daemon=True).start()
+
+    def _affine_live_worker(self, name, knm, imgs, seq_no):
+        try:
+            import yb_analysis.analysis.affine_transform as aff
+            from yb_analysis.analysis import update_log
+            with _AFFINE_UPDATE_LOCK:
+                roi = np.asarray(self._roi, dtype=np.float64)
+                cand = aff.propose_scan_update(
+                    imgs, knm, roi, self.mask_mat, str(self.scan_id),
+                    search_range=AFFINE_LIVE_SEARCH_RANGE)
+                rec = {'scan_id': str(self.scan_id), 'seq_no': int(seq_no),
+                       'shift_dy': cand.get('shift_dy'), 'shift_dx': cand.get('shift_dx'),
+                       'snr': cand.get('snr')}
+                # Safety (railed shift / low SNR / no affine): log + skip, don't move.
+                if not cand.get('accept'):
+                    rec.update(accepted=False, reason=cand.get('reason'))
+                    update_log.append('affine.jsonl', rec)
+                    logger.info('Affine live update skipped @shot %d (%s)',
+                                seq_no, cand.get('reason'))
+                    return
+                entry = aff.commit_update(cand, ema_weight=AFFINE_LIVE_EMA)
+                A = np.asarray(entry['A'], dtype=np.float64).reshape(2, 3)
+                self._refresh_grids_from_affine(A)
+                self.grid_shift_history.append(
+                    (cand.get('shift_dy', 0), cand.get('shift_dx', 0)))
+                rec.update(accepted=True, ema=AFFINE_LIVE_EMA,
+                           ty=float(A[0, 2]), tx=float(A[1, 2]),
+                           rotation_deg=entry.get('rotation_deg'),
+                           scale_x=entry.get('scale_x'), scale_y=entry.get('scale_y'))
+                update_log.append('affine.jsonl', rec)
+                logger.info('Affine live-updated @shot %d: shift (dy=%s, dx=%s) '
+                            'snr=%.1f -> t=[%.2f, %.2f]', seq_no,
+                            cand.get('shift_dy'), cand.get('shift_dx'),
+                            cand.get('snr') or 0.0, A[0, 2], A[1, 2])
+        except Exception as e:
+            logger.warning('Affine live update failed @shot %d: %s', seq_no, e)
+        finally:
+            self._affine_update_running = False
+
+    def _refresh_grids_from_affine(self, A):
+        """Re-derive the live detection grid(s) from affine ``A`` (2x3) + ROI.
+        Whole-array reference swaps (atomic under the GIL) so a concurrent
+        detect_atom read sees either the old or new grid, never a torn one."""
+        import yb_analysis.analysis.affine_transform as aff
+        roi = self._roi
+        if 0 in self._pattern_knm:
+            g0 = aff.apply_affine_cropped(
+                aff._knm_to_xy(self._pattern_knm[0]), A, roi)
+            self.grid_locations = np.ascontiguousarray(g0)
+            self._affine_grid0 = g0.copy()
+        last = max(1, self.num_images_per_seq) - 1
+        if self.is_two_array and last in self._pattern_knm:
+            gl = aff.apply_affine_cropped(
+                aff._knm_to_xy(self._pattern_knm[last]), A, roi)
+            self.grid_locations_img2 = np.ascontiguousarray(gl)
+
+    def _placement_ratio(self, fits, thres):
+        """Per-site r = (thr - mu_empty)/(mu_atom - mu_empty) from a full Gaussian
+        fit — where the principled threshold sits between the two peaks. The cheap
+        inter-fit tracker holds this ratio as the populations drift. NaN/degenerate
+        sites -> 0.5 (midpoint)."""
+        n = int(self.num_sites)
+        r = np.full(n, 0.5, dtype=np.float64)
+        for s in range(min(n, len(fits))):
+            p = fits[s].get('params') if isinstance(fits[s], dict) else None
+            if p is None:
+                continue
+            mu_e, mu_a = float(p[0]), float(p[3])
+            if mu_a - mu_e > 1e-9:
+                r[s] = float(np.clip((thres[s] - mu_e) / (mu_a - mu_e), 0.0, 1.0))
+        return r
+
+    def _update_thresholds_live_cheap(self):
+        """Cheap (<50 ms) per-site threshold EWMA between full fits. For each site,
+        split the recent shots by the current threshold into empty/atom populations,
+        place a candidate threshold at the fit's ratio between their means, and
+        EWMA-blend (~100-shot memory). Saves per-pattern + logs. Sites without
+        enough shots on BOTH sides keep their current threshold (safety)."""
+        name = self._pattern_names.get(0)
+        if not name:
+            return
+        accum = self._intensity_accum
+        if len(accum) < max(2 * THRES_LIVE_MIN_PER_SIDE, 10):
+            return
+        thr = np.asarray(self.thresholds, dtype=np.float64).ravel()
+        if thr.size != self.num_sites:
+            return
+        W = np.asarray(accum[-THRES_LIVE_WINDOW:], dtype=np.float64)
+        if W.ndim != 2 or W.shape[1] != self.num_sites:
+            return
+        above = W > thr[None, :]
+        ca = above.sum(0)
+        cb = W.shape[0] - ca
+        mean_a = np.where(ca > 0, (W * above).sum(0) / np.maximum(ca, 1), thr)
+        mean_b = np.where(cb > 0, (W * ~above).sum(0) / np.maximum(cb, 1), thr)
+        r = self._thr_place_ratio
+        if r is None or np.asarray(r).size != self.num_sites:
+            r = np.full(self.num_sites, 0.5, dtype=np.float64)
+        cand = mean_b + r * (mean_a - mean_b)
+        valid = ((ca >= THRES_LIVE_MIN_PER_SIDE) & (cb >= THRES_LIVE_MIN_PER_SIDE)
+                 & np.isfinite(cand))
+        new = thr.copy()
+        a = THRES_LIVE_EMA
+        new[valid] = (1.0 - a) * thr[valid] + a * cand[valid]
+        self.live_thresholds = new
+        self._save_threshold()
+        self._log_threshold_update(name, 'cheap', int(valid.sum()))
+
+    def _log_threshold_update(self, name, source, n_updated, *,
+                              log_infidelities=False):
+        """Append one shot-stamped threshold record (full per-site vector) to the
+        per-pattern audit log so the drift can be analysed offline."""
+        if not name:
+            return
+        try:
+            from yb_analysis.analysis import update_log
+            import yb_analysis.analysis.pattern_registry as reg
+            thr = np.asarray(self.thresholds, dtype=np.float64).ravel()
+            rec = {'scan_id': str(self.scan_id), 'seq_no': int(self._seq_total),
+                   'pattern': name, 'source': source, 'n_updated': int(n_updated),
+                   'mean_thr': float(np.nanmean(thr)) if thr.size else None,
+                   'thresholds': thr.tolist()}
+            if log_infidelities:
+                inf = np.asarray(self.infidelities, dtype=np.float64).ravel()
+                rec['infidelities'] = inf.tolist()
+            update_log.append('thresholds/%s.jsonl' % reg._sanitize_name(name), rec)
+        except Exception as e:  # noqa: BLE001
+            logger.debug('threshold log failed: %s', e)
+
     # --- EFFECTIVE properties ---
 
     @property
     def thresholds(self):
         return self.live_thresholds if self.live_thresholds is not None else self.loaded_thresholds
+
+    def _effective_thresholds(self, pattern_name, loaded):
+        """Per-pattern effective thresholds for a frame whose loading pattern
+        is ``pattern_name`` and whose stored per-site thresholds are ``loaded``.
+
+        The live Gaussian refit ONLY ever updates the LOADING (frame-0)
+        pattern's thresholds (img2 / post-protocol frames never feed the
+        refit). So a frame uses the live thresholds exactly when its pattern
+        IS that loading pattern; any other pattern uses its own stored per-site
+        thresholds. This keeps thresholds per-pattern and per-site, and means
+        when both frames share the loading pattern a single (img1-driven)
+        refit serves both."""
+        if (self.live_thresholds is not None and pattern_name is not None
+                and pattern_name == self._pattern_names.get(0)):
+            return self.live_thresholds
+        return loaded
 
     @property
     def infidelities(self):
@@ -751,9 +1065,15 @@ class DataManager:
     # --- Data flow ---
 
     def store_new_data(self, info):
-        n_seq = len(info['seq_ids'])
+        pSeq = max(1, self.num_images_per_seq)
+        imgs_in = info['imgs']
+        sids_in = info['seq_ids']
+        # imgs and seq_ids are paired 1:1 per sequence by the wire decoder;
+        # guard the (pathological) length-mismatch case anyway.
+        n_seq = min(len(imgs_in), len(sids_in))
+        kept = 0
         for i in range(n_seq):
-            img3d = info['imgs'][i]  # (rows, cols, pSeq)
+            img3d = imgs_in[i]  # (rows, cols, n_frames) for this sequence
             # Auto-detect frame_size from first image (config may have swapped W/H)
             actual_shape = img3d.shape[:2]
             if actual_shape != self.frame_size and not self._frame_size_fixed:
@@ -770,14 +1090,47 @@ class DataManager:
                         logger.info('HDF5 file created after frame_size fix')
                     except Exception as e:
                         logger.warning('HDF5 retry failed: %s', e)
-            for p in range(img3d.shape[2]):
+
+            # --- Frame-drop SAFETY -----------------------------------------
+            # Each sequence must deliver exactly pSeq frames. A short (or extra)
+            # block means a camera/compute stall dropped (or duplicated) a frame
+            # for THIS sequence. The img1/img2 split downstream is purely by
+            # frame parity (idx % pSeq in process_data, [0::2]/[1::2] in
+            # save_data), so a single off-count sequence would phase-flip that
+            # split for EVERY later sequence and silently scramble survival
+            # pairing (img1[k] vs img2[k] taken from different shots), as seen
+            # on scan 20260608_111039 (img1=244, img2=186). Drop the whole
+            # incomplete sequence — its seq_id too — so frames<->seq_ids stay
+            # 1:1 and the parity split stays valid. The dropped shot is already
+            # unusable for survival (missing its final image) anyway.
+            n_frames = img3d.shape[2]
+            if n_frames != pSeq:
+                self._dropped_seqs += 1
+                if len(self._dropped_seq_ids) < 1000:
+                    self._dropped_seq_ids.append(int(sids_in[i]))
+                logger.warning(
+                    'Dropping seq_id=%s: got %d frame(s), expected pSeq=%d '
+                    '(frame drop / stall). %d sequence(s) dropped this scan.',
+                    int(sids_in[i]), n_frames, pSeq, self._dropped_seqs)
+                continue
+            # ----------------------------------------------------------------
+
+            for p in range(pSeq):
                 self._imgs_to_process.append(img3d[:, :, p])
             if self.img_buffer is not None:
                 self.img_buffer.push(img3d[:, :, 0].astype(np.int16))
-        self._seq_ids_to_process.extend(info['seq_ids'])
-        self._img_cnt_grid += n_seq
-        self._img_cnt_refit += n_seq
-        self._img_cnt_loading += n_seq
+            self._seq_ids_to_process.append(int(sids_in[i]))
+            kept += 1
+
+        # Refit / loading / drift cadence counts only the COMPLETE sequences
+        # actually stored (not the raw arrivals), so a burst of drops doesn't
+        # prematurely trip a refit on too-few real shots.
+        self._img_cnt_grid += kept
+        self._img_cnt_refit += kept
+        self._img_cnt_loading += kept
+        self._img_cnt_affine += kept
+        self._img_cnt_thres_live += kept
+        self._diag_pull_cnt += kept
 
     def process_data(self):
         if not self._imgs_to_process:
@@ -810,7 +1163,14 @@ class DataManager:
             # use grid_locations.
             if self.is_two_array and is_last:
                 grid_i = self.grid_locations_img2
-                thr_i = self.loaded_thresholds_img2
+                # Per-pattern, per-site thresholds. A frame detects with ITS
+                # pattern's thresholds. The live Gaussian refit only ever
+                # updates the LOADING (frame-0) pattern — img2 is AFTER the
+                # protocol and must never drive a refit — so the final frame
+                # gets the live thresholds exactly when its pattern IS that
+                # loading pattern, otherwise its own stored per-site thresholds.
+                thr_i = self._effective_thresholds(
+                    self._pattern_names.get(pSeq - 1), self.loaded_thresholds_img2)
             else:
                 grid_i = self.grid_locations
                 thr_i = self.thresholds
@@ -860,6 +1220,7 @@ class DataManager:
                 seq_logic_buf.clear()
                 n_new_seqs += 1
         self._last_batch_seq_ids = batch_sids
+        self._seq_total += n_new_seqs
 
         # Rebin histograms from accumulated intensities (cheap: ~0.5ms)
         if len(self._intensity_accum) >= 1:
@@ -894,8 +1255,33 @@ class DataManager:
         if self.is_init:
             return
 
-        # Grid (every 50 seq)
-        if self._img_cnt_grid >= UPDATE_GRID_INTERVAL:
+        pattern_active = (self._pattern_grids is not None and self._roi is not None
+                          and self._pattern_names.get(0) is not None)
+
+        # --- POSITIONS ---
+        # Loading-pattern scan: every N shots nudge the GLOBAL affine TRANSLATION
+        # (EWMA, ~100-shot memory) in a background thread and re-derive the live
+        # detection grid from it. Legacy day-folder scan: the local-grid drift
+        # tracker (full integer shift, every 50) is unchanged.
+        if pattern_active:
+            if self._img_cnt_affine >= AFFINE_LIVE_INTERVAL:
+                self._img_cnt_affine = 0
+                self._schedule_affine_live()
+
+        # --- Live target-aware survival: pull per-shot diag targets ---
+        # Every ~25 shots, refresh seq_id->target-sites from the SLM diag in a
+        # background thread so the live scan curve can show TP (matches the
+        # Analysis tab). Backs off after a few empty pulls (non-rearrange runs
+        # have no diag), so it's a no-op cost there.
+        if (self._diag_pull_cnt >= DIAG_PULL_INTERVAL
+                and self._diag_empty_streak < DIAG_PULL_MAX_EMPTY
+                and not self._diag_pull_running):
+            self._diag_pull_cnt = 0
+            self._diag_pull_running = True
+            threading.Thread(target=self._pull_live_targets,
+                             name='diag-targets-%s' % self.scan_id,
+                             daemon=True).start()
+        elif self._img_cnt_grid >= UPDATE_GRID_INTERVAL:
             if self.img_buffer and self.img_buffer.size() >= UPDATE_GRID_BATCH_SIZE:
                 self._img_cnt_grid = 0
                 n = min(self.img_buffer.size(), UPDATE_GRID_BATCH_SIZE)
@@ -913,7 +1299,18 @@ class DataManager:
                 self._save_grid()
                 logger.info('Grid updated (dy=%d, dx=%d)', dy, dx)
 
-        # Gaussian refit (every 200 seq, NOT before 200)
+        # --- THRESHOLDS (cheap, every N shots) ---
+        # Track the per-site threshold between full fits: keep it at the last
+        # fit's placement ratio between the (drifting) empty/atom population
+        # means, EWMA-blended (~100-shot memory). <50 ms; saves + logs each time.
+        if pattern_active and self._img_cnt_thres_live >= THRES_LIVE_INTERVAL:
+            self._img_cnt_thres_live = 0
+            self._update_thresholds_live_cheap()
+
+        # --- THRESHOLDS (full Gaussian refit, every 200 seq) ---
+        # The authoritative re-anchor: refits the double Gaussians (true
+        # infidelities), replaces the live thresholds, and refreshes the
+        # placement ratio the cheap tracker rides between fits.
         n_accum = len(self._intensity_accum)
         if self._img_cnt_refit >= UPDATE_THRES_INTERVAL and n_accum >= UPDATE_THRES_INTERVAL:
             self._img_cnt_refit = 0
@@ -923,10 +1320,15 @@ class DataManager:
             self.live_gauss_fits = fits
             self.live_thresholds = thres
             self.live_infidelities = inf
+            self._thr_place_ratio = self._placement_ratio(fits, thres)
             self._hist_version += 1
             self._hist_rep_sites = self._pick_rep_sites()
             self._save_threshold()
             self._save_histdata()
+            if pattern_active:
+                self._log_threshold_update(
+                    self._pattern_names.get(0), 'fit', int(self.num_sites),
+                    log_infidelities=True)
 
         # Loading rates (every 5 seq)
         if self._img_cnt_loading >= UPDATE_LOADING_INTERVAL:
@@ -1048,22 +1450,48 @@ class DataManager:
         sids = np.array(self._seq_ids_to_save, dtype=np.int64)
 
         if self._save_two_array:
-            # Demux the interleaved per-frame lists into per-image-per-sequence
-            # arrays. Frame indices 0,2,4,... are img1; 1,3,5,... are img2.
-            # See plan: HDF5 two-array layout.
-            logs1 = (np.array(self._logicals_to_save[0::2], dtype=bool)
-                     if self._logicals_to_save
-                     else np.zeros((len(imgs) // 2, max(self.num_sites, 1)),
+            # Demux the interleaved per-frame buffer into per-sequence rows:
+            # img1 = first frame of each sequence ([0::pSeq]); img2 = FINAL
+            # frame ([pSeq-1::pSeq]), matching process_data's is_first/is_last.
+            # Middle frames (pSeq>=3, two-round rearrangement) stay in `imgs`
+            # but are not part of the per-sequence logicals datasets. Keying on
+            # pSeq (not a hard-coded 0::2 / 1::2) keeps img1/img2 paired for
+            # pSeq>=3 too — the old 1::2 picked the MIDDLE frame as img2.
+            pSeq = max(1, self.num_images_per_seq)
+            # Safety: store_new_data only admits whole sequences, so the buffer
+            # length should be a multiple of pSeq. If a partial sequence ever
+            # slips in, trim the orphan tail (loudly) so the parity demux can't
+            # phase-flip img1<->img2 for every subsequent block (the failure
+            # mode behind scan 20260608_111039's img1=244 / img2=186 split).
+            if self._logicals_to_save:
+                n_full = (len(self._logicals_to_save) // pSeq) * pSeq
+                if n_full != len(self._logicals_to_save):
+                    logger.warning(
+                        'save_data: %d orphan frame(s) in two-array buffer '
+                        '(len=%d, pSeq=%d) — trimming tail to keep img1/img2 in '
+                        'phase.', len(self._logicals_to_save) - n_full,
+                        len(self._logicals_to_save), pSeq)
+                logs_all = self._logicals_to_save[:n_full]
+                ints_all = self._intensities_to_save[:n_full]
+                imgs = imgs[:n_full]
+            else:
+                # No logicals (defensive) — let the zeros-branch below size
+                # itself from `imgs`; never trim `imgs` to zero here.
+                logs_all = []
+                ints_all = []
+            logs1 = (np.array(logs_all[0::pSeq], dtype=bool)
+                     if logs_all
+                     else np.zeros((len(imgs) // pSeq, max(self.num_sites, 1)),
                                    dtype=bool))
-            logs2 = (np.array(self._logicals_to_save[1::2], dtype=bool)
-                     if self._logicals_to_save
-                     else np.zeros((len(imgs) // 2,
+            logs2 = (np.array(logs_all[pSeq - 1::pSeq], dtype=bool)
+                     if logs_all
+                     else np.zeros((len(imgs) // pSeq,
                                     max(self.num_sites_img2, 1)), dtype=bool))
-            ints1 = (np.array(self._intensities_to_save[0::2], dtype=np.float64)
-                     if self._intensities_to_save
+            ints1 = (np.array(ints_all[0::pSeq], dtype=np.float64)
+                     if ints_all
                      else np.zeros_like(logs1, dtype=np.float64))
-            ints2 = (np.array(self._intensities_to_save[1::2], dtype=np.float64)
-                     if self._intensities_to_save
+            ints2 = (np.array(ints_all[pSeq - 1::pSeq], dtype=np.float64)
+                     if ints_all
                      else np.zeros_like(logs2, dtype=np.float64))
 
             def _do():
@@ -1136,9 +1564,17 @@ class DataManager:
     def _save_threshold(self):
         try:
             from scipy.io import savemat
+            # Preserve the best-available Gaussian fits: the live fit when present,
+            # else the loaded (previous full-fit) ones. The cheap inter-fit
+            # threshold update runs BEFORE the first full fit (live_gauss_fits is
+            # None), and must NOT wipe the per-pattern gaussFitsStruct the
+            # dashboard/analysis rely on -- so use self.gauss_fits, not the live
+            # fits alone.
+            gfsrc = self.gauss_fits
             gs = np.empty(self.num_sites, dtype=[('params', 'O')])
             for s in range(self.num_sites):
-                p = self.live_gauss_fits[s].get('params') if self.live_gauss_fits else None
+                p = (gfsrc[s].get('params')
+                     if (gfsrc is not None and s < len(gfsrc)) else None)
                 gs[s]['params'] = p if p is not None else np.array([])
             mat = {
                 'thresholds': self.thresholds,
@@ -1204,6 +1640,9 @@ class DataManager:
             'infidelities': self.infidelities.copy(),
             'loading_rates': self.loading_rates.copy(),
             'loading_history': get_loading_history(),
+            # Per-shot survival (TP) for the 0d Scan-Curve timeseries — shows
+            # survival instead of loading, target-aware when diag targets known.
+            'survival_history': self._per_shot_survival_series(),
             'loaded_gauss_fits': self.loaded_gauss_fits,
             'live_hist_data': self.live_hist_data,
             'live_gauss_fits': self.live_gauss_fits,
@@ -1217,7 +1656,8 @@ class DataManager:
                 self._scan_params, self.num_images_per_seq,
                 scan_dims=self._scan_dims,
                 is_two_array=self.is_two_array,
-                recent_seq_ids=self._last_batch_seq_ids),
+                recent_seq_ids=self._last_batch_seq_ids,
+                seq_targets=self._seq_targets),
             'scan_name': self._scan_name,
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,

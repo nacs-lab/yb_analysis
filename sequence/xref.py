@@ -77,9 +77,13 @@ def load_xref(seq_dir, fname=None):
         # region(s). Absent in older artifacts -> empty (the aggregate maps still work).
         "pulses": entry.get("pulses") or {},
         "param_to_pids": entry.get("param_to_pids") or {},
-        # Wait/timing regions: {param: [[t0_ms, t1_ms], ...]} -> shaded time-axis bands.
+        # Wait/timing regions: {param: [[t0_ms, t1_ms(, seq_idx)], ...]} -> shaded time-axis
+        # bands. The optional 3rd element (v9+) is the owning basic-sequence id, so the viewer
+        # draws a band only on its basic sequence (each bseq's frame restarts at 0).
         "time_regions": entry.get("time_regions") or {},
-        # Top-level step boundaries: [{label, t0, t1}, ...] -> the labeled phase ruler.
+        # Top-level step boundaries: [{label, t0, t1(, seq_idx)}, ...] -> the labeled phase
+        # ruler. ``seq_idx`` (v9+, == bseq_id) lets the viewer show only the displayed basic
+        # sequence's steps (a multi-basic-seq scan otherwise overlaid every bseq's steps).
         "steps": entry.get("steps") or [],
         # Per-pulse source backtrace (producer B3): {pid(str): [{file, name, line}, ...]},
         # innermost (the user's .add/.add_step) first. pyctrl writes these here (its .seq has

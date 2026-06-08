@@ -49,9 +49,10 @@ def list_runs(*, since_days: Optional[int] = None,
           'date':      '20260529',
           'time':      '025015',
           'name':      None | str,   # human-readable scan-class name
-          'n_shots':   None | int,
+          'n_shots':   None | int,   # reps per scan point (NumPerGroup)
           'n_params':  None | int,   # number of scan points (sweep size)
-          'swept':     None | str,   # 'axis0 (23 pts)' or 'axis0,axis1'
+          'n_total_shots': None | int,  # n_params * n_shots (total shots)
+          'swept':     None | str,   # 'axis0 (4600 shots)' or 'axis0  ·  axis1'
           'has_diag':  bool,
           'has_code':  bool,
           'has_grid':  bool,
@@ -115,6 +116,40 @@ def list_runs(*, since_days: Optional[int] = None,
     return out
 
 
+def _actual_shots(h5_path: Path) -> Optional[int]:
+    """Number of recorded sequences (shots) = seq_ids dataset length.
+
+    Opens the scan's HDF5 read-only and reads only the dataset SHAPE
+    (no data). Falls back to logicals/logicals_img1 row count when seq_ids
+    is absent. Returns None on any failure (file missing, not yet written).
+    """
+    if not h5_path.is_file():
+        return None
+    try:
+        import h5py
+        with h5py.File(str(h5_path), 'r') as f:
+            for k in ('seq_ids', 'logicals_img1', 'logicals'):
+                if k in f:
+                    return int(f[k].shape[0])
+    except Exception:
+        return None
+    return None
+
+
+def _shots_tag(actual: Optional[int], total: Optional[int]) -> Optional[str]:
+    """Format the shot-count tag: 'N shots', or 'A/T shots' when the actual
+    count differs from the scheduled total (e.g. an aborted scan)."""
+    if actual is not None and total is not None:
+        if actual == total:
+            return f'{total} shots'
+        return f'{actual}/{total} shots'
+    if actual is not None:
+        return f'{actual} shots'
+    if total is not None:
+        return f'{total} shots'
+    return None
+
+
 def _enrich_meta(scan_dir: Path, row: dict) -> None:
     """Best-effort: pull scan name + swept-param info from the config sidecar.
 
@@ -131,6 +166,11 @@ def _enrich_meta(scan_dir: Path, row: dict) -> None:
     has_mat = mat_path.is_file()
     if not has_mat and not json_path.is_file():
         return
+    # Actual recorded shots = number of saved sequences (seq_ids dataset
+    # length in the scan's HDF5). Cheap: reads dataset SHAPE only, never the
+    # data. Distinct from the scheduled nParams*NumPerGroup (a scan can be
+    # aborted early). Best-effort — leaves n_actual_shots None on any error.
+    row['n_actual_shots'] = _actual_shots(scan_dir / f'{base}.h5')
     try:
         import numpy as np
         from yb_analysis.io.mat_reader import load_scan_config
@@ -141,6 +181,18 @@ def _enrich_meta(scan_dir: Path, row: dict) -> None:
         # the .mat reader (matlab), so this handles both backends.
         scan = load_scan_config(str(mat_path)) or {}
         row['name'] = _resolve_scan_name(scan)
+        # Whether this scan carries a pyctrl per-run code snapshot (the
+        # ``code_snapshot`` block in the .json sidecar). Distinct from ``has_code``
+        # (the SLM-server ``slm_code.json``). Drives the Sequence-tab picker's
+        # Reconstructable-vs-Unrecoverable split: a snapshot means a missing .seq
+        # can be regenerated offline from the captured code (+ runtime globals).
+        row['has_snapshot'] = bool(scan.get('code_snapshot'))
+        # Whether the sidecar carries the self-contained reconstruction ``descriptor``
+        # (scangroup_to_descriptor output). Reconstruction ALSO needs this -- it rebuilds
+        # the ScanGroup + resolves the seq function from it. Scans that predate the
+        # descriptor-storage change have a snapshot but NO descriptor, so they are NOT
+        # actually reconstructable (the picker must require both).
+        row['has_descriptor'] = bool(scan.get('descriptor'))
         # NumPerGroup is the shot count per scan point.
         npg = scan.get('NumPerGroup')
         if npg is not None:
@@ -152,14 +204,30 @@ def _enrich_meta(scan_dir: Path, row: dict) -> None:
         # the plain nested dict for a pyctrl .json sidecar.
         dims = (extract_scan_dims_h5(str(mat_path)) if has_mat
                 else extract_scan_dims(scan))
+        npg = row.get('n_shots')   # reps per scan point (NumPerGroup)
         if dims:
             names = [d.get('name') or f'axis{i}'
                      for i, d in enumerate(dims)]
             sizes = [int(d.get('size') or 0) for d in dims]
             row['swept_paths'] = names
             row['swept_dims']  = sizes
-            row['n_params']    = int(np.prod(sizes)) if sizes else None
-            if len(names) == 1:
+            n_params = int(np.prod(sizes)) if sizes else None
+            row['n_params'] = n_params
+            # Description shows the ACTUAL shot count when known (a scan can be
+            # aborted before all scheduled shots run), falling back to the
+            # scheduled TOTAL (points x reps-per-point). n_dims labels the
+            # sweep dimensionality (1D / 2D / ...).
+            total = (n_params * npg) if (n_params and npg) else None
+            row['n_total_shots'] = total
+            n_dims = len([s for s in sizes if s and s > 1])
+            row['n_dims'] = n_dims
+            actual = row.get('n_actual_shots')
+            axis = names[0] if len(names) == 1 else '  ·  '.join(names)
+            dim_tag = f'{n_dims}D' if n_dims else '0D'
+            shots_tag = _shots_tag(actual, total)
+            if shots_tag:
+                row['swept'] = f'{axis} · {dim_tag} · {shots_tag}'
+            elif len(names) == 1:
                 row['swept'] = f'{names[0]} ({sizes[0]} pts)'
             else:
                 pairs = [f'{n} ({s})' for n, s in zip(names, sizes)]
@@ -170,8 +238,14 @@ def _enrich_meta(scan_dir: Path, row: dict) -> None:
             if params is not None:
                 try:
                     p = np.asarray(params)
-                    row['n_params'] = int(p.shape[0])
-                    row['swept'] = f'{p.shape[0]} pts (path unknown)'
+                    n_params = int(p.shape[0])
+                    row['n_params'] = n_params
+                    total = (n_params * npg) if npg else None
+                    row['n_total_shots'] = total
+                    shots_tag = _shots_tag(row.get('n_actual_shots'), total)
+                    row['swept'] = (f'{shots_tag} (path unknown)'
+                                    if shots_tag is not None
+                                    else f'{n_params} pts (path unknown)')
                 except Exception:
                     pass
     except Exception as ex:

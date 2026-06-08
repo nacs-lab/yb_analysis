@@ -445,13 +445,26 @@ def commit_update(candidate, *, ema_weight=EMA_WEIGHT) -> dict:
         else:
             A_new = A_cand
             created = _now_iso()
+        # Fit-quality (rms/coverage/pairs) is only measured on FULL refits.
+        # A drift (translation) update leaves them None — CARRY FORWARD the
+        # last full fit's values (the geometry quality is unchanged, only the
+        # translation moved) so "how aligned now" survives drift churn instead
+        # of going blank once the full-fit entry ages out of the history.
+        prev = cur or {}
+        has_fit = candidate.get('rms_px') is not None
         entry = {
             'A': A_new.tolist(),
             'created_iso': created, 'updated_iso': _now_iso(),
             'last_scan_id': candidate.get('scan_id'),
-            'n_pairs': candidate.get('n_pairs'),
-            'coverage': candidate.get('coverage'),
-            'rms_px': candidate.get('rms_px'),
+            'n_pairs': candidate.get('n_pairs') if candidate.get('n_pairs') is not None
+                       else prev.get('n_pairs'),
+            'coverage': candidate.get('coverage') if candidate.get('coverage') is not None
+                        else prev.get('coverage'),
+            'rms_px': candidate.get('rms_px') if has_fit else prev.get('rms_px'),
+            # Which scan last did a FULL fit (so the dashboard can label the
+            # carried-forward quality), and when.
+            'fit_scan_id': candidate.get('scan_id') if has_fit else prev.get('fit_scan_id'),
+            'fit_iso': _now_iso() if has_fit else prev.get('fit_iso'),
         }
         entry.update(decompose(A_new))
         data['current'] = entry
@@ -483,13 +496,24 @@ def rollback() -> bool:
 
 def bootstrap_from_scan(avg_image, pattern_record, roi, *,
                         spot_sigma=5.0, min_distance=None, scan_id=None,
-                        detected_yx=None, n_det_factor=1.1):
-    """Fit the FIRST affine: pattern knm <-> detected atoms in ``avg_image``.
+                        detected_yx=None, n_det_factor=1.1,
+                        seed_from_current=True):
+    """Fit a full (rotation+scale+translation) affine: pattern knm <-> detected
+    atoms in ``avg_image`` (a LOADING / img1 average).
 
     Defocus robustness: spots may be blurred/sidelobed, so detection uses a
     GENEROUS ``spot_sigma`` and the LoG centroid (intensity-weighted) — the
     spot's mean position is preserved under defocus. Pass ``detected_yx`` to
     skip detection (e.g. for tests or a manual-anchor fit).
+
+    Correspondence: when ``seed_from_current`` and a current affine exists, the
+    existing affine SEEDS the knm<->spot matching (robust — no orientation
+    search). This is the normal RE-bootstrap case (a small rotation/scale drift
+    off a known-good affine) and avoids the blind 90°-family search mis-pairing
+    on a dense array. With no current affine (the true first calibration) it
+    falls back to the blind orientation search. The fit itself is a free
+    least-squares 2x3 either way, so the seed only fixes WHICH spot pairs with
+    which site, not the resulting rotation/scale.
 
     Detected positions are in CROPPED pixels; we lift them to absolute via
     the ROI offset before fitting (A lives in absolute sensor coordinates).
@@ -511,7 +535,13 @@ def bootstrap_from_scan(avg_image, pattern_record, roi, *,
     # cropped -> absolute
     xoff, yoff = float(roi[0]), float(roi[1])
     cam_abs = detected_yx + np.array([yoff, xoff], dtype=np.float64)
-    return propose_update(knm_yx, cam_abs, scan_id, bootstrap=True)
+    # Seed from the current affine when re-bootstrapping; blind only for the
+    # genuine first fit. ``bootstrap=False`` ALSO arms the rotation/scale
+    # deviation gates (a re-bootstrap should be a small refinement, not a wild
+    # jump); pass ``bootstrap=True`` to recalibrate from scratch after moving
+    # the camera (relaxes those gates and searches orientation).
+    use_blind = (not seed_from_current) or (load_matrix() is None)
+    return propose_update(knm_yx, cam_abs, scan_id, bootstrap=use_blind)
 
 
 def _expected_cam_pitch(pattern_record, roi):

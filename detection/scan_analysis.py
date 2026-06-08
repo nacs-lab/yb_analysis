@@ -150,8 +150,22 @@ def _find_first_numeric(obj, path):
 
     Returns (array, path_list) or (None, []).
     """
+    # A swept axis stored as a plain Python list/tuple (the pyctrl JSON
+    # sidecar keeps swept values this way -- numeric like [50, 100] AND
+    # boolean like [False, True] for bool kwargs e.g. model_bookend_pre).
+    # Coerce to ndarray so bool/int/float sweeps all resolve their dotted
+    # name instead of falling back to an "axisN" placeholder.
+    if isinstance(obj, (list, tuple)):
+        try:
+            arr = np.asarray(obj)
+        except Exception:
+            return None, []
+        if arr.dtype.kind in ('b', 'i', 'u', 'f') and arr.ndim <= 2 and arr.size > 1:
+            return arr.ravel().astype(np.float64), path
+        return None, []
     if isinstance(obj, np.ndarray):
-        # Skip arrays of object references or non-numeric dtypes
+        # Skip arrays of object references or non-numeric dtypes (bool 'b'
+        # is numeric here -- it's how boolean swept kwargs are stored).
         if obj.dtype.kind in ('O', 'V', 'U', 'S'):
             return None, []
         if obj.ndim <= 2 and obj.size > 1:
@@ -211,8 +225,53 @@ def extract_scan_params_h5(mat_path):
 #  Compute scan curves (1-D and 2-D)
 # ---------------------------------------------------------------------------
 
+def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets):
+    """Per-shot target-aware TP averaged per flat param index.
+
+    Mirrors the offline ``_target_aware_from_lab_paths``: for each shot with a
+    known target set (``seq_targets[seq_id]`` = lab-site indices from the diag),
+    TP = (# target sites occupied in the final image) / (# target sites). Index
+    into the logicals directly (no grid needed). Returns
+    ``(mean, sem, n_reps)`` each length ``n_total``, or ``None`` when no shot
+    had usable targets (→ caller falls back to per-site survival)."""
+    sum_tp = np.zeros(n_total)
+    sumsq = np.zeros(n_total)
+    cnt = np.zeros(n_total, dtype=int)
+    used = 0
+    for seq_id, logic1, logic2 in scan_logicals:
+        if logic2 is None:
+            continue
+        tgt = seq_targets.get(int(seq_id))
+        if tgt is None:
+            continue
+        li = int(seq_id) - 1
+        if li < 0 or li >= len(param_indices):
+            continue
+        p = int(param_indices[li]) - 1
+        if p < 0 or p >= n_total:
+            continue
+        l2 = np.asarray(logic2)
+        t = np.asarray(tgt, dtype=int)
+        t = t[(t >= 0) & (t < l2.shape[0])]
+        if t.size == 0:
+            continue
+        tp = float(l2[t].sum()) / t.size
+        sum_tp[p] += tp
+        sumsq[p] += tp * tp
+        cnt[p] += 1
+        used += 1
+    if used == 0:
+        return None
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean = np.where(cnt > 0, sum_tp / np.maximum(cnt, 1), np.nan)
+        var = np.where(cnt > 0, sumsq / np.maximum(cnt, 1) - mean ** 2, np.nan)
+        sem = np.sqrt(np.maximum(var, 0.0) / np.maximum(cnt, 1))
+    return mean, sem, cnt
+
+
 def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
-                       scan_dims=None, is_two_array=False, recent_seq_ids=None):
+                       scan_dims=None, is_two_array=False, recent_seq_ids=None,
+                       seq_targets=None):
     """Compute survival, loading, or rearrangement curve from accumulated
     logicals.
 
@@ -247,7 +306,8 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
     if is_2d:
         return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
-                           is_two_array=is_two_array, recent_seq_ids=recent_seq_ids)
+                           is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
+                           seq_targets=seq_targets)
 
     # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
@@ -257,6 +317,24 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     n_sites_1 = len(scan_logicals[0][1])
     has_logic2 = scan_logicals[0][2] is not None
     n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
+
+    # Target-aware survival (matches the Analysis tab's TP): when the diag
+    # supplied per-shot target sets, the live curve is per-shot TP, not
+    # per-site survival. Falls through to per-site when no targets apply.
+    if seq_targets and num_images >= 2 and has_logic2:
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_params, seq_targets)
+        if ta is not None:
+            mean, sem, cnt = ta
+            order = np.argsort(scan_params)
+            return {
+                'scan_x': scan_params[order],
+                'y_mean': mean[order],
+                'y_sem': sem[order],
+                'y_mean_sr': mean[order][None, :],
+                'n_reps': cnt[order],
+                'mode': 'survival',
+                'target_aware': True,
+            }
     # In two-array mode with different-sized grids, the per-param metric is
     # the mean of logic2 over array-2 sites. With same-sized grids, treat as
     # matched-index survival like the legacy single-array case.
@@ -305,7 +383,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
 
 def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
-                is_two_array=False, recent_seq_ids=None):
+                is_two_array=False, recent_seq_ids=None, seq_targets=None):
     """Compute 2-D heatmap for multi-dimensional scans.
 
     The flat param_index decomposes column-major (dim-0 varies fastest):
@@ -323,6 +401,36 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
     n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
     different_arrays = is_two_array and has_logic2 and n_sites_1 != n_sites_2
     n_sites = n_sites_2 if different_arrays else n_sites_1
+
+    # Target-aware survival (matches Analysis TP) when the diag gave targets.
+    if seq_targets and num_images >= 2 and has_logic2:
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets)
+        if ta is not None:
+            mean_flat, sem_flat, n_flat = ta
+            sids = list(recent_seq_ids) if recent_seq_ids else (
+                [int(scan_logicals[-1][0])] if scan_logicals else [])
+            current = []
+            seen = set()
+            for sid in sids:
+                li = int(sid) - 1
+                if not (0 <= li < len(param_indices)):
+                    continue
+                p = int(param_indices[li]) - 1
+                if not (0 <= p < n_total):
+                    continue
+                cell = (p % s0, p // s0)
+                if cell not in seen:
+                    seen.add(cell)
+                    current.append({'x_idx': cell[0], 'y_idx': cell[1]})
+            return {
+                'mode': 'survival', 'ndim': 2, 'target_aware': True,
+                'heatmap': mean_flat.reshape(s1, s0),
+                'sem': sem_flat.reshape(s1, s0),
+                'n_reps': n_flat.reshape(s1, s0),
+                'x_values': d0['values'], 'y_values': d1['values'],
+                'x_name': d0['name'], 'y_name': d1['name'],
+                'x_size': s0, 'y_size': s1, 'current': current,
+            }
 
     # Bucket by flat param index (0-based)
     buckets = [[] for _ in range(n_total)]

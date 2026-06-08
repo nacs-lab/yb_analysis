@@ -51,6 +51,15 @@ class RunnerLauncher:
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def take_ownership(self) -> None:
+        """Force stop() to actually tear the runner down even if we adopted it
+        in reuse mode. Used by a backend SWITCH: the old backend must die (it
+        holds the single DCAM camera handle + ZMQ port) so the new one can
+        bind. Without this, stop() is a no-op in reuse mode and the freshly
+        spawned backend would adopt the still-alive old one (ping is
+        backend-blind)."""
+        self._owned = True
+
     def start(self, boot_timeout: float = 45.0) -> None:
         """Kill stale port binders, spawn the runner, wait for ping.
 

@@ -56,6 +56,22 @@
     "label": {
       "type": "string",
       "description": "Optional human label for queue UI; falls back to seq name."
+    },
+    "code_snapshot": {
+      "description": "Optional reproducibility pin (#3): replay the experiment code (YbSeqs/YbSteps/YbScans) captured for a prior run instead of the live tree. Set by 're-queue (orig code)'. Inert for normal runs; honored by the pyctrl run loop, ignored by the MATLAB backend.",
+      "type": "object",
+      "required": ["scan_id"],
+      "additionalProperties": false,
+      "properties": {
+        "scan_id": {
+          "type": "integer",
+          "description": "14-digit YYYYMMDDHHMMSS of the source run whose code snapshot to replay."
+        },
+        "data_root": {
+          "type": "string",
+          "description": "Optional override for the data root holding _code_snapshots (defaults to the scan-prep data root)."
+        }
+      }
     }
   },
   "$defs": {

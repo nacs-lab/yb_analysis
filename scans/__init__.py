@@ -28,6 +28,7 @@ from yb_analysis.scans.client import (
     list_jobs,
     cancel,
     move,
+    requeue,
 )
 from yb_analysis.scans.convenience import (
     sweep_linspace,
@@ -45,6 +46,7 @@ __all__ = [
     'list_jobs',
     'cancel',
     'move',
+    'requeue',
     'sweep_linspace',
     'sweep_logspace',
     'sweep_values',

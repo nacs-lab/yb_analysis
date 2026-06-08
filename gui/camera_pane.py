@@ -10,6 +10,7 @@ import tkinter as tk
 import tkinter.ttk as ttk
 
 from yb_analysis.config import write_orca_roi, write_orca_exposure
+from yb_analysis.control import web_control as _web_control
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,16 @@ class CameraPane(ttk.LabelFrame):
         self._cmd_pending = False  # True while waiting for a command to take effect
         self._last_server_roi = None  # track what the server reports
         self._last_server_exposure = None
+        # Last error string + the transient "Connecting…/Applying…" label,
+        # mirrored to the web sidebar's Camera card via web_control.
+        self._last_error = ''
+        self._busy_text = ''
+        # Extended Orca telemetry mirrored to the web Camera card (pyctrl backend
+        # publishes these via camera_status; the MATLAB backend leaves them blank).
+        self._last_trigger = ''
+        self._last_cooler = ''
+        self._last_cooler_status = ''
+        self._last_temperature = None
 
         # Deferred expConfig persistence: user-applied values land here in the
         # main thread before the ZMQ command is queued.  The poll loop writes
@@ -131,8 +142,10 @@ class CameraPane(ttk.LabelFrame):
         self._lbl_status.config(text='Connecting...', foreground='orange')
         self._lbl_error.config(text='')
         self._cmd_pending = True
+        self._busy_text = 'Connecting...'
         self._pending_persist_roi = list(roi)
         self._pending_persist_exposure = float(exposure)
+        self._publish_web_status()
         threading.Thread(target=self._do_connect, args=(roi, exposure),
                          daemon=True).start()
 
@@ -150,6 +163,8 @@ class CameraPane(ttk.LabelFrame):
     def _on_disconnect(self):
         self._lbl_status.config(text='Disconnecting...', foreground='orange')
         self._cmd_pending = True
+        self._busy_text = 'Disconnecting...'
+        self._publish_web_status()
         threading.Thread(target=self._do_disconnect, daemon=True).start()
 
     def _do_disconnect(self):
@@ -186,8 +201,10 @@ class CameraPane(ttk.LabelFrame):
         self._lbl_error.config(text='')
         self._lbl_status.config(text='Applying settings...', foreground='orange')
         self._cmd_pending = True
+        self._busy_text = 'Applying settings...'
         self._pending_persist_roi = list(roi)
         self._pending_persist_exposure = float(exposure)
+        self._publish_web_status()
         threading.Thread(target=self._do_apply_all, args=(roi, exposure),
                          daemon=True).start()
 
@@ -259,11 +276,25 @@ class CameraPane(ttk.LabelFrame):
         self._last_server_roi = roi
         self._last_server_exposure = exposure
         self._connected = connected
+        self._last_error = err or ''
+        # Extended Orca telemetry (present only on the pyctrl backend). Captured every
+        # poll so the web card tracks live temperature / cooler / trigger transitions.
+        self._last_trigger = status.get('trigger', '') or ''
+        self._last_cooler = status.get('cooler', '') or ''
+        self._last_cooler_status = status.get('cooler_status', '') or ''
+        self._last_temperature = status.get('temperature', None)
 
         # Persist to expConfig.m only once the server reflects what the user
         # requested. This runs regardless of _cmd_pending so rapid successive
         # applies still persist correctly when each lands.
         self._maybe_persist(connected, roi, exposure, err)
+
+        # Mirror the latest camera state to the web sidebar's Camera card.
+        # Done every poll so the browser tracks connect/disconnect/error
+        # transitions even when no command originated from the web.
+        if not self._cmd_pending:
+            self._busy_text = ''
+        self._publish_web_status()
 
         # While a command is pending, don't overwrite the UI
         if self._cmd_pending:
@@ -367,3 +398,69 @@ class CameraPane(ttk.LabelFrame):
                 and self._pending_persist_roi is None
                 and self._pending_persist_exposure is None):
             self._cmd_pending = False
+
+    # ----------------------------------------------- Web-dashboard mirror
+
+    def _publish_web_status(self):
+        """Mirror the camera state to the web sidebar's Camera card.
+
+        Best-effort. ``status_text`` matches the Tkinter status label
+        wording (Connected / Disconnected / Error / Connecting… / …) so
+        the remote card reads identically to the local one."""
+        if self._cmd_pending and self._busy_text:
+            text = self._busy_text
+        elif self._connected:
+            text = 'Connected'
+        elif self._last_error:
+            text = 'Error'
+        else:
+            text = 'Disconnected'
+        try:
+            payload = {
+                'connected': bool(self._connected),
+                'roi': (list(self._last_server_roi)
+                        if self._last_server_roi is not None else None),
+                'exposure_time': self._last_server_exposure,
+                'error': self._last_error or '',
+                'busy': bool(self._cmd_pending),
+                'status_text': text,
+            }
+            # Extended Orca telemetry is published ONLY by the pyctrl backend's
+            # camera_status (trigger / cooler / cooler_status / temperature). The
+            # MATLAB backend never reports these, so we omit the keys entirely when
+            # absent — keeping the MATLAB payload (and dashboard card) unchanged.
+            if (self._last_trigger or self._last_cooler
+                    or self._last_cooler_status or self._last_temperature is not None):
+                payload.update({
+                    'trigger': self._last_trigger,
+                    'cooler': self._last_cooler,
+                    'cooler_status': self._last_cooler_status,
+                    'temperature': self._last_temperature,
+                })
+            _web_control.publish_camera_status(payload)
+        except Exception:
+            pass
+
+    def apply_web_command(self, action, roi=None, exposure=None):
+        """Execute a camera command spooled by the web dashboard.
+
+        Runs on the Tk main thread (dispatched from ControlPanel's
+        status poll), so it reuses the exact same handlers the local
+        Connect / Disconnect / Apply buttons call — setting the entry
+        fields first so validation, expConfig persistence, and the
+        status mirror all behave identically to a local click."""
+        try:
+            if roi is not None:
+                self.set_roi(roi)
+            if exposure is not None:
+                self.set_exposure(exposure)
+        except Exception as e:
+            logger.warning('apply_web_command(%r): bad fields: %s', action, e)
+        if action == 'connect':
+            self._on_connect()
+        elif action == 'apply':
+            self._on_apply_all()
+        elif action == 'disconnect':
+            self._on_disconnect()
+        else:
+            logger.warning('apply_web_command: unknown action %r', action)

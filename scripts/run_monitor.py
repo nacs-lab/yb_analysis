@@ -23,6 +23,7 @@ from yb_analysis.config import (
     MATLAB_URL, DASHBOARD_PORT, MATLAB_EXE, MATLAB_ROOT,
     SLM_URL, SLM_VERIFY_TLS, SLM_PASSWORD_PATH, SLM_POLL_INTERVALS_MS,
     SLM_HTTP_TIMEOUT_S, LAB_PC_TAILSCALE_IP,
+    DEFAULT_BACKEND, VALID_BACKENDS, PYCTRL_PYTHON, PYCTRL_MODULE, PYCTRL_CWD,
 )
 
 
@@ -44,6 +45,13 @@ def main():
                              f'IP ({LAB_PC_TAILSCALE_IP}) instead of '
                              f'0.0.0.0 / loopback. Mutually exclusive with '
                              f'--lan; useful when you want tailnet-only access.')
+    parser.add_argument('--enable-remote-controls', action='store_true',
+                        help='Expose the dashboard control endpoints '
+                             '(/api/control/*: pause/abort/start/restart/'
+                             'dummy-mode/init) to non-loopback clients. '
+                             'Loopback is always allowed; --bind-tailscale '
+                             'allows the tailnet by default; --lan hides '
+                             'controls unless this flag is set.')
     parser.add_argument('--slm-url', default=SLM_URL,
                         help=f'SLM PC HTTP URL (default: {SLM_URL}). '
                              f'Read-only proxy polls health/lock/camera/phase '
@@ -52,8 +60,17 @@ def main():
                         help='Disable the SLM proxy entirely. /api/slm/* '
                              'endpoints will return 503 and the dashboard '
                              'SLM panel will show "proxy disabled".')
+    parser.add_argument('--backend', choices=VALID_BACKENDS,
+                        default=DEFAULT_BACKEND,
+                        help=f'Sequence backend hosting the ExptServer '
+                             f'(default: {DEFAULT_BACKEND}). '
+                             f'"matlab" spawns SequenceRunner.m; "pyctrl" '
+                             f'spawns the Python front-end run loop. Normally '
+                             f'set by the GUI backend toggle (a Restart-All '
+                             f'handoff), not typed by hand.')
     parser.add_argument('--no-runner', action='store_true',
-                        help='Do not spawn the background MATLAB SequenceRunner')
+                        help='Do not spawn the background backend '
+                             '(MATLAB SequenceRunner or pyctrl run loop)')
     parser.add_argument('--reuse-runner', action='store_true',
                         help='Reuse an already-running SequenceRunner if present, '
                              'and DO NOT shut it down on exit. Mitigates the '
@@ -104,19 +121,41 @@ def main():
     # Clear any stale listener on the dashboard port
     kill_port(args.port)
 
-    # Start the background MATLAB runner (owns the ZMQ server at args.url)
+    # Start the background backend (owns the ZMQ ExptServer at args.url).
+    # The backend is selected by --backend; the GUI toggle relaunches us with
+    # a different value. We degrade gracefully if the chosen backend fails to
+    # boot — the GUI still comes up (showing a dead backend) so the user can
+    # toggle back to a working one. This matters because the pyctrl run loop
+    # is a Phase-5 deliverable that may not exist yet.
     runner = None
     if not args.no_runner:
-        from yb_analysis.acquisition.runner_launcher import RunnerLauncher
-        runner = RunnerLauncher(
-            matlab_exe=args.matlab_exe,
-            matlab_root=args.matlab_root,
-            url=args.url,
-            mock=args.mock,
-            reuse=args.reuse_runner,
-        )
-        logging.info('Starting MATLAB SequenceRunner (mock=%s)...', args.mock)
-        runner.start()
+        if args.backend == 'pyctrl':
+            from yb_analysis.acquisition.pyctrl_launcher import PyctrlLauncher
+            runner = PyctrlLauncher(
+                python=PYCTRL_PYTHON,
+                module=PYCTRL_MODULE,
+                url=args.url,
+                cwd=PYCTRL_CWD,
+                reuse=args.reuse_runner,
+            )
+            logging.info('Starting pyctrl backend (%s -m %s)...',
+                         PYCTRL_PYTHON, PYCTRL_MODULE)
+        else:
+            from yb_analysis.acquisition.runner_launcher import RunnerLauncher
+            runner = RunnerLauncher(
+                matlab_exe=args.matlab_exe,
+                matlab_root=args.matlab_root,
+                url=args.url,
+                mock=args.mock,
+                reuse=args.reuse_runner,
+            )
+            logging.info('Starting MATLAB SequenceRunner (mock=%s)...', args.mock)
+        try:
+            runner.start()
+        except Exception as e:
+            logging.error('Backend %r failed to start: %s. Bringing up the '
+                          'GUI anyway so you can switch backends from the '
+                          'toggle.', args.backend, e)
 
     from yb_analysis.acquisition.zmq_client import ZmqClient
     from yb_analysis.plotting.dashboard import DashboardRenderer
@@ -136,6 +175,27 @@ def main():
         dash_host = '0.0.0.0'
     else:
         dash_host = '127.0.0.1'
+
+    # Phase 5.5 Track A remote-control exposure policy. The dashboard reads
+    # YB_DASH_REMOTE_CONTROLS (auto|on|off); loopback is always allowed.
+    #   --enable-remote-controls -> 'on'  (any remote client may control)
+    #   --lan (no enable flag)    -> 'off' (loopback only; LAN can view only)
+    #   default / --bind-tailscale-> 'auto' (loopback + tailnet allowed)
+    if args.enable_remote_controls:
+        os.environ['YB_DASH_REMOTE_CONTROLS'] = 'on'
+    elif args.lan:
+        os.environ['YB_DASH_REMOTE_CONTROLS'] = 'off'
+    else:
+        os.environ['YB_DASH_REMOTE_CONTROLS'] = 'auto'
+
+    # Tell the dashboard subprocess which backend is live so its control
+    # endpoints route correctly: MATLAB -> write the MemoryMap; pyctrl -> spool
+    # to this process's ZMQ client (no local memmap). Set BEFORE spawning the
+    # dashboard so it's inherited; fixed for the subprocess's lifetime (a
+    # backend switch relaunches the whole monitor). See dashboard
+    # _backend_uses_memmap().
+    os.environ['YB_BACKEND'] = args.backend
+
     dashboard = DashboardRenderer(port=args.port, host=dash_host)
 
     # Start the SLM proxy (background daemon threads). On --no-slm, skip
@@ -235,7 +295,9 @@ def main():
         logging.info('Dashboard at http://localhost:%d  '
                      '(API endpoints at /api/*; pass --lan to expose on LAN)',
                      args.port)
-    app = ControlPanel(client, dashboard, init_dir=init_dir, init_status=init_status)
+    app = ControlPanel(client, dashboard, init_dir=init_dir,
+                       init_status=init_status, backend=args.backend,
+                       backend_runner=runner)
     app._camera_pane.set_roi(orca_cfg['roi'])
     app._camera_pane.set_exposure(orca_cfg['exposure_time'])
     # Kick off camera init in the background so the GUI shows "Connecting..."

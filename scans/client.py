@@ -177,6 +177,83 @@ def move(entry_id: int, direction: str, *, url: Optional[str] = None,
     return isinstance(rep, str) and rep.lower().startswith('ok')
 
 
+def requeue(entry_id: int, *, with_code: bool = False,
+            url: Optional[str] = None, client=None, validate: bool = True) -> int:
+    """Re-submit an existing queue/history entry's descriptor.
+
+    Looks ``entry_id`` up in the live queue snapshot (``running`` /
+    ``queued`` / ``history``), pulls the original descriptor JSON it was
+    submitted with, and re-submits it -- producing a new descriptor whose
+    parameters are byte-identical to the original. Returns the new
+    descriptor's queue id.
+
+    ``with_code`` (reproducibility, #3): also pin the new descriptor to the
+    source run's captured code snapshot (``code_snapshot.scan_id`` = the
+    run's data id), so the pyctrl run loop replays the exact experiment
+    source (YbSeqs/YbSteps/YbScans) that ran originally instead of the live
+    tree. Requires the source entry to carry a data id (``file_id``) -- i.e.
+    a pyctrl run that actually executed and was snapshotted.
+
+    Only scans submitted through the descriptor path carry a replayable
+    descriptor; a job submitted some other way (e.g. a raw payload from
+    MATLAB outside ``submit_scan_descriptor``) has nothing to replay.
+
+    Raises
+    ------
+    LookupError
+        If no entry has that id, the entry has no stored descriptor, or
+        (``with_code``) the entry has no data id to locate its snapshot.
+    DescriptorError
+        If ``validate`` is set and the resulting descriptor doesn't validate.
+    """
+    if client is None:
+        client = _get_client(url)
+    entry = _find_entry(int(entry_id), client.queue_list())
+    if entry is None:
+        raise LookupError(f"no queue/history entry with id {entry_id}")
+    desc_json = entry.get('descriptor')
+    if not desc_json:
+        raise LookupError(
+            f"entry {entry_id} has no stored descriptor to re-queue "
+            "(only scans submitted via the descriptor path can be replayed)")
+    if with_code:
+        desc_json = _pin_code_snapshot(desc_json, entry)
+    if validate:
+        try:
+            validate_descriptor(json.loads(desc_json))
+        except DescriptorError:
+            raise
+        except Exception as ex:
+            raise DescriptorError(
+                f"stored descriptor for id {entry_id} is unreadable: {ex}")
+    # Preserve the original display label; fall back to the seq name.
+    label = entry.get('label') or ''
+    if not label:
+        try:
+            label = _seq_name(json.loads(desc_json).get('seq'))
+        except Exception:
+            label = ''
+    return int(client.submit_scan_descriptor(desc_json, label=label))
+
+
+def _pin_code_snapshot(desc_json: str, entry: Mapping) -> str:
+    """Add ``code_snapshot.scan_id`` (from the entry's data id) to the descriptor JSON,
+    so a re-queue replays the source run's captured code. Raises LookupError if the entry
+    has no usable data id. Params are otherwise untouched (only the pin is added)."""
+    file_id = entry.get('file_id') or ''
+    digits = ''.join(ch for ch in str(file_id) if ch.isdigit())
+    if len(digits) != 14:
+        raise LookupError(
+            f"entry {entry.get('id')} has no 14-digit data id (got {file_id!r}); "
+            "cannot locate its code snapshot to re-queue with original code")
+    try:
+        d = json.loads(desc_json)
+    except Exception as ex:
+        raise DescriptorError(f"stored descriptor is unreadable: {ex}")
+    d['code_snapshot'] = {'scan_id': int(digits)}
+    return json.dumps(d, ensure_ascii=False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -200,6 +277,20 @@ def _kind_of(entry_id: int, snap: Mapping) -> Optional[str]:
     running = snap.get('running')
     if isinstance(running, Mapping) and running.get('id') == eid:
         return running.get('kind', 'job')
+    return None
+
+
+def _find_entry(entry_id: int, snap: Mapping) -> Optional[Mapping]:
+    """Return the queue_list entry with ``id == entry_id`` (searching
+    running, then queued, then history), or None if absent."""
+    eid = int(entry_id)
+    running = snap.get('running')
+    if isinstance(running, Mapping) and running.get('id') == eid:
+        return running
+    for section in ('queued', 'history'):
+        for r in snap.get(section) or []:
+            if isinstance(r, Mapping) and r.get('id') == eid:
+                return r
     return None
 
 

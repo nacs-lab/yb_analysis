@@ -92,6 +92,30 @@ def _scan_dir(scan_id):
     return os.path.join(config.DATA_DIR, day, f'data_{day}_{sid[8:]}')
 
 
+def _num_images_per_seq(sdir, sid):
+    """NumImages (frames per sequence) from the scan's .json sidecar (pyctrl) or .mat config,
+    or None. Used as a fallback to isolate the img1 (loading) frames when the per-sequence
+    intensities aren't present to infer the stride."""
+    jp = os.path.join(sdir, f'data_{sid[:8]}_{sid[8:]}.json')
+    if os.path.isfile(jp):
+        try:
+            with open(jp, encoding='utf-8') as fh:
+                v = json.load(fh).get('NumImages')
+            if v:
+                return int(np.ravel(v)[0])
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        from yb_analysis.io.mat_reader import load_scan_config_from_mat
+        cfg = load_scan_config_from_mat(os.path.join(sdir, f'data_{sid[:8]}_{sid[8:]}.mat'))
+        v = cfg.get('NumImages')
+        if v:
+            return int(np.ravel(v)[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _avg_image_and_roi(scan_id):
     import h5py
     os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
@@ -99,11 +123,30 @@ def _avg_image_and_roi(scan_id):
     sid = scan_id.replace('_', '')
     h5p = os.path.join(sdir, f'data_{sid[:8]}_{sid[8:]}.h5')
     with h5py.File(h5p, 'r', libver='latest', swmr=True) as f:
-        n = f['imgs'].shape[0]
-        acc = np.zeros(f['imgs'].shape[1:], np.float64)
-        for i in range(n):
-            acc += f['imgs'][i].astype(np.float64)
-        avg = acc / n
+        imgs = f['imgs']
+        n = imgs.shape[0]
+        # ALWAYS average the img1 (loading) frames ONLY. A two-image scan (e.g. SLM
+        # rearrangement: img1 = loading 33x33, img2 = rearranged every-other) interleaves
+        # frames as [seq0_img1, seq0_img2, seq1_img1, ...]; averaging ALL frames would smear
+        # the loading array with a DIFFERENT post-protocol pattern and wreck the fit. The
+        # loading image is frame 0 of each sequence -> indices 0, pSeq, 2*pSeq, ... . Infer
+        # pSeq from the per-sequence intensities the same data_manager wrote (most reliable);
+        # fall back to NumImages from the scan config, else assume single-image (pSeq=1).
+        pSeq = 1
+        if 'intensities_img1' in f and f['intensities_img1'].shape[0] > 0:
+            nseq = int(f['intensities_img1'].shape[0])
+            if nseq > 0 and n % nseq == 0:
+                pSeq = max(1, n // nseq)
+        if pSeq == 1:
+            ni = _num_images_per_seq(sdir, sid)
+            if ni and n % ni == 0:
+                pSeq = ni
+        idx = list(range(0, n, pSeq))     # frame 0 of each sequence = loading image
+        acc = np.zeros(imgs.shape[1:], np.float64)
+        for i in idx:
+            acc += imgs[i].astype(np.float64)
+        avg = acc / max(len(idx), 1)
+        print(f'    averaged {len(idx)} img1 frames (pSeq={pSeq}, {n} total)')
     # ROI from scan config, else expConfig default.
     roi = None
     try:
@@ -175,6 +218,9 @@ def main(argv=None):
     p.add_argument('--spot-sigma', type=float, default=5.0)
     p.add_argument('--apply', action='store_true',
                    help='write registry record + commit the affine')
+    p.add_argument('--ema-weight', type=float, default=1.0,
+                   help='blend weight when a current affine exists (1.0 = full '
+                        'replace, the bootstrap default; <1 = EMA-nudge toward the fit)')
     p.add_argument('--url', default=None)
     args = p.parse_args(argv)
 
@@ -234,7 +280,7 @@ def main(argv=None):
                   '(use a better scan or adjust gates.)')
             return 1
         reg.write_pattern(record)
-        entry = aff.commit_update(cand)
+        entry = aff.commit_update(cand, ema_weight=args.ema_weight)
         print(f'\n[5] committed affine to {aff._affine_path()}')
         print(f'    registry record at {reg._record_path(args.pattern)}')
         print(json.dumps({k: entry[k] for k in (

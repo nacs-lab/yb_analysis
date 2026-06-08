@@ -192,6 +192,23 @@ UPDATE_LOADING_INTERVAL = 50  # update loading rates every 50 shots (like grid)
 UPDATE_HIST_BATCH_SIZE = 2000  # accumulate this many shots for histogram
 UPDATE_HIST_INTERVAL = 200     # recompute histograms every N shots
 
+# ---- Live per-N-shots EWMA self-calibration (loading-pattern scans only) ----
+# Every N loading shots we nudge BOTH the global SLM->camera affine (TRANSLATION
+# only) and the per-pattern detection thresholds toward what the recent shots
+# show, as an exponentially-weighted moving average (no stored queue; just blend
+# with a weight). The EWMA weight w gives an effective memory of ~ N/w shots, so
+# w = N / memory. With N = 10 and a ~100-shot memory, w ~= 0.1. Every update is
+# persisted (affine_transform.json / per-pattern threshold.mat) AND appended to a
+# shot-stamped jsonl audit log so the drift can be analysed offline.
+AFFINE_LIVE_INTERVAL = 10        # seqs between affine translation updates
+AFFINE_LIVE_BATCH = 30           # recent img1 frames averaged for the shift estimate
+AFFINE_LIVE_SEARCH_RANGE = 4     # px cross-correlation half-width (drift/N shots is sub-px)
+AFFINE_LIVE_EMA = 0.1            # EWMA weight per update (~N/EMA = 100-shot memory)
+THRES_LIVE_INTERVAL = 10         # seqs between cheap per-site threshold EWMA updates
+THRES_LIVE_WINDOW = 100          # recent shots used for each cheap threshold estimate
+THRES_LIVE_EMA = 0.1             # EWMA weight for the cheap threshold update
+THRES_LIVE_MIN_PER_SIDE = 3      # min recent shots on each side of the threshold to trust a site
+
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
 

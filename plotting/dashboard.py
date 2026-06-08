@@ -874,6 +874,27 @@ def _read_slm_diag_h5(path, scan_id):
             'overflow': False, 'entries': entries}
 
 
+#: Tail size for the Logs tab viewer (last N bytes of huge logs).
+_LOG_TAIL_BYTES = 256 * 1024
+
+
+def _log_dirs():
+    """On-disk log directories the Logs tab browses, in display order.
+
+    Returns ``[(category, label, abspath), ...]`` for the three per-session
+    log trees that sit under ``<project_root>/log/`` (written by the pyctrl
+    backend's ``logging_setup``, the windowless ``Restart All`` respawn, and
+    the MATLAB runner's ``-logfile``)."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))  # yb_analysis/plotting/ -> project root
+    base = os.path.join(root, 'log')
+    return [
+        ('pyctrl',  'pyctrl backend (log/pyctrl_log)',  os.path.join(base, 'pyctrl_log')),
+        ('monitor', 'run_monitor (log/monitor_log)',    os.path.join(base, 'monitor_log')),
+        ('matlab',  'MATLAB backend (log/matlab_log)',  os.path.join(base, 'matlab_log')),
+    ]
+
+
 def _register_api_routes(server):
     """Attach read-only JSON endpoints to the Flask app underlying Dash."""
     from flask import jsonify
@@ -1129,6 +1150,79 @@ def _register_api_routes(server):
         `/slm/runs/{scan_id}/diag` endpoint (~live data, ~5s stale).
         """
         return _runs_diag_response(scan_id)
+
+    # ---- Logs tab: browse + view the on-disk server/monitor/backend logs ----
+
+    @server.route('/api/logs/list')
+    def _api_logs_list():
+        """List the log files in each log dir, newest first:
+        -> {groups: [{category, label, files: [{name, size, mtime, mtime_iso}]}]}"""
+        groups = []
+        for category, label, d in _log_dirs():
+            files = []
+            try:
+                names = os.listdir(d)
+            except OSError:
+                names = []
+            for nm in names:
+                fp = os.path.join(d, nm)
+                try:
+                    if not os.path.isfile(fp):
+                        continue
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                files.append({
+                    'name': nm, 'size': st.st_size, 'mtime': st.st_mtime,
+                    'mtime_iso': time.strftime('%Y-%m-%d %H:%M:%S',
+                                               time.localtime(st.st_mtime))})
+            files.sort(key=lambda f: f['mtime'], reverse=True)
+            groups.append({'category': category, 'label': label, 'files': files})
+        return jsonify({'groups': groups})
+
+    @server.route('/api/logs/file')
+    def _api_logs_file():
+        """Return one log file's contents. ?category=&name= [&tail=1] [&raw=1].
+
+        ``tail=1`` (default) returns only the last ~256 KB (fast for huge,
+        still-growing logs); ``raw=1`` streams the whole file as text/plain
+        (used by the viewer's "Raw" link). Path-traversal-safe: ``name`` must
+        be a bare filename inside one of the known log dirs."""
+        from flask import request, Response
+        category = request.args.get('category', '')
+        name = request.args.get('name', '')
+        tail = request.args.get('tail', '1') != '0'
+        raw = request.args.get('raw') == '1'
+        cats = {c: p for c, _l, p in _log_dirs()}
+        d = cats.get(category)
+        if d is None:
+            return jsonify({'error': 'unknown category'}), 400
+        # Path-traversal guard: a bare filename, no separators, no '..'.
+        if (not name or name != os.path.basename(name) or name in ('.', '..')
+                or os.sep in name or (os.altsep and os.altsep in name)):
+            return jsonify({'error': 'bad name'}), 400
+        fp = os.path.join(d, name)
+        if not os.path.isfile(fp):
+            return jsonify({'error': 'not found'}), 404
+        try:
+            total = os.path.getsize(fp)
+            with open(fp, 'rb') as fh:
+                truncated = False
+                if tail and not raw and total > _LOG_TAIL_BYTES:
+                    fh.seek(total - _LOG_TAIL_BYTES)
+                    truncated = True
+                data = fh.read()
+        except OSError as e:
+            return jsonify({'error': str(e)}), 500
+        if raw:
+            return Response(data, mimetype='text/plain; charset=utf-8')
+        text = data.decode('utf-8', errors='replace')
+        if truncated:
+            nl = text.find('\n')      # drop the partial first line after the seek
+            if nl != -1:
+                text = text[nl + 1:]
+        return jsonify({'text': text, 'total_bytes': total,
+                        'returned_bytes': len(data), 'truncated': truncated})
 
     @server.route('/api/runs/<scan_id>/diag_live')
     def _api_runs_diag_live(scan_id):
@@ -2202,9 +2296,9 @@ def _register_api_routes(server):
         if g is not None:
             return g
         action = (request.args.get('action') or '').lower()
-        if action not in ('abort', 'restart_all', 'set_backend'):
+        if action not in ('abort', 'restart_all', 'set_backend', 'shutdown'):
             return jsonify(
-                {'error': 'action must be abort|restart_all|set_backend'}), 400
+                {'error': 'action must be abort|restart_all|set_backend|shutdown'}), 400
         return jsonify({'token': _issue_confirm_token(action),
                         'ttl_s': _CONFIRM_TTL_S})
 
@@ -2306,6 +2400,23 @@ def _register_api_routes(server):
             return jsonify(
                 {'error': 'restart_all requires a valid confirm token'}), 400
         _wc.enqueue('restart_all')
+        return jsonify({'ok': True, 'via': 'run_monitor'})
+
+    @server.route('/api/control/shutdown', methods=['POST'])
+    def _api_control_shutdown():
+        # Full shutdown: tear down camera/backend/dashboard and exit
+        # run_monitor WITHOUT respawning (unlike restart_all). Confirm-token
+        # gated like the other destructive ops.
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        tok = request.args.get('confirm') or (request.get_json(silent=True)
+                                              or {}).get('confirm')
+        if not _consume_confirm_token(tok or '', 'shutdown'):
+            return jsonify(
+                {'error': 'shutdown requires a valid confirm token'}), 400
+        _wc.enqueue('shutdown')
         return jsonify({'ok': True, 'via': 'run_monitor'})
 
     @server.route('/api/control/set_backend', methods=['POST'])
@@ -4250,7 +4361,7 @@ def _fig_scan_curve(d, cbar_scale='01'):
     scan_name = d.get('scan_name', 'Scan')
     x_label = d.get('scan_param_path') or scan_name
     if mode == 'survival':
-        y_label = 'Survival'
+        y_label = 'Survival — TP (target)' if sc.get('target_aware') else 'Survival'
     elif mode == 'rearrangement':
         y_label = 'Rearrangement Success (mean of logic2)'
     else:
@@ -4267,6 +4378,12 @@ def _fig_scan_curve(d, cbar_scale='01'):
     fig.update_layout(**_L, title=title_text,
                       xaxis=dict(title=x_label, **_A),
                       yaxis=dict(title=y_label, range=[-0.05, 1.05], **_A))
+    if sc.get('target_aware'):
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.0, y=1.0, xanchor='left', yanchor='top',
+            text='⌖ target-aware (diag)', showarrow=False,
+            font=dict(size=10, color='#3fb950'),
+            bgcolor='rgba(0,0,0,0.35)', borderpad=2)
     return fig
 
 
@@ -4279,33 +4396,59 @@ def _fig_scan_timeseries(d):
     size so the operator isn't staring at "Waiting for data..." for an
     entire 0d run.
     """
-    hist = d.get('loading_history')
-    if hist is None or len(hist) == 0:
+    # Prefer a SURVIVAL timeseries (per-shot TP) when the run has a second
+    # image — for a 0d rearrangement scan the operator wants survival, not
+    # loading. Target-aware (TP at this run's diag targets) when known, else
+    # per-site survival. Falls back to loading for 1-image scans.
+    sh = d.get('survival_history')
+    is_surv = bool(sh and isinstance(sh, dict) and sh.get('values'))
+    if is_surv:
+        vals = sh.get('values') or []
+        target_aware = bool(sh.get('target_aware'))
+        y_label = 'Survival — TP (target)' if target_aware else 'Survival'
+        series_name = 'survival'
+        color = '#3fb950'
+    else:
+        vals = d.get('loading_history')
+        target_aware = False
+        y_label = 'Fraction loaded'
+        series_name = 'loaded fraction'
+        color = '#58a6ff'
+    if vals is None or len(vals) == 0:
         return _waiting('Scan Curve',
                         'No swept axis; waiting for shots to fill time series...')
-    hist = np.asarray(hist, dtype=float)
-    n = hist.size
+    # Survival series may carry None gaps (shot with no atoms / no target).
+    arr = np.array([np.nan if v is None else float(v) for v in vals], dtype=float)
+    n = arr.size
     x = np.arange(1, n + 1)
-    avg = float(hist.mean()) if n else 0.0
+    finite = arr[np.isfinite(arr)]
+    avg = float(finite.mean()) if finite.size else 0.0
     fig = go.Figure(go.Scatter(
-        x=x, y=hist, mode='lines+markers',
-        line=dict(color='#58a6ff', width=1.5),
-        marker=dict(size=4, color='#58a6ff'),
-        name='loaded fraction',
+        x=x, y=arr, mode='lines+markers',
+        line=dict(color=color, width=1.5),
+        marker=dict(size=4, color=color),
+        name=series_name, connectgaps=False,
     ))
     fig.add_shape(type='line', xref='paper', x0=0, x1=1, y0=avg, y1=avg,
                   line=dict(color='#ffdd44', width=1.5, dash='dash'))
+    kind = 'survival' if is_surv else 'loaded'
     fig.add_annotation(
-        text=f'Avg: {100*avg:.1f}%  ({n} shots, 0d / no swept axis)',
+        text=f'Avg {kind}: {100*avg:.1f}%  ({n} shots, 0d / no swept axis)',
         xref='paper', yref='paper', x=0.99, y=0.99,
         showarrow=False, xanchor='right', yanchor='top',
         font=dict(color='#ffdd44', size=11),
         bgcolor='rgba(20,20,40,0.7)')
+    if target_aware:
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.0, y=1.0, xanchor='left', yanchor='top',
+            text='⌖ target-aware (diag)', showarrow=False,
+            font=dict(size=10, color='#3fb950'),
+            bgcolor='rgba(0,0,0,0.35)', borderpad=2)
     title = _scan_title(d.get('scan_name') or 'Scan (0d)',
                         d.get('scan_filename'))
     fig.update_layout(**_L, title=title,
                       xaxis=dict(title='Shot # (oldest → latest)', **_A),
-                      yaxis=dict(title='Fraction loaded',
+                      yaxis=dict(title=y_label,
                                  tickformat='.0%', autorange=True, **_A))
     return fig
 
@@ -4366,7 +4509,10 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
         x_disp = x_vals
 
     z = np.where(n_reps > 0, heatmap, np.nan)
-    y_label = 'Survival' if mode == 'survival' else 'Loading'
+    if mode == 'survival':
+        y_label = 'TP (target)' if sc.get('target_aware') else 'Survival'
+    else:
+        y_label = 'Loading'
     avg_reps = int(n_reps[n_reps > 0].mean()) if np.any(n_reps > 0) else 0
 
     # Colorbar z-range: 'auto' lets Plotly autoscale to the data, '01' pins 0–1.

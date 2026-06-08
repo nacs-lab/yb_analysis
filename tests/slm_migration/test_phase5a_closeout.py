@@ -425,6 +425,31 @@ def test_lab_paths_target_aware_new_run(tmp_path):
     assert abs(ta['overall_mean'] - 0.75) < 1e-6
 
 
+def test_lab_paths_target_aware_no_grid(tmp_path):
+    """Target-aware survival must work even when the run has NO baked grid
+    (a legacy pyctrl config with no initGridLocations and no slm_grid.json):
+    the primary path indexes the logicals directly via target_paired, needing
+    only the logicals width, not site coordinates. survival_vs_distance still
+    needs coords and is correctly skipped."""
+    import glob
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    scan_dir, expected_tp = _make_new_run_fixture(tmp_path)
+    # Strip every grid source: initGridLocations in the .mat + the sidecar.
+    matp = glob.glob(str(scan_dir / 'data_*.mat'))[0]
+    with h5py.File(matp, 'a') as f:
+        for k in ('initGridLocationsX', 'initGridLocationsY'):
+            if k in f['Scan']:
+                del f['Scan'][k]
+    (scan_dir / 'slm_grid.json').unlink()
+    result = analyze_scan_dir(str(scan_dir), sync_slm_diag=False)
+    ta = result['target_aware']
+    assert ta is not None and ta['source'] == 'lab_paths', (
+        f'no-grid target_aware should still be lab_paths; got {ta}')
+    assert abs(ta['overall_mean'] - 0.75) < 1e-6
+    # The distance plot genuinely needs coords → correctly None (not an error).
+    assert result['survival_vs_distance'] is None
+
+
 def test_lab_paths_prefers_over_slm_cache(tmp_path):
     """When BOTH paths_per_shot and slm_analysis.json are present, the
     lab-paths computation wins (source = 'lab_paths')."""

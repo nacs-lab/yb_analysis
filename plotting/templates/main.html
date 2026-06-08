@@ -39,8 +39,8 @@
     <button id="tab-btn-hardware" data-tab="hardware" role="tab" aria-selected="false">SLM Hardware</button>
     <button id="tab-btn-analysis" data-tab="analysis" role="tab" aria-selected="false">Analysis</button>
     <button id="tab-btn-queue"    data-tab="queue"    role="tab" aria-selected="false">Queue</button>
-    <button id="tab-btn-diag"     data-tab="diag"     role="tab" aria-selected="false">Diag</button>
     <button id="tab-btn-sequence" data-tab="sequence" role="tab" aria-selected="false">Sequence</button>
+    <button id="tab-btn-logs"     data-tab="logs"     role="tab" aria-selected="false">Logs</button>
   </nav>
   <div class="header-right">
     <label class="switch">
@@ -129,7 +129,8 @@
     <div class="ctrl-row">
       <button class="ctrl-btn ctrl-danger" data-kind="abort"
               data-confirm-action="abort"
-              title="Abort the running scan — stops after the current shot (a shot in progress can't be interrupted)">Abort</button>
+              title="Abort the running scan — stops after the current shot (a shot in progress can't be interrupted)"><span
+              class="abort-ind ind-stop" id="abort-ind" title="">✗</span>Abort</button>
       <button class="ctrl-btn" data-kind="restart-dash" title="Restart the dashboard subprocess">Restart Dash</button>
     </div>
     <div class="ctrl-row">
@@ -138,6 +139,14 @@
               title="Respawn run_monitor (drops the camera) — hold 1 s"
               style="grid-column: span 2;">
         <span class="hold-bar"></span><span class="ctrl-btn-label">Restart All</span>
+      </button>
+    </div>
+    <div class="ctrl-row">
+      <button class="ctrl-btn ctrl-hold ctrl-danger" data-kind="shutdown"
+              data-confirm-action="shutdown"
+              title="Shut down run_monitor + backend and EXIT (no restart) — hold 1 s"
+              style="grid-column: span 2;">
+        <span class="hold-bar"></span><span class="ctrl-btn-label">Shutdown</span>
       </button>
     </div>
 
@@ -328,19 +337,14 @@
     <div class="plot-container" id="plot-loading-live" style="height: 220px;"></div>
   </section>
 
-  <section class="card col-4" data-card-id="live-load-map">
+  <section class="card col-6" data-card-id="live-load-map">
     <h2>Per-site loading<span class="grow"></span></h2>
     <div class="plot-container" id="plot-load-map" style="height: 380px;"></div>
   </section>
 
-  <section class="card col-4" data-card-id="live-infid-map">
+  <section class="card col-6" data-card-id="live-infid-map">
     <h2>Per-site infidelity<span class="grow"></span></h2>
     <div class="plot-container" id="plot-infid-map" style="height: 380px;"></div>
-  </section>
-
-  <section class="card col-4" data-card-id="live-shift">
-    <h2>Grid shift<span class="grow"></span></h2>
-    <div class="plot-container" id="plot-shift" style="height: 380px;"></div>
   </section>
 
   <section class="card col-12" data-card-id="live-histograms">
@@ -376,6 +380,29 @@
     </div>
   </section>
 
+  <!-- Affine alignment (replaced the old Grid-shift card). The global
+       SLM(knm)→camera(px) affine, its update history, and how well aligned
+       the array is RIGHT NOW (current-fit RMS + coverage + freshness). -->
+  <section class="card col-12" data-card-id="live-affine" id="card-affine">
+    <h2>Affine alignment<span class="grow"></span>
+        <label class="svd-mode-ctl" title="History metric to trend over the affine updates">trend:
+          <select id="affine-metric"></select>
+        </label>
+        <button class="ghost" id="affine-rollback"
+                title="Restore the previous affine from history (e.g. after a bad auto-update)">↶ rollback</button>
+        <span class="hint mono" id="affine-info"></span>
+    </h2>
+    <!-- Current alignment-quality badges (rms / coverage / pairs / geometry). -->
+    <div id="affine-quality" class="affine-quality">
+      <span class="muted">waiting for affine…</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1.35fr 1fr;gap:12px;margin-top:10px;">
+      <div class="plot-container" id="plot-affine-trend" style="height:300px;"></div>
+      <div class="plot-container" id="plot-affine-drift" style="height:300px;"></div>
+    </div>
+    <div id="affine-table" class="affine-table"></div>
+  </section>
+
 </section>
 
 <!-- =========================== HARDWARE TAB ========================== -->
@@ -388,8 +415,9 @@
      all of that JavaScript -- AND any future change on the SLM side
      (new feature, new metric) appears here for free.
 
-     Lab-PC-specific cards (Rearrange diag, per-scan ledger lookup)
-     live in the Diag tab instead, so this tab is just the SLM server. -->
+     so this tab is just the SLM server. (Per-shot rearrange diag still
+     shows in the Live tile + the Analysis tab; the old standalone Diag
+     tab was replaced by the Logs tab.) -->
 <section id="tab-hardware" class="tab-pane fullbleed-tab" hidden>
   <div id="hw-iframe-wrap" class="iframe-wrap">
     <iframe id="hw-iframe"
@@ -878,67 +906,42 @@
 
 </section>
 
-<!-- ============================= DIAG TAB ============================ -->
-<section id="tab-diag" class="tab-pane" hidden>
+<!-- ============================= LOGS TAB ============================ -->
+<section id="tab-logs" class="tab-pane" hidden>
 
-  <section class="card col-12" data-card-id="diag-rearrange">
-    <h2>Rearrange diagnostics (last shots)
-      <span class="grow"></span>
-      <span class="badge mono" id="diag-rearrange-count">—</span>
+  <section class="card col-4" data-card-id="logs-files">
+    <h2>Log files<span class="grow"></span>
+        <button class="ghost flex-fixed" id="logs-refresh-btn"
+                style="font-size:11px;padding:5px 10px;">Refresh</button>
     </h2>
     <p class="hint">
-      Per-shot SLM rearrangement diagnostics from
-      <code class="mono">/slm/rearrange_diag</code>: timing, n_loaded,
-      abort flags, two-round phase, etc. Cached by the lab-PC proxy
-      thread; click Refresh on top right to force a fresh poll.
+      Server, monitor, and backend logs on disk
+      (<code class="mono">log/pyctrl_log/</code>,
+      <code class="mono">log/monitor_log/</code>,
+      <code class="mono">log/matlab_log/</code>). Newest first; click to view.
+      The list + open file auto-refresh every 5&nbsp;s.
     </p>
-    <div id="rearrange-diag-body" style="margin-top:10px;">
-      <div class="hint">no diag rows yet</div>
+    <div id="logs-list" class="logs-list scrollable" style="max-height:620px;margin-top:8px;">
+      <div class="hint">loading…</div>
     </div>
   </section>
 
-  <section class="card col-6" data-card-id="diag-ledger-lookup">
-    <h2>Look up scan ledger<span class="grow"></span></h2>
-    <p class="hint">
-      Pull every diag row the SLM server kept for a specific scan_id.
-      Sidecar-first (lab-PC <code class="mono">slm_diag.h5</code>) then
-      live SLM passthrough.
-    </p>
-    <div class="row" style="margin-top:8px;">
-      <input type="text" id="ledger-scan-id"
-             placeholder="14-digit scan_id (e.g. 20260529025015)">
-      <button class="flex-fixed" id="ledger-load-btn">Load</button>
-    </div>
-    <div id="ledger-status" class="hint" style="margin-top:8px;">ready</div>
-  </section>
-
-  <section class="card col-6" data-card-id="diag-ledger-summary">
-    <h2>Ledger summary<span class="grow"></span>
-        <span class="badge mono" id="ledger-rows-count">0 rows</span>
+  <section class="card col-8" data-card-id="logs-viewer">
+    <h2><span id="logs-view-title" class="mono">no file selected</span>
+        <span class="grow"></span>
+        <label class="hint flex-fixed" style="display:flex;gap:5px;align-items:center;">
+          <input type="checkbox" id="logs-tail-toggle" checked> tail
+        </label>
+        <a id="logs-download" class="ghost flex-fixed" href="#" target="_blank"
+           rel="noopener" style="font-size:11px;padding:5px 10px;">Raw</a>
     </h2>
-    <dl class="kv" id="ledger-summary">
-      <dt>scan_id</dt><dd>—</dd>
-      <dt>total rows</dt><dd>—</dd>
-      <dt>mean total_ms</dt><dd>—</dd>
-      <dt>mean n_loaded</dt><dd>—</dd>
-      <dt>aborted</dt><dd>—</dd>
-    </dl>
-  </section>
-
-  <section class="card col-12" data-card-id="diag-ledger-rows">
-    <h2>Ledger rows<span class="grow"></span></h2>
-    <div class="scrollable" style="max-height: 500px;">
-      <table id="ledger-table" class="dense">
-        <thead>
-          <tr><th>ts</th><th>seq_id</th><th>retry</th>
-              <th>total_ms</th><th>n_loaded</th><th>aborted</th>
-              <th>two_round</th></tr>
-        </thead>
-        <tbody>
-          <tr><td colspan="7" class="muted">type a scan_id above and click Load</td></tr>
-        </tbody>
-      </table>
-    </div>
+    <p class="hint">
+      <b>tail</b> shows the last ~256&nbsp;KB (fast for huge logs and
+      auto-scrolls to follow a running server); uncheck for the whole file.
+      <b>Raw</b> opens the file in a new tab.
+    </p>
+    <pre id="logs-view" class="logs-view mono scrollable"
+         style="max-height:620px;white-space:pre-wrap;word-break:break-word;">Pick a log file on the left.</pre>
   </section>
 
 </section>
