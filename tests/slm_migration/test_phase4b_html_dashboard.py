@@ -61,6 +61,7 @@ def test_seq_catalog_step_introspection():
         'Cool556Step should be in the steps catalog'
 
 
+@_skip_no_matlab
 def test_seq_catalog_get_seq_has_params():
     """Pick a known seq and assert its catalog entry has params with
     paths like 'Namespace.field' and non-empty defaults."""
@@ -234,6 +235,7 @@ def dash_app(tmp_path, monkeypatch):
     return flask_app.test_client()
 
 
+@_skip_no_matlab
 def test_api_seqs_list(dash_app):
     from yb_analysis.scans.seq_catalog import invalidate_cache
     invalidate_cache()
@@ -257,6 +259,7 @@ def test_api_seqs_refresh(dash_app):
     assert body['ok'] is True
 
 
+@_skip_no_matlab
 def test_api_seqs_get_includes_runp(dash_app):
     """Any cataloged seq returns a runp block listing the standard
     NumPerGroup / NumImages / Scramble defaults."""
