@@ -8,6 +8,15 @@ or via pytest:
 Tests are self-contained: the FakeSlmServer fixture spins up a Flask server on
 an OS-assigned port, the proxy is constructed with short poll intervals (50 ms),
 and assertions run against the on-disk pickle / Flask test client.
+
+NOTE (environmental): test_proxy_polls_fake_slm and test_passthrough_routes
+assert on a *shared* pickle at ``<tempdir>/yb_dash_slm.pkl``. If a LIVE dashboard
+proxy is running on the same machine it owns that file, so the test proxy gets a
+WinError 5 on write and reads the live proxy's payload instead (e.g. the real SLM
+url rather than the FakeSlmServer url) — these two tests then fail. This is a
+test-isolation limitation, not a product bug: they pass on a clean machine / CI
+where no live dashboard is running. (A proper fix would give the proxy a
+per-test temp pickle path.)
 """
 
 import math

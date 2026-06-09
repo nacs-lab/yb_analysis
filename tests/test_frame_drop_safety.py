@@ -40,6 +40,7 @@ def _drop_safety_dm(pSeq=2):
     dm._seq_ids_to_process = []
     dm._img_cnt_grid = dm._img_cnt_refit = dm._img_cnt_loading = 0
     dm._img_cnt_affine = dm._img_cnt_thres_live = 0
+    dm._diag_pull_cnt = 0                 # incremented in store_new_data (live-target pull cadence)
     return dm
 
 
