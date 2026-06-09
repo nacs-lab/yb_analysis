@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://yb-tweezer.local/schemas/scan-descriptor.json",
   "title": "Yb scan descriptor",
-  "description": "JSON descriptor for a single scan submission. Consumed by matlab_new/YbExptCtrl/dispatch_descriptor.m on the MATLAB side and by yb_analysis/scans/client.py on the lab-PC side. Schema version 1.",
+  "description": "JSON descriptor for a single scan submission. Consumed by the MATLAB dispatch_descriptor.m on the MATLAB side and by yb_analysis/scans/client.py on the lab-PC side. Schema version 1.",
   "type": "object",
   "additionalProperties": false,
   "required": ["seq"],

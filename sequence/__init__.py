@@ -3,9 +3,9 @@
 Reads the flattened ``.seq`` files (SeqPlotter format) that the experiment
 runtime writes per scan, and shapes them for the dashboard's Sequence tab.
 
-The ``.seq`` byte layout is the spec kept canonical in
-``pyctrl/tools/compare_seq_bytes.py`` and the MATLAB source
-``matlab_new/lib/ExpSeq.m``.  See ``seq_parse`` for the reader.
+The ``.seq`` byte layout is the spec kept canonical in pyctrl's
+``compare_seq_bytes.py`` and the MATLAB framework source ``lib/ExpSeq.m``.
+See ``seq_parse`` for the reader.
 """
 
 from yb_analysis.sequence.seq_parse import (

@@ -1,38 +1,19 @@
 """ZMQ client wrapper with numpy conversion.
 
-Thin GUI-side wrapper around ExptClient (matlab_new/YbExptCtrl/ExptClient.py).
+Thin GUI-side wrapper around the vendored ExptClient (acquisition/expt_client.py).
 Adds numpy conversion for the image stream, the camera_init wait-for-connected
 wrapper, status string-to-int translation, and a single lock to serialize REQ
 access from multiple GUI threads.
 """
 
 import logging
-import sys
-import os
 import threading
 import time
 import numpy as np
 
+from .expt_client import ExptClient
+
 logger = logging.getLogger(__name__)
-
-# Add the YbExptCtrl directory to sys.path so we can import ExptClient.
-# yb_analysis/acquisition/ -> repo_root -> matlab_new/YbExptCtrl.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_CANDIDATES = [
-    os.path.normpath(os.path.join(_THIS_DIR, '..', '..', 'matlab_new', 'YbExptCtrl')),
-    # Canonical location on the lab PC, kept as a last-resort fallback
-    r'C:\msys64\home\Ybtweezer-PC2\projects\experiment-control\matlab_new\YbExptCtrl',
-]
-_EXPSERVER_DIR = next(
-    (p for p in _CANDIDATES if os.path.isfile(os.path.join(p, 'ExptClient.py'))),
-    None)
-if _EXPSERVER_DIR is None:
-    raise ImportError(
-        "Could not locate ExptClient.py. Checked: " + ", ".join(_CANDIDATES))
-if _EXPSERVER_DIR not in sys.path:
-    sys.path.insert(0, _EXPSERVER_DIR)
-
-from ExptClient import ExptClient  # noqa: E402
 
 
 # ExptServer returns one of these strings; ZmqClient.get_status returns the

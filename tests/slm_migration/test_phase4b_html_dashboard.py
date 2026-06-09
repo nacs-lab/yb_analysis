@@ -28,21 +28,32 @@ import pytest
 _REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO))
 
+# The Tier-1 catalog tests need the MATLAB Seq/Step library (introspected by
+# seq_catalog). Absent in a standalone yb_analysis checkout — skip rather than
+# fail on an empty catalog.
+from yb_analysis.scans.seq_catalog import _matlab_root  # noqa: E402
+
+_skip_no_matlab = pytest.mark.skipif(
+    _matlab_root() is None,
+    reason="MATLAB Seq/Step library absent (matlab_new tree not alongside)")
+
 
 # ---------------------------------------------------------------------------
 # Tier 1 — seq_catalog
 # ---------------------------------------------------------------------------
 
+@_skip_no_matlab
 def test_seq_catalog_lists_yb_seqs():
     from yb_analysis.scans.seq_catalog import list_seqs, invalidate_cache
     invalidate_cache()
     seqs = list_seqs()
     assert len(seqs) > 0, 'expected at least one Seq function discovered'
     names = {s['name'] for s in seqs}
-    # Should pick up the canonical sequences shipped in matlab_new/YbSeqs.
+    # Should pick up the canonical sequences shipped in the MATLAB YbSeqs library.
     assert 'CoolingOptimizationSeq' in names or 'BlueTweezerLoadingSeq' in names
 
 
+@_skip_no_matlab
 def test_seq_catalog_step_introspection():
     from yb_analysis.scans.seq_catalog import list_steps
     steps = list_steps()

@@ -17,8 +17,8 @@ Five test tiers:
    `kind: 'descriptor'` rows survives __load_queue without crashing
    older code.
 
-MATLAB-side tests live at matlab_new/test/phase3/TestYbBuildScanPayload.m
-and run via MATLAB's `runtests`.
+MATLAB-side tests live in the MATLAB test suite
+(test/phase3/TestYbBuildScanPayload.m) and run via MATLAB's `runtests`.
 """
 
 import json
@@ -29,12 +29,10 @@ from pathlib import Path
 
 import pytest
 
-
-# Make matlab_new/YbExptCtrl importable (ExptServer / ExptClient).
-_REPO = Path(__file__).resolve().parents[3]
-_EXPSERVER_DIR = _REPO / 'matlab_new' / 'YbExptCtrl'
-if str(_EXPSERVER_DIR) not in sys.path:
-    sys.path.insert(0, str(_EXPSERVER_DIR))
+# ExptServer/ExptClient live in the backend tree; conftest puts them on
+# sys.path (prefer pyctrl, fall back to matlab_new). The fixtures that need a
+# real server importorskip it, so Tier-1 (pure schema) tests still run when no
+# backend is present.
 
 from yb_analysis.scans.convenience import (   # noqa: E402
     sweep_linspace, sweep_logspace, sweep_values, func_handle,
@@ -188,7 +186,7 @@ def fresh_expt_server(tmp_path, monkeypatch):
     """Spawn a fresh ExptServer bound to a free port with an isolated
     runner_queue.json. The server's worker thread is started so ZMQ
     verbs work, but we mostly call methods directly."""
-    import ExptServer as expt_server_mod
+    expt_server_mod = pytest.importorskip("ExptServer")
     # Route queue persistence into the tmp dir so the test doesn't
     # clobber the lab's real runner_queue.json.
     monkeypatch.setattr(expt_server_mod, 'QUEUE_PATH',
@@ -325,8 +323,8 @@ def test_pop_next_job_explicit_kind_for_existing_entries(fresh_expt_server):
 def server_and_client(tmp_path, monkeypatch):
     """Real ZMQ in-process: ExptServer worker thread + ExptClient REQ
     socket on the same TCP loopback port."""
-    import ExptServer as expt_server_mod
-    import ExptClient as expt_client_mod
+    expt_server_mod = pytest.importorskip("ExptServer")
+    from yb_analysis.acquisition import expt_client as expt_client_mod
     monkeypatch.setattr(expt_server_mod, 'QUEUE_PATH',
                         str(tmp_path / 'runner_queue.json'))
     port = _free_port()
@@ -379,7 +377,7 @@ def dashboard_app(tmp_path, monkeypatch):
     """A dashboard server with /api/queue/* wired up against a fresh
     in-process ExptServer. Uses ZMQ via ZmqClient so we hit the full
     network stack the production dashboard uses."""
-    import ExptServer as expt_server_mod
+    expt_server_mod = pytest.importorskip("ExptServer")
     monkeypatch.setattr(expt_server_mod, 'QUEUE_PATH',
                         str(tmp_path / 'runner_queue.json'))
     port = _free_port()
@@ -479,7 +477,7 @@ def test_unknown_kind_skipped_on_load(tmp_path, monkeypatch):
     """A future kind ('mlproject', etc.) must not crash the runner;
     those rows are skipped with a warning. This is the downgrade safety
     rule documented in the Phase 3 plan."""
-    import ExptServer as expt_server_mod
+    expt_server_mod = pytest.importorskip("ExptServer")
     queue_path = tmp_path / 'runner_queue.json'
     # Hand-craft a runner_queue.json with a known-good job + an unknown
     # kind that shouldn't exist yet.
@@ -517,7 +515,7 @@ def test_unknown_kind_skipped_on_load(tmp_path, monkeypatch):
 def test_building_descriptor_demoted_on_reload(tmp_path, monkeypatch):
     """A descriptor stuck in 'building' (mid-dispatch crash) is
     re-queued on next startup."""
-    import ExptServer as expt_server_mod
+    expt_server_mod = pytest.importorskip("ExptServer")
     queue_path = tmp_path / 'runner_queue.json'
     import datetime
     queue_path.write_text(json.dumps({

@@ -1,6 +1,6 @@
 """Shared MATLAB MemoryMap signalling layout + helpers.
 
-The MATLAB runtime (``matlab_new/YbExptCtrl/MemoryMap.m``) memory-maps a small
+The MATLAB runtime (``YbExptCtrl/MemoryMap.m``) memory-maps a small
 file under ``<tempdir>/nacsctl/nacs_mem_map.dat`` as the IPC channel between the
 StartScan / runSeq session and the monitor. Both the Tkinter control panel
 (``yb_analysis.gui.control_panel``) and the web dashboard

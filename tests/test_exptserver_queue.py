@@ -12,6 +12,10 @@ import time
 import pytest
 import zmq
 
+# ExptServer belongs to the backend tree (conftest puts it on sys.path); skip
+# the whole module when no backend is present (standalone yb_analysis checkout).
+pytest.importorskip("ExptServer")
+
 _port_counter = itertools.count(14500)
 
 
@@ -217,7 +221,7 @@ def test_exptclient_recovers_after_timeout():
     """If a queue_list times out, the next call must not hit EFSM. Exercises
     the recreate_sock-on-timeout path in ExptClient."""
     from ExptServer import ExptServer
-    from ExptClient import ExptClient
+    from yb_analysis.acquisition.expt_client import ExptClient
 
     url = _next_url()
     # no server yet — every call should time out and recover

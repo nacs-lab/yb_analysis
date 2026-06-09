@@ -8,7 +8,7 @@ PATH_PREFIX = os.environ.get('YB_PATH_PREFIX', r'D:\OneDrive - Harvard Universit
 DATA_DIR = os.path.join(PATH_PREFIX, 'Data')
 
 # ZMQ server URL for AnalysisClient — must match consts.MatlabURL in
-# matlab_new/expConfig.m (line 9).
+# the MATLAB expConfig.m.
 MATLAB_URL = 'tcp://127.0.0.1:1408'
 
 # Fixed ports

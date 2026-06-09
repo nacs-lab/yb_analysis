@@ -1,6 +1,6 @@
 """Offline initialization of tweezer grid locations and detection thresholds.
 
-Port of matlab_new/AtomDetection/YbHistInit.m + LocateAtom.m (initial mode).
+Port of the MATLAB AtomDetection YbHistInit.m + LocateAtom.m (initial mode).
 
 Two ways to use this module:
 

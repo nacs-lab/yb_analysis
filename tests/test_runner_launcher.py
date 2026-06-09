@@ -10,6 +10,10 @@ import time
 
 import pytest
 
+from yb_analysis.tests._expserver import expserver_dir
+
+# The fake runner binds a real ExptServer (backend tree). Skip when absent.
+pytest.importorskip("ExptServer")
 
 _port_counter = itertools.count(14600)
 
@@ -23,11 +27,10 @@ def fake_runner_script(tmp_path):
     """A Python script that mimics SequenceRunner: binds ExptServer and
     loops forever. RunnerLauncher.stop() force-kills it."""
     script = tmp_path / "fake_runner.py"
-    expserver_dir = os.path.abspath(os.path.join(
-        os.path.dirname(__file__), '..', '..', 'matlab_new', 'YbExptCtrl'))
+    _expserver = expserver_dir()
     script.write_text(textwrap.dedent(f"""
         import sys, time
-        sys.path.insert(0, {expserver_dir!r})
+        sys.path.insert(0, {_expserver!r})
         from ExptServer import ExptServer
         url = sys.argv[1]
         srv = ExptServer(url)

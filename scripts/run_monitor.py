@@ -81,7 +81,7 @@ def main():
     parser.add_argument('--matlab-exe', default=MATLAB_EXE,
                         help=f'MATLAB binary (default: {MATLAB_EXE})')
     parser.add_argument('--matlab-root', default=MATLAB_ROOT,
-                        help=f'matlab_new directory (default: {MATLAB_ROOT})')
+                        help=f'MATLAB framework directory (default: {MATLAB_ROOT})')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable debug logging')
     args = parser.parse_args()

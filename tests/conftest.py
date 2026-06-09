@@ -5,10 +5,13 @@ import tempfile
 
 import pytest
 
-# Make matlab_new/YbExptCtrl importable so tests can import ExptServer/Client.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-_EXPSERVER = os.path.join(_REPO_ROOT, 'matlab_new', 'YbExptCtrl')
-if _EXPSERVER not in sys.path:
+from yb_analysis.tests._expserver import expserver_dir
+
+# Put a backend's ExptServer/ExptClient on sys.path so the protocol tests can
+# import it (prefer pyctrl, fall back to matlab_new). When neither backend tree
+# is present, those tests skip via pytest.importorskip("ExptServer").
+_EXPSERVER = expserver_dir()
+if _EXPSERVER and _EXPSERVER not in sys.path:
     sys.path.insert(0, _EXPSERVER)
 
 

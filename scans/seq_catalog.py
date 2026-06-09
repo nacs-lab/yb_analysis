@@ -1,4 +1,4 @@
-"""Sequence catalog: introspects matlab_new/YbSeqs and matlab_new/YbSteps
+"""Sequence catalog: introspects the MATLAB YbSeqs and YbSteps library
 to surface each available Seq with the params it accepts.
 
 Used by the dashboard Queue tab to give the operator a picker: choose a
@@ -89,9 +89,15 @@ _CACHE: Dict[str, dict] = {}    # 'steps' | 'seqs' -> {name -> entry}
 _CACHE_VERSION = 0
 
 
-def _matlab_root() -> Path:
-    """Locate matlab_new on disk. Prefer the relative path from this
-    file (deploy-stable); fall back to an env override."""
+def _matlab_root() -> Optional[Path]:
+    """Locate matlab_new on disk. Prefer the relative path from this file
+    (deploy-stable; resolves in the combined experiment-control checkout where
+    matlab_new sits alongside), fall back to a ``$YB_MATLAB_ROOT`` override.
+
+    Returns ``None`` when matlab_new is absent (e.g. yb_analysis checked out
+    standalone). The MATLAB Seq/Step catalog is a dashboard convenience sourced
+    from the .m library; without it the catalog is simply empty rather than an
+    error (see _scan_steps_dir / _scan_seqs_dir)."""
     here = Path(__file__).resolve().parent
     candidate = here.parents[1] / 'matlab_new'   # yb_analysis/scans/.. -> repo
     if candidate.is_dir():
@@ -99,8 +105,7 @@ def _matlab_root() -> Path:
     env = os.environ.get('YB_MATLAB_ROOT')
     if env and Path(env).is_dir():
         return Path(env)
-    raise RuntimeError(
-        f"seq_catalog: could not locate matlab_new (tried {candidate}, $YB_MATLAB_ROOT)")
+    return None
 
 
 def invalidate_cache() -> None:
@@ -199,7 +204,10 @@ def _extract_step_params(src: str) -> List[Dict[str, str]]:
 
 
 def _scan_steps_dir() -> Dict[str, dict]:
-    steps_dir = _matlab_root() / 'YbSteps'
+    root = _matlab_root()
+    if root is None:
+        return {}
+    steps_dir = root / 'YbSteps'
     if not steps_dir.is_dir():
         return {}
     out: Dict[str, dict] = {}
@@ -211,7 +219,7 @@ def _scan_steps_dir() -> Dict[str, dict]:
         params = _extract_step_params(src)
         out[name] = {
             'name': name,
-            'file': str(path.relative_to(_matlab_root().parent)),
+            'file': str(path.relative_to(root.parent)),
             'params': params,
         }
     return out
@@ -256,7 +264,10 @@ def _compose_seq_params(seq_steps: List[Dict[str, str]],
 
 
 def _scan_seqs_dir(steps_catalog: Dict[str, dict]) -> Dict[str, dict]:
-    seqs_dir = _matlab_root() / 'YbSeqs'
+    root = _matlab_root()
+    if root is None:
+        return {}
+    seqs_dir = root / 'YbSeqs'
     if not seqs_dir.is_dir():
         return {}
     out: Dict[str, dict] = {}
@@ -268,7 +279,7 @@ def _scan_seqs_dir(steps_catalog: Dict[str, dict]) -> Dict[str, dict]:
         params = _compose_seq_params(seq_steps, steps_catalog)
         out[name] = {
             'name': name,
-            'file': str(path.relative_to(_matlab_root().parent)),
+            'file': str(path.relative_to(root.parent)),
             'steps': seq_steps,
             'params': params,
             'runp': list(_DEFAULT_RUNP_PARAMS),

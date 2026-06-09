@@ -42,6 +42,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _REARRANGE = _REPO_ROOT / 'matlab_new' / 'YbSeqs' / 'RearrangeCommSeq.m'
 _SLM_CLIENT = _REPO_ROOT / 'SLMnet' / 'src' / 'slmnet' / 'experimental' / 'slm_client.m'
 
+# The Tier-1 tests statically grep MATLAB sources that live in sibling trees
+# (matlab_new, SLMnet). In a standalone yb_analysis checkout those are absent;
+# skip rather than error.
+_skip_no_rearrange = pytest.mark.skipif(
+    not _REARRANGE.exists(),
+    reason="RearrangeCommSeq.m absent (matlab_new tree not alongside)")
+_skip_no_slm_client = pytest.mark.skipif(
+    not _SLM_CLIENT.exists(),
+    reason="slm_client.m absent (SLMnet tree not alongside)")
+
 
 # ---------------------------------------------------------------------------
 # Tier 1 — static analysis of MATLAB source
@@ -50,6 +60,7 @@ _SLM_CLIENT = _REPO_ROOT / 'SLMnet' / 'src' / 'slmnet' / 'experimental' / 'slm_c
 # MATLAB. Cheap and catches the "I edited but forgot to save" class of bug
 # that's easy to miss when the actual MATLAB integration test is gated.
 
+@_skip_no_rearrange
 def test_rearrange_call_site_has_runid_opts():
     """RearrangeCommSeq.m::hand_over_slm threads runid_opts into rearrange()."""
     src = _REARRANGE.read_text(encoding='utf-8', errors='replace')
@@ -62,6 +73,7 @@ def test_rearrange_call_site_has_runid_opts():
         'rearrange() call site should pass runid_opts{:}.')
 
 
+@_skip_no_rearrange
 def test_update_rearrange_call_site_has_runid_opts():
     """RearrangeCommSeq.m::post_run threads runid_opts into update_rearrange."""
     src = _REARRANGE.read_text(encoding='utf-8', errors='replace')
@@ -69,6 +81,7 @@ def test_update_rearrange_call_site_has_runid_opts():
         'update_rearrange() call site should pass runid_opts{:}.')
 
 
+@_skip_no_rearrange
 def test_build_runid_opts_local_function_present():
     """The helper is defined as a local function at the end of the file."""
     src = _REARRANGE.read_text(encoding='utf-8', errors='replace')
@@ -85,6 +98,7 @@ def test_build_runid_opts_local_function_present():
         'JS Number precision loss in the JSON body.')
 
 
+@_skip_no_slm_client
 def test_slm_client_rearrange_accepts_runid_opts():
     """slm_client.m::rearrange's arguments block lists scan_id + seq_id."""
     src = _SLM_CLIENT.read_text(encoding='utf-8', errors='replace')
@@ -101,6 +115,7 @@ def test_slm_client_rearrange_accepts_runid_opts():
     assert 'body.seq_id = double(opts.seq_id)' in src
 
 
+@_skip_no_slm_client
 def test_slm_client_update_rearrange_accepts_runid_opts():
     """update_rearrange now has an arguments block with scan_id + seq_id."""
     src = _SLM_CLIENT.read_text(encoding='utf-8', errors='replace')

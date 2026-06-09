@@ -35,9 +35,6 @@ import pytest
 
 
 _REPO = Path(__file__).resolve().parents[3]
-_EXPSERVER_DIR = _REPO / 'matlab_new' / 'YbExptCtrl'
-if str(_EXPSERVER_DIR) not in sys.path:
-    sys.path.insert(0, str(_EXPSERVER_DIR))
 
 
 # ---------------------------------------------------------------------------
