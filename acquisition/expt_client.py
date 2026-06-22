@@ -297,3 +297,20 @@ class ExptClient(object):
 
     def clear_last_seq_meta(self, timeout_ms: int = 2000) -> str:
         return self._str_call("clear_last_seq_meta", timeout_ms)
+
+    def shot_health(self, timeout_ms: int = 1000) -> dict:
+        """Return the backend's per-shot health rollup (pyctrl only):
+        {total, last_message, last_kind, seconds_since_last, seconds_since_ok,
+         scan_id, errors}. A MATLAB backend lacks the verb (replies empty) ->
+        json.loads raises -> the caller treats it as 'no health info'."""
+        try:
+            self.__sock.send_string("shot_health")
+            if self.__sock.poll(timeout_ms) == 0:
+                self._reset_on_failure()
+                raise TimeoutError("shot_health: no reply")
+            return json.loads(self.__sock.recv())
+        except TimeoutError:
+            raise
+        except Exception:
+            self._reset_on_failure()
+            raise

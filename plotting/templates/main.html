@@ -36,10 +36,8 @@
   </div>
   <nav class="tab-nav" role="tablist" aria-label="Dashboard sections">
     <button id="tab-btn-live"     class="active" data-tab="live"     role="tab" aria-selected="true">Live</button>
-    <button id="tab-btn-hardware" data-tab="hardware" role="tab" aria-selected="false">SLM Hardware</button>
     <button id="tab-btn-analysis" data-tab="analysis" role="tab" aria-selected="false">Analysis</button>
-    <button id="tab-btn-queue"    data-tab="queue"    role="tab" aria-selected="false">Queue</button>
-    <button id="tab-btn-sequence" data-tab="sequence" role="tab" aria-selected="false">Sequence</button>
+    <button id="tab-btn-hardware" data-tab="hardware" role="tab" aria-selected="false">Hardware</button>
     <button id="tab-btn-logs"     data-tab="logs"     role="tab" aria-selected="false">Logs</button>
   </nav>
   <div class="header-right">
@@ -49,6 +47,8 @@
       <span>Auto refresh</span>
     </label>
     <button class="ghost" id="manual-refresh" title="Refresh now">Refresh</button>
+    <!-- The per-sub-view "open source ↗" action lives INSIDE each Hardware
+         sub-tab now (see .hw-subtabs); there's no header reload button. -->
     <a class="old-link" href="/old/" title="Old Plotly-based live page">/old</a>
   </div>
 </header>
@@ -66,11 +66,13 @@
        Status sitting in a tall card with most of it empty. Now it's a
        full-width thin strip and the Scan Curve takes the next row. -->
   <section class="card col-12 status-strip" data-card-id="status-overview">
-    <div class="stat-tile">
+    <div class="stat-tile stat-link-tile" id="tile-scan-id"
+         title="Open this run in the Analysis tab">
       <span class="stat-label">scan_id</span>
       <span class="stat-value mono" id="kv-scan-id">—</span>
     </div>
-    <div class="stat-tile">
+    <div class="stat-tile stat-link-tile" id="tile-scan-name"
+         title="Open this run in the Analysis tab">
       <span class="stat-label">scan_name</span>
       <span class="stat-value" id="kv-scan-name">—</span>
     </div>
@@ -78,38 +80,65 @@
       <span class="stat-label">shot #</span>
       <span class="stat-value mono" id="kv-shot">—</span>
     </div>
-    <div class="stat-tile">
-      <span class="stat-label">num_sites</span>
-      <span class="stat-value mono" id="kv-sites">—</span>
+    <div class="stat-tile" title="Average time per shot = elapsed since the run started / shots so far">
+      <span class="stat-label">shot length</span>
+      <span class="stat-value mono" id="kv-shot-length">—</span>
     </div>
     <div class="stat-tile">
       <span class="stat-label">loading rate</span>
       <span class="stat-value mono" id="kv-loading-rate">—</span>
     </div>
-    <div class="stat-tile">
-      <span class="stat-label">progress</span>
-      <span class="stat-value mono" id="scan-progress">—</span>
+    <div class="stat-tile" title="Overall survival (per-shot TP) averaged over all recent shots this run">
+      <span class="stat-label">survival</span>
+      <span class="stat-value mono" id="kv-survival">—</span>
     </div>
     <!-- The "active job" + "queue" tiles moved to the Yb Control sidebar
          (a preview list there mirrors the Tkinter queue pane), so the top
          strip stays a single fixed-height row that never reflows. -->
-    <!-- Phase 5.5 Track D: near-real-time SLM diag rows pulled while a
-         scan is live (every 2 s). Hidden until rows arrive. -->
-    <div class="stat-tile" id="live-diag-tile" hidden>
-      <span class="stat-label">live diag</span>
-      <span class="stat-value mono" id="live-diag-readout">—</span>
+    <!-- Per-shot health chip (replaces the old full-width "shots failing"
+         banner): a single compact status light fed by /api/control/status's
+         shot_health (backend ExptServer.shot_health). data-state drives the
+         colour -- green=no failures, yellow=failed earlier but not currently,
+         red=actively failing (running + the per-scan error count is climbing).
+         'none' (grey) when the backend reports no health info. -->
+    <div class="stat-tile shot-health-tile shot-health-clickable" id="shot-health-tile" data-state="none"
+         title="Per-shot health: green = no failures · yellow = failed earlier, not now · red = currently failing. Click to open the backend log (jumps to the error when failing).">
+      <span class="stat-label">shots</span>
+      <span class="stat-value" id="shot-health-readout">—</span>
+    </div>
+    <!-- HDF5 save health (monitor-side, from /api/snapshot save_health). The
+         save runs in a daemon thread; if append_block ultimately fails (e.g. a
+         OneDrive file-lock that outlasts the retries) a block of shots is lost.
+         green=all saved · yellow=saves resumed after an earlier loss · red=a
+         save is failing now (shots being lost to disk). -->
+    <div class="stat-tile shot-health-tile save-health-tile" id="save-health-tile" data-state="none"
+         title="HDF5 save health: green = all saved · yellow = recovered after an earlier loss · red = saves failing (shots lost to disk)">
+      <span class="stat-label">save</span>
+      <span class="stat-value" id="save-health-readout">—</span>
+    </div>
+    <!-- ZMQ delivery gap chip: green = no missing shots, yellow = N shots lost
+         to a get_imgs() timeout while a large batch accumulated in the server
+         buffer (root cause: process stall + 2 kms ZMQ poll timeout). -->
+    <div class="stat-tile shot-health-tile" id="seq-gap-tile" data-state="none"
+         title="ZMQ delivery: green = no missing shots -- yellow = shots lost to timeout this scan">
+      <span class="stat-label">delivery</span>
+      <span class="stat-value" id="seq-gap-readout">—</span>
     </div>
   </section>
 
-  <!-- ===== Right sidebar: Yb tweezer control panel (Phase 5.5 Track A)
-       Mirror of the Tkinter control_panel.py — Start/Pause/Abort/
-       Restart Dash/Restart All + dummy-mode radios + init folder +
-       current-scan readout. Non-destructive ops are single-click;
-       Abort (1 s) and Restart All (3 s) require a press-and-hold. -->
+  <!-- ===== Yb tweezer control panel (GLOBAL, always-on right column).
+       Reparented to <body> on load (globalizeControlPanel in dashboard.js) so
+       it docks on the right edge of EVERY tab (Live / Analysis / Hardware /
+       Logs). NOT hideable: it reads as a continuation of the header -- square
+       corners, header-matched colour, and its TOP pinned to the header's bottom
+       edge (measured in JS; see dashboard.css). The tab content is pushed left
+       to clear it (body.ctrl-open is set once and never removed). Scrolls
+       internally with the scrollbar hidden. Mirror of the Tkinter
+       control_panel.py -- Start/Pause/Abort/Restart/backend/queue/camera/init/
+       current-scan. Non-destructive ops single-click; Abort + Restart All
+       require a press-and-hold. NOTE: it lives inside #tab-live in source for
+       readability, but JS hoists it to <body> at load. -->
   <aside class="card live-sidebar" data-card-id="live-control-panel">
-    <button class="live-sidebar-toggle" id="live-sidebar-toggle"
-            title="Collapse / expand control panel"
-            aria-label="toggle control panel"></button>
     <h2>Yb Control<span class="grow"></span></h2>
     <!-- Live runner status, mirroring the Tkinter window's status label
          (Idle / Running / Paused / Pausing… / Stopped, with the dummy
@@ -122,30 +151,31 @@
       remote controls disabled on this interface
     </div>
 
-    <div class="ctrl-row">
-      <button class="ctrl-btn" data-kind="start"   title="Start / resume the sequence">Start</button>
-      <button class="ctrl-btn" data-kind="pause"   title="Pause the sequence">Pause</button>
-    </div>
-    <div class="ctrl-row">
+    <!-- Transport row: Start / Pause are compact play/pause icons (half their
+         former width); Abort sits to their right and takes the rest of the row.
+         Six former buttons now collapse into two rows. -->
+    <div class="ctrl-row ctrl-row-transport">
+      <button class="ctrl-btn ctrl-icon" data-kind="start" aria-label="Start"
+              title="Start / resume the sequence">&#9654;</button>
+      <button class="ctrl-btn ctrl-icon" data-kind="pause" aria-label="Pause"
+              title="Pause the sequence">&#10074;&#10074;</button>
       <button class="ctrl-btn ctrl-danger" data-kind="abort"
               data-confirm-action="abort"
               title="Abort the running scan — stops after the current shot (a shot in progress can't be interrupted)"><span
               class="abort-ind ind-stop" id="abort-ind" title="">✗</span>Abort</button>
-      <button class="ctrl-btn" data-kind="restart-dash" title="Restart the dashboard subprocess">Restart Dash</button>
     </div>
-    <div class="ctrl-row">
+    <!-- Restart Dash keeps its neutral colour; Restart All + Shutdown are both
+         yellow (warn) hold-to-confirm buttons. All three share one row. -->
+    <div class="ctrl-row ctrl-row-restarts">
+      <button class="ctrl-btn" data-kind="restart-dash" title="Restart the dashboard subprocess">Restart Dash</button>
       <button class="ctrl-btn ctrl-hold ctrl-warn" data-kind="restart-all"
               data-confirm-action="restart_all"
-              title="Respawn run_monitor (drops the camera) — hold 1 s"
-              style="grid-column: span 2;">
+              title="Respawn run_monitor (drops the camera) — hold 1 s">
         <span class="hold-bar"></span><span class="ctrl-btn-label">Restart All</span>
       </button>
-    </div>
-    <div class="ctrl-row">
-      <button class="ctrl-btn ctrl-hold ctrl-danger" data-kind="shutdown"
+      <button class="ctrl-btn ctrl-hold ctrl-warn" data-kind="shutdown"
               data-confirm-action="shutdown"
-              title="Shut down run_monitor + backend and EXIT (no restart) — hold 1 s"
-              style="grid-column: span 2;">
+              title="Shut down run_monitor + backend and EXIT (no restart) — hold 1 s">
         <span class="hold-bar"></span><span class="ctrl-btn-label">Shutdown</span>
       </button>
     </div>
@@ -175,6 +205,26 @@
       <div class="hint">Switching restarts the monitor on the chosen backend.</div>
     </div>
 
+    <!-- Scan-queue preview: a compact mirror of the Tkinter queue pane
+         (running + next-up + recent history). The full table with
+         move/cancel lives in the Queue tab. Each queued / history row also
+         carries a re-queue button (and +code for runs with a code snapshot),
+         mirroring the Queue tab's re-queue. -->
+    <div class="ctrl-section ctrl-queue-section" id="ctrl-queue-section"
+         title="Click to open the full queue">
+      <div class="ctrl-section-label">
+        Queue<span class="grow"></span>
+        <a class="ctrl-queue-link" id="ctrl-queue-open">full ›</a>
+      </div>
+      <div class="ctrl-queue-active" id="ctrl-queue-active" data-state="idle">
+        <span class="ctrl-queue-active-dot"></span>
+        <span class="ctrl-queue-active-text" id="ctrl-queue-active-text">(idle)</span>
+      </div>
+      <ul class="ctrl-queue-list" id="ctrl-queue-list">
+        <li class="ctrl-queue-empty">queue empty</li>
+      </ul>
+    </div>
+
     <div class="ctrl-section">
       <div class="ctrl-section-label">Dummy mode</div>
       <div class="ctrl-row dummy-mode">
@@ -183,19 +233,6 @@
         <label><input type="radio" name="dummy-mode-ph5" value="last" checked> Last seq</label>
       </div>
       <div class="hint" id="ctrl-dummy-last">Last: —</div>
-    </div>
-
-    <!-- SeqPlotter auto-dump toggle: write one .seq per compiled sequence into
-         the scan folder for the Sequence tab. Rides the pyctrl runtime_state mmap
-         flag (offset 8) via /api/sequence/dump_toggle. -->
-    <div class="ctrl-section">
-      <div class="ctrl-section-label">Sequence dumps</div>
-      <label class="switch">
-        <input type="checkbox" id="seq-autosave">
-        <span class="track"></span>
-        <span>Auto-save during scans</span>
-      </label>
-      <div class="hint">Off = compile + run as usual (no .seq written).</div>
     </div>
 
     <!-- Camera: mirror of the Tkinter CameraPane (status + ROI + exposure
@@ -256,22 +293,18 @@
       </dl>
     </div>
 
-    <!-- Scan-queue preview: a compact mirror of the Tkinter queue pane
-         (running + next-up + recent history). The full table with
-         move/cancel lives in the Queue tab. -->
+    <!-- SeqPlotter auto-dump toggle: write one .seq per compiled sequence into
+         the scan folder for the Sequence tab. Rides the pyctrl runtime_state mmap
+         flag (offset 8) via /api/sequence/dump_toggle. Lives at the bottom of the
+         sidebar (least-used control). -->
     <div class="ctrl-section">
-      <div class="ctrl-section-label">
-        Queue<span class="grow"></span>
-        <a class="ctrl-queue-link" data-goto-tab="queue"
-           title="Open the full queue">full ›</a>
-      </div>
-      <div class="ctrl-queue-active" id="ctrl-queue-active" data-state="idle">
-        <span class="ctrl-queue-active-dot"></span>
-        <span class="ctrl-queue-active-text" id="ctrl-queue-active-text">(idle)</span>
-      </div>
-      <ul class="ctrl-queue-list" id="ctrl-queue-list">
-        <li class="ctrl-queue-empty">queue empty</li>
-      </ul>
+      <div class="ctrl-section-label">Sequence dumps</div>
+      <label class="switch">
+        <input type="checkbox" id="seq-autosave">
+        <span class="track"></span>
+        <span>Auto-save during scans</span>
+      </label>
+      <div class="hint">Off = compile + run as usual (no .seq written).</div>
     </div>
   </aside>
 
@@ -347,37 +380,67 @@
     <div class="plot-container" id="plot-infid-map" style="height: 380px;"></div>
   </section>
 
-  <section class="card col-12" data-card-id="live-histograms">
-    <h2>Histograms<span class="grow"></span></h2>
-    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:12px;">
-      <div class="plot-container" id="plot-hist-avg" style="height: 220px;"></div>
-      <div class="plot-container" id="plot-hist-rep0" style="height: 220px;"></div>
-      <div class="plot-container" id="plot-hist-rep1" style="height: 220px;"></div>
-      <div class="plot-container" id="plot-hist-rep2" style="height: 220px;"></div>
-      <div class="plot-container" id="plot-hist-rep3" style="height: 220px;"></div>
+  <!-- Histograms, split into two half-width cards: the pooled AVG histogram
+       gets the whole left half (bigger, easier to read), and the right half
+       holds the four per-site histograms in a 2x2 grid (best / worst / random
+       + the operator's SELECTION, with its own site picker). Both keep a
+       normal card background (see the live-flat exclusions in dashboard.css). -->
+  <section class="card col-6" data-card-id="live-hist-avg" id="card-hist-avg">
+    <h2>Avg histogram<span class="grow"></span></h2>
+    <div class="plot-container" id="plot-hist-avg" style="height: 440px;"></div>
+  </section>
+
+  <!-- Right half: best / worst / random representative sites + the selected
+       site. The selection cell carries the site picker + per-site info readout;
+       its plot (#plot-hist-site) is fetched via /api/live/figures?which=site&
+       site=N each time the picker changes (and on each live poll). -->
+  <section class="card col-6" data-card-id="live-hist-reps" id="card-hist-reps">
+    <h2>Per-site histograms<span class="grow"></span>
+        <span class="hint">best · worst · random · your pick</span>
+    </h2>
+    <div class="hist-reps-grid">
+      <div class="plot-container" id="plot-hist-rep0" style="height: 200px;"></div>
+      <div class="plot-container" id="plot-hist-rep1" style="height: 200px;"></div>
+      <div class="plot-container" id="plot-hist-rep2" style="height: 200px;"></div>
+      <div class="hist-sel-cell">
+        <div class="hist-sel-controls">
+          <label>Site #</label>
+          <input type="number" id="site-pick" min="1" value="1" step="1">
+          <span id="site-info" class="hint mono">(pick a site)</span>
+        </div>
+        <div class="plot-container" id="plot-hist-site"></div>
+      </div>
     </div>
   </section>
 
-  <!-- Per-site histogram with a site picker + info readout, matching
-       the old Dash dashboard's Row 4 site selector. Plot is fetched via
-       /api/live/figures?which=site&site=N each time the picker
-       changes (and on each live poll while the panel is visible). -->
-  <section class="card col-12" data-card-id="live-site-hist">
-    <h2>Per-site histogram<span class="grow"></span>
-        <span class="hint">pick any site by number</span>
+  <!-- Detection thresholds & calibration. Sits below the histograms: the
+       active loading pattern + defocus, calibration health (spread / mean
+       infidelity), when the last full fit was + how many shots until the next,
+       any recent REJECTED fits, and the cheap/fit update history over time for
+       the current pattern. Fed by /api/thresholds/history (per-pattern audit
+       log + live threshold_health). -->
+  <section class="card col-12" data-card-id="live-thresholds" id="card-thresholds">
+    <h2>Detection thresholds &amp; calibration<span class="grow"></span>
+        <span class="badge" id="threshold-active" title="Loading pattern + defocus this scan is detecting with"></span>
+        <label class="svd-mode-ctl" title="Which loading pattern's threshold history to show. Green = img1 pattern · blue = img2 pattern · gray = a loaded pattern not used in this scan. Resets to img1 on page refresh.">pattern:
+          <select id="threshold-pattern" class="pattern-select"></select>
+        </label>
+        <label class="svd-mode-ctl" title="History metric to trend over the threshold updates">trend:
+          <select id="threshold-metric"></select>
+        </label>
+        <span class="hint mono" id="threshold-info"></span>
     </h2>
-    <div class="row" style="gap:14px;align-items:flex-start;">
-      <div class="flex-fixed" style="min-width:200px;max-width:240px;">
-        <label>Site #</label>
-        <input type="number" id="site-pick" min="1" value="1" step="1">
-        <div id="site-info" class="hint mono" style="margin-top:10px;line-height:1.7;">
-          (pick a site)
-        </div>
-      </div>
-      <div style="flex:1;min-width:0;">
-        <div class="plot-container" id="plot-hist-site" style="height: 320px;"></div>
-      </div>
+    <!-- Loud warning banner: degraded store / unknown pattern (A3/A5). -->
+    <div id="threshold-banner" class="threshold-banner" hidden></div>
+    <!-- Current calibration-health badges (spread / infidelity / last fit / next fit / rejections). -->
+    <div id="threshold-quality" class="affine-quality">
+      <span class="muted">waiting for thresholds…</span>
     </div>
+    <div style="display:grid;grid-template-columns:1.35fr 1fr;gap:12px;margin-top:10px;">
+      <div class="plot-container" id="plot-threshold-trend" style="height:300px;"></div>
+      <div class="plot-container" id="plot-threshold-events" style="height:300px;"></div>
+    </div>
+    <div id="threshold-table" class="affine-table"></div>
   </section>
 
   <!-- Affine alignment (replaced the old Grid-shift card). The global
@@ -406,39 +469,94 @@
 </section>
 
 <!-- =========================== HARDWARE TAB ========================== -->
-<!-- The Hardware tab embeds the SLM server's existing dashboard via an
-     iframe.  This is intentionally a thin wrapper: the SLM dashboard
-     already has every hardware-control widget the operator needs
-     (server-control, phase canvas, camera preview, clock-lock,
-     locks/clients tables, logs, ↗-expand focus pages).  Embedding it
-     gives us automatic parity with the SLM team's UX without porting
-     all of that JavaScript -- AND any future change on the SLM side
-     (new feature, new metric) appears here for free.
-
-     so this tab is just the SLM server. (Per-shot rearrange diag still
-     shows in the Live tile + the Analysis tab; the old standalone Diag
-     tab was replaced by the Logs tab.) -->
-<section id="tab-hardware" class="tab-pane fullbleed-tab" hidden>
-  <div id="hw-iframe-wrap" class="iframe-wrap">
-    <iframe id="hw-iframe"
-            src="{{ slm_url }}/dashboard/hardware"
-            referrerpolicy="no-referrer"
-            allow="fullscreen"
-    ></iframe>
-    <!-- Floating escape hatch (top-right corner): reload + open-in-new-tab
-         buttons. Lets the operator recover if the iframe is blank without
-         abandoning the lab dashboard. We DON'T probe SLM reachability
-         and overlay a fallback -- the iframe loads independently of
-         /api/slm/health (the proxy can be cold while the iframe URL is
-         still reachable), so probing was over-eager. -->
-    <div class="iframe-actions">
-      <button class="ghost" id="hw-iframe-reload"
-              title="Reload iframe">↻</button>
-      <a class="ghost iframe-actions-link" href="{{ slm_url }}/dashboard/hardware"
-         target="_blank" title="Open SLM dashboard in a new tab">↗</a>
+<!-- Merged hardware hub: a thin sub-tab bar switches between four hardware
+     views that used to be separate top tabs --
+       * SLM      -- iframe of the SLM server dashboard ({{slm_url}}/dashboard/hardware)
+       * Monitor  -- iframe of the yb_monitor service  ({{monitor_url}}/dashboard?embed=1)
+       * Molecube -- NATIVE FPGA1 DDS/TTL/clock control (cards, /api/molecube/*)
+       * Scope    -- iframe of the bench-scope dashboard ({{scope_url}}/dashboard)
+     The three iframe views are full-bleed; Molecube is a 12-col card grid.
+     Each sub-tab has an inline ↗ that opens that view's source in a new tab.
+     The Molecube cards are reparented into #hw-pane-molecube at load
+     (foldHardwareSubtabs). -->
+<section id="tab-hardware" class="tab-pane fullbleed-tab hw-merged" hidden>
+  <!-- Each sub-tab carries a small ↗ (shown on hover / when active, like the
+       scope dashboard's per-tab pencil) that opens THAT view's source in a new
+       tab: SLM /dashboard, Monitor /dashboard, Scope /, and the Molecube web UI.
+       data-open-url is jinja-rendered (dashboard.js is static). -->
+  <nav class="hw-subtabs" role="tablist" aria-label="Hardware views">
+    <button data-hwview="overview" class="active" role="tab" aria-selected="true"
+            title="Starred views from every source, in one place">★ Overview</button>
+    <button data-hwview="slm" role="tab" aria-selected="false"
+            data-open-url="{{ slm_url }}/dashboard">SLM<span class="hw-subtab-open"
+            title="Open the SLM dashboard in a new tab">↗</span></button>
+    <button data-hwview="monitor" role="tab" aria-selected="false"
+            data-open-url="{{ monitor_url }}/dashboard">Monitor<span class="hw-subtab-open"
+            title="Open the monitor dashboard in a new tab">↗</span></button>
+    <button data-hwview="molecube" role="tab" aria-selected="false"
+            data-open-url="{{ molecube_web_url }}">Channels<span class="hw-subtab-open"
+            title="Open the molecube web UI in a new tab">↗</span></button>
+    <button data-hwview="scope" role="tab" aria-selected="false"
+            data-open-url="{{ scope_url }}/">Scope<span class="hw-subtab-open"
+            title="Open the scope dashboard in a new tab">↗</span></button>
+  </nav>
+  <div id="hw-sub-content">
+    <div id="hw-pane-slm" class="hw-pane">
+      <div id="hw-iframe-wrap" class="iframe-wrap">
+        <!-- &star=1 -> the SLM embed shows the ★ "add to Overview" toggles on its
+             top tabs (Live / Runs / Handoff), posted up to the Overview pane. -->
+        <iframe id="hw-iframe"
+                src="{{ slm_url }}/dashboard?embed=1&star=1"
+                referrerpolicy="no-referrer" allow="fullscreen"></iframe>
+      </div>
+    </div>
+    <div id="hw-pane-monitor" class="hw-pane" hidden>
+      <div id="mon-iframe-wrap" class="iframe-wrap">
+        <!-- &star=1 -> the yb_monitor embed shows the ★ "add to Overview" toggles
+             on each card (Oven / Schedule / Health / Service / Plots), posted up
+             to the Overview pane (see dashboard.js hwtile protocol). -->
+        <iframe id="mon-iframe"
+                src="{{ monitor_url }}/dashboard?embed=1&star=1"
+                referrerpolicy="no-referrer" allow="fullscreen"></iframe>
+      </div>
+    </div>
+    <!-- Molecube (native cards) reparented here from #tab-molecube at load. -->
+    <div id="hw-pane-molecube" class="hw-pane hw-pane-grid" hidden></div>
+    <div id="hw-pane-scope" class="hw-pane" hidden>
+      <div id="scope-iframe-wrap" class="iframe-wrap">
+        <!-- &star=1 -> the embed shows the ★ "add to Overview" toggles, which
+             post their selections up to the Overview pane (see dashboard.js). -->
+        <iframe id="scope-iframe"
+                src="{{ scope_url }}/dashboard?embed=1&star=1"
+                referrerpolicy="no-referrer" allow="fullscreen"></iframe>
+      </div>
+    </div>
+    <!-- OVERVIEW: a grid of starred tiles aggregated from the other sub-views.
+         Each tile iframes a source's chrome-less single-view embed
+         (base?embed=1&tab=<tab>); drag to reorder, ✕ to unstar. Server-persisted
+         via /api/hw/overview (shared across browsers). Built by dashboard.js. -->
+    <div id="hw-pane-overview" class="hw-pane">
+      <div id="hw-overview-grid" class="hw-overview-grid"></div>
+      <!-- Drop-zone shown only while dragging a tile: drag a tile here to remove
+           it from the overview (replaces the old per-tile ✕). -->
+      <div id="hw-trash" class="hw-trash">🗑<span>drop a tile here to remove</span></div>
     </div>
   </div>
 </section>
+
+<!-- Hardware sources for the Overview (single source of truth; add a source =
+     add a line here). base = the source's dashboard root; tiles iframe
+     "base?embed=1&tab=<tab>". native sources are rendered by us, not iframed. -->
+<script id="yb-hw-sources" type="application/json">
+{
+  "slm":      {"label": "SLM",      "base": "{{ slm_url }}/dashboard"},
+  "scope":    {"label": "Scope",    "base": "{{ scope_url }}/dashboard"},
+  "monitor":  {"label": "Monitor",  "base": "{{ monitor_url }}/dashboard"},
+  "molecube": {"label": "Channels", "native": true}
+}
+</script>
+
+<!-- (Monitor is now a sub-view of the Hardware tab -- see #hw-pane-monitor.) -->
 
 <!-- =========================== ANALYSIS TAB ========================== -->
 <section id="tab-analysis" class="tab-pane" hidden>
@@ -484,7 +602,7 @@
     <div class="runs-picker-body" id="runs-picker-body">
       <!-- Search + filter row. Date filter inline, smaller. -->
       <div class="row runs-search-row">
-        <input type="text" id="runs-search" placeholder="Search scan_id or name…">
+        <input type="text" id="runs-search" placeholder="Search scan_id, name, or description…">
         <select id="runs-date-filter" class="flex-fixed runs-date-mini">
           <option value="">All dates</option>
         </select>
@@ -506,7 +624,19 @@
        Stat tiles, sweep description, code/grid sidecar badges. Cards
        BELOW this section are filtered by the Filter panel. -->
   <section class="card col-12" data-card-id="analysis-detail">
-    <h2>Run summary<span class="grow"></span>
+    <h2>
+        <!-- Data / Sequence sub-toggle. Run summary (this card) is SHARED by
+             both modes; everything BELOW it swaps: Data = the analysis cards,
+             Sequence = the flattened-sequence viewer (folded in from the old
+             Sequence tab; the Scans picker is already shared). -->
+        <span class="analysis-mode-toggle" id="analysis-mode-toggle" role="tablist"
+              aria-label="Analysis sub-view">
+          <button type="button" data-mode="data" class="active"
+                  role="tab" aria-selected="true">Data</button>
+          <button type="button" data-mode="sequence"
+                  role="tab" aria-selected="false">Sequence</button>
+        </span>
+        Run summary<span class="grow"></span>
         <span class="badge mono" id="selected-scan-id">none</span>
         <span class="status-pill dim" id="analysis-status"
               style="margin-left:6px;font-size:11px;">
@@ -530,6 +660,12 @@
       <div id="calib-body"><div class="hint">Loading SLM&rarr;camera affine + patterns&hellip;</div></div>
     </details>
   </section>
+
+  <!-- ===== DATA sub-view ============================================
+       Everything below run summary, shown when the sub-toggle = "Data".
+       display:contents (see CSS) so these cards stay direct grid items of
+       the 12-col tab grid; the wrapper just gates visibility as a group. -->
+  <div id="analysis-data-pane">
 
   <!-- ===== 3. Filters ================================================
        Per-axis chips (one button per discrete sweep value). Clicking a
@@ -586,6 +722,10 @@
         </label>
         <button class="ghost" id="sweep-swap" title="Swap which swept param is on X vs Y / lines">↔ Swap axes</button>
         <label class="chk"><input type="checkbox" id="sweep-square"> square cells</label>
+        <!-- Colorbar autoscale (mirrors the live Scan-curve "Autoscale" toggle):
+             OFF pins the heatmap colorbar to 0–1 (the survival/loading default);
+             ON autoscales it to the data range. -->
+        <label class="chk" title="Autoscale the 2-D heatmap colorbar to the data range. OFF pins it to 0–1 (the survival/loading default)."><input type="checkbox" id="sweep-autoscale"> autoscale</label>
       </span>
     </div>
     <div class="plot-container" id="plot-analysis-scan" style="height:420px;"></div>
@@ -744,165 +884,14 @@
     <pre id="protocol-src-body" class="log scrollable" style="display:none;max-height:600px;">(none loaded)</pre>
   </section>
 
-</section>
+  </div><!-- /#analysis-data-pane -->
 
-<!-- =========================== QUEUE TAB ============================= -->
-<!-- Modeled on SLMnet's handoff_dashboard.html structure (status row
-     + queue/detail side-by-side + history + protocol catalog). -->
-<section id="tab-queue" class="tab-pane" hidden>
-
-  <!-- Status row -->
-  <section class="card col-12" data-card-id="queue-status">
-    <div class="row" style="gap:24px;align-items:flex-end;">
-      <div>
-        <div class="hint">Active job</div>
-        <div id="queue-active-name" class="mono" style="font-size:14px;">
-          <span class="muted">(none)</span>
-        </div>
-        <div id="queue-active-progress" class="hint mono" style="margin-top:2px;">—</div>
-      </div>
-      <div>
-        <div class="hint">Queue depth</div>
-        <div id="queue-depth" style="font-size:22px;font-weight:600;">—</div>
-      </div>
-      <div>
-        <div class="hint">Descriptors waiting</div>
-        <div id="queue-desc-depth" style="font-size:22px;font-weight:600;">—</div>
-      </div>
-      <div>
-        <div class="hint">History (today)</div>
-        <div id="queue-history-count" style="font-size:22px;font-weight:600;">—</div>
-      </div>
-      <div class="grow"></div>
-    </div>
-    <div id="queue-last-shot" class="hint" style="margin-top:8px;">—</div>
-  </section>
-
-  <!-- Queue + Active detail (side by side) -->
-  <section class="card col-7" data-card-id="queue-active">
-    <h2>Queue<span class="grow"></span><span class="badge mono" id="queue-counts">—</span></h2>
-    <table id="queue-table" class="dense">
-      <thead>
-        <tr>
-          <th>id</th><th>kind</th><th>state</th><th>name/label</th><th>file_id</th><th></th>
-        </tr>
-      </thead>
-      <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
-    </table>
-  </section>
-
-  <section class="card col-5" data-card-id="queue-active-detail">
-    <h2>Active detail<span class="grow"></span></h2>
-    <div id="queue-active-detail-body">
-      <span class="muted">(no active job)</span>
-    </div>
-  </section>
-
-  <!-- Recent history -->
-  <section class="card col-12" data-card-id="queue-history">
-    <h2>Recent history<span class="grow"></span>
-        <button class="ghost flex-fixed" id="queue-refresh-btn"
-                style="font-size:11px;padding:3px 10px;">Refresh</button>
-    </h2>
-    <table id="history-table" class="dense">
-      <thead>
-        <tr>
-          <th>id</th><th>kind</th><th>name</th>
-          <th>status</th><th>file_id</th>
-          <th>built_job_id</th><th>error</th><th></th>
-        </tr>
-      </thead>
-      <tbody><tr><td colspan="8" class="muted">loading…</td></tr></tbody>
-    </table>
-  </section>
-
-  <!-- Submit Scan form -->
-  <section class="card col-7" data-card-id="queue-submit">
-    <h2>Submit scan<span class="grow"></span>
-        <button class="ghost flex-fixed" id="format-json-btn"
-                style="font-size:11px;padding:3px 10px;">Format JSON</button>
-        <button id="submit-scan-btn"
-                style="font-size:11px;padding:3px 14px;">Submit</button>
-    </h2>
-    <div class="row" style="gap:8px;align-items:flex-end;margin-bottom:8px;">
-      <div class="flex-fixed" style="min-width:240px;">
-        <label>Seq function</label>
-        <select id="submit-seq-select">
-          <option value="">— pick a sequence —</option>
-        </select>
-      </div>
-      <div class="flex-fixed">
-        <label>Label (optional)</label>
-        <input type="text" id="submit-label" placeholder="e.g. cooling-sweep">
-      </div>
-      <button class="ghost flex-fixed" id="fill-template-btn"
-              style="font-size:11px;padding:5px 10px;">
-        Fill descriptor template from seq
-      </button>
-    </div>
-    <textarea id="submit-scan-json"
-      placeholder='{
-  "seq": "CoolingSeq",
-  "params": {"Cooling.Detuning": {"scan": 1, "linspace": [20e6, 30e6, 11]}},
-  "runp": {"NumPerGroup": 4000, "Scramble": true}
-}'></textarea>
-    <div class="hint" style="margin-top:6px;" id="submit-scan-result">
-      ready
-    </div>
-  </section>
-
-  <!-- Sequence catalog (analog to handoff's "Custom protocols" panel) -->
-  <section class="card col-5" data-card-id="queue-seq-catalog">
-    <h2>Available sequences<span class="grow"></span>
-        <button class="ghost flex-fixed" id="seq-refresh-btn"
-                style="font-size:11px;padding:3px 10px;"
-                title="Re-scan YbSeqs/YbSteps from disk">Refresh</button>
-    </h2>
-    <p class="hint">
-      Sequences are introspected from the MATLAB
-      <code class="mono">YbSeqs/</code> +
-      <code class="mono">YbSteps/</code> library.
-      Click a row to see its params; click <b>Use</b> to pre-fill the
-      descriptor template.
-    </p>
-    <div class="row" style="margin:8px 0;">
-      <input type="text" id="seq-filter" placeholder="filter…" style="flex:1;">
-    </div>
-    <div class="scrollable" style="max-height:340px;">
-      <table id="seq-catalog-table" class="dense">
-        <thead>
-          <tr><th>name</th><th>steps</th><th>params</th><th></th></tr>
-        </thead>
-        <tbody><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
-      </table>
-    </div>
-    <div id="seq-detail" style="margin-top:14px; display:none;">
-      <h3 style="font-size:12px;color:var(--text-dim);
-                 text-transform:uppercase;letter-spacing:0.5px;
-                 margin:0 0 6px 0;">
-        <span id="seq-detail-name" class="mono">—</span>
-        <button class="ghost flex-fixed" id="seq-use-btn"
-                style="font-size:10px;padding:2px 8px;margin-left:8px;">
-          Use this seq
-        </button>
-      </h3>
-      <div class="hint" id="seq-detail-file"></div>
-      <div style="margin-top:10px;">
-        <div class="hint" style="text-transform:uppercase;letter-spacing:0.5px;">Params</div>
-        <table class="dense">
-          <thead><tr><th>path</th><th>step</th><th>default</th></tr></thead>
-          <tbody id="seq-detail-params"></tbody>
-        </table>
-      </div>
-      <div style="margin-top:10px;">
-        <div class="hint" style="text-transform:uppercase;letter-spacing:0.5px;">Runp knobs</div>
-        <table class="dense">
-          <thead><tr><th>field</th><th>default</th><th>note</th></tr></thead>
-          <tbody id="seq-detail-runp"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
+  <!-- ===== SEQUENCE sub-view ========================================
+       Shown when the sub-toggle = "Sequence". The flattened-sequence
+       viewer cards are reparented in here from #tab-sequence at load
+       (foldSequenceIntoAnalysis), so there's a single sequence view.
+       display:contents (see CSS) keeps them as 12-col grid items. -->
+  <div id="analysis-sequence-pane" hidden></div>
 
 </section>
 
@@ -945,6 +934,104 @@
   </section>
 
 </section>
+
+<!-- ============================ MOLECUBE TAB ========================= -->
+<!-- FPGA1 DDS / TTL / clock control THROUGH the molecube2 ZMQ daemon.
+     Driven by /api/molecube/* (master-gated; closed by default -> the poller
+     gets HTTP 403 and this tab shows the "disabled" banner until enabled). -->
+<section id="tab-molecube" class="tab-pane" hidden>
+
+  <section class="card col-12" data-card-id="mc-status">
+    <h2>Channels &mdash; FPGA1 DDS / TTL / Clock
+        <span class="grow"></span>
+        <span id="mc-conn-pill" class="mc-pill">&hellip;</span>
+        <button class="ghost flex-fixed" id="mc-refresh-btn"
+                style="font-size:11px;padding:5px 10px;">Refresh</button>
+    </h2>
+    <p class="hint">
+      Live readback + control of FPGA1 through the <b>molecube</b> ZMQ daemon
+      (<code class="mono">tcp://192.168.0.174:7777</code>) &mdash; the same daemon libnacs
+      runs sequences on. Every action goes <b>through the daemon</b>, never the devices
+      directly. Changes apply immediately.
+    </p>
+    <div id="mc-gate-banner" class="mc-banner" hidden></div>
+    <div id="mc-status-line" class="hint mono"></div>
+    <div class="mc-clock-inline" title="Clock-output divider byte (0-255; 255 = off)">
+      <label for="mc-clock-input">Clock divider</label>
+      <input type="number" id="mc-clock-input" min="0" max="255" step="1" class="mono">
+      <button id="mc-clock-set" class="mc-mini mc-set">Set</button>
+      <span class="hint" id="mc-clock-cur"></span>
+    </div>
+  </section>
+
+  <!-- DDS + NI DAC split the row 50/50 (col-6 + col-6) and match height (the grid
+       row stretches both to the taller one); see the #hw-pane-molecube rules in
+       dashboard.css for the row sizing. -->
+  <section class="card col-6" data-card-id="mc-dds">
+    <h2>DDS channels<span class="grow"></span>
+        <span class="hint flex-fixed" id="mc-dds-count"></span></h2>
+    <p class="hint mc-hint-1line"
+       title="Frequency in MHz, amplitude 0-1, phase in degrees. Edit a field and press Set (or Enter). ovr forces a fixed override value (click again to clear); an overridden value shows a triangle. Click a channel's Name to rename it: a box appears -- press Enter or the check to confirm (this writes the name to the FPGA daemon).">
+      Frequency in MHz, amplitude 0&ndash;1, phase in degrees. Edit a field and press
+      <b>Set</b> (or Enter). <b>ovr</b> forces a fixed override value (click again to clear);
+      an overridden value shows <span class="mc-ovr-tag">&#9650;</span>. Click a
+      <b>Name</b> to rename it (Enter or <b>&#10003;</b> to confirm).
+    </p>
+    <div id="mc-dds-body" class="mc-dds-body scrollable" style="max-height:560px;">
+      <div class="hint">&mdash;</div>
+    </div>
+  </section>
+
+  <!-- NI DAC channel monitor -- NOT via molecube. Read-only readback of the NI
+       PCIe-6738 analog-out channels' actual output voltages, via the card's
+       internal per-AO monitor (Dev1/_aoN_vs_aognd) through /api/nidaq/monitor.
+       Lives in this tab for convenience but is a wholly separate data path from
+       the molecube daemon (which fronts FPGA1 DDS/TTL only). -->
+  <section class="card col-6" data-card-id="mc-nidaq">
+    <h2>NI DAC channels &mdash; Dev1 (PCIe-6738)
+        <span class="grow"></span>
+        <span id="ni-mon-pill" class="mc-pill">&hellip;</span>
+        <button class="ghost flex-fixed" id="ni-mon-refresh"
+                style="font-size:11px;padding:5px 10px;">Refresh</button>
+    </h2>
+    <p class="hint">
+      Live readback of the NI analog-out voltages, read <b>directly from the
+      PCIe-6738's internal AO monitor</b> (<code class="mono">Dev1/_aoN_vs_aognd</code>)
+      &mdash; <b>independent of the molecube daemon</b> (which only fronts FPGA1
+      DDS/TTL). Type a voltage under <b>Set&nbsp;(V)</b> and press Enter/Set to drive
+      a channel: a one-off DC write (like <code class="mono">setV</code>; the DAC
+      holds it, &plusmn;10&nbsp;V). Readback + writes are <b>paused while a scan is
+      running</b> (the run owns the NI card).
+    </p>
+    <div id="ni-mon-status" class="hint mono"></div>
+    <div id="ni-mon-body" class="mc-dds-body scrollable" style="max-height:480px;">
+      <div class="hint">&mdash;</div>
+    </div>
+  </section>
+
+  <section class="card col-12" data-card-id="mc-ttl">
+    <h2>TTL channels<span class="grow"></span>
+        <span class="hint flex-fixed" id="mc-ttl-count"></span></h2>
+    <p class="hint mc-hint-1line"
+       title="Click a channel to toggle its output. Shift-click cycles the override (normal -> force-low -> force-high). A forced channel is outlined low / high. Click the channel's NAME (not the chip) to rename it: a box appears -- press Enter or the check to confirm. Clicking the name never toggles the output.">
+      <b>Click</b> a channel to toggle its output. <b>Shift-click</b> cycles the override
+      (normal &rarr; force-low &rarr; force-high). A forced channel is outlined
+      <span class="mc-ttl-lo-key">low</span> / <span class="mc-ttl-hi-key">high</span>.
+      Click a channel's <b>name</b> to rename it (Enter / <b>&#10003;</b> to confirm).
+    </p>
+    <div id="mc-ttl-grid" class="mc-ttl-grid"><div class="hint">&mdash;</div></div>
+  </section>
+
+  <section class="card col-12" data-card-id="mc-startup">
+    <h2>Startup sequence<span class="grow"></span></h2>
+    <p class="hint">The command-list the daemon runs on boot (read-only).</p>
+    <pre id="mc-startup-view" class="logs-view mono scrollable"
+         style="max-height:240px;white-space:pre-wrap;">&mdash;</pre>
+  </section>
+
+</section>
+
+<!-- (Scope is now a sub-view of the Hardware tab -- see #hw-pane-scope.) -->
 
 <!-- ============================ SEQUENCE TAB ========================= -->
 <!-- Flattened-sequence viewer (merged from the standalone SeqPlotter).
@@ -1030,20 +1117,11 @@
      tight). Each card is an edge tab that expands on hover; the plot stays
      full-width underneath. dashboard.js wires each + toggles both hosts
      `hidden` per tab. -->
-<div id="floating-seqscan-host" class="floating-analysis-host" hidden>
-  <!-- Scans picker (LEFT): the Analysis-style scan list (search + date +
-       clickable rows; scans without a dump are grayed/inert). -->
-  <section class="card" id="seqscan-card" data-float-count="0">
-    <div class="seqscan-header">
-      <input type="text" id="seq-scan-search" placeholder="search scan_id or name…">
-      <select id="seq-scan-date" class="flex-fixed"><option value="">All dates</option></select>
-      <button class="ghost flex-fixed" id="seq-scan-refresh"
-              style="font-size:11px;padding:5px 10px;">Refresh</button>
-      <span class="badge mono flex-fixed" id="seq-scan-count">—</span>
-    </div>
-    <div id="seq-scan-table" class="seq-scan-table run-picker"></div>
-  </section>
-</div>
+<!-- LEFT-docked SHARED "Scans" picker host. dashboard.js reparents the unified
+     picker (#analysis-runs-card) into here; it's shown on BOTH the Analysis and
+     Sequence tabs (one picker, one selection). The old separate Sequence scan
+     card was removed -- the Analysis Runs picker IS the Scans picker now. -->
+<div id="floating-seqscan-host" class="floating-analysis-host" hidden></div>
 <div id="floating-sequence-host" class="floating-analysis-host" hidden>
   <!-- Channels picker (RIGHT). -->
   <section class="card" id="sequence-chn-card" data-float-count="0">
@@ -1076,6 +1154,52 @@
     </div>
     <div class="shot-modal-sub" id="shot-modal-sub"></div>
     <div class="shot-modal-body" id="shot-modal-body"></div>
+  </div>
+</div>
+
+<!-- Full-queue popup: opened from the Live control sidebar's "full ›" link.
+     Docks to the LEFT of the control sidebar, over part of the live view (NOT
+     a full-screen modal). Mirrors the Queue tab's detail: active job, queued +
+     running table, recent history, with re-queue / +code / cancel / move /
+     abort and click-a-row-to-open-in-Analysis. Live-refreshed by pollLive
+     while open. The standalone Queue tab is kept for now. -->
+<div id="queue-popup" class="queue-popup" hidden role="dialog" aria-label="Full queue">
+  <div class="queue-popup-head">
+    <span class="queue-popup-title">Queue</span>
+    <span class="badge mono" id="pq-counts">—</span>
+    <span class="grow"></span>
+    <button class="ghost" id="pq-refresh" title="Refresh">↻</button>
+    <button class="ghost" id="queue-popup-close" title="Close (Esc)" aria-label="Close">×</button>
+  </div>
+  <div class="queue-popup-body scrollable">
+    <div class="qp-active">
+      <div class="qp-active-name mono" id="pq-active-name"><span class="muted">(none)</span></div>
+      <div class="qp-active-detail" id="pq-active-detail-body"><span class="muted">(no active job)</span></div>
+    </div>
+
+    <div class="qp-section-label">Queued + running</div>
+    <table id="pq-queue-table" class="dense qp-table">
+      <thead><tr>
+        <th>id</th><th>kind</th>
+        <th title="when added to the queue">added</th><th title="run duration">dur</th>
+        <th title="sequences run / submitted">#seq</th>
+        <th title="duration / sequences actually run (finished jobs)">t/seq</th>
+        <th>state</th><th>name/label</th><th>file_id</th><th></th>
+      </tr></thead>
+      <tbody><tr><td colspan="10" class="muted">loading…</td></tr></tbody>
+    </table>
+
+    <div class="qp-section-label">Recent history</div>
+    <table id="pq-history-table" class="dense qp-table">
+      <thead><tr>
+        <th>id</th><th>kind</th><th>name</th>
+        <th title="when added to the queue">added</th><th title="run duration">dur</th>
+        <th title="sequences run / submitted">#seq</th>
+        <th title="duration / sequences actually run (finished jobs)">t/seq</th>
+        <th>status</th><th>file_id</th><th>error</th><th></th>
+      </tr></thead>
+      <tbody><tr><td colspan="11" class="muted">loading…</td></tr></tbody>
+    </table>
   </div>
 </div>
 

@@ -292,6 +292,16 @@ class ZmqClient:
             except Exception:
                 return None
 
+    def shot_health(self, timeout_ms=1000):
+        """Per-shot health rollup (pyctrl backend). Returns None on wire failure
+        OR when the backend lacks the verb (MATLAB), so callers degrade to
+        'no health info' rather than surfacing a false alarm."""
+        with self._lock:
+            try:
+                return self._client.shot_health(timeout_ms)
+            except Exception:
+                return None
+
     # -------- Images / status / sequence control --------
 
     def grab_imgs(self):
@@ -313,7 +323,7 @@ class ZmqClient:
             return empty
         try:
             with self._lock:
-                raw = self._client.get_imgs(timeout_ms=2000)
+                raw = self._client.get_imgs(timeout_ms=30000)
         except Exception:
             self._grab_imgs_cooldown_until = (
                 time.monotonic() + _GRAB_IMGS_COOLDOWN_S)

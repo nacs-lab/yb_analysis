@@ -171,6 +171,68 @@ def test_pyctrl_run_parameters_from_scangroup_base_params(tmp_path):
     assert any(p["group"] == "swept" for p in rp)
 
 
+def test_run_parameters_surface_model_runp_config_and_slm(tmp_path):
+    """EVERY run-defining parameter must be reachable in Details, so a run is
+    100% reproducible: the SLM model + warmup/run settings (descriptor['runp'])
+    and the baseline device snapshot (expConfig) — not just swept + base params.
+    Also surfaces the authoritative model the SLM server snapshotted
+    (slm_code.json -> manifest.model_filename) as the 'slm_model' row.
+    """
+    model = "SLMnet/checkpoints/sinc_3x3_experiment/models/direct/direct_best.pth"
+    extra = {
+        # pyctrl descriptor: flat dotted params (incl. a swept leaf) + runp.
+        "descriptor": {
+            "schema_version": 1,
+            "seq": "RearrangeCommSeq",
+            "params": {
+                "rearrange_kwargs.protocol": "rearrange",
+                # a sweep leaf — must NOT be listed as a fixed param
+                "Pushout.Green.Freq": {"scan": 1, "values": SWEPT_VALUES},
+            },
+            "runp": {
+                "warmup_kwargs.model_filename": model,
+                "warmup_kwargs.derive_threshold": 0.35,
+                "loading_defocus": -5.0,
+                "Scramble": 1.0,
+                "useScanLongSlmLock": 1.0,
+            },
+        },
+        # baseline device-config snapshot (nested) -> dotted 'config' leaves.
+        "expConfig": {
+            "Orca": {"ROI": [1000.0, 100.0, 2100.0, 2100.0]},
+            "Resonance556mj0Freq": 107753100.0,
+        },
+    }
+    scan_dir, _ = _write_pyctrl_scan(str(tmp_path), extra_cfg=extra)
+    # slm_code.json: the model the SLM server actually loaded for this run.
+    with open(os.path.join(scan_dir, RA.CODE_JSON), "w") as f:
+        json.dump({"manifest": {"model_filename": model, "files": []}}, f)
+
+    res = analyze_scan_dir(scan_dir)
+    rp = res.get("run_parameters") or []
+    by_name = {p["name"]: p for p in rp}
+
+    # The model — requested (descriptor runp) AND authoritative (slm_code.json).
+    assert by_name["warmup_kwargs.model_filename"]["value"] == model
+    assert by_name["warmup_kwargs.model_filename"]["group"] == "runp"
+    assert by_name["slm_model"]["value"] == model
+    assert by_name["slm_model"]["group"] == "slm"
+    assert res["code"]["model_filename"] == model
+
+    # Other run settings + the device snapshot are reachable too.
+    assert by_name["loading_defocus"]["value"] == -5.0
+    assert by_name["Scramble"]["group"] == "runp"
+    assert by_name["Orca.ROI"]["group"] == "config"
+    assert by_name["Resonance556mj0Freq"]["value"] == 107753100.0
+
+    # The swept axis stays a single 'swept' row — the descriptor's sweep leaf
+    # must not be duplicated as a fixed param.
+    swept = [p for p in rp if p["group"] == "swept"]
+    assert len(swept) == 1 and swept[0]["name"] == SWEPT_PATH
+    assert "Pushout.Green.Freq" not in {
+        p["name"] for p in rp if p["group"] == "param"}
+
+
 def test_str_or_none_decodes_float_char_codes():
     # _config_arrays floats numeric JSON lists, so a scanname stored as char
     # codes arrives as a float ndarray; _str_or_none must still decode it.
@@ -184,6 +246,61 @@ def test_str_or_none_leaves_real_float_arrays_alone():
     decoded = RA._str_or_none(np.array([0.1, 0.2, 0.3]))
     # Non-integral -> not treated as char codes (no chr() of fractional values).
     assert decoded is None or not decoded.startswith("\x00")
+
+
+def test_planned_vs_actual_shots_honors_n_shots_planned(tmp_path, monkeypatch):
+    """"Supposed to do" (planned) must come from the run PLAN, not n_params x
+    NumPerGroup. An explicit-rep scan over 3 points with rep=4 is SET to run 12
+    shots (n_shots_planned), even though NumPerGroup is a 2000-shot sentinel;
+    here only 8 were recorded (aborted). Both the runs list and analyze_scan_dir
+    must report planned=12 / actual=8 -- NOT the old 3*2000=6000 over-count.
+    """
+    scan_id = "20990202120000"
+    day, hms = scan_id[:8], scan_id[8:]
+    scan_dir = os.path.join(str(tmp_path), "Data", day, f"data_{day}_{hms}")
+    os.makedirs(scan_dir, exist_ok=True)
+    base = f"data_{day}_{hms}"
+
+    n_params = len(SWEPT_VALUES)          # 3 sweep points
+    planned = 12                          # nseqs(3) * rep(4) -- the run plan
+    actual = 8                            # aborted before all 12 ran
+    params = [(i % n_params) + 1 for i in range(planned)]   # full realized order
+    seq_ids = np.arange(1, actual + 1, dtype=np.int64)      # only 8 recorded
+    n_sites = 5
+
+    cfg = {
+        "frameSize": [8, 8], "NumImages": 1,
+        "NumPerGroup": 2000,              # run-until-stopped sentinel (NOT per-point reps)
+        "n_shots_planned": planned,       # the authoritative "supposed to do"
+        "isInit": 0, "isHC": 0, "isGrid2": 0,
+        "scan_id": int(scan_id), "source": "pyctrl",
+        "Params": params,
+        "ScanName": {"scanname": [ord(c) for c in SCAN_NAME]},
+        "ScanGroup": {"version": 1, "base": {
+            "vars": {"params": [{"Pushout": {"Green": {"Freq": SWEPT_VALUES}}}],
+                     "size": [n_params]},
+            "params": {}}},
+    }
+    with open(os.path.join(scan_dir, f"{base}.json"), "w") as f:
+        json.dump(cfg, f)
+    rng = np.random.default_rng(0)
+    logicals = rng.random((actual, n_sites)) < 0.55
+    with h5py.File(os.path.join(scan_dir, f"{base}.h5"), "w") as f:
+        f.create_dataset("logicals", data=logicals)
+        f.create_dataset("seq_ids", data=seq_ids)
+
+    # runs list (picker): planned total + actual, and reps/pt = 12 // 3 = 4.
+    monkeypatch.setattr(RL._yb_cfg, "PATH_PREFIX", str(tmp_path))
+    row = next(r for r in RL.list_runs(since_days=None, with_meta=True)
+               if r["scan_id"] == scan_id)
+    assert row["n_total_shots"] == planned        # NOT 3 * 2000
+    assert row["n_actual_shots"] == actual
+    assert row["n_shots"] == planned // n_params   # reps/pt = StackNum = 4
+
+    # analysis tab: scheduled = plan, n_shots = actual recovered.
+    res = analyze_scan_dir(scan_dir)
+    assert res["n_shots_scheduled"] == planned
+    assert res["n_shots"] == actual
 
 
 def test_extract_scan_dims_resolves_list_and_bool_axes():

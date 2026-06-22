@@ -196,15 +196,44 @@ class DashboardRenderer:
 def _read_data():
     """Read plot data from the shared pickle file (called in Dash process).
 
-    Uses pointer file to find which buffer to read (avoids Windows lock conflicts).
+    Uses a pointer file to pick the freshest of two alternating buffers
+    (avoids Windows lock conflicts). The pointer is written in-place by the
+    main process (truncate + write), so a read that races that brief window
+    sees an EMPTY pointer; and a buffer can momentarily be mid-write. Either
+    transient previously returned None -> /api/live/figures served empty
+    "waiting" figures -> the whole live view BLANKED for a poll. We now retry
+    the pointer briefly and, failing that, fall back to whichever buffer
+    actually loads (freshest by mtime) so the view shows the last good frame
+    instead of blanking.
     """
-    try:
-        with open(_DATA_FILE, 'r') as f:
-            idx = f.read().strip()
-        with open(_DATA_FILE + f'.{idx}', 'rb') as f:
-            return pickle.load(f)
-    except (FileNotFoundError, EOFError, ValueError, pickle.UnpicklingError, OSError):
-        return None
+    import time as _t
+    for _attempt in range(3):
+        try:
+            with open(_DATA_FILE, 'r') as f:
+                idx = f.read().strip()
+            if idx in ('0', '1'):
+                with open(_DATA_FILE + f'.{idx}', 'rb') as f:
+                    return pickle.load(f)
+        except (FileNotFoundError, EOFError, ValueError,
+                pickle.UnpicklingError, OSError):
+            pass
+        _t.sleep(0.02)   # transient race -> brief backoff, then retry
+    # Last resort: try BOTH buffers (freshest first); return the first that
+    # loads cleanly. Never blank on a single bad pointer/buffer read.
+    cands = []
+    for _b in ('0', '1'):
+        p = _DATA_FILE + f'.{_b}'
+        try:
+            cands.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    for _, p in sorted(cands, reverse=True):
+        try:
+            with open(p, 'rb') as f:
+                return pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, OSError):
+            continue
+    return None
 
 
 def _read_queue_data():
@@ -302,6 +331,32 @@ def _log_refresh_profile(n, t0, t_read, t_build, emitted):
                  payload / 1e6, (t_emit - t0) * 1e3)
 
 
+def _threshold_record_scalars(r):
+    """Light scalars from one threshold audit-log record for the Thresholds card.
+
+    Drops the heavy per-site ``thresholds``/``infidelities`` arrays before
+    shipping to the browser (deriving mean/std/min/max server-side when an older
+    record lacks them) — per the dashboard-at-scale rule (never push thousands
+    of per-site values per record)."""
+    keep = ('ts', 'scan_id', 'seq_no', 'pattern', 'source', 'n_updated',
+            'reason', 'mean_thr', 'std_thr', 'mean_infidelity',
+            'attempted_mean_thr', 'attempted_spread')
+    out = {k: r.get(k) for k in keep}
+    thr = r.get('thresholds')
+    if isinstance(thr, list) and thr:
+        a = np.asarray(thr, dtype=float)
+        if out.get('mean_thr') is None:
+            out['mean_thr'] = float(np.nanmean(a))
+        if out.get('std_thr') is None:
+            out['std_thr'] = float(np.nanstd(a))
+        out['min_thr'] = float(np.nanmin(a))
+        out['max_thr'] = float(np.nanmax(a))
+    inf = r.get('infidelities')
+    if out.get('mean_infidelity') is None and isinstance(inf, list) and inf:
+        out['mean_infidelity'] = float(np.nanmean(np.asarray(inf, dtype=float)))
+    return out
+
+
 def _to_jsonable(x):
     """Recursively convert numpy / bytes payloads to JSON-safe Python types.
 
@@ -333,7 +388,7 @@ def _to_jsonable(x):
 # is excluded (those live in _HEAVY_KEYS and are stripped from /snapshot).
 _API_KEYS_STATUS = ('scan_id', 'scan_name', 'scan_filename', 'scan_param_path',
                     'num_sites', 'num_images', 'is_two_array', 'n_accum_shots',
-                    'hist_version', '_dummy_mode')
+                    'hist_version', '_dummy_mode', '_failing_mode')
 _API_KEYS_GRID = ('grid_locations', 'thresholds', 'grid_locations_img2',
                   'thresholds_img2', 'num_sites', 'num_sites_img2', 'box_size',
                   'is_two_array')
@@ -708,6 +763,90 @@ def _resolve_scan_dir(scan_id):
         return None
 
 
+# Cache of recovered recorded-shot counts for FINISHED scans (immutable once a
+# scan is done): scan_id -> int. Lets the Queue panel show actual/planned '#seq'
+# for runs that finished before the backend tracked the count (or pre-restart).
+_RECORDED_SHOTS_CACHE = {}
+
+
+def _recorded_shots_for_scan(file_id, *, cache_ok=True):
+    """Actual recorded sequence count (= ``len(seq_ids)``) for a scan, by file_id.
+
+    Cheap: opens the scan HDF5 read-only and reads only the dataset SHAPE (no
+    data) via ``runs_list._actual_shots`` — the same source the Analysis tab's
+    shot count uses, so the numbers match. Returns None when the folder/h5 is
+    missing or unreadable. Finished-scan counts are cached (immutable).
+    """
+    sid = ''.join(ch for ch in str(file_id or '') if ch.isdigit())
+    if len(sid) != 14:
+        return None
+    if cache_ok and sid in _RECORDED_SHOTS_CACHE:
+        return _RECORDED_SHOTS_CACHE[sid]
+    try:
+        import os
+        from pathlib import Path
+        from yb_analysis import config as _cfg
+        from yb_analysis.analysis.runs_list import _actual_shots
+        day, hms = sid[:8], sid[8:]
+        # Non-creating resolution (do NOT use _resolve_scan_dir / make_scan_dir
+        # here -- those os.makedirs the folder). Check DATA_DIR, then the
+        # YB_DATA_DIR override, like run_analysis._resolve_scan_dir_from_id.
+        bases = [_cfg.DATA_DIR]
+        env_dir = os.environ.get('YB_DATA_DIR')
+        if env_dir:
+            bases.append(env_dir)
+        n = None
+        for b in bases:
+            d = Path(b) / day / f'data_{day}_{hms}'
+            if d.is_dir():
+                n = _actual_shots(d / f'{d.name}.h5')
+                break
+    except Exception:
+        return None
+    if n is not None and cache_ok:
+        _RECORDED_SHOTS_CACHE[sid] = n
+    return n
+
+
+def _fill_scan_ids(q):
+    """Stamp a 14-digit ``scan_id`` on each running/queued/history entry where
+    derivable (an existing scan_id field, else the digits of ``file_id``), so
+    the dashboard can link a queue row to its Analysis view and highlight the
+    selected run(s). Queued-but-not-yet-run entries have no data folder / file_id
+    and are left without a scan_id (the UI renders them inert)."""
+    def _sid(e):
+        for src in (e.get('scan_id'), e.get('file_id')):
+            s = ''.join(ch for ch in str(src or '') if ch.isdigit())
+            if len(s) == 14:
+                return s
+        return None
+    groups = [q.get('queued') or [], q.get('history') or []]
+    if isinstance(q.get('running'), dict):
+        groups.append([q['running']])
+    for g in groups:
+        for e in g:
+            if isinstance(e, dict):
+                sid = _sid(e)
+                if sid:
+                    e['scan_id'] = sid
+
+
+def _fill_recorded_shots(q):
+    """Backfill ``seq_num`` (actual recorded shots) on FINISHED history rows the
+    backend didn't record — runs that completed before seq_num tracking existed,
+    or whose history was reloaded from disk after a restart. The Queue panel's
+    '#seq' column then shows actual/planned for them too. Running/queued rows are
+    left to the backend's live ``seq_num`` (the live HDF5 is mid-write)."""
+    for e in (q.get('history') or []):
+        if not isinstance(e, dict) or e.get('seq_num') is not None:
+            continue
+        if e.get('state') not in ('done', 'error'):
+            continue
+        n = _recorded_shots_for_scan(e.get('file_id'), cache_ok=True)
+        if n is not None:
+            e['seq_num'] = n
+
+
 def _parse_reconstruct_result(stdout):
     """Extract the offline reconstruct driver's ``RECONSTRUCT_RESULT:{json}`` line.
 
@@ -926,6 +1065,7 @@ def _register_api_routes(server):
         '/api/runs/<scan_id>/grid':     'per-scan grid sidecar (init/target knm coords + grid_rotation): synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/analysis': 'lab-side per-scan analysis: survival, loading, diag aggregate, sweep description, code/grid pointers',
         '/api/runs/<scan_id>/avg_image': 'PNG of mean image across all shots (single-image scans only; computed on first call, cached as avg_image.png next to data_*.h5)',
+        '/api/runs/dates':              'every available data day (YYYYMMDD), newest-first -- cheap dir listing, no enrichment; pairs with ?date= on /api/runs/list & /api/sequence/scans to jump to one historical day -> {dates:[...]}',
         '/api/sequence/list':   'flattened-sequence index for a scan: ?scan_id= or ?folder= -> {files, points, scanned_axes}',
         '/api/sequence/figure': 'Plotly figure for selected channels: ?scan_id=|folder= &file= &seq= &chns=a,b,c',
         '/api/sequence/params': 'parameters tree (+ scanned_paths) for a scan, from the .json sidecar (expConfig+base.params+base.vars), else .seq-embedded: ?scan_id=|folder=',
@@ -945,6 +1085,7 @@ def _register_api_routes(server):
         '/api/patterns':             'registered loading patterns (compact metadata; no big arrays)',
         '/api/patterns/<name>':      'full pattern record incl. knm positions + per-site phases',
         '/api/patterns/<name>/refresh': 'POST: re-derive a pattern from the SLM (force)',
+        '/api/thresholds/history':   'per-pattern detection-threshold update history (cheap/fit/fit_rejected) + live calibration health (?pattern=<name>)',
     }
 
     def _list_endpoints():
@@ -1000,7 +1141,10 @@ def _register_api_routes(server):
         q = _read_queue_data()
         if q is None:
             return jsonify({'running': None, 'queued': [], 'history': []})
-        return jsonify(_to_jsonable(q))
+        q = _to_jsonable(q)
+        _fill_recorded_shots(q)   # recover actual shot counts for old history rows
+        _fill_scan_ids(q)         # stamp scan_id so queue rows link to Analysis
+        return jsonify(q)
 
     @server.route('/api/snapshot')
     def _api_snapshot():
@@ -1039,6 +1183,18 @@ def _register_api_routes(server):
         return jsonify(_to_jsonable({'ok': ok, 'current': _aff.load_affine()})), \
             (200 if ok else 409)
 
+    # ---- Hardware-tab Overview (starred-tile layout, shared across browsers) ----
+    # GET returns the ordered tile list; POST replaces it. Tiles are
+    # {source, tab, label}; order == on-screen arrangement. See hw_overview.py.
+    @server.route('/api/hw/overview', methods=['GET', 'POST'])
+    def _api_hw_overview():
+        from yb_analysis.analysis import hw_overview as _hwo
+        if request.method == 'POST':
+            body = request.get_json(force=True, silent=True) or {}
+            tiles = _hwo.save(body.get('tiles'))
+            return jsonify({'ok': True, 'tiles': tiles})
+        return jsonify({'tiles': _hwo.load()})
+
     @server.route('/api/patterns')
     def _api_patterns():
         from yb_analysis.analysis import pattern_registry as _reg
@@ -1065,13 +1221,113 @@ def _register_api_routes(server):
                 default_loading_zernike=rec.get('default_loading_zernike'),
                 order=rec.get('order', 'col'),
                 legacy_zerniked=rec.get('legacy_zerniked', False),
-                baked_zernike=rec.get('baked_zernike'), force=True)
+                baked_zernike=rec.get('baked_zernike'),
+                # Preserve 3-D-ness across a manual refresh; without this a
+                # 3-D pattern would silently re-derive as 2-D (None planes).
+                planes_z_rad=rec.get('planes_z_rad'), force=True)
             return jsonify(_to_jsonable(
                 {'ok': out is not None,
                  'pattern': _reg._compact(out) if out else None}))
         except Exception as ex:
             logger.exception('pattern refresh failed')
             return jsonify({'error': str(ex)}), 500
+
+    @server.route('/api/thresholds/history')
+    def _api_thresholds_history():
+        """Per-pattern detection-threshold update history + live calibration
+        health for the Live-tab Thresholds card. Reads the on-disk audit log
+        update_logs/thresholds/<pattern>.jsonl (tail last ~N) and merges the live
+        threshold_health / active pattern / fit cadence from the plot snapshot.
+        Heavy per-site arrays are NOT shipped (scalars derived server-side)."""
+        from flask import request
+        snap = _read_data() or {}
+        active_pattern = snap.get('active_pattern')          # img1 loading pattern
+        active_pattern_img2 = snap.get('active_pattern_img2')  # img2 (distinct only)
+        pattern = (request.args.get('pattern') or active_pattern)
+        if not pattern:
+            # Idle / no active scan (e.g. just after a restart): the threshold
+            # HISTORY persists on disk even though the live shot count resets per
+            # run, so fall back to the most-recently-updated pattern's log rather
+            # than reporting "no history".
+            try:
+                import glob as _glob
+                from yb_analysis.analysis import update_log as _ul0
+                _cands = _glob.glob(os.path.join(_ul0._logs_dir(), 'thresholds', '*.jsonl'))
+                if _cands:
+                    pattern = os.path.splitext(os.path.basename(
+                        max(_cands, key=os.path.getmtime)))[0]
+            except Exception:
+                pass
+        try:
+            n = max(1, min(2000, int(request.args.get('n', 400))))
+        except (TypeError, ValueError):
+            n = 400
+        records = []
+        if pattern:
+            try:
+                from yb_analysis.analysis import update_log as _ul
+                import yb_analysis.analysis.pattern_registry as _reg
+                path = os.path.join(_ul._logs_dir(), 'thresholds',
+                                    '%s.jsonl' % _reg._sanitize_name(pattern))
+                if os.path.isfile(path):
+                    with open(path, 'r', encoding='utf-8') as fh:
+                        lines = fh.readlines()[-n:]
+                    for ln in lines:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            records.append(_threshold_record_scalars(json.loads(ln)))
+                        except Exception:
+                            continue
+            except Exception:
+                logger.debug('threshold history read failed', exc_info=True)
+        # Live calibration health for the SELECTED pattern. The snapshot only
+        # carries live health for the currently-running frames: img1
+        # (threshold_health) and, when img2 is a distinct loading pattern,
+        # img2 (threshold_health_img2). A selected pattern that isn't either
+        # of those isn't running now, so it has no live health — the card
+        # derives its badges from the on-disk history instead.
+        if pattern and active_pattern_img2 and pattern == active_pattern_img2:
+            health = snap.get('threshold_health_img2') or {}
+            shots_since_fit = snap.get('shots_since_fit_img2')
+            next_fit_in = snap.get('next_fit_in_img2')
+            health_pattern = active_pattern_img2
+        elif pattern and pattern == active_pattern:
+            health = snap.get('threshold_health') or {}
+            shots_since_fit = snap.get('shots_since_fit')
+            next_fit_in = snap.get('next_fit_in')
+            health_pattern = active_pattern
+        else:
+            health = {}
+            shots_since_fit = next_fit_in = None
+            health_pattern = None
+        active = {
+            'pattern': health_pattern,
+            'defocus': snap.get('active_defocus') if health_pattern == active_pattern else None,
+            'source': health.get('source'),
+            'state': health.get('state'),
+            'reason': health.get('reason'),
+            'spread': health.get('spread'),
+            'mean_infidelity': health.get('mean_infidelity'),
+            'shots_since_fit': shots_since_fit,
+            'next_fit_in': next_fit_in,
+            'updated_iso': health.get('updated_iso'),
+        }
+        # All registered loading patterns (names only) so the card's pattern
+        # dropdown can list every loaded pattern, not just the running ones.
+        try:
+            import yb_analysis.analysis.pattern_registry as _regp
+            all_patterns = sorted(_regp.list_patterns().keys())
+        except Exception:
+            all_patterns = []
+        return jsonify(_to_jsonable({
+            'pattern': pattern, 'active_pattern': active_pattern,
+            'active_pattern_img2': active_pattern_img2,
+            'all_patterns': all_patterns,
+            'current': (records[-1] if records else None),
+            'history': records, 'health': health, 'active': active,
+        }))
 
     # ---- SLM passthrough routes (read from yb_dash_slm.pkl) ----
     # All return cached SLM-PC data, polled by yb_analysis.slm_proxy on the
@@ -1678,8 +1934,16 @@ def _register_api_routes(server):
         from yb_analysis.sequence.manifest import find_sequence_dir
         since_days = request.args.get('since_days', type=int)
         max_count = request.args.get('max', type=int, default=500)
+        # ?date=YYYYMMDD jumps to one historical day (bounded; no whole-archive
+        # walk) -- the picker's date dropdown. None = recent window.
+        date_str = request.args.get('date') or None
+        force = request.args.get('force', '0') not in ('0', '', 'false', 'False')
         scans = []
-        for r in list_runs(since_days=since_days, max_count=max_count, with_meta=True):
+        # Shares the same enrichment cache as /api/runs/list (one enrich pass
+        # serves both the Analysis and Sequence pickers).
+        for r in list_runs(since_days=since_days, max_count=max_count,
+                           with_meta=True, use_cache=True, force=force,
+                           date_str=date_str):
             seq_dir = find_sequence_dir(r['scan_dir'])
             n = 0
             if seq_dir:
@@ -1691,12 +1955,16 @@ def _register_api_routes(server):
                 'scan_id': r['scan_id'],
                 'scan_dir': r['scan_dir'],
                 'name': r.get('name'),
+                # Free-text run purpose/context (pyctrl descriptor `description`);
+                # drives the picker's run-search + hover tooltip. Blank for old runs.
+                'description': r.get('description'),
                 'swept': r.get('swept'),
                 # Richer meta for the picker's full-info hover tooltip (the row
                 # is too narrow to show all of this inline).
                 'date': r.get('date'),
                 'time': r.get('time'),
                 'n_shots': r.get('n_shots'),
+                'n_actual_shots': r.get('n_actual_shots'),
                 'n_params': r.get('n_params'),
                 'n_total_shots': r.get('n_total_shots'),
                 'has_diag': bool(r.get('has_diag')),
@@ -1928,12 +2196,31 @@ def _register_api_routes(server):
             since_days = request.args.get('since_days', type=int)
             max_count  = request.args.get('max', type=int, default=500)
             with_meta  = request.args.get('with_meta', '1') != '0'
+            # ?date=YYYYMMDD jumps to one historical day (bounded; no whole-archive
+            # walk) -- the picker's date dropdown. None = recent window.
+            date_str   = request.args.get('date') or None
+            # Incremental cache: re-enrich only NEW / live-growing scans. ?force=1
+            # is the Full-rescan button (clears the cache first).
+            force = request.args.get('force', '0') not in ('0', '', 'false', 'False')
             rows = list_runs(since_days=since_days, max_count=max_count,
-                             with_meta=with_meta)
+                             with_meta=with_meta, use_cache=True, force=force,
+                             date_str=date_str)
             return jsonify({'runs': rows, 'count': len(rows)})
         except Exception as ex:
             logger.exception('runs_list failed')
             return jsonify({'error': str(ex), 'runs': []}), 500
+
+    @server.route('/api/runs/dates')
+    def _api_runs_dates():
+        """Every available data day (YYYYMMDD), newest-first. Cheap -- one
+        directory listing, NO per-scan enrichment -- so the picker can offer a
+        full date jump across the whole archive without loading every run."""
+        from yb_analysis.analysis.runs_list import list_dates
+        try:
+            return jsonify({'dates': list_dates()})
+        except Exception as ex:
+            logger.exception('runs_dates failed')
+            return jsonify({'error': str(ex), 'dates': []}), 500
 
     @server.route('/api/runs/groups', methods=['GET', 'POST'])
     def _api_runs_groups():
@@ -2169,7 +2456,26 @@ def _register_api_routes(server):
 
         names = ['array', 'array_mid', 'array2', 'intens', 'loadlive',
                  'load', 'infid', 'shift', 'scan', 'avghist',
-                 'rep0', 'rep1', 'rep2', 'rep3']
+                 'rep0', 'rep1', 'rep2']
+        # Two live fetch groups, both built from the SAME _read_data() snapshot ('d'
+        # above) -- so a single request's figures are mutually consistent (one shot).
+        #   ?group=snapshot -> the coherent SINGLE-SHOT view: both camera frames
+        #       (array/array_mid/array2) + that frame's per-site intensities (intens)
+        #       + the scan-result panel (scan), whose red current-cell outline marks
+        #       that shot's param combo. Fetching them together guarantees they all
+        #       reflect ONE shot -- never img2 from a later frame than img1, nor the
+        #       red outline ahead of the images. The client polls this on its own loop
+        #       (gated by the ~5 MB image payload), so it may SKIP shots -- but it skips
+        #       them together / always stays coherent.
+        #   ?group=stream   -> everything else (survival/loading maps, histograms):
+        #       aggregate data that just accumulates, polled fast + independently.
+        #   (no group)      -> the full set (back-compat: tab-switch render, older clients)
+        _SNAPSHOT_FIGS = ('array', 'array_mid', 'array2', 'intens', 'scan')
+        group = request.args.get('group', '').lower()
+        if group == 'snapshot':
+            names = [n for n in names if n in _SNAPSHOT_FIGS]
+        elif group == 'stream':
+            names = [n for n in names if n not in _SNAPSHOT_FIGS]
         out = {n: _figdict(_fig_for(n)) for n in names}
         body = json.dumps({'figures': out}, cls=_putils.PlotlyJSONEncoder,
                           allow_nan=False, default=str)
@@ -2806,6 +3112,566 @@ def _slm_passthrough(slm_path, *, cache_key=None, slow_poll=False):
 
 
 # ===========================================================================
+# Molecube (FPGA1 DDS / TTL / clock) control endpoints  -- /api/molecube/*
+# ===========================================================================
+#
+# These talk to the molecube2 ZMQ daemon via yb_analysis.control.molecube_client
+# -- ALWAYS through the daemon, NEVER the DDS/TTL devices directly. The daemon is
+# the same one libnacs submits sequences to and that the Next.js page at
+# https://yb.nigrp.org/s/zynq/1/dds drives.
+#
+# ###########################################################################
+# ##  TWO GATES -- read this before changing                              ##
+# ###########################################################################
+# The molecube API is split into READ endpoints and WRITE endpoints, each with
+# its own gate, so reads and writes can be enabled independently:
+#
+#   READS  (status / snapshot / startup)  -> @_molecube_gated_read
+#          CURRENTLY **OPEN** so the dashboard populates with live FPGA values.
+#          DDS/clock reads never change device state. TTL readback is a special
+#          case: it has no dedicated 'get' command, so the client sends GUARANTEED
+#          ZERO-mask set_ttl/override_ttl frames (hard-coded + asserted zero), which
+#          the daemon runs as no-op gets -- non-mutating, exactly what the official
+#          web UI does. It is sub-gated as a READ (_molecube_ttl_reads_open(), OPEN);
+#          actual TTL *writes* stay behind the closed write gate.
+#
+#   WRITES (set [batched], dds/set, dds/override, dds/reset, ttl/set, ttl/override,
+#          clock/set)  -> @_molecube_gated_write
+#          CURRENTLY **OPEN**: writes reach the live daemon. They all funnel through
+#          MolecubeClient.set_values, which emits the SAME set_ttl/override_ttl/
+#          set_dds/override_dds/set_clock frames + value<->override coupling as the
+#          labctrl-node web dashboard (server/zynq.js set_values).
+#
+#   TO CLOSE WRITES again, do ANY ONE of:
+#     * launch run_monitor with   YB_MOLECUBE_WRITES=0
+#     * change the default in _molecube_writes_open() below to `return False`
+#     * uncomment-style: re-enable the gate (it already 403s when closed)
+#   TO CLOSE READS: set YB_MOLECUBE_READS=0 (or edit _molecube_reads_open()).
+# ###########################################################################
+
+# DDS register type name <-> code (matches molecube_client TYP_FREQ/AMP/PHASE).
+_MOLECUBE_TYPE_MAP = {'freq': 0, 'amp': 1, 'phase': 2}
+
+# Lazily-built singleton client (keyed so a config URL change rebuilds it).
+_molecube_client_box = {}
+
+# ---------------------------------------------------------------------------
+# NI DAC monitor state (NOT molecube). The /api/nidaq/monitor route reads the
+# PCIe-6738's internal per-AO monitor channels (Dev1/_aoN_vs_aognd) by spawning
+# the engine-venv driver (yb_analysis/control/ni_monitor_driver.py) -- nidaqmx
+# lives only in the engine venv. Shape mirrors the molecube reads: gated +
+# cached. See _register_nidaq_routes below.
+_NIDAQ_CACHE = {'data': None, 'ts': 0.0}        # last good driver result + monotonic time
+_NIDAQ_CACHE_TTL_S = 5.0                          # serve cache within this window (spawn is ~1-2 s)
+_NIDAQ_LOCK = threading.Lock()                    # serialize spawns (one reader at a time)
+
+
+def _nidaq_monitor_open():
+    """READ gate for the NI DAC monitor. OPEN by default (read-only -- it only opens
+    an AI task on the card's internal AO monitor and reads). Disable with
+    YB_NIDAQ_MONITOR=0 if it ever needs to be taken fully off the hardware."""
+    return os.environ.get('YB_NIDAQ_MONITOR', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _nidaq_write_open():
+    """WRITE gate for NI DAC channels. OPEN by default (NI writes enabled). A write is a
+    one-off DC set via nidaq_io_handler.set_channel (== MATLAB setV; on-demand, no FPGA
+    clock, DAC holds after close) -- NOT set_chns() (which resets every channel). It is
+    DEFERRED while a scan is running (a scan owns Dev1's AO subsystem). Disable with
+    YB_NIDAQ_WRITES=0."""
+    return os.environ.get('YB_NIDAQ_WRITES', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _molecube_reads_open():
+    """READ gate. OPEN by default so the dashboard can show live FPGA state.
+    Close reads too by setting YB_MOLECUBE_READS=0 (or returning False here)."""
+    return os.environ.get('YB_MOLECUBE_READS', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _molecube_writes_open():
+    """WRITE gate. OPEN by default -- control commands reach the daemon. Writes use the
+    SAME ZMQ methods + mask/override logic as labctrl-node (MolecubeClient.set_values).
+    Close again with YB_MOLECUBE_WRITES=0 (or `return False` here)."""
+    return os.environ.get('YB_MOLECUBE_WRITES', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _molecube_ttl_reads_open():
+    """TTL-READ sub-gate. OPEN by default so the TTL box loads. Reading TTL has no
+    dedicated 'get' command -- the client sends GUARANTEED ZERO-mask
+    set_ttl/override_ttl frames (hard-coded + asserted zero in molecube_client),
+    which the daemon executes as no-op gets, so this is non-mutating (exactly what
+    the official web UI does). This is a READ -- TTL *writes* stay behind the
+    separate, closed write gate. Close TTL reads again with YB_MOLECUBE_TTL_READS=0."""
+    return os.environ.get('YB_MOLECUBE_TTL_READS', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _molecube_gated_read(fn):
+    """Decorator for READ endpoints: 403 unless the read gate is open."""
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        from flask import jsonify
+        # ---- READ GATE (comment the next 2 lines to always allow reads) ----
+        if not _molecube_reads_open():
+            return jsonify({'ok': False, 'gated': True, 'kind': 'read',
+                            'error': 'Molecube reads are disabled.'}), 403
+        return fn(*args, **kwargs)
+    return _wrapped
+
+
+def _molecube_gated_write(fn):
+    """Decorator for WRITE endpoints: 403 unless the write gate is open."""
+    import functools
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        from flask import jsonify
+        # ---- WRITE GATE (comment the next 2 lines to allow writes) ----
+        if not _molecube_writes_open():
+            return jsonify({'ok': False, 'gated': True, 'kind': 'write',
+                            'error': 'Molecube writes are disabled (read-only mode). '
+                                     'Enable with YB_MOLECUBE_WRITES=1.'}), 403
+        return fn(*args, **kwargs)
+    return _wrapped
+
+
+def _molecube_client():
+    """Return the lazily-built MolecubeClient singleton (rebuilt if the URL changed).
+
+    Constructing the client does NOT connect; the first request opens the socket."""
+    from yb_analysis import config as _cfg
+    cli = _molecube_client_box.get('cli')
+    if cli is None or cli.url != _cfg.MOLECUBE_URL:
+        from yb_analysis.control.molecube_client import MolecubeClient
+        cli = MolecubeClient(_cfg.MOLECUBE_URL, timeout_ms=_cfg.MOLECUBE_TIMEOUT_MS)
+        _molecube_client_box['cli'] = cli
+    return cli
+
+
+def _molecube_encode_value(typ, value, raw):
+    """Engineering value -> raw register word (or pass-through when raw=True)."""
+    from yb_analysis.control import molecube_client as _mcm
+    if raw:
+        return int(value) & 0xFFFFFFFF
+    if typ == _mcm.TYP_FREQ:
+        return _mcm.hz_to_ftw(float(value))
+    if typ == _mcm.TYP_AMP:
+        return _mcm.frac_to_amp(float(value))
+    return _mcm.deg_to_phase(float(value))
+
+
+def _mc_build_vals(body, raw=False):
+    """Convert a batched-write body to set_values' flat shape, encoding DDS engineering
+    values (freq Hz / amp 0-1 / phase deg) to register words unless ``raw`` is set.
+    ``ttl`` val<i>/ovr<i> booleans and dds ``ovr_*`` booleans pass through untouched."""
+    import re
+    vals = {}
+    if body.get('clock') is not None:
+        vals['clock'] = int(body['clock'])
+    ttl = body.get('ttl')
+    if isinstance(ttl, dict):
+        vals['ttl'] = dict(ttl)
+    dds = body.get('dds')
+    if isinstance(dds, dict):
+        out = {}
+        for k, v in dds.items():
+            m = re.match(r'^(freq|amp|phase)(\d+)$', k)
+            if m and not raw:
+                out[k] = _molecube_encode_value(_MOLECUBE_TYPE_MAP[m.group(1)], v, False)
+            else:
+                out[k] = v
+        vals['dds'] = out
+    return vals
+
+
+def _register_molecube_routes(server):
+    """Attach the molecube control endpoints to the Flask app.
+
+    Reads are gated by @_molecube_gated_read (open), writes by
+    @_molecube_gated_write (closed). See the TWO GATES banner above."""
+    from flask import jsonify, request
+    from yb_analysis.control import molecube_client as _mcm
+
+    def _err(e, code=502):
+        return jsonify({'ok': False, 'error': str(e)}), code
+
+    # -------- reads --------------------------------------------------------
+    @server.route('/api/molecube/status')
+    @_molecube_gated_read
+    def _mc_status():
+        from yb_analysis import config as _cfg
+        cli = _molecube_client()
+        out = {'url': cli.url, 'connected': False,
+               'writes_enabled': _molecube_writes_open(),
+               'ttl_max_chn': getattr(_cfg, 'MOLECUBE_MAX_TTL_CHN', None)}
+        try:
+            sid, server_id = cli.state_id()
+            out.update(connected=True, state_id=sid, server_id=server_id)
+            try:                       # clock only -- NOT get_max_ttl (see client note)
+                out['clock'] = cli.get_clock()
+            except _mcm.MolecubeError:
+                pass
+        except _mcm.MolecubeError as e:
+            out['error'] = str(e)
+        return jsonify(out)
+
+    @server.route('/api/molecube/snapshot')
+    @_molecube_gated_read
+    def _mc_snapshot():
+        # snapshot() performs several reads and folds per-read failures into
+        # result['errors'] rather than aborting -- ideal for the live poller.
+        # TTL reads are sub-gated off (they'd issue zero-mask set_ttl frames).
+        ttl_on = _molecube_ttl_reads_open()
+        from yb_analysis import config as _cfg
+        snap = _molecube_client().snapshot(
+            include_ttl=ttl_on, ttl_max_chn=getattr(_cfg, 'MOLECUBE_MAX_TTL_CHN', None))
+        snap['writes_enabled'] = _molecube_writes_open()
+        snap['ttl_reads_enabled'] = ttl_on
+        return jsonify(snap)
+
+    @server.route('/api/molecube/startup')
+    @_molecube_gated_read
+    def _mc_startup():
+        try:
+            return jsonify({'ok': True, 'startup': _molecube_client().get_startup()})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    # -------- writes (all routed through MolecubeClient.set_values) --------
+    # Every write below builds labctrl-node's flat {ttl/dds/clock} "vals" shape and
+    # hands it to set_values(vals, cur), which emits the SAME set_ttl/override_ttl/
+    # set_dds/override_dds/set_clock frames labctrl-node does (incl. value<->override
+    # coupling + "set value before releasing override"). `cur` is a fresh snapshot so
+    # the coupling decisions match the live device state.
+    def _cur():
+        from yb_analysis import config as _cfg
+        cli = _molecube_client()
+        snap = cli.snapshot(include_ttl=True,
+                            ttl_max_chn=getattr(_cfg, 'MOLECUBE_MAX_TTL_CHN', None))
+        return cli, _mcm.MolecubeClient.flatten_current(snap)
+
+    @server.route('/api/molecube/set', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_set():
+        # Batched write -- body is labctrl-node's shape: {clock, ttl:{val<i>,ovr<i>},
+        # dds:{<type><i>(eng or raw),ovr_<type><i>}}. DDS values are engineering units
+        # unless {"raw": true}. Mirrors labctrl-node set_values end-to-end.
+        body = request.get_json(force=True, silent=True) or {}
+        try:
+            cli, cur = _cur()
+            vals = _mc_build_vals(body, raw=bool(body.get('raw')))
+            sent = cli.set_values(vals, cur)
+            return jsonify({'ok': True, 'sent': _to_jsonable(sent)})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/dds/set', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_dds_set():
+        body = request.get_json(force=True, silent=True) or {}
+        typ = _MOLECUBE_TYPE_MAP.get(str(body.get('type', 'freq')))
+        if typ is None or 'chn' not in body or 'value' not in body:
+            return jsonify({'ok': False, 'error': 'need chn, type(freq|amp|phase), value'}), 400
+        try:
+            word = _molecube_encode_value(typ, body['value'], bool(body.get('raw')))
+            cli, cur = _cur()
+            # set_values routes this to override_dds automatically if the channel is
+            # currently overridden -- exactly as labctrl-node does.
+            cli.set_values({'dds': {'%s%d' % (body['type'], int(body['chn'])): word}}, cur)
+            return jsonify({'ok': True, 'chn': int(body['chn']),
+                            'type': body['type'], 'word': word})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/dds/override', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_dds_override():
+        body = request.get_json(force=True, silent=True) or {}
+        typ = _MOLECUBE_TYPE_MAP.get(str(body.get('type', 'freq')))
+        if typ is None or 'chn' not in body:
+            return jsonify({'ok': False, 'error': 'need chn, type; value=null clears'}), 400
+        try:
+            chn = int(body['chn'])
+            tname = body['type']
+            val = body.get('value', None)
+            cli, cur = _cur()
+            if val is None:                              # clear override
+                cli.set_values({'dds': {'ovr_%s%d' % (tname, chn): False}}, cur)
+            else:                                        # enable override at value
+                word = _molecube_encode_value(typ, val, bool(body.get('raw')))
+                cli.set_values({'dds': {'ovr_%s%d' % (tname, chn): True,
+                                        '%s%d' % (tname, chn): word}}, cur)
+            return jsonify({'ok': True, 'chn': chn, 'type': tname, 'cleared': val is None})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/dds/reset', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_dds_reset():
+        body = request.get_json(force=True, silent=True) or {}
+        if 'chn' not in body:
+            return jsonify({'ok': False, 'error': 'need chn'}), 400
+        try:
+            _molecube_client().reset_dds(int(body['chn']))    # labctrl-node: sock.reset_dds
+            return jsonify({'ok': True, 'chn': int(body['chn'])})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/ttl/set', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_ttl_set():
+        body = request.get_json(force=True, silent=True) or {}
+        if 'chn' not in body or 'on' not in body:
+            return jsonify({'ok': False, 'error': 'need chn, on(bool)'}), 400
+        try:
+            cli, cur = _cur()
+            # {val<chn>: on} -> set_values routes to override if the channel is forced.
+            cli.set_values({'ttl': {'val%d' % int(body['chn']): bool(body['on'])}}, cur)
+            return jsonify({'ok': True, 'chn': int(body['chn']), 'on': bool(body['on'])})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/ttl/override', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_ttl_override():
+        body = request.get_json(force=True, silent=True) or {}
+        mode = str(body.get('mode', '')).lower()   # 'low' | 'high' | 'normal'
+        if 'chn' not in body or mode not in ('low', 'high', 'normal'):
+            return jsonify({'ok': False, 'error': "need chn, mode(low|high|normal)"}), 400
+        chn = int(body['chn'])
+        # labctrl-node encoding: force-high = {ovr:true, val:true}; force-low =
+        # {ovr:true, val:false}; normal = {ovr:false} (set_values restores the value).
+        if mode == 'normal':
+            ttl = {'ovr%d' % chn: False}
+        else:
+            ttl = {'ovr%d' % chn: True, 'val%d' % chn: (mode == 'high')}
+        try:
+            cli, cur = _cur()
+            cli.set_values({'ttl': ttl}, cur)
+            return jsonify({'ok': True, 'chn': chn, 'mode': mode})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/clock/set', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_clock_set():
+        body = request.get_json(force=True, silent=True) or {}
+        if 'clock' not in body:
+            return jsonify({'ok': False, 'error': 'need clock(0..255)'}), 400
+        try:
+            _molecube_client().set_values({'clock': int(body['clock'])})
+            return jsonify({'ok': True, 'clock': int(body['clock']) & 0xFF})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    # -------- channel names (write straight to the daemon's name store) ----
+    # Names live in the molecube daemon (its dds.yaml/ttl.yaml), set via
+    # set_dds_names/set_ttl_names -- the SAME store the labctrl-node web UI uses.
+    # We MERGE one channel at a time (the daemon does not replace the whole map),
+    # so renaming one channel never disturbs the others. We keep no local name map.
+    # An empty name clears the label (the daemon stores "" and get_*_names skips it).
+    def _mc_set_name(kind):
+        body = request.get_json(force=True, silent=True) or {}
+        if 'chn' not in body or 'name' not in body:
+            return jsonify({'ok': False, 'error': 'need chn, name'}), 400
+        try:
+            chn = int(body['chn'])
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'chn must be an integer'}), 400
+        # Names are NUL-terminated on the wire, so strip embedded NULs; trim
+        # surrounding whitespace; cap length (labctrl-node uses short labels).
+        name = str(body.get('name') or '').replace('\x00', '').strip()[:63]
+        try:
+            cli = _molecube_client()
+            (cli.set_dds_names if kind == 'dds' else cli.set_ttl_names)({chn: name})
+            return jsonify({'ok': True, 'chn': chn, 'name': name, 'kind': kind})
+        except _mcm.MolecubeError as e:
+            return _err(e)
+
+    @server.route('/api/molecube/dds/name', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_dds_name():
+        return _mc_set_name('dds')
+
+    @server.route('/api/molecube/ttl/name', methods=['POST'])
+    @_molecube_gated_write
+    def _mc_ttl_name():
+        return _mc_set_name('ttl')
+
+
+# ===========================================================================
+# NI DAC channel monitor  --  /api/nidaq/monitor   (NOT via molecube)
+# ===========================================================================
+# Read-only readback of the NI PCIe-6738 analog-out channels' ACTUAL output
+# voltages, shown in the Hardware tab's Molecube sub-view as a separate card.
+# The molecube2 daemon fronts FPGA1 only and knows nothing about the NI DAQ, so
+# this takes a wholly independent path: the card's per-AO internal monitor
+# (Dev1/_aoN_vs_aognd) read through the engine-venv driver subprocess (nidaqmx
+# is only installed in the engine venv, not the dashboard's conda env -- same
+# spawn-the-engine-python pattern as /api/sequence/reconstruct).
+#
+# SAFETY: the AI monitor read reserves Dev1, so it is DEFERRED while a scan is
+# running (a scan owns the AO subsystem; an ill-timed open could perturb it). It
+# drives no output -- it only reads back what the DAC is already holding.
+
+def _register_nidaq_routes(server):
+    """Attach the NI DAC monitor endpoint (read-only) to the Flask app."""
+    import os as _os
+    import subprocess
+    from flask import jsonify
+
+    @server.route('/api/nidaq/monitor')
+    def _api_nidaq_monitor():
+        from yb_analysis import config as _cfg
+        if not _nidaq_monitor_open():
+            return jsonify({'ok': False, 'disabled': True,
+                            'error': 'NI DAC monitor is disabled (YB_NIDAQ_MONITOR=0).'}), 403
+
+        now = time.monotonic()
+        # Defer while a scan is running: the run owns Dev1's AO subsystem, so a
+        # monitor read would fail (and the task open could disturb the live run).
+        # Return the last good reading (if any) flagged paused.
+        try:
+            q = _read_queue_data()
+            running = bool(q and q.get('running') and q['running'].get('id') is not None)
+        except Exception:  # noqa: BLE001
+            running = False
+        if running:
+            cached = _NIDAQ_CACHE.get('data')
+            payload = dict(cached) if isinstance(cached, dict) else {'ok': True, 'channels': []}
+            payload.update({'ok': True, 'paused': True,
+                            'reason': 'a scan is running -- monitor paused',
+                            'age_s': (now - _NIDAQ_CACHE['ts']) if cached else None})
+            return jsonify(_to_jsonable(payload))
+
+        # Serve a fresh-enough cache without re-spawning (the poll is ~every few
+        # seconds; the subprocess costs ~1-2 s of engine-python startup).
+        cached = _NIDAQ_CACHE.get('data')
+        if cached is not None and (now - _NIDAQ_CACHE['ts']) < _NIDAQ_CACHE_TTL_S:
+            return jsonify(_to_jsonable(dict(cached, cached=True,
+                                             age_s=now - _NIDAQ_CACHE['ts'])))
+
+        py = getattr(_cfg, 'PYCTRL_PYTHON', None)
+        root = getattr(_cfg, 'PYCTRL_CWD', '') or ''
+        driver = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                               'control', 'ni_monitor_driver.py')
+        if not py or not _os.path.exists(py) or not _os.path.exists(driver) or not root:
+            return jsonify({'ok': False,
+                            'error': 'engine python or NI monitor driver not found'}), 500
+
+        # One reader at a time (the hardware is single-owner). If another request
+        # is mid-spawn, fall through to whatever it just cached.
+        with _NIDAQ_LOCK:
+            now = time.monotonic()
+            cached = _NIDAQ_CACHE.get('data')
+            if cached is not None and (now - _NIDAQ_CACHE['ts']) < _NIDAQ_CACHE_TTL_S:
+                return jsonify(_to_jsonable(dict(cached, cached=True,
+                                                 age_s=now - _NIDAQ_CACHE['ts'])))
+            try:
+                proc = subprocess.run([py, driver, '--pyctrl-root', root],
+                                      capture_output=True, text=True, timeout=20)
+            except Exception as ex:  # noqa: BLE001
+                return jsonify({'ok': False, 'error': 'driver spawn failed: %s' % ex}), 500
+            result = _parse_nidaq_result(proc.stdout or '')
+            if result is None:
+                return jsonify({'ok': False,
+                                'error': 'NI monitor driver produced no result',
+                                'stderr': (proc.stderr or '')[-1500:]}), 500
+            if result.get('ok'):
+                _NIDAQ_CACHE['data'] = result
+                _NIDAQ_CACHE['ts'] = time.monotonic()
+            return jsonify(_to_jsonable(result)), (200 if result.get('ok') else 500)
+
+    # -- NI DAC channel WRITE (one-off DC set; the proper setV-style convention) --
+    @server.route('/api/nidaq/set', methods=['POST'])
+    def _api_nidaq_set():
+        from flask import request
+        from yb_analysis import config as _cfg
+        if not _nidaq_write_open():
+            return jsonify({'ok': False, 'disabled': True,
+                            'error': 'NI DAC write is disabled (YB_NIDAQ_WRITES=0).'}), 403
+        body = request.get_json(force=True, silent=True) or {}
+        channel = body.get('channel')
+        if not channel or body.get('voltage') is None:
+            return jsonify({'ok': False, 'error': 'need channel, voltage (volts)'}), 400
+        try:
+            v = float(body.get('voltage'))
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'voltage must be a number'}), 400
+        if not (-10.0 <= v <= 10.0):
+            return jsonify({'ok': False, 'error': 'voltage %g out of +-10 V' % v}), 400
+
+        # Defer while a scan is running: the run owns Dev1's AO subsystem, so an
+        # out-of-band write would fight/perturb it (same guard as the monitor read).
+        try:
+            q = _read_queue_data()
+            running = bool(q and q.get('running') and q['running'].get('id') is not None)
+        except Exception:  # noqa: BLE001
+            running = False
+        if running:
+            return jsonify({'ok': False, 'paused': True,
+                            'reason': 'a scan is running -- NI write deferred'}), 503
+
+        py = getattr(_cfg, 'PYCTRL_PYTHON', None)
+        root = getattr(_cfg, 'PYCTRL_CWD', '') or ''
+        driver = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                               'control', 'ni_set_driver.py')
+        if not py or not _os.path.exists(py) or not _os.path.exists(driver) or not root:
+            return jsonify({'ok': False, 'error': 'engine python or NI set driver not found'}), 500
+
+        # One card owner at a time -- share the monitor's lock so a write and a
+        # monitor read never open Dev1 concurrently.
+        with _NIDAQ_LOCK:
+            try:
+                proc = subprocess.run(
+                    [py, driver, '--pyctrl-root', root, '--channel', str(channel),
+                     '--voltage', repr(v), '--readback'],
+                    capture_output=True, text=True, timeout=20)
+            except Exception as ex:  # noqa: BLE001
+                return jsonify({'ok': False, 'error': 'driver spawn failed: %s' % ex}), 500
+            result = _parse_nidaq_write_result(proc.stdout or '')
+            if result is None:
+                return jsonify({'ok': False,
+                                'error': 'NI set driver produced no result',
+                                'stderr': (proc.stderr or '')[-1500:]}), 500
+            if result.get('ok'):
+                _NIDAQ_CACHE['ts'] = 0.0     # invalidate read cache -> next monitor refreshes
+            return jsonify(_to_jsonable(result)), (200 if result.get('ok') else 500)
+
+
+def _parse_nidaq_result(stdout):
+    """Pull the single ``NI_MONITOR_RESULT:{json}`` line from the driver's stdout."""
+    prefix = 'NI_MONITOR_RESULT:'
+    for line in (stdout or '').splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            try:
+                return json.loads(line[len(prefix):])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _parse_nidaq_write_result(stdout):
+    """Pull the single ``NI_WRITE_RESULT:{json}`` line from the set driver's stdout."""
+    prefix = 'NI_WRITE_RESULT:'
+    for line in (stdout or '').splitlines():
+        line = line.strip()
+        if line.startswith(prefix):
+            try:
+                return json.loads(line[len(prefix):])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+# ===========================================================================
 # Phase 4 main HTML dashboard (served at /)
 # ===========================================================================
 
@@ -2864,6 +3730,9 @@ def _register_main_html_routes(server):
         return tmpl.render(
             static_url='/static/dashboard/',
             slm_url=yb_cfg.SLM_URL,
+            scope_url=yb_cfg.SCOPE_URL,
+            monitor_url=yb_cfg.MONITOR_URL,
+            molecube_web_url=yb_cfg.MOLECUBE_WEB_URL,
             cache_bust=str(int(_time.time())),
             plotly_local_url='/vendor/plotly.min.js',
         )
@@ -3185,6 +4054,16 @@ def _build_app():
     # Lets external clients (e.g. the SLM server) poll experiment state over
     # the LAN. All GET, no writes. Bound to the same port as the dashboard.
     _register_api_routes(app.server)
+
+    # ---- Molecube (FPGA1 DDS/TTL/clock) control API -- MASTER-GATED ----
+    # All /api/molecube/* routes are closed by default (HTTP 403); see the
+    # MASTER GATE banner above _register_molecube_routes to enable.
+    _register_molecube_routes(app.server)
+
+    # ---- NI DAC channel monitor (read-only; NOT via molecube) ----------
+    # /api/nidaq/monitor reads the PCIe-6738's internal AO monitors via the
+    # engine-venv driver. Shown in the Hardware/Molecube sub-view.
+    _register_nidaq_routes(app.server)
 
     # ---- New SLM-styled HTML dashboard at / (Phase 4) -----------------
     _register_main_html_routes(app.server)
@@ -3595,7 +4474,12 @@ new MutationObserver(function(mutations) {
             n_acc = d.get('n_accum_shots', 0)
 
             num_images = int(d.get('num_images', 1) or 1)
-            img2_no_data_msg = ('No image 2 (NumImages = 1)' if num_images < 2
+            # Failing-shot DISPLAY-ONLY frames (control_panel._dispatch_failing_batch): img1 (and
+            # img2 if captured) flash by so the view isn't frozen, while the shot-health chip stays
+            # red. img2 absent on a failing shot => an explicit "failing shot" no-data message.
+            is_failing = bool(d.get('_failing_mode'))
+            img2_no_data_msg = ('No image 2 — failing shot' if is_failing
+                                else 'No image 2 (NumImages = 1)' if num_images < 2
                                 else 'Waiting for data...')
             img_mid_no_data_msg = ('No middle frame (NumImages < 3)'
                                    if num_images < 3 else 'Waiting for data...')
@@ -3613,8 +4497,13 @@ new MutationObserver(function(mutations) {
             def _stale(title, builder):
                 return _waiting(title, dummy_msg) if is_dummy else builder()
 
+            img1_title = ('Tweezer Array (img 1) — failing shot' if is_failing
+                          else 'Tweezer Array (img 1)')
+            img2_title = ('Tweezer Array (img 2) — failing shot' if is_failing
+                          else 'Tweezer Array (img 2)')
             figs = [
-                _fig_array(d) if has_img else _waiting('Tweezer Array (img 1)'),
+                _fig_array(d, title=img1_title) if has_img
+                    else _waiting('Tweezer Array (img 1)'),
                 _fig_array(d, img_key='_img_mid_data_uri',
                            shape_key='_img_mid_shape',
                            vlo_key='_img_mid_vlo', vhi_key='_img_mid_vhi',
@@ -3626,7 +4515,7 @@ new MutationObserver(function(mutations) {
                 _fig_array(d, img_key='_img2_data_uri', shape_key='_img2_shape',
                            vlo_key='_img2_vlo', vhi_key='_img2_vhi',
                            logicals_key='logicals2', grid_key=img2_grid_key,
-                           title='Tweezer Array (img 2)')
+                           title=img2_title)
                     if has_img2 else _waiting('Tweezer Array (img 2)',
                                               img2_no_data_msg),
                 _fig_intens(d),
@@ -4060,7 +4949,11 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
                title='Tweezer Array (img 1)'):
     data_uri = d.get(img_key)
     shape = d.get(shape_key)
-    if data_uri is None or shape is None:
+    # Only bake a layout image for a well-formed data URI. An empty/malformed
+    # value would render as the browser's broken-image glyph in the panel;
+    # fall back to the clean "Waiting for data..." placeholder instead.
+    if (not data_uri or not isinstance(data_uri, str)
+            or not data_uri.startswith('data:') or shape is None):
         return _waiting(title)
     H, W = shape
     fig = go.Figure()
@@ -4080,11 +4973,13 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
         hoverinfo='skip', showlegend=False))
 
     # Site occupancy overlay (green = loaded, red = empty).
+    # Suppressed on failing shots: the logicals are unreliable / absent and
+    # overlays on a red-state frame mislead more than they help.
     grid = d.get(grid_key)
     logicals = d.get(logicals_key)
     box = d.get('box_size', 11)
     n = len(grid) if grid is not None else 0
-    if grid is not None and n > 0:
+    if grid is not None and n > 0 and not d.get('_failing_mode'):
         if logicals is not None and len(logicals) >= n:
             occ = np.asarray(logicals[:n], dtype=float)
         else:
@@ -4296,7 +5191,7 @@ def _fig_infid(d, marker_size=12):
     customdata = np.column_stack([np.arange(1, n + 1), np.asarray(inf)])
     fig = go.Figure(go.Scattergl(
         x=grid[:,1], y=grid[:,0], mode=mode,
-        marker=dict(size=sz, color=log_inf.tolist(), colorscale='Magma_r', cmin=-4, cmax=-0.3,
+        marker=dict(size=sz, color=log_inf.tolist(), colorscale='Magma', cmin=-4, cmax=-0.3,
                     colorbar=dict(title='log10', len=0.9), line=dict(width=0.5, color='white')),
         text=text, textfont=tfont, textposition='middle center',
         customdata=customdata,
@@ -4590,6 +5485,21 @@ def _fig_avghist(d):
     _add_avg_fit_curve(fig, d.get('live_gauss_fits'), '#44aaff', 'Live fit', faint=False)
     # Live bars
     _add_avg_bars(fig, d.get('live_hist_data'), d.get('n_accum_shots', 0))
+    # Faint average-threshold marker — the mean of the per-site detection
+    # thresholds currently in use. Drawn faint so it's clear but doesn't
+    # compete with the bars/fits.
+    thr = d.get('thresholds')
+    if thr is not None:
+        t = np.asarray(thr, dtype=float)
+        t = t[np.isfinite(t)]
+        if t.size:
+            mthr = float(np.mean(t))
+            fig.add_vline(x=mthr, line_width=1, line_dash='dash',
+                          line_color='#d29922', opacity=0.35,
+                          annotation_text=f'avg thr {mthr:.0f}',
+                          annotation_position='top right',
+                          annotation_font_size=9, annotation_font_color='#d29922',
+                          annotation_opacity=0.6)
     fig.update_layout(**_L, title='Avg Histogram', barmode='overlay',
                       xaxis=dict(title='Intensity', **_A), yaxis=dict(title='Density', **_A),
                       legend=dict(x=0.5, y=0.99, bgcolor='rgba(0,0,0,0.3)', font=dict(size=8)))

@@ -39,6 +39,11 @@ from yb_analysis.config import VALID_BACKENDS
 
 logger = logging.getLogger(__name__)
 
+# Sentinel scan_id for FAILING-shot frames the backend publishes for LIVE DISPLAY ONLY (never
+# persisted / accumulated). Distinct from dummy mode's -1 so the view can label them "failing"
+# rather than "dummy". MUST match pyctrl/YbExptCtrl/rearrange_runtime.py FAILING_DISPLAY_SCAN_ID.
+FAILING_DISPLAY_SCAN_ID = -2
+
 
 def _monitor_logfile():
     """Timestamped logfile for a windowless 'Restart All' respawn.
@@ -159,7 +164,7 @@ class ControlPanel(tk.Tk):
         self._backend_runner = backend_runner
         self._cur_scan_id = 0
         self._cur_seq_id = 0
-        self._refresh_ms = 2000
+        self._refresh_ms = 500
         self._running = True
         # True from an Abort press until the scan actually stops; drives the
         # _ABORT_HINT status so the per-sequence abort latency is visible.
@@ -173,6 +178,11 @@ class ControlPanel(tk.Tk):
             'available': False, 'name': '', 'file_id': '',
             'fallback_active': False,
         }
+        # Last per-shot health rollup from the (pyctrl) backend, refreshed in
+        # the background poll and republished for the web dashboard's "shots
+        # failing" banner. None until first fetched / when the backend lacks
+        # the verb (MATLAB).
+        self._shot_health = None
         # Reference to the last real-scan DataManager. Dummy frames borrow
         # its plot-data dict so the dashboard can show the live frame without
         # mutating the real DM's internal state or its save buffers.
@@ -319,8 +329,9 @@ class ControlPanel(tk.Tk):
         rf = ttk.Frame(gi)
         rf.grid(row=4, column=0, columnspan=2, sticky='w', pady=(4, 0))
         ttk.Label(rf, text='Refresh (s):', font=_FONT_SM).pack(side='left')
-        self._rate_entry = ttk.Entry(rf, width=3, font=_FONT_SM)
-        self._rate_entry.insert(0, str(self._refresh_ms // 1000))
+        self._rate_entry = ttk.Entry(rf, width=4, font=_FONT_SM)
+        # Display in seconds; %g shows "0.5" / "2" without trailing zeros.
+        self._rate_entry.insert(0, '%g' % (self._refresh_ms / 1000))
         self._rate_entry.pack(side='left', padx=4)
         self._rate_entry.bind('<Return>', self._on_rate)
 
@@ -648,8 +659,8 @@ class ControlPanel(tk.Tk):
 
     def _on_rate(self, _=None):
         try:
-            v = int(self._rate_entry.get())
-            self._refresh_ms = max(500, v * 1000)
+            v = float(self._rate_entry.get())
+            self._refresh_ms = max(500, int(round(v * 1000)))
         except ValueError:
             pass
 
@@ -778,12 +789,19 @@ class ControlPanel(tk.Tk):
                     foreground=_STATUS_COLORS.get(status, '#000000'))
                 self._publish_ctrl_status(status)
             else:
-                s = _STATUS.get(self._client.get_status(), 'Unknown')
-                s = self._apply_abort_hint(s)
-                self._lbl_status.config(
-                    text=f'Status: {s}',
-                    foreground=_STATUS_COLORS.get(s, '#000000'))
-                self._publish_ctrl_status(s)
+                # pyctrl backend: get_status() is a BLOCKING ZMQ round-trip. If
+                # the backend is dead it blocks for the full client timeout
+                # (~30 s). Running it on the Tk main thread would freeze the
+                # WHOLE UI for that whole time -- buttons AND _poll_web_control_loop
+                # (the web-command drain), so the operator could not even click
+                # "Restart All" to recover (exactly the wedge that stranded a dead
+                # backend). Offload to a daemon thread and marshal the label
+                # update back via after(0, ...). The busy guard means a slow/hung
+                # call can't pile up one worker thread per 1 s tick.
+                if not getattr(self, '_status_poll_busy', False):
+                    self._status_poll_busy = True
+                    threading.Thread(target=self._poll_status_pyctrl_async,
+                                     daemon=True).start()
         except Exception:
             pass
         # Refresh the cached-last-seq label in the background. Throttled to
@@ -795,7 +813,42 @@ class ControlPanel(tk.Tk):
                              daemon=True).start()
         self.after(1000, self._poll_status)
 
+    def _poll_status_pyctrl_async(self):
+        """Off-main-thread status fetch for the pyctrl backend (see _poll_status).
+
+        Runs the blocking get_status() ZMQ call in a daemon thread so the Tk
+        main loop stays responsive even when the backend is unreachable, then
+        marshals the label/web-mirror update back onto the main thread. A dead
+        backend simply shows 'Unknown' and the rest of the UI keeps working --
+        crucially the web/local Restart All, which needs no backend at all."""
+        try:
+            s = _STATUS.get(self._client.get_status(), 'Unknown')
+        except Exception:
+            s = 'Unknown'   # backend unreachable -> keep the UI alive
+        finally:
+            self._status_poll_busy = False
+
+        def _apply():
+            if not self._running:
+                return
+            s2 = self._apply_abort_hint(s)
+            self._lbl_status.config(
+                text=f'Status: {s2}',
+                foreground=_STATUS_COLORS.get(s2, '#000000'))
+            self._publish_ctrl_status(s2)
+        try:
+            self.after(0, _apply)
+        except Exception:
+            pass
+
     def _refresh_last_seq_async(self):
+        # Per-shot health for the web "shots failing" banner. Cheap; pulled on
+        # the same throttled background tick as last_seq. None (MATLAB backend /
+        # wire error) just leaves the banner cleared.
+        try:
+            self._shot_health = self._client.shot_health()
+        except Exception:
+            self._shot_health = None
         try:
             meta = self._client.last_seq_status()
         except Exception:
@@ -816,6 +869,8 @@ class ControlPanel(tk.Tk):
                 'seq_id': self._cur_seq_id,
                 'state': status,
                 'backend': self._backend,
+                'shot_health': (dict(self._shot_health)
+                                if isinstance(self._shot_health, dict) else None),
             })
         except Exception:
             pass
@@ -925,9 +980,13 @@ class ControlPanel(tk.Tk):
                                    'seq_ids': seq_ids[start:end]})
                 dm.process_data()
                 dm.update_data()
-                if self._dashboard:
-                    self._dashboard.update(dm.get_plot_data())
-                self.after(0, self._init_pane.set_is_init_scan, dm.is_init)
+                # Persist to disk FIRST, then update the live display. Saving
+                # must never depend on the display path: a downstream
+                # get_plot_data() error (e.g. the cross-grid survival-series
+                # crash) previously aborted this cycle BEFORE save_data ran,
+                # so shots were dropped from the .h5 AND the live view froze /
+                # lagged behind the backend. The display update is also isolated
+                # so one bad frame can't starve the save or stall the loop.
                 fname = ''
                 save_err = ''
                 try:
@@ -936,12 +995,25 @@ class ControlPanel(tk.Tk):
                     save_err = f'Save failed: {e}'
                     logger.error('save_data() failed for scan %d: %s',
                                  cur_scan, e)
+                if self._dashboard:
+                    try:
+                        self._dashboard.update(dm.get_plot_data())
+                    except Exception as e:
+                        logger.error('dashboard update failed for scan %d: %s',
+                                     cur_scan, e)
+                self.after(0, self._init_pane.set_is_init_scan, dm.is_init)
                 self._cur_scan_id = cur_scan
                 self._cur_seq_id = int(seq_ids[-1])
                 # Track this DM so dummy frames (cur_scan < 0) can borrow its
                 # plot context. Updated only on real saves.
                 self._last_real_dm = dm
                 self.after(0, self._update_labels, fname, save_err)
+            elif cur_scan == FAILING_DISPLAY_SCAN_ID:
+                # Failing-shot frames published for DISPLAY ONLY (backend's
+                # publish_failed_shot): the shot couldn't form a real pair, but
+                # show img1 (+ img2 or "no data") so the live view keeps flashing
+                # while the shot-health chip stays "failing". No save, no accum.
+                self._dispatch_failing_batch(imgs[start:end], seq_ids[start:end])
             elif cur_scan < 0:
                 # Dummy-mode frames: scan_id was set to -1 by SequenceRunner
                 # before replaying the cached last seq. Suppress disk save and
@@ -1008,6 +1080,68 @@ class ControlPanel(tk.Tk):
             self._dashboard.update(data)
         except Exception:
             logger.error('dummy dispatch error:\n%s', traceback.format_exc())
+
+    def _dispatch_failing_batch(self, batch_imgs, batch_seq_ids):
+        """Display a FAILING shot's captured frames without persisting anything.
+
+        A failing rearrange shot can't form a real (img1, img2) pair, but we still flash whatever
+        it captured so the operator sees activity instead of a frozen view: img1 always; img2 if it
+        was captured, otherwise the array-2 panel shows "no data". Detection boxes use the last real
+        DM's grid/thresholds when one exists (else the bare frame is shown). Cumulative panels carry
+        over the last real scan's values -- the red shot-health chip already signals "failing".
+        Nothing is appended to save buffers and no HDF5 write happens.
+
+        Mirrors ``_dispatch_dummy_batch`` but (a) shows the SECOND frame too and (b) tags
+        ``_failing_mode`` (not ``_dummy_mode``) so the dashboard labels it correctly. Unlike the
+        dummy path it does NOT bail when no real DM exists yet -- a run that fails from its very
+        first shot must still flash its frames (just without detection boxes)."""
+        if not self._dashboard or not batch_imgs:
+            return
+        try:
+            latest = batch_imgs[-1]
+            # entries are (H, W, n_imgs_per_seq): img1 = [..., 0]; img2 = [..., 1] if captured.
+            if getattr(latest, 'ndim', 0) == 3 and latest.shape[2] >= 1:
+                img1 = latest[:, :, 0]
+                img2 = latest[:, :, 1] if latest.shape[2] >= 2 else None
+            else:
+                img1, img2 = latest, None
+            img1_f = img1.astype(np.float64)
+            img2_f = img2.astype(np.float64) if img2 is not None else None
+
+            dm = self._last_real_dm
+            data = dict(dm.get_plot_data()) if dm is not None else {}
+            data['cur_image'] = img1_f
+            # cur_image2 only when img2 was actually captured; None -> "no data" in the array-2 panel
+            # (don't let the last real img2 linger as if it were this shot's).
+            data['cur_image2'] = img2_f
+            if dm is not None and dm.num_sites > 0 and len(dm.grid_locations) > 0:
+                from yb_analysis.detection.detect_atom import detect_atom
+                logicals, intensities = detect_atom(
+                    img1_f, dm.grid_locations, dm.thresholds, dm.mask_mat)
+                data['cur_intensities'] = intensities
+                data['logicals'] = logicals
+                record_loading(logicals)
+                if img2_f is not None:
+                    logicals2, intensities2 = detect_atom(
+                        img2_f, dm.grid_locations, dm.thresholds, dm.mask_mat)
+                    data['cur_intensities2'] = intensities2
+                    data['logicals2'] = logicals2
+                else:
+                    data.pop('logicals2', None)
+                    data.pop('cur_intensities2', None)
+            else:
+                # No grid yet -> show the bare frame(s), no boxes.
+                data['cur_intensities'] = None
+                data['logicals'] = None
+                data.pop('logicals2', None)
+                data.pop('cur_intensities2', None)
+            data['loading_history'] = get_loading_history()
+            # Flag so the dashboard labels the image panels "failing shot" and the (frozen)
+            # cumulative panels aren't mistaken for this shot's data.
+            data['_failing_mode'] = True
+            self._dashboard.update(data)
+        except Exception:
+            logger.error('failing dispatch error:\n%s', traceback.format_exc())
 
     def _update_labels(self, fname='', save_err=''):
         from yb_analysis.config import PATH_PREFIX

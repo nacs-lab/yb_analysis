@@ -70,6 +70,10 @@ def _validate_handrolled(desc: Mapping[str, Any]) -> None:
         raise DescriptorError(
             f"label must be a string, got {type(desc['label']).__name__}")
 
+    if 'description' in desc and not isinstance(desc['description'], str):
+        raise DescriptorError(
+            f"description must be a string, got {type(desc['description']).__name__}")
+
     if 'code_snapshot' in desc:
         _check_code_snapshot(desc['code_snapshot'])
 

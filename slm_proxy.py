@@ -184,13 +184,27 @@ class SlmProxy:
             snapshot['last_error_ts'] = dict(self._state['last_error_ts'])
             snapshot['last_error_msg'] = dict(self._state['last_error_msg'])
         tmp = SLM_DATA_FILE + '.tmp'
-        try:
-            with self._write_lock:
+        import time as _t
+        with self._write_lock:
+            try:
                 with open(tmp, 'wb') as f:
                     pickle.dump(snapshot, f, protocol=pickle.HIGHEST_PROTOCOL)
-                os.replace(tmp, SLM_DATA_FILE)
-        except OSError as e:
-            logger.warning('SLM proxy pickle write failed: %s', e)
+            except OSError as e:
+                logger.warning('SLM proxy pickle write failed: %s', e)
+                return
+            # os.replace hits WinError 5/32 (access denied / in use) when the
+            # Dash reader momentarily holds the dest open. The reader's open is
+            # brief, so retry instead of dropping the update -- otherwise the
+            # SLM hardware row goes stale on every read collision.
+            last = None
+            for _attempt in range(5):
+                try:
+                    os.replace(tmp, SLM_DATA_FILE)
+                    return
+                except OSError as e:
+                    last = e
+                    _t.sleep(0.02)
+            logger.warning('SLM proxy pickle write failed after retries: %s', last)
 
 
 def _read_slm_data():

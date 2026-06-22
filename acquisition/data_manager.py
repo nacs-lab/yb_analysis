@@ -7,9 +7,11 @@ State model (3 layers):
 """
 
 import os
+import time
 import logging
 import threading
 import collections
+import warnings
 import numpy as np
 
 from yb_analysis.config import (
@@ -19,8 +21,15 @@ from yb_analysis.config import (
     AFFINE_LIVE_INTERVAL, AFFINE_LIVE_BATCH, AFFINE_LIVE_SEARCH_RANGE,
     AFFINE_LIVE_EMA, THRES_LIVE_INTERVAL, THRES_LIVE_WINDOW,
     THRES_LIVE_EMA, THRES_LIVE_MIN_PER_SIDE,
+    THRES_FIT_MIN_SEP_ABS, THRES_FIT_MIN_SEP_SIGMA, THRES_FIT_MIN_SEP_FRAC,
+    THRES_FIT_MIN_LOADING, THRES_LIVE_VALLEY_MARGIN, THRES_LOADED_MAX_SPREAD,
+    THRES_ACCUM_CROSS_RUN_WINDOW_S, THRES_ACCUM_CROSS_RUN_MAX,
+    BLANK_FRAME_FLOOR, THRES_FIT_MAX_BLANK_FRAC, THRES_FIT_MAX_SHOTS,
+    HIST_DISPLAY_CLIP_PCT,
+    IMG2_SHAPE_MODEL_VARIANT,
 )
 from yb_analysis.detection.detect_atom import detect_atom
+from yb_analysis.detection import spot_shape_model as ssm
 from yb_analysis.detection.scan_analysis import (
     extract_scan_params, extract_scan_params_h5, extract_scan_name,
     extract_scan_dims, extract_scan_dims_h5, compute_scan_curve,
@@ -69,6 +78,56 @@ def get_loading_history():
     """Snapshot of the persistent loading-rate history as a 1-D array."""
     with _loading_history_lock:
         return np.array(_loading_history, dtype=float) if _loading_history else None
+
+
+# --- Cross-run threshold accumulation (in-memory, per loading pattern) ---------
+# A DataManager (and its frame-0 intensity buffer) is recreated per scan_id, so a
+# short run never reaches the 200-shot full Gaussian refit. To let the full fit
+# fire over SEVERAL short runs of the SAME pattern, carry recent frame-0 intensity
+# vectors at module scope, keyed by pattern name, age-windowed to
+# THRES_ACCUM_CROSS_RUN_WINDOW_S. Lost on process restart (acceptable). Each holder:
+#   {'entries': deque[(ts, vec)], 'n_since_attempt': int, 'num_sites': int}
+_pattern_accum = {}
+_pattern_accum_lock = threading.Lock()
+
+
+def _get_pattern_accum(name, num_sites):
+    """Return the cross-run accumulator for ``name`` (reset if its site count
+    changed, e.g. a different grid). None name -> None."""
+    if not name:
+        return None
+    with _pattern_accum_lock:
+        pa = _pattern_accum.get(name)
+        if pa is None or pa['num_sites'] != int(num_sites):
+            pa = {'entries': collections.deque(), 'n_since_attempt': 0,
+                  'num_sites': int(num_sites)}
+            _pattern_accum[name] = pa
+        return pa
+
+
+def _is_blank_intensities(intensities):
+    """True if a shot is a blank / dropped frame — every masked-site intensity is
+    essentially zero (the camera/ZMQ returned no real frame). Real frames always sit
+    on the camera pedestal, far above BLANK_FRAME_FLOOR, so this never rejects a
+    legitimately-empty atom shot. Such frames must be kept out of the threshold-fit
+    accumulators and the per-site histograms (see BLANK_FRAME_FLOOR)."""
+    arr = np.asarray(intensities)
+    if arr.size == 0:
+        return True
+    mx = np.nanmax(arr)
+    return not np.isfinite(mx) or float(mx) < BLANK_FRAME_FLOOR
+
+
+def _prune_pattern_accum(pa, now):
+    """Drop entries older than the cross-run window and cap the deque length."""
+    if pa is None:
+        return
+    cutoff = now - THRES_ACCUM_CROSS_RUN_WINDOW_S
+    entries = pa['entries']
+    while entries and entries[0][0] < cutoff:
+        entries.popleft()
+    while len(entries) > THRES_ACCUM_CROSS_RUN_MAX:
+        entries.popleft()
 
 
 def get_data_manager(scan_id):
@@ -125,6 +184,26 @@ def _scalar(val, default=0):
     if isinstance(val, np.ndarray):
         return float(val.flat[0])
     return float(val) if val is not None else default
+
+
+def _scalar_or_none(val):
+    """Like _scalar but returns None (not 0) when the value is absent/empty."""
+    try:
+        if val is None:
+            return None
+        if isinstance(val, np.ndarray):
+            if val.size == 0:
+                return None
+            return float(val.flat[0])
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _now_iso():
+    """Local ISO timestamp (ms precision) for threshold-health stamping."""
+    from datetime import datetime
+    return datetime.now().isoformat(timespec='milliseconds')
 
 
 def _mat_str(val):
@@ -208,6 +287,33 @@ class DataManager:
         self.loaded_hist_data_img2 = None
         self.loading_rates_img2 = None
         self.log_buffer_img2 = None
+        # img2 INDEPENDENT threshold refit (loading-pattern affine migration):
+        # when img2 is a DISTINCT loading pattern from img1, it gets its OWN
+        # live Gaussian refit on the final-frame intensities. (When both frames
+        # share the loading pattern, img2 keeps sharing img1's single refit via
+        # _effective_thresholds — unchanged.) Same degenerate-fit guard as img1;
+        # between full fits img2 HOLDS the last accepted fit (no cheap inter-fit
+        # drift tracker — a post-protocol frame has no tracking need and holding
+        # is strictly safe). Refined thresholds save back to img2's per-pattern
+        # store, so it self-calibrates per pattern just like img1.
+        self.live_thresholds_img2 = None
+        self.live_infidelities_img2 = None
+        self.live_gauss_fits_img2 = None
+        self.live_hist_data_img2 = None
+        self._intensity_accum_img2 = []
+        self._img_cnt_refit_img2 = 0
+        self._thr_has_accepted_fit_img2 = False
+        self._threshold_health_img2 = {'state': 'init', 'reason': '',
+                                       'source': None, 'spread': None,
+                                       'updated_iso': None}
+        # img2 spot-shape GMM detector: when active, img2 logicals come from the
+        # model (not the intensity threshold) and each carries a per-site
+        # posterior "% certainty". Resolved in _resolve_img2_model() once the
+        # grid is known; None -> img2 falls back to threshold detection.
+        self._img2_model = None
+        self._img2_logicals_source = None   # provenance tag stored in the HDF5
+        self._display_proba2 = None         # last img2 per-site posterior (display)
+        self._proba_img2_to_save = []       # per-(is_last)-frame posteriors, for HDF5
         box_size = int(_scalar(self.config.get('boxSize', 11)))
         mask_sigma = float(_scalar(self.config.get('maskSigma', 2.0)))
         self.mask_mat = _gaussian_mask(box_size, mask_sigma)
@@ -251,12 +357,25 @@ class DataManager:
         self._img_cnt_loading = 0
         self._img_cnt_affine = 0            # counts toward the live affine (position) update
         self._img_cnt_thres_live = 0        # counts toward the cheap threshold EWMA update
+        self._blank_shot_count = 0          # whole-frame ~0 (dropped) shots skipped this scan
         self._seq_total = 0                 # cumulative completed seqs this run (= shot stamp)
         # Frame-drop safety: sequences the camera/compute stall delivered with
         # != pSeq frames. We drop them whole (see store_new_data) so they can't
         # phase-flip the img1/img2 parity demux for the rest of the run.
         self._dropped_seqs = 0              # count of incomplete sequences dropped
         self._dropped_seq_ids = []          # their seq_ids (for diagnostics)
+        # ZMQ delivery gap tracking: detects seq_ids that were never received
+        # (lost when a grab_imgs() timeout races a large server buffer drain).
+        self._seq_ids_max_seen = 0          # highest seq_id received this scan
+        self._seq_gap_count = 0             # total shots inferred missing
+        self._seq_gap_ids = []              # first <=200 missing seq_ids
+        # HDF5 save health surfaced to the dashboard (see get_plot_data). The
+        # save runs in a daemon thread; if append_block ultimately fails (e.g. a
+        # OneDrive lock that outlasts the retries) we record it here instead of
+        # letting the thread die silently, so the Live view turns red.
+        self._save_health = {'state': 'ok', 'reason': '', 'lost_seqs': 0,
+                             'lost_seq_ids': [], 'last_error': '',
+                             'updated_iso': None}
         self._hist_version = 0              # incremented on each Gaussian refit
         self._hist_rep_sites = self._pick_rep_sites()
         # Live self-calibration helpers (loading-pattern scans). Placement ratio
@@ -264,7 +383,75 @@ class DataManager:
         # Gaussian fit; the cheap inter-fit threshold tracker keeps the threshold
         # at this ratio between the (drifting) empty/atom population means.
         self._thr_place_ratio = None        # (num_sites,) or None -> default 0.5
+        # Structural guard state. Valley clamp band [lo, hi] per site comes from
+        # the last ACCEPTED full fit; the cheap tracker keeps each threshold inside
+        # it so a drift can never climb onto/past a peak. None until an accepted fit
+        # exists (this session or carried in via the cross-run accumulator).
+        self._thr_clamp_lo = None
+        self._thr_clamp_hi = None
+        self._thr_fit_anchor = None          # last full-fit thresholds: the FIXED
+                                             # cut the cheap tracker shifts (no ratchet)
+        self._thr_fit_med_below = None       # fit-window medians below/above the cut
+        self._thr_fit_med_above = None       # (same estimator the cheap tracker uses;
+                                             # cheap shifts the cut by their drift)
+        self._thr_has_accepted_fit = False   # gate for the cheap refit (need an anchor)
+        # Detection-threshold health surfaced to the dashboard (see get_plot_data).
+        self._threshold_health = {'state': 'init', 'reason': '', 'source': None,
+                                  'spread': None, 'updated_iso': None}
+        # Cross-run accumulation: the frame-0 (loading) pattern name this run
+        # contributes its intensities to, plus the active loading defocus (display).
+        self._accum_pattern_name = self._pattern_names.get(0)
+        self._active_defocus = _scalar_or_none(self.config.get('loadingDefocus'))
         self._affine_update_running = False  # guard: one background affine thread at a time
+
+        # Seed the frame-0 intensity buffer from the SAME pattern's recent shots
+        # (other short runs within the cross-run window) so the 200-shot full fit
+        # can fire across runs, not just within one. Carry the shots-since-attempt
+        # counter so the trigger counts total accumulated shots.
+        if self._accum_pattern_name:
+            pa = _get_pattern_accum(self._accum_pattern_name, self.num_sites)
+            _prune_pattern_accum(pa, time.time())
+            with _pattern_accum_lock:
+                # Drop blank/dropped frames carried over from a prior run — they
+                # would otherwise re-poison the first full fit (a blank-vs-pedestal
+                # toggle read as empty-vs-atom).
+                self._intensity_accum = [v.copy() for _, v in pa['entries']
+                                         if not _is_blank_intensities(v)]
+                self._img_cnt_refit = min(int(pa['n_since_attempt']),
+                                          UPDATE_THRES_INTERVAL)
+            if self._intensity_accum:
+                logger.info('Seeded %d cross-run frame-0 shots for pattern %s '
+                            '(shots-since-attempt=%d)', len(self._intensity_accum),
+                            self._accum_pattern_name, self._img_cnt_refit)
+
+        # Same cross-run seeding for the img2 frame when it is a distinct
+        # loading pattern (so its 200-shot full fit can also fire over several
+        # short runs). Namespaced key — see _img2_accum_key.
+        if self._img2_refit_active():
+            akey = self._img2_accum_key()
+            pa2 = _get_pattern_accum(akey, self.num_sites_img2)
+            _prune_pattern_accum(pa2, time.time())
+            with _pattern_accum_lock:
+                self._intensity_accum_img2 = [v.copy() for _, v in pa2['entries']
+                                              if not _is_blank_intensities(v)]
+                self._img_cnt_refit_img2 = min(int(pa2['n_since_attempt']),
+                                               UPDATE_THRES_INTERVAL)
+            if self._intensity_accum_img2:
+                logger.info('Seeded %d cross-run img2 shots for pattern %s '
+                            '(shots-since-attempt=%d)',
+                            len(self._intensity_accum_img2),
+                            self._img2_pattern_name(), self._img_cnt_refit_img2)
+
+        # On-load sanity of the starting thresholds (degraded store -> loud warn +
+        # hold; healthy store -> prime the cheap-tracker anchor).
+        try:
+            self._validate_loaded_thresholds()
+        except Exception as e:  # noqa: BLE001
+            logger.debug('loaded-threshold validation failed: %s', e)
+
+        # Resolve the img2 spot-shape detector now that the grid is known (so
+        # the provenance tag is ready for create_scan_file below).
+        self._resolve_img2_model()
 
         # --- Buffers ---
         buf_size = max(UPDATE_THRES_BATCH_SIZE, UPDATE_GRID_BATCH_SIZE)
@@ -340,12 +527,16 @@ class DataManager:
         self._save_two_array = (self.is_two_array
                                 and self.num_images_per_seq >= 2
                                 and self.num_sites_img2 > 0)
+        # img2 logicals from the shape model -> persist a per-site certainty
+        # dataset + a provenance tag, but only when we're actually saving img2.
+        img2_src = self._img2_logicals_source if self._save_two_array else None
         if self.num_sites > 0:
             try:
                 create_scan_file(
                     self.fname, self.config, self.frame_size, self.num_sites,
                     two_array=self._save_two_array,
                     num_sites_img2=self.num_sites_img2,
+                    img2_logicals_source=img2_src,
                 )
                 self._file_created = True
             except Exception as e:
@@ -368,6 +559,20 @@ class DataManager:
         self.loaded_hist_data_img2 = None
         self.loading_rates_img2 = None
         self.log_buffer_img2 = None
+        self.live_thresholds_img2 = None
+        self.live_infidelities_img2 = None
+        self.live_gauss_fits_img2 = None
+        self.live_hist_data_img2 = None
+        self._intensity_accum_img2 = []
+        self._img_cnt_refit_img2 = 0
+        self._thr_has_accepted_fit_img2 = False
+        self._threshold_health_img2 = {'state': 'init', 'reason': '',
+                                       'source': None, 'spread': None,
+                                       'updated_iso': None}
+        self._img2_model = None
+        self._img2_logicals_source = None
+        self._display_proba2 = None
+        self._proba_img2_to_save = []
         self._save_two_array = False
         self._display_image = None
         self._display_intensities = None
@@ -381,6 +586,25 @@ class DataManager:
         self._intensity_accum = []
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
+        self._thr_place_ratio = None
+        self._thr_clamp_lo = self._thr_clamp_hi = None
+        self._thr_fit_anchor = None
+        self._thr_fit_med_below = None
+        self._thr_fit_med_above = None
+        self._thr_has_accepted_fit = False
+        self._threshold_health = {'state': 'init', 'reason': '', 'source': None,
+                                  'spread': None, 'updated_iso': None}
+        # HDF5 save health (isInit scans still create the file + save images).
+        self._save_health = {'state': 'ok', 'reason': '', 'lost_seqs': 0,
+                             'lost_seq_ids': [], 'last_error': '',
+                             'updated_iso': None}
+        self._dropped_seqs = 0
+        self._dropped_seq_ids = []
+        self._seq_ids_max_seen = 0
+        self._seq_gap_count = 0
+        self._seq_gap_ids = []
+        self._accum_pattern_name = None
+        self._active_defocus = None
         self._hist_version = 0
         self._hist_rep_sites = []
         self.loading_rates = np.array([])
@@ -410,6 +634,7 @@ class DataManager:
         # NOTE: don't reset self._day_dir — it's set in __init__ before this call
         self.img_buffer = self.log_buffer = None
         self._img_cnt_grid = self._img_cnt_refit = self._img_cnt_loading = 0
+        self._seq_total = 0   # per-run shot stamp (get_plot_data: shots_this_run)
 
     def _load_from_disk(self):
         """Load LOADED state: try day folder first, then scan config."""
@@ -585,6 +810,18 @@ class DataManager:
                 return None
             return zl if any(c != 0.0 for c in zl) else None
 
+        def _planes_list(z):
+            # Axial layer depths (ANSI 2*rho^2-1 radians) for a 3-D pattern.
+            # Unlike a Zernike, z=0 is a meaningful layer depth, so DON'T drop
+            # all-zero; only an empty/absent list means "2-D" -> None.
+            if z is None:
+                return None
+            try:
+                zl = [float(c) for c in _vector(z).tolist()]
+            except Exception:
+                return None
+            return zl if zl else None
+
         raw = cfg.get('imagePatternsJson')
         if raw is not None:
             s = _mat_str(raw)
@@ -606,6 +843,12 @@ class DataManager:
                             'legacy_zerniked': bool(it.get('legacy_zerniked',
                                                            bz is not None)),
                             'baked_zernike': bz,
+                            # OPTIONAL 3-D layer depths; None -> legacy 2-D.
+                            'planes_z_rad': _planes_list(it.get('planes_z_rad')),
+                            # OPTIONAL per-spec extraction-threshold override; None
+                            # -> fall back to the pattern's registry-record value,
+                            # then the 0.30 default (see _build_pattern_grids).
+                            'threshold': it.get('threshold'),
                         }
                 if any(specs):
                     return specs
@@ -616,17 +859,27 @@ class DataManager:
             final_p = _norm(wk.get('final_phase'))
             extras = wk.get('extras') if isinstance(wk.get('extras'), dict) else {}
 
-            def _spec(path, zern):
+            # Optional per-phase (or shared) 3-D layer depths from extras;
+            # absent -> 2-D, unchanged. The actual rearrange-protocol 3-D
+            # wiring lives elsewhere; here we only thread the depths so the
+            # detection grid is derived per-plane when declared.
+            shared_planes = extras.get('planes_z_rad')
+
+            def _spec(path, zern, planes):
                 bz = _zern_list(zern)
                 return {'name': os.path.splitext(os.path.basename(path))[0],
                         'base_phase_path': path, 'zernike': None, 'order': 'col',
-                        'legacy_zerniked': bz is not None, 'baked_zernike': bz}
+                        'legacy_zerniked': bz is not None, 'baked_zernike': bz,
+                        'planes_z_rad': _planes_list(
+                            planes if planes is not None else shared_planes)}
             if init_p:
                 specs = [None] * pSeq
-                specs[0] = _spec(init_p, extras.get('initial_phase_zernike'))
+                specs[0] = _spec(init_p, extras.get('initial_phase_zernike'),
+                                 extras.get('initial_phase_planes_z_rad'))
                 if final_p and pSeq >= 2:
                     specs[pSeq - 1] = _spec(
-                        final_p, extras.get('final_phase_zernike'))
+                        final_p, extras.get('final_phase_zernike'),
+                        extras.get('final_phase_planes_z_rad'))
                 return specs
         return None
 
@@ -682,12 +935,29 @@ class DataManager:
             if not s:
                 continue
             try:
+                # Per-pattern extraction threshold precedence: an explicit per-spec
+                # override (imagePatternsJson "threshold") wins; else the value
+                # stored on the pattern's registry record; else the 0.30 default.
+                # This lets a pattern that needs a higher cut to reject spurious
+                # low-amplitude edge ghosts (e.g. 33x33_uniform_centered_level ->
+                # 0.40, which otherwise leaks 8 phantom spots, 4 off-sensor) carry
+                # that in its registry record WITHOUT every scan having to pass it,
+                # while a scan can still override per-shot. NOTE: this is the
+                # lab-side DETECTION-grid threshold, distinct from the rearrange
+                # server-side warmup_kwargs.derive_threshold (the SLM rearrange grid).
+                _existing = reg.get_pattern(s['name'])
+                _thr = s.get('threshold')
+                if _thr is None and _existing is not None:
+                    _thr = _existing.get('threshold')
+                _thr = 0.30 if _thr is None else float(_thr)
                 rec = reg.fetch_or_refresh_pattern(
                     s['name'], base_phase_path=s['base_phase_path'],
                     default_loading_zernike=s.get('zernike'),
                     order=s.get('order', 'col'),
+                    threshold=_thr,
                     legacy_zerniked=s.get('legacy_zerniked', False),
-                    baked_zernike=s.get('baked_zernike'))
+                    baked_zernike=s.get('baked_zernike'),
+                    planes_z_rad=s.get('planes_z_rad'))
             except Exception as e:
                 logger.warning('pattern %s fetch failed (%s); trying cache',
                                s['name'], e)
@@ -816,6 +1086,13 @@ class DataManager:
                 vals.append(float(a2[t].sum()) / t.size if t.size else None)
                 if t.size:
                     target_aware = True
+            elif a1.shape[0] != a2.shape[0]:
+                # Cross-grid run (init pattern != target pattern): img1 and img2
+                # are detected on DIFFERENT grids, so matched-index per-site
+                # survival (a1 & a2) is undefined and would raise. Leave None
+                # until this shot's diag targets arrive (the target-aware branch
+                # above then fills it with per-shot TP).
+                vals.append(None)
             else:
                 loaded = int(a1.sum())
                 vals.append(float((a1 & a2).sum()) / loaded if loaded > 0 else None)
@@ -975,62 +1252,363 @@ class DataManager:
                 r[s] = float(np.clip((thres[s] - mu_e) / (mu_a - mu_e), 0.0, 1.0))
         return r
 
+    def _valley_clamp_band(self, fits):
+        """Per-site [lo, hi] the cheap tracker must keep each threshold within,
+        from an ACCEPTED full fit: [mu_e + m*sep, mu_a - m*sep] with
+        m = THRES_LIVE_VALLEY_MARGIN. A threshold can then never drift onto or
+        past either peak (the spread-explosion mechanism). Degenerate/failed
+        sites -> (nan, nan): the cheap tracker skips them (no anchor)."""
+        n = int(self.num_sites)
+        lo = np.full(n, np.nan, dtype=np.float64)
+        hi = np.full(n, np.nan, dtype=np.float64)
+        m = THRES_LIVE_VALLEY_MARGIN
+        for s in range(min(n, len(fits))):
+            p = fits[s].get('params') if isinstance(fits[s], dict) else None
+            if p is None:
+                continue
+            mu_e, mu_a = float(p[0]), float(p[3])
+            sep = mu_a - mu_e
+            if sep > 1e-9:
+                lo[s] = mu_e + m * sep
+                hi[s] = mu_a - m * sep
+        return lo, hi
+
+    def _validate_full_fit(self, fits, thres, all_i, num_sites=None):
+        """Structural guard: decide whether a full Gaussian refit is trustworthy.
+        Rejects two failure modes: (1) low-loading / near-unimodal data that
+        collapses both Gaussians onto one peak (peaks not credibly separated) and
+        (2) blank/dropped frames (whole-frame ~0) polluting the buffer, which the
+        fit reads as a perfectly-separated empty(~0)-vs-atom(pedestal) pair — the
+        2026-06-19 corruption that passed the separation/loading checks. Returns
+        (ok: bool, reason: str, stats: dict)."""
+        seps, sig_es = [], []
+        for f in fits:
+            p = f.get('params') if isinstance(f, dict) else None
+            if p is None:
+                continue
+            seps.append(float(p[3]) - float(p[0]))
+            sig_es.append(abs(float(p[1])))
+        n_conv = len(seps)
+        ns = int(self.num_sites if num_sites is None else num_sites)
+        stats = {'n_converged': int(n_conv), 'n_sites': ns}
+        if n_conv == 0:
+            return False, 'no per-site fit converged', stats
+        # Blank-frame backstop: even though the ingestion filter keeps blanks out of
+        # the accumulators, reject defensively if a meaningful fraction of the fit
+        # buffer is whole-frame ~0 (e.g. a buffer carried in before the filter
+        # existed). A blank-vs-pedestal split looks like a flawless discriminator,
+        # so it would otherwise sail through the separation/loading checks below.
+        blank_frac = (float(np.mean(np.nanmax(all_i, axis=1) < BLANK_FRAME_FLOOR))
+                      if all_i.size else 0.0)
+        stats['blank_frac'] = round(blank_frac, 4)
+        if blank_frac > THRES_FIT_MAX_BLANK_FRAC:
+            return False, ('%.0f%% of accumulated shots are blank/dropped frames '
+                           '(whole-frame ~0)' % (100 * blank_frac)), stats
+        seps = np.asarray(seps, dtype=np.float64)
+        sig_e = float(np.median(sig_es)) if sig_es else 0.0
+        min_sep = max(THRES_FIT_MIN_SEP_ABS, THRES_FIT_MIN_SEP_SIGMA * sig_e)
+        frac_sep = float(np.mean(seps >= min_sep))
+        loaded_frac = float(np.mean(all_i > thres[None, :]))
+        stats.update({'min_sep': round(min_sep, 3),
+                      'frac_separated': round(frac_sep, 3),
+                      'loaded_frac': round(loaded_frac, 4),
+                      'median_sep': round(float(np.median(seps)), 3),
+                      'sigma_empty': round(sig_e, 3)})
+        if frac_sep < THRES_FIT_MIN_SEP_FRAC:
+            return False, ('only %.0f%% of sites have separated peaks '
+                           '(need >=%.0f%%, min sep %.2f ADU)'
+                           % (100 * frac_sep, 100 * THRES_FIT_MIN_SEP_FRAC,
+                              min_sep)), stats
+        if loaded_frac < THRES_FIT_MIN_LOADING:
+            return False, ('pooled loaded fraction %.1f%% too low for a bimodal '
+                           'fit' % (100 * loaded_frac)), stats
+        return True, 'ok', stats
+
+    def _validate_loaded_thresholds(self):
+        """On-load sanity of the per-site thresholds we start with (from the
+        per-pattern store, or day folder for a scan that declares no pattern).
+        Sets self._threshold_health and, when the loaded store is HEALTHY with
+        matching Gaussian fits, primes the cheap-tracker anchor so it can track
+        from the start. A DEGRADED per-pattern store is NOT swapped for day-folder
+        thresholds (a different pattern's thresholds are useless) — the cheap
+        tracker holds and the first ACCEPTED full fit re-anchors. Warns loudly."""
+        n = int(self.num_sites)
+        if n <= 0:
+            return
+        name = self._pattern_names.get(0)
+        src = ('pattern:%s' % name) if name else (
+            _mat_str(self.config.get('calibrationSource')) or 'day-folder')
+        thr = np.asarray(self.loaded_thresholds, dtype=np.float64).ravel()
+        iso = _now_iso()
+        if thr.size != n or not np.isfinite(thr).any():
+            logger.warning('No usable loaded thresholds for %s (n=%d) — will '
+                           'calibrate from live data', src, n)
+            self._threshold_health = {
+                'state': 'unknown', 'reason': 'no usable loaded thresholds',
+                'source': src, 'spread': None, 'updated_iso': iso}
+            return
+        spread = float(np.nanstd(thr))
+        # fit-aware: fraction of sites whose loaded threshold sits OUTSIDE its own
+        # [mu_empty, mu_atom] — a direct degeneracy signal.
+        frac_outside = None
+        gf = self.loaded_gauss_fits
+        if gf and len(gf) == n:
+            out, cnt = 0, 0
+            for s in range(n):
+                p = gf[s].get('params') if isinstance(gf[s], dict) else None
+                pr = np.ravel(p) if p is not None else None
+                if pr is None or pr.size < 4:
+                    continue
+                cnt += 1
+                mu_e, mu_a = float(pr[0]), float(pr[3])
+                if mu_a - mu_e <= 1e-9 or not (mu_e <= thr[s] <= mu_a):
+                    out += 1
+            if cnt:
+                frac_outside = out / cnt
+        outside_bad = (frac_outside is not None
+                       and frac_outside > (1.0 - THRES_FIT_MIN_SEP_FRAC))
+        if spread > THRES_LOADED_MAX_SPREAD or outside_bad:
+            reasons = []
+            if spread > THRES_LOADED_MAX_SPREAD:
+                reasons.append('threshold spread %.2f ADU (> %.2f)'
+                               % (spread, THRES_LOADED_MAX_SPREAD))
+            if outside_bad:
+                reasons.append('%.0f%% of cuts outside their own peaks'
+                               % (100 * frac_outside))
+            msg = '; '.join(reasons)
+            logger.warning('Loaded thresholds for %s look DEGRADED (%s) — holding '
+                           'and re-anchoring from live data; NOT using day folder',
+                           src, msg)
+            self._threshold_health = {
+                'state': 'degraded', 'reason': msg, 'source': src,
+                'spread': spread, 'frac_outside': frac_outside,
+                'updated_iso': iso}
+            return
+        # Healthy loaded store: prime the cheap-tracker anchor from its fits so it
+        # can track immediately (re-anchored by the first accepted full fit).
+        anchor_primed = False
+        if gf and len(gf) == n:
+            self._thr_place_ratio = self._placement_ratio(gf, thr)
+            self._thr_clamp_lo, self._thr_clamp_hi = self._valley_clamp_band(gf)
+            if float(np.isfinite(self._thr_clamp_lo).mean()) >= THRES_FIT_MIN_SEP_FRAC:
+                self._thr_has_accepted_fit = True
+                self._thr_fit_anchor = thr.copy()   # fixed cut for the cheap tracker
+                # NOTE: the cheap tracker's median references come only from a live
+                # full fit (raw intensities aren't available on load), so it HOLDS
+                # the loaded thresholds until the first accepted full fit sets them.
+                anchor_primed = True
+        if not name:
+            logger.warning('Scan declares no loading pattern — using %s thresholds '
+                           '(NOT per-pattern); spread %.2f ADU', src, spread)
+        self._threshold_health = {
+            'state': 'ok' if name else 'unknown_pattern',
+            'reason': '' if name else 'no loading pattern declared; using day folder',
+            'source': src, 'spread': spread, 'frac_outside': frac_outside,
+            'anchor_primed': anchor_primed, 'updated_iso': iso}
+
     def _update_thresholds_live_cheap(self):
-        """Cheap (<50 ms) per-site threshold EWMA between full fits. For each site,
-        split the recent shots by the current threshold into empty/atom populations,
-        place a candidate threshold at the fit's ratio between their means, and
-        EWMA-blend (~100-shot memory). Saves per-pattern + logs. Sites without
-        enough shots on BOTH sides keep their current threshold (safety)."""
+        """Cheap (<50 ms) per-site threshold tracker between full fits. Each cut is
+        held at the last ACCEPTED full-fit value shifted by the measured drift of
+        BOTH peaks since that fit, so it tracks TOWARD the next full fit (the goal)
+        rather than drifting away:
+            new = fit_cut + (1-r)*Δμ_empty + r*Δμ_atom
+        where r is the fit's placement ratio (the cut sits at fraction r between the
+        peaks) and Δμ_{empty,atom} are the drifts of each peak's robust centre. The
+        centres are MEDIANS of the recent window split by the FIXED fit cut (below =
+        empty, above = atom), and the fit-time references (``_thr_fit_med_below/
+        above``) are computed with the SAME median estimator on the fit window — so
+        the truncation bias of a one-sided median cancels in the difference and only
+        the true drift remains. Splitting by the fixed cut (not the drifting one)
+        also kills the positive-feedback ratchet. Net: unbiased + no overshoot +
+        tracks both peaks. GUARDS: holds until the first accepted full fit sets the
+        references; needs enough samples on BOTH sides; clamps inside the valley
+        band so a cut can never sit on/past a peak."""
         name = self._pattern_names.get(0)
         if not name:
             return
+        if not self._thr_has_accepted_fit:
+            return
+        anchor = self._thr_fit_anchor       # last accepted full-fit cut (fixed)
+        r = self._thr_place_ratio           # cut's fractional position between peaks
+        mb0 = self._thr_fit_med_below       # fit-window median below the cut (empty ref)
+        ma0 = self._thr_fit_med_above       # fit-window median above the cut (atom ref)
+        lo = self._thr_clamp_lo
+        hi = self._thr_clamp_hi
+        n = int(self.num_sites)
+        if any(x is None or np.asarray(x).size != n
+               for x in (anchor, r, mb0, ma0, lo, hi)):
+            return  # references not set yet (no accepted full fit) -> hold
         accum = self._intensity_accum
         if len(accum) < max(2 * THRES_LIVE_MIN_PER_SIDE, 10):
             return
         thr = np.asarray(self.thresholds, dtype=np.float64).ravel()
-        if thr.size != self.num_sites:
+        if thr.size != n:
             return
         W = np.asarray(accum[-THRES_LIVE_WINDOW:], dtype=np.float64)
-        if W.ndim != 2 or W.shape[1] != self.num_sites:
+        if W.ndim != 2 or W.shape[1] != n:
             return
-        above = W > thr[None, :]
+        anchor = np.asarray(anchor, dtype=np.float64)
+        r = np.asarray(r, dtype=np.float64)
+        mb0 = np.asarray(mb0, dtype=np.float64)
+        ma0 = np.asarray(ma0, dtype=np.float64)
+        lo = np.asarray(lo, dtype=np.float64)
+        hi = np.asarray(hi, dtype=np.float64)
+        below = W < anchor[None, :]
+        above = W > anchor[None, :]
+        cb = below.sum(0)
         ca = above.sum(0)
-        cb = W.shape[0] - ca
-        mean_a = np.where(ca > 0, (W * above).sum(0) / np.maximum(ca, 1), thr)
-        mean_b = np.where(cb > 0, (W * ~above).sum(0) / np.maximum(cb, 1), thr)
-        r = self._thr_place_ratio
-        if r is None or np.asarray(r).size != self.num_sites:
-            r = np.full(self.num_sites, 0.5, dtype=np.float64)
-        cand = mean_b + r * (mean_a - mean_b)
-        valid = ((ca >= THRES_LIVE_MIN_PER_SIDE) & (cb >= THRES_LIVE_MIN_PER_SIDE)
-                 & np.isfinite(cand))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)   # empty cols -> nan (gated out)
+            mbn = np.nanmedian(np.where(below, W, np.nan), axis=0)
+            man = np.nanmedian(np.where(above, W, np.nan), axis=0)
+        # Drift of each peak since the fit (same estimator -> bias cancels); the cut
+        # moves with the weighted drift of the two peaks it sits between.
+        de = mbn - mb0
+        da = man - ma0
+        cand = anchor + (1.0 - r) * de + r * da
+        valid = ((cb >= THRES_LIVE_MIN_PER_SIDE) & (ca >= THRES_LIVE_MIN_PER_SIDE)
+                 & np.isfinite(cand) & np.isfinite(mb0) & np.isfinite(ma0)
+                 & np.isfinite(lo) & np.isfinite(hi))
         new = thr.copy()
         a = THRES_LIVE_EMA
         new[valid] = (1.0 - a) * thr[valid] + a * cand[valid]
+        # Structural valley clamp: never on/past a peak.
+        new[valid] = np.clip(new[valid], lo[valid], hi[valid])
         self.live_thresholds = new
         self._save_threshold()
         self._log_threshold_update(name, 'cheap', int(valid.sum()))
 
+    def _fit_median_refs(self, all_i, thres):
+        """Per-site fit-window medians of the values below / above the fit cut — the
+        SAME estimator the cheap tracker uses live, so its one-sided truncation bias
+        cancels when it differences (now - fit). Empty cols -> NaN (cheap skips)."""
+        thr = np.asarray(thres, dtype=np.float64).ravel()
+        below = all_i < thr[None, :]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            mb = np.nanmedian(np.where(below, all_i, np.nan), axis=0)
+            ma = np.nanmedian(np.where(~below, all_i, np.nan), axis=0)
+        return mb, ma
+
+    def _maybe_refit_img2(self):
+        """Independent full Gaussian refit for the img2 (final) frame when it is
+        a DISTINCT loading pattern from img1. Mirrors the img1 200-shot refit —
+        SAME degenerate-fit guard — but on the img2 accumulator, writing the
+        result to img2's per-pattern store. Fires every UPDATE_THRES_INTERVAL
+        img2 shots once enough have accumulated (across short runs via the
+        namespaced cross-run accumulator). Between fits img2 HOLDS the last
+        accepted fit (no cheap inter-fit drift tracker)."""
+        name2 = self._img2_pattern_name()
+        n2 = len(self._intensity_accum_img2)
+        if (self._img_cnt_refit_img2 < UPDATE_THRES_INTERVAL
+                or n2 < UPDATE_THRES_INTERVAL):
+            return
+        self._img_cnt_refit_img2 = 0
+        # Reset the cross-run shots-since-attempt for img2's (namespaced) pattern.
+        akey = self._img2_accum_key()
+        if akey:
+            pa = _get_pattern_accum(akey, self.num_sites_img2)
+            with _pattern_accum_lock:
+                pa['n_since_attempt'] = 0
+        all_i = np.array(self._intensity_accum_img2)
+        hist = self._compute_hist_data(all_i, self.num_sites_img2)
+        self.live_hist_data_img2 = hist
+        fits, thres, inf = self._fit_gaussians(all_i, hist_data=hist)
+        ok, reason, stats = self._validate_full_fit(
+            fits, thres, all_i, num_sites=self.num_sites_img2)
+        iso = _now_iso()
+        if ok:
+            logger.info('Accepted img2 Gaussian refit for %s (%d shots): %s',
+                        name2, n2, stats)
+            self.live_gauss_fits_img2 = fits
+            self.live_thresholds_img2 = thres
+            self.live_infidelities_img2 = inf
+            self._thr_has_accepted_fit_img2 = True
+            self._threshold_health_img2 = {
+                'state': 'ok', 'reason': '', 'source': 'fit',
+                'spread': float(np.nanstd(thres)),
+                'mean_infidelity': (float(np.nanmean(inf)) if inf.size else None),
+                'updated_iso': iso, 'stats': stats}
+            self._save_threshold_img2()
+            self._log_threshold_update(
+                name2, 'fit', int(self.num_sites_img2), log_infidelities=True,
+                thresholds=thres, infidelities=inf, seq_no=self._seq_total)
+        else:
+            logger.warning('REJECTED degenerate img2 threshold refit for %s '
+                           '(%d shots): %s %s — img2 thresholds unchanged, not '
+                           'saved', name2, n2, reason, stats)
+            held = (self.live_thresholds_img2
+                    if self.live_thresholds_img2 is not None
+                    else self.loaded_thresholds_img2)
+            held = (np.asarray(held, dtype=np.float64)
+                    if held is not None else np.array([]))
+            self._threshold_health_img2 = {
+                'state': 'degraded', 'reason': reason, 'source': 'fit_rejected',
+                'spread': (float(np.nanstd(held)) if held.size else None),
+                'attempted_spread': float(np.nanstd(thres)),
+                'updated_iso': iso, 'stats': stats}
+            self._log_threshold_rejected(
+                name2, reason, stats, thres, current_thres=held,
+                seq_no=self._seq_total)
+
     def _log_threshold_update(self, name, source, n_updated, *,
-                              log_infidelities=False):
+                              log_infidelities=False, thresholds=None,
+                              infidelities=None, seq_no=None):
         """Append one shot-stamped threshold record (full per-site vector) to the
-        per-pattern audit log so the drift can be analysed offline."""
+        per-pattern audit log so the drift can be analysed offline. Defaults to
+        the img1 EFFECTIVE thresholds; the img2 refit passes its own vectors so
+        the img2 pattern's log records img2's calibration."""
         if not name:
             return
         try:
             from yb_analysis.analysis import update_log
             import yb_analysis.analysis.pattern_registry as reg
-            thr = np.asarray(self.thresholds, dtype=np.float64).ravel()
-            rec = {'scan_id': str(self.scan_id), 'seq_no': int(self._seq_total),
+            thr = np.asarray(self.thresholds if thresholds is None else thresholds,
+                             dtype=np.float64).ravel()
+            rec = {'scan_id': str(self.scan_id),
+                   'seq_no': int(self._seq_total if seq_no is None else seq_no),
                    'pattern': name, 'source': source, 'n_updated': int(n_updated),
                    'mean_thr': float(np.nanmean(thr)) if thr.size else None,
+                   'std_thr': float(np.nanstd(thr)) if thr.size else None,
                    'thresholds': thr.tolist()}
             if log_infidelities:
-                inf = np.asarray(self.infidelities, dtype=np.float64).ravel()
+                inf = np.asarray(self.infidelities if infidelities is None
+                                 else infidelities, dtype=np.float64).ravel()
                 rec['infidelities'] = inf.tolist()
+                rec['mean_infidelity'] = (float(np.nanmean(inf))
+                                          if inf.size else None)
             update_log.append('thresholds/%s.jsonl' % reg._sanitize_name(name), rec)
         except Exception as e:  # noqa: BLE001
             logger.debug('threshold log failed: %s', e)
+
+    def _log_threshold_rejected(self, name, reason, stats, attempted_thres, *,
+                                current_thres=None, seq_no=None):
+        """Append a 'fit_rejected' record to the per-pattern audit log when a full
+        refit is rejected as degenerate, so the dashboard threshold tab can show
+        the rejection (with its reason) and the attempted spread. The per-site
+        thresholds are NOT logged (they were not applied). ``current_thres``
+        defaults to the img1 EFFECTIVE thresholds; the img2 refit passes its
+        own held thresholds."""
+        if not name:
+            return
+        try:
+            from yb_analysis.analysis import update_log
+            import yb_analysis.analysis.pattern_registry as reg
+            cur = np.asarray(self.thresholds if current_thres is None
+                             else current_thres, dtype=np.float64).ravel()
+            att = np.asarray(attempted_thres, dtype=np.float64).ravel()
+            rec = {'scan_id': str(self.scan_id),
+                   'seq_no': int(self._seq_total if seq_no is None else seq_no),
+                   'pattern': name, 'source': 'fit_rejected', 'n_updated': 0,
+                   'reason': str(reason),
+                   'mean_thr': float(np.nanmean(cur)) if cur.size else None,
+                   'std_thr': float(np.nanstd(cur)) if cur.size else None,
+                   'attempted_mean_thr': float(np.nanmean(att)) if att.size else None,
+                   'attempted_spread': float(np.nanstd(att)) if att.size else None,
+                   'stats': stats}
+            update_log.append('thresholds/%s.jsonl' % reg._sanitize_name(name), rec)
+        except Exception as e:  # noqa: BLE001
+            logger.debug('threshold reject-log failed: %s', e)
 
     # --- EFFECTIVE properties ---
 
@@ -1038,20 +1616,73 @@ class DataManager:
     def thresholds(self):
         return self.live_thresholds if self.live_thresholds is not None else self.loaded_thresholds
 
+    def _img2_pattern_name(self):
+        """Loading-pattern name of the FINAL (img2) frame, or None."""
+        return self._pattern_names.get(max(1, self.num_images_per_seq) - 1)
+
+    def _img2_accum_key(self):
+        """In-memory cross-run accumulator key for the img2 frame. Namespaced
+        away from the bare pattern name (which the SAME pattern uses as an img1
+        LOADING frame in other scans) so img2's post-protocol intensities never
+        contaminate that pattern's loading-frame full fit. This key is only ever
+        a dict key in _pattern_accum — it is never written to disk."""
+        name2 = self._img2_pattern_name()
+        return ('%s\x00img2' % name2) if name2 else None
+
+    def _img2_refit_active(self):
+        """True when img2 should get its OWN threshold refit: it is a declared
+        loading pattern DISTINCT from img1's. When the two frames share a
+        pattern, img2 keeps using img1's single live refit (via
+        :meth:`_effective_thresholds`), so no separate img2 refit is needed."""
+        if not self.is_two_array or self.num_sites_img2 <= 0:
+            return False
+        p2 = self._img2_pattern_name()
+        return bool(p2) and (p2 != self._pattern_names.get(0))
+
+    def _resolve_img2_model(self):
+        """Load the img2 spot-shape detector when enabled + available. Sets
+        ``self._img2_model`` (an ``ssm`` model dict or None) and the provenance
+        tag. The model is the img2 detector whenever we'll save img2 frames;
+        falls back to threshold detection if disabled
+        (``IMG2_SHAPE_MODEL_VARIANT=''``) or the artifact is missing."""
+        self._img2_model = None
+        self._img2_logicals_source = None
+        variant = (IMG2_SHAPE_MODEL_VARIANT or '').strip()
+        if not variant:
+            return
+        # ONLY for runs where img2 is a DISTINCT loading pattern from img1
+        # (same condition as the img2 threshold refit). When both frames share
+        # the pattern, img2 keeps using img1's threshold detection unchanged.
+        if not (self._img2_refit_active() and self.num_images_per_seq >= 2):
+            return
+        m = ssm.load_model(variant)
+        if not m:
+            return
+        self._img2_model = m
+        self._img2_logicals_source = m['tag']
+        logger.info('img2 detection uses spot-shape model %s (box=%d) for '
+                    'pattern %s (%d sites)', m['tag'], m['box_size'],
+                    self._img2_pattern_name(), self.num_sites_img2)
+
     def _effective_thresholds(self, pattern_name, loaded):
         """Per-pattern effective thresholds for a frame whose loading pattern
         is ``pattern_name`` and whose stored per-site thresholds are ``loaded``.
 
-        The live Gaussian refit ONLY ever updates the LOADING (frame-0)
-        pattern's thresholds (img2 / post-protocol frames never feed the
-        refit). So a frame uses the live thresholds exactly when its pattern
-        IS that loading pattern; any other pattern uses its own stored per-site
-        thresholds. This keeps thresholds per-pattern and per-site, and means
-        when both frames share the loading pattern a single (img1-driven)
-        refit serves both."""
+        A frame detects with the live thresholds for ITS pattern:
+          * the frame-0 (loading) pattern -> img1's live refit, and
+          * a DISTINCT img2 pattern -> img2's own live refit (set by
+            :meth:`_maybe_refit_img2`).
+        Any other pattern (or before its first accepted fit) uses its stored
+        per-site thresholds. This keeps thresholds per-pattern and per-site;
+        when both frames share the loading pattern a single (img1-driven) refit
+        serves both."""
         if (self.live_thresholds is not None and pattern_name is not None
                 and pattern_name == self._pattern_names.get(0)):
             return self.live_thresholds
+        if (self.live_thresholds_img2 is not None and pattern_name is not None
+                and pattern_name == self._img2_pattern_name()
+                and len(self.live_thresholds_img2) == len(loaded)):
+            return self.live_thresholds_img2
         return loaded
 
     @property
@@ -1119,7 +1750,24 @@ class DataManager:
                 self._imgs_to_process.append(img3d[:, :, p])
             if self.img_buffer is not None:
                 self.img_buffer.push(img3d[:, :, 0].astype(np.int16))
-            self._seq_ids_to_process.append(int(sids_in[i]))
+            sid = int(sids_in[i])
+            if self._seq_ids_max_seen > 0 and sid > self._seq_ids_max_seen + 1:
+                gap_start = self._seq_ids_max_seen + 1
+                gap_end = sid - 1
+                gap_size = gap_end - gap_start + 1
+                self._seq_gap_count += gap_size
+                if len(self._seq_gap_ids) < 200:
+                    self._seq_gap_ids.extend(
+                        range(gap_start,
+                              min(gap_start + (200 - len(self._seq_gap_ids)),
+                                  gap_end + 1)))
+                logger.warning(
+                    'ZMQ delivery gap: seq_ids %d..%d (%d shot(s)) missing '
+                    '(total missing this scan: %d)',
+                    gap_start, gap_end, gap_size, self._seq_gap_count)
+            if sid > self._seq_ids_max_seen:
+                self._seq_ids_max_seen = sid
+            self._seq_ids_to_process.append(sid)
             kept += 1
 
         # Refit / loading / drift cadence counts only the COMPLETE sequences
@@ -1127,6 +1775,7 @@ class DataManager:
         # prematurely trip a refit on too-few real shots.
         self._img_cnt_grid += kept
         self._img_cnt_refit += kept
+        self._img_cnt_refit_img2 += kept
         self._img_cnt_loading += kept
         self._img_cnt_affine += kept
         self._img_cnt_thres_live += kept
@@ -1161,6 +1810,7 @@ class DataManager:
             # frame (post-rearrangement / post-pushout). Middle frames are
             # still in the same configuration as the initial image, so they
             # use grid_locations.
+            proba_vec = None   # img2 per-site posterior for this frame (model path)
             if self.is_two_array and is_last:
                 grid_i = self.grid_locations_img2
                 # Per-pattern, per-site thresholds. A frame detects with ITS
@@ -1171,12 +1821,33 @@ class DataManager:
                 # loading pattern, otherwise its own stored per-site thresholds.
                 thr_i = self._effective_thresholds(
                     self._pattern_names.get(pSeq - 1), self.loaded_thresholds_img2)
+                fr = img.astype(np.float64)
+                if self._img2_model is not None:
+                    # Spot-SHAPE GMM detector (distinct-pattern img2 only):
+                    # logicals from the model, not the intensity threshold.
+                    # Intensities are still the production masked sum (for
+                    # storage / histograms / unchanged analysis), computed in the
+                    # SAME vectorised pass. proba_vec = per-site P(loaded).
+                    res = None
+                    try:
+                        res = ssm.detect_frame(self._img2_model, fr, grid_i,
+                                               self.mask_mat)
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug('img2 shape-model detect failed (%s); '
+                                     'falling back to threshold', e)
+                    if res is not None:
+                        logicals, proba_vec, intensities = res
+                    else:
+                        logicals, intensities = detect_atom(
+                            fr, grid_i, thr_i, self.mask_mat)
+                else:
+                    logicals, intensities = detect_atom(
+                        fr, grid_i, thr_i, self.mask_mat)
             else:
                 grid_i = self.grid_locations
                 thr_i = self.thresholds
-            logicals, intensities = detect_atom(
-                img.astype(np.float64), grid_i, thr_i, self.mask_mat
-            )
+                logicals, intensities = detect_atom(
+                    img.astype(np.float64), grid_i, thr_i, self.mask_mat)
             self._logicals_to_save.append(logicals)
             self._intensities_to_save.append(intensities)
             self._imgs_to_save.append(img.astype(np.int16))
@@ -1184,7 +1855,30 @@ class DataManager:
 
             # On first image of each sequence: accumulate for histograms + display
             if is_first:
-                self._intensity_accum.append(intensities.copy())
+                # Blank/dropped frames (whole-frame ~0 — camera/ZMQ returned no real
+                # image) carry no atom info; keep them OUT of the threshold-fit
+                # accumulators (live + cross-run) and the histograms, else the
+                # double-Gaussian refit reads the 0-vs-pedestal toggle as empty-vs-atom
+                # and corrupts both the thresholds and the histogram binning.
+                if _is_blank_intensities(intensities):
+                    self._blank_shot_count += 1
+                    if self._blank_shot_count % 20 == 1:
+                        logger.warning('Blank/dropped frame skipped from threshold '
+                                       'accumulators (max intensity < %.1f); %d so far '
+                                       'this scan', BLANK_FRAME_FLOOR,
+                                       self._blank_shot_count)
+                else:
+                    self._intensity_accum.append(intensities.copy())
+                    # Also feed the cross-run accumulator for this pattern so the
+                    # 200-shot full fit can fire over several short runs (in-memory,
+                    # age-windowed; lost on restart).
+                    if self._accum_pattern_name:
+                        pa = _get_pattern_accum(self._accum_pattern_name, self.num_sites)
+                        if pa is not None and intensities.size == pa['num_sites']:
+                            with _pattern_accum_lock:
+                                pa['entries'].append((time.time(), intensities.copy()))
+                                pa['n_since_attempt'] += 1
+                                _prune_pattern_accum(pa, time.time())
                 self.log_buffer.push(logicals.astype(np.float64))
                 record_loading(logicals)
                 # Always display image-1 (loading image, not pushout)
@@ -1204,8 +1898,42 @@ class DataManager:
                 self._display_image2 = img.astype(np.int16)
                 self._display_intensities2 = intensities.copy()
                 self._display_logicals2 = logicals.copy()
+                self._display_proba2 = (proba_vec.copy()
+                                        if proba_vec is not None else None)
                 if self.is_two_array and self.log_buffer_img2 is not None:
                     self.log_buffer_img2.push(logicals.astype(np.float64))
+                # When the shape model is the img2 detector, buffer its per-site
+                # posterior 1:1 with the final-frame logicals for HDF5 (NaN for
+                # any frame that fell back to the threshold so the certainties
+                # dataset stays shape-aligned with logicals_img2).
+                if self._img2_model is not None and self._save_two_array:
+                    if (proba_vec is not None
+                            and np.size(proba_vec) == self.num_sites_img2):
+                        self._proba_img2_to_save.append(
+                            np.asarray(proba_vec, dtype=np.float64))
+                    else:
+                        self._proba_img2_to_save.append(
+                            np.full(self.num_sites_img2, np.nan))
+                # Accumulate img2 intensities for its OWN Gaussian refit, but
+                # only when img2 is a DISTINCT loading pattern from img1 AND the
+                # shape model is NOT the active img2 detector (the model
+                # supersedes the threshold refit — running it anyway would just
+                # log redundant degenerate-fit rejections). Mirrors the img1
+                # accumulation, incl. the img2-NAMESPACED cross-run accumulator
+                # (_img2_accum_key) so the SAME pattern's post-protocol (img2)
+                # intensities never pollute its loading-frame fit elsewhere.
+                if (self._img2_model is None and self._img2_refit_active()
+                        and intensities.size == self.num_sites_img2
+                        and not _is_blank_intensities(intensities)):
+                    self._intensity_accum_img2.append(intensities.copy())
+                    akey = self._img2_accum_key()
+                    if akey:
+                        pa = _get_pattern_accum(akey, self.num_sites_img2)
+                        if pa is not None and intensities.size == pa['num_sites']:
+                            with _pattern_accum_lock:
+                                pa['entries'].append((time.time(), intensities.copy()))
+                                pa['n_since_attempt'] += 1
+                                _prune_pattern_accum(pa, time.time())
 
             # On last image of each sequence: accumulate for scan curve.
             # logic2 always refers to the FINAL frame's logicals so the
@@ -1238,18 +1966,54 @@ class DataManager:
             self.live_thresholds = None
             self.live_infidelities = None
 
+        # Same rotation for the img2 accumulator (distinct-pattern refit).
+        if len(self._intensity_accum_img2) >= UPDATE_HIST_BATCH_SIZE:
+            if self.live_gauss_fits_img2 is not None:
+                self.loaded_gauss_fits_img2 = self.live_gauss_fits_img2
+            if self.live_thresholds_img2 is not None:
+                self.loaded_thresholds_img2 = self.live_thresholds_img2.copy()
+            if self.live_infidelities_img2 is not None:
+                self.loaded_infidelities_img2 = self.live_infidelities_img2.copy()
+            self._intensity_accum_img2.clear()
+            self.live_hist_data_img2 = None
+            self.live_gauss_fits_img2 = None
+            self.live_thresholds_img2 = None
+            self.live_infidelities_img2 = None
+
         self._seq_ids_to_save.extend(self._seq_ids_to_process)
         self._imgs_to_process.clear()
         self._seq_ids_to_process.clear()
 
-    def _rebin_histograms(self):
-        all_i = np.array(self._intensity_accum)  # (N, num_sites)
+    @staticmethod
+    def _compute_hist_data(all_i, num_sites):
+        """Per-site density histograms ({counts, bin_centers}) over an
+        (N, num_sites) intensity stack. Shared by the img1 and img2 refits AND
+        read by the full fit as its per-site bins. Two robustness measures:
+          * only the most recent THRES_FIT_MAX_SHOTS shots are binned (bounds the
+            per-rebuild cost; the cross-run buffer can reach 2000), and
+          * each site's 50-bin RANGE is clipped to the HIST_DISPLAY_CLIP_PCT central
+            percentile band, so one hot pixel / outlier shot can't stretch the bins
+            so wide the empty/atom doublet collapses into a single bar."""
         hist_data = []
-        for s in range(self.num_sites):
-            counts, edges = np.histogram(all_i[:, s], bins=50, density=True)
+        if all_i.shape[0] > THRES_FIT_MAX_SHOTS:
+            all_i = all_i[-THRES_FIT_MAX_SHOTS:]
+        lo_pct, hi_pct = HIST_DISPLAY_CLIP_PCT
+        for s in range(int(num_sites)):
+            col = all_i[:, s]
+            if col.size:
+                lo, hi = np.percentile(col, [lo_pct, hi_pct])
+                if not (hi > lo):           # degenerate (all-equal) site
+                    lo, hi = float(col.min()) - 0.5, float(col.max()) + 0.5
+            else:
+                lo, hi = 0.0, 1.0
+            counts, edges = np.histogram(col, bins=50, range=(lo, hi), density=True)
             centers = 0.5 * (edges[:-1] + edges[1:])
             hist_data.append({'counts': counts, 'bin_centers': centers})
-        self.live_hist_data = hist_data
+        return hist_data
+
+    def _rebin_histograms(self):
+        all_i = np.array(self._intensity_accum)  # (N, num_sites)
+        self.live_hist_data = self._compute_hist_data(all_i, self.num_sites)
 
     def update_data(self):
         if self.is_init:
@@ -1310,25 +2074,68 @@ class DataManager:
         # --- THRESHOLDS (full Gaussian refit, every 200 seq) ---
         # The authoritative re-anchor: refits the double Gaussians (true
         # infidelities), replaces the live thresholds, and refreshes the
-        # placement ratio the cheap tracker rides between fits.
+        # placement ratio + valley clamp band the cheap tracker rides between
+        # fits. n_accum counts shots accumulated for THIS pattern, including any
+        # carried in from recent runs (cross-run accumulator), so the fit fires
+        # over several short runs. A DEGENERATE fit (low-loading / near-unimodal
+        # data) is REJECTED: thresholds unchanged, nothing saved, health degraded.
         n_accum = len(self._intensity_accum)
         if self._img_cnt_refit >= UPDATE_THRES_INTERVAL and n_accum >= UPDATE_THRES_INTERVAL:
             self._img_cnt_refit = 0
-            logger.info('Refitting Gaussians (%d shots)', n_accum)
+            if self._accum_pattern_name:   # reset cross-run shots-since-attempt
+                pa = _get_pattern_accum(self._accum_pattern_name, self.num_sites)
+                with _pattern_accum_lock:
+                    pa['n_since_attempt'] = 0
             all_i = np.array(self._intensity_accum)
             fits, thres, inf = self._fit_gaussians(all_i)
-            self.live_gauss_fits = fits
-            self.live_thresholds = thres
-            self.live_infidelities = inf
-            self._thr_place_ratio = self._placement_ratio(fits, thres)
-            self._hist_version += 1
-            self._hist_rep_sites = self._pick_rep_sites()
-            self._save_threshold()
-            self._save_histdata()
-            if pattern_active:
-                self._log_threshold_update(
-                    self._pattern_names.get(0), 'fit', int(self.num_sites),
-                    log_infidelities=True)
+            ok, reason, stats = self._validate_full_fit(fits, thres, all_i)
+            iso = _now_iso()
+            if ok:
+                logger.info('Accepted Gaussian refit (%d shots): %s', n_accum, stats)
+                self.live_gauss_fits = fits
+                self.live_thresholds = thres
+                self.live_infidelities = inf
+                self._thr_place_ratio = self._placement_ratio(fits, thres)
+                self._thr_clamp_lo, self._thr_clamp_hi = self._valley_clamp_band(fits)
+                self._thr_fit_anchor = np.asarray(thres, dtype=np.float64).copy()
+                self._thr_fit_med_below, self._thr_fit_med_above = \
+                    self._fit_median_refs(all_i, thres)
+                self._thr_has_accepted_fit = True
+                self._threshold_health = {
+                    'state': 'ok', 'reason': '', 'source': 'fit',
+                    'spread': float(np.nanstd(thres)),
+                    'mean_infidelity': (float(np.nanmean(inf))
+                                        if inf.size else None),
+                    'updated_iso': iso, 'stats': stats}
+                self._hist_version += 1
+                self._hist_rep_sites = self._pick_rep_sites()
+                self._save_threshold()
+                self._save_histdata()
+                if pattern_active:
+                    self._log_threshold_update(
+                        self._pattern_names.get(0), 'fit', int(self.num_sites),
+                        log_infidelities=True)
+            else:
+                logger.warning('REJECTED degenerate threshold refit (%d shots): %s '
+                               '%s — thresholds unchanged, not saved',
+                               n_accum, reason, stats)
+                self._threshold_health = {
+                    'state': 'degraded', 'reason': reason, 'source': 'fit_rejected',
+                    'spread': (float(np.nanstd(self.thresholds))
+                               if self.thresholds.size else None),
+                    'attempted_spread': float(np.nanstd(thres)),
+                    'updated_iso': iso, 'stats': stats}
+                if pattern_active:
+                    self._log_threshold_rejected(
+                        self._pattern_names.get(0), reason, stats, thres)
+
+        # --- THRESHOLDS for img2 (independent full refit, every 200 seq) ---
+        # When img2 is a DISTINCT loading pattern from img1, refit ITS thresholds
+        # from the final-frame intensities (same guard), saving back to img2's
+        # per-pattern store. Skipped when the spot-shape model is img2's detector
+        # (it supersedes thresholds) or when img2 shares img1's pattern.
+        if self._img2_model is None and self._img2_refit_active():
+            self._maybe_refit_img2()
 
         # Loading rates (every 5 seq)
         if self._img_cnt_loading >= UPDATE_LOADING_INTERVAL:
@@ -1343,15 +2150,29 @@ class DataManager:
                         self.log_buffer_img2.get_last_n(n2).mean(axis=0))
                 self._img_cnt_loading = 0
 
-    def _fit_gaussians(self, all_intensities):
+    def _fit_gaussians(self, all_intensities, hist_data=None):
         from scipy.optimize import least_squares, minimize_scalar
-        from scipy.stats import norm
+        from scipy.special import ndtr   # standard-normal CDF; ~2.5x faster than norm.cdf
+        from yb_analysis.detection.dynamical_threshold import _gauss_pdf
+
+        # Per-site bin centres/counts to fit against. Defaults to the img1 live
+        # histograms (self.live_hist_data); the img2 refit passes its own.
+        hd = hist_data if hist_data is not None else self.live_hist_data
+
+        # Fit only the most recent THRES_FIT_MAX_SHOTS shots — the per-site fit is the
+        # dominant cost and a few hundred shots already resolve the doublet; this also
+        # keeps the avg-prior / per-site-stat passes from scaling with the (up to
+        # 2000-shot) cross-run buffer. Matches the cap _compute_hist_data uses for hd.
+        if all_intensities.shape[0] > THRES_FIT_MAX_SHOTS:
+            all_intensities = all_intensities[-THRES_FIT_MAX_SHOTS:]
 
         M = all_intensities.shape[1]
         fits, thres, inf = [], np.zeros(M), np.zeros(M)
 
+        # Manual Gaussian PDF (no scipy.stats.norm input-validation overhead, paid on
+        # every residual eval across thousands of sites) -- ~2.5x faster, identical math.
         def two_g(p, x):
-            return p[2]*norm.pdf(x, p[0], p[1]) + p[5]*norm.pdf(x, p[3], p[4])
+            return p[2]*_gauss_pdf(x, p[0], p[1]) + p[5]*_gauss_pdf(x, p[3], p[4])
 
         # Step 1: Fit the AVERAGE histogram to get global priors
         all_vals = all_intensities.ravel()
@@ -1398,7 +2219,7 @@ class DataManager:
                 lb = [mn - 0.1*rng, sd/50, 0.01, p50, sd/50, 0.01]
                 ub = [p50, sd*2, 1.0, mx + 0.1*rng, sd*2, 1.0]
 
-            h = self.live_hist_data[s] if self.live_hist_data else None
+            h = hd[s] if (hd and s < len(hd)) else None
             if h:
                 bc, ct = h['bin_centers'], h['counts']
             else:
@@ -1411,7 +2232,7 @@ class DataManager:
                 if p[0] > p[3]:
                     p = np.array([p[3], p[4], p[5], p[0], p[1], p[2]])
                 opt = minimize_scalar(
-                    lambda xc: (1 - norm.cdf(xc, p[0], p[1])) + norm.cdf(xc, p[3], p[4]),
+                    lambda xc: (1 - ndtr((xc - p[0]) / p[1])) + ndtr((xc - p[3]) / p[4]),
                     bounds=(p[0], p[3]), method='bounded'
                 )
                 fits.append({'params': p})
@@ -1442,6 +2263,52 @@ class DataManager:
         return sites
 
     # --- Save ---
+
+    def _save_block(self, do_append, sids, n_frames, two_array=False):
+        """Run the HDF5 append (on the daemon save thread), recording
+        ``save_health`` on failure instead of letting the thread die silently.
+
+        ``append_block`` already retries transient OS locks; this is the
+        last-resort surface for when even the retries are exhausted — the block
+        is lost, but the operator sees it (Live view turns red) rather than the
+        old behaviour where the exception printed to the log and vanished.
+        """
+        # Fetch (lazily create) the health dict once — robust to any
+        # construction path (e.g. tests that build a bare DM via __new__) and
+        # keeps the except branch from double-faulting.
+        sh = getattr(self, '_save_health', None)
+        if not isinstance(sh, dict):
+            sh = self._save_health = {'state': 'ok', 'reason': '', 'lost_seqs': 0,
+                                      'lost_seq_ids': [], 'last_error': '',
+                                      'updated_iso': None}
+        try:
+            with self._save_lock:
+                do_append()
+            logger.info('Saved %d frames%s', n_frames,
+                        ' (two-array)' if two_array else '')
+            # Writes are flowing again after an earlier failure: drop the active
+            # 'fail' state but keep the lost tally so the warning persists.
+            if sh.get('state') == 'fail':
+                sh['state'] = 'recovered'
+                sh['reason'] = ('HDF5 saves resumed; %d sequence(s) lost earlier'
+                                % int(sh.get('lost_seqs', 0)))
+                sh['updated_iso'] = _now_iso()
+        except Exception as e:
+            ids = [int(s) for s in list(sids)] if sids is not None else []
+            n = len(ids)
+            sh['state'] = 'fail'
+            sh['lost_seqs'] = int(sh.get('lost_seqs', 0)) + n
+            kept = sh.setdefault('lost_seq_ids', [])
+            room = max(0, 1000 - len(kept))
+            if room:
+                kept.extend(ids[:room])
+            sh['last_error'] = '%s: %s' % (type(e).__name__, e)
+            sh['reason'] = ('HDF5 save failed — %d sequence(s) lost so far (%s)'
+                            % (sh['lost_seqs'], sh['last_error']))
+            sh['updated_iso'] = _now_iso()
+            logger.error('HDF5 save FAILED for %d sequence(s) (seq_ids %s%s): %s '
+                         '— this block is LOST.', n, ids[:12],
+                         '...' if n > 12 else '', e)
 
     def save_data(self):
         if not self._imgs_to_save or not self._file_created:
@@ -1493,15 +2360,28 @@ class DataManager:
             ints2 = (np.array(ints_all[pSeq - 1::pSeq], dtype=np.float64)
                      if ints_all
                      else np.zeros_like(logs2, dtype=np.float64))
+            # img2 per-site posterior "% certainty" from the shape model, one
+            # row per sequence aligned 1:1 with logs2 (None when the threshold
+            # detector was used -> no certainties dataset). Materialise before
+            # the save thread so clearing the buffer below is safe.
+            proba2 = None
+            if self._proba_img2_to_save:
+                k = logs2.shape[0]
+                pr = self._proba_img2_to_save[:k]
+                if 0 < len(pr) < k:        # defensive pad (shouldn't happen)
+                    pr = pr + [np.full(self.num_sites_img2, np.nan)] * (k - len(pr))
+                if pr:
+                    proba2 = np.array(pr, dtype=np.float64)
 
             def _do():
-                with self._save_lock:
-                    append_block(
+                self._save_block(
+                    lambda: append_block(
                         self.fname, imgs, logs1, ints1, sids,
                         logicals_img2_block=logs2,
                         intensities_img2_block=ints2,
-                    )
-                    logger.info('Saved %d frames (two-array)', len(imgs))
+                        proba_img2_block=proba2,
+                    ),
+                    sids, len(imgs), two_array=True)
         else:
             logs = (np.array(self._logicals_to_save, dtype=bool)
                     if self._logicals_to_save
@@ -1512,15 +2392,16 @@ class DataManager:
                     else np.zeros_like(logs, dtype=np.float64))
 
             def _do():
-                with self._save_lock:
-                    append_block(self.fname, imgs, logs, ints, sids)
-                    logger.info('Saved %d frames', len(imgs))
+                self._save_block(
+                    lambda: append_block(self.fname, imgs, logs, ints, sids),
+                    sids, len(imgs))
 
         threading.Thread(target=_do, daemon=True).start()
         self._imgs_to_save.clear()
         self._logicals_to_save.clear()
         self._intensities_to_save.clear()
         self._seq_ids_to_save.clear()
+        self._proba_img2_to_save.clear()
         return self.fname
 
     def _schedule_slm_sync(self):
@@ -1592,6 +2473,42 @@ class DataManager:
         except Exception as e:
             logger.warning('Threshold save failed: %s', e)
 
+    def _save_threshold_img2(self):
+        """Persist img2's live-refined thresholds to img2's per-pattern store
+        (and the day-folder threshold_img2.mat the legacy two-array path reads).
+        Mirrors _save_threshold but for the img2 frame — it NEVER touches img1's
+        day-folder threshold.mat or the frame-0 pattern store."""
+        name2 = self._img2_pattern_name()
+        n = int(self.num_sites_img2)
+        if n <= 0:
+            return
+        try:
+            from scipy.io import savemat
+            thr = (self.live_thresholds_img2 if self.live_thresholds_img2 is not None
+                   else self.loaded_thresholds_img2)
+            inf = (self.live_infidelities_img2 if self.live_infidelities_img2 is not None
+                   else self.loaded_infidelities_img2)
+            gfsrc = (self.live_gauss_fits_img2 if self.live_gauss_fits_img2 is not None
+                     else self.loaded_gauss_fits_img2)
+            gs = np.empty(n, dtype=[('params', 'O')])
+            for s in range(n):
+                p = (gfsrc[s].get('params')
+                     if (gfsrc is not None and s < len(gfsrc)) else None)
+                gs[s]['params'] = p if p is not None else np.array([])
+            mat = {
+                'thresholds': np.asarray(thr, dtype=np.float64).ravel(),
+                'infidelities': np.asarray(
+                    inf if inf is not None else np.full(n, np.nan),
+                    dtype=np.float64).ravel(),
+                'gaussFitsStruct': gs,
+            }
+            savemat(os.path.join(self._day_dir, 'threshold_img2.mat'), mat)
+            if name2:
+                import yb_analysis.analysis.pattern_registry as reg
+                reg.save_pattern_thresholds(name2, mat)
+        except Exception as e:
+            logger.warning('img2 threshold save failed: %s', e)
+
     def _save_histdata(self):
         if not self.live_hist_data:
             return
@@ -1619,6 +2536,15 @@ class DataManager:
             'cur_image2': self._display_image2.astype(np.float64) if self._display_image2 is not None else None,
             'cur_intensities2': self._display_intensities2,
             'logicals2': self._display_logicals2,
+            # img2 detector provenance + mean per-site posterior "% certainty"
+            # (only when the spot-shape GMM is img2's detector; None ->
+            # thresholds). The full per-site certainties persist to HDF5
+            # (certainties_img2); the live snapshot ships only the scalar mean.
+            'logicals2_source': self._img2_logicals_source,
+            'logicals2_certainty_mean': (
+                float(np.nanmean(self._display_proba2))
+                if self._display_proba2 is not None
+                and np.size(self._display_proba2) else None),
             'cur_image_mid': self._display_image_mid.astype(np.float64) if self._display_image_mid is not None else None,
             'cur_intensities_mid': self._display_intensities_mid,
             'logicals_mid': self._display_logicals_mid,
@@ -1627,12 +2553,29 @@ class DataManager:
             'grid_locations_img2': self.grid_locations_img2.copy()
                 if self.grid_locations_img2 is not None else None,
             'num_sites_img2': self.num_sites_img2,
-            'thresholds_img2': self.loaded_thresholds_img2,
-            'infidelities_img2': self.loaded_infidelities_img2,
-            'loaded_gauss_fits_img2': self.loaded_gauss_fits_img2,
-            'loaded_hist_data_img2': self.loaded_hist_data_img2,
+            # img2 EFFECTIVE thresholds: the live refit (distinct-pattern img2)
+            # when one has been accepted, else the loaded per-pattern store.
+            'thresholds_img2': (self.live_thresholds_img2
+                                if self.live_thresholds_img2 is not None
+                                else self.loaded_thresholds_img2),
+            'infidelities_img2': (self.live_infidelities_img2
+                                  if self.live_infidelities_img2 is not None
+                                  else self.loaded_infidelities_img2),
+            'loaded_gauss_fits_img2': (self.live_gauss_fits_img2
+                                       if self.live_gauss_fits_img2 is not None
+                                       else self.loaded_gauss_fits_img2),
+            'loaded_hist_data_img2': (self.live_hist_data_img2
+                                      if self.live_hist_data_img2 is not None
+                                      else self.loaded_hist_data_img2),
             'loading_rates_img2': self.loading_rates_img2.copy()
                 if self.loading_rates_img2 is not None else None,
+            # img2 independent-refit status (distinct loading pattern only).
+            'active_pattern_img2': (self._img2_pattern_name()
+                                    if self._img2_refit_active() else None),
+            'threshold_health_img2': self._threshold_health_img2,
+            'shots_since_fit_img2': int(self._img_cnt_refit_img2),
+            'next_fit_in_img2': max(
+                0, UPDATE_THRES_INTERVAL - int(self._img_cnt_refit_img2)),
             'grid_locations': self.grid_locations.copy() if len(self.grid_locations) > 0 else None,
             'box_size': self.mask_mat.shape[0],
             'num_sites': self.num_sites,
@@ -1649,6 +2592,27 @@ class DataManager:
             'hist_version': self._hist_version,
             'hist_rep_sites': self._hist_rep_sites,
             'n_accum_shots': len(self._intensity_accum),
+            # Per-RUN shot count for the status "shot #" display: resets each scan
+            # (new DataManager). NOT len(_intensity_accum) above — that's the live
+            # histogram / fit accumulator, which the cross-run seeding carries
+            # between short runs of the same loading pattern (so it would otherwise
+            # make the displayed shot # "keep ticking up" across rearrange runs).
+            'shots_this_run': int(self._seq_total),
+            # Detection-threshold calibration health + cadence (threshold tab).
+            'threshold_health': self._threshold_health,
+            # HDF5 save health (Live status strip): turns the save tile red when
+            # an append_block ultimately failed and a block of shots was lost.
+            'save_health': self._save_health,
+            'seq_reconciliation': {
+                'max_seen': getattr(self, '_seq_ids_max_seen', 0),
+                'gap_count': getattr(self, '_seq_gap_count', 0),
+                'gap_ids': list(getattr(self, '_seq_gap_ids', [])[:50]),
+            },
+            'active_pattern': self._pattern_names.get(0),
+            'active_defocus': self._active_defocus,
+            'blank_shots': int(self._blank_shot_count),
+            'shots_since_fit': int(self._img_cnt_refit),
+            'next_fit_in': max(0, UPDATE_THRES_INTERVAL - int(self._img_cnt_refit)),
             'grid_shift_heatmap': self.grid_shift_heatmap.copy() if self.grid_shift_heatmap is not None else None,
             'grid_shift_history': list(self.grid_shift_history),
             'scan_curve': compute_scan_curve(

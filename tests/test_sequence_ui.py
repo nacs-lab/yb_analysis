@@ -30,7 +30,12 @@ def test_index_renders_sequence_tab(html_client):
     assert r.status_code == 200
     html = r.get_data(as_text=True)
     for marker in [
-        'id="tab-btn-sequence"', 'data-tab="sequence"',
+        # The standalone Sequence tab was removed; the sequence view is now a
+        # sub-mode of the Analysis tab (Data/Sequence toggle). #tab-sequence
+        # still exists as the (hidden) source container the cards are reparented
+        # out of at load (foldSequenceIntoAnalysis).
+        'id="analysis-mode-toggle"', 'data-mode="sequence"',
+        'id="analysis-sequence-pane"',
         'id="tab-sequence"', 'id="plot-sequence"',
         'id="seq-folder"', 'id="seq-load-btn"', 'id="seq-point-select"',
         'id="seq-seq-select"', 'id="seq-params"',
@@ -38,8 +43,11 @@ def test_index_renders_sequence_tab(html_client):
         'id="seq-chn-list"', 'id="seq-chn-clear"', 'id="seq-chn-search"',
         'data-card-id="sequence-source"', 'data-card-id="sequence-plot"',
         'data-card-id="sequence-params"', 'id="seq-autosave"',
-        # Two floating-picker hosts: Scans docked LEFT, Channels docked RIGHT.
-        'id="floating-seqscan-host"', 'id="seqscan-card"',
+        # Two floating-picker hosts: the SHARED "Scans" picker docks LEFT
+        # (#floating-seqscan-host; dashboard.js reparents the unified
+        # #analysis-runs-card into it -- there's no separate seqscan-card
+        # anymore), Channels docks RIGHT.
+        'id="floating-seqscan-host"',
         'id="floating-sequence-host"', 'id="sequence-chn-card"',
         # Params search + config/modified/scanned show-hide toggles.
         'id="seq-param-search"', 'id="seq-filter-config"',
@@ -52,7 +60,8 @@ def test_dashboard_js_wires_sequence():
     js = open(os.path.join(_PLOTTING, "static", "dashboard.js"),
               encoding="utf-8").read()
     for marker in [
-        '"sequence"',                 # in TABS
+        'function foldSequenceIntoAnalysis',   # sequence cards -> Analysis pane
+        'function setAnalysisSubMode',          # Data/Sequence sub-toggle
         'function initSequenceTab',
         'function loadSequence',
         'function seqRenderPlot',
@@ -95,7 +104,7 @@ def test_dashboard_js_wires_sequence():
 def test_dashboard_css_has_sequence_styles():
     css = open(os.path.join(_PLOTTING, "static", "dashboard.css"),
                encoding="utf-8").read()
-    for marker in ["#tab-sequence .plot-container", ".seq-tree",
+    for marker in ["#plot-sequence", ".seq-tree",
                    ".seq-modified", ".seq-config", ".seq-scanned-badge",
                    "#floating-seqscan-host",          # left-dock for the Scans picker
                    ".seq-row-reconstructable",        # three-state picker

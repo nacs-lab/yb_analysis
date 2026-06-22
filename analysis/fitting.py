@@ -10,6 +10,7 @@ from .fittings import (  # noqa: F401
     lorentzian_peak,
     double_lorentzian_dip,
     fit_lorentzian,
+    fit_double_lorentzian,
     fit_lorentzian_site_resolved,
     exponential_decay,
     fit_exponential,

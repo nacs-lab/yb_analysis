@@ -175,12 +175,16 @@ def test_summary_round_trip(server):
 def test_queue_formatting_helpers():
     """The pure-Python formatters used by the GUI should handle 1D / parallel /
     2D axes and dimensionless vs. units correctly."""
-    from yb_analysis.gui.queue_pane import _format_axes, _format_detail, _pretty_value
+    # _format_axes was renamed _format_axes_short (alongside _format_axes_full);
+    # alias it so the body reads naturally. Its format also changed: empty -> '--',
+    # single axis uses 'name: range', 2D joins with ' x '.
+    from yb_analysis.gui.queue_pane import (
+        _format_axes_short as _format_axes, _format_detail, _pretty_value)
 
-    assert _format_axes([]) == '—'
+    assert _format_axes([]) == '--'
     assert _format_axes([{'dim': 1, 'name': 'X', 'units': 'Hz',
                           'min': 50e3, 'max': 1e6, 'npts': 20}]) == \
-        'X = 50 kHz..1 MHz (20 pt)'
+        'X: 50 kHz..1 MHz (20 pt)'
     # parallel
     parallel = _format_axes([
         {'dim': 1, 'name': 'A', 'units': '', 'min': 1, 'max': 5, 'npts': 51},
@@ -192,7 +196,7 @@ def test_queue_formatting_helpers():
         {'dim': 1, 'name': 'A', 'units': '', 'min': 0, 'max': 1, 'npts': 2},
         {'dim': 2, 'name': 'B', 'units': '', 'min': 0, 'max': 1, 'npts': 2},
     ])
-    assert '×' in two_d
+    assert ' x ' in two_d
 
     # dimensionless numbers should NOT get SI prefixes
     assert _pretty_value(0.8) == '0.8'

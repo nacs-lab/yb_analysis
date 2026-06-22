@@ -218,7 +218,7 @@ def test_dashboard_renders_controls(app):
         'name="dummy-mode-ph5"', 'id="ctrl-init-path"',
         'id="ctrl-scan-id"', 'id="ctrl-runner-state"',
         'id="downsample-live"', 'id="show-mid-live"',
-        'id="analysis-svd-card"', 'id="live-diag-tile"',
+        'id="analysis-svd-card"', 'id="shot-health-tile"',
         # Phase 5.5 sidebar additions: runner-status banner, camera card,
         # queue preview.
         'id="ctrl-status-banner"', 'id="cam-status"', 'data-cam="connect"',

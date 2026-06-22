@@ -166,3 +166,90 @@ def test_fetch_or_refresh_offline_fallback(patterns_dir, fake, client):
         'p', base_phase_path='phase/base/p.pt', order='col',
         client=client, force=True)
     assert got is not None and got['n_sites'] == 4
+
+
+# ---- 3-D loading-pattern support ----------------------------------------
+
+def test_initialize_loading_pattern_body_3d(fake, client):
+    """planes_z_rad rides in the request body only when supplied (and a 2-D
+    call still omits it entirely)."""
+    client.initialize_loading_pattern(
+        phase_path='phase/base/two_layer.pt', order='col', name='two_layer',
+        planes_z_rad=[-3.07, 3.07])
+    body = fake.captured_bodies('initialize_loading_pattern')[-1]
+    assert body['planes_z_rad'] == [-3.07, 3.07]
+    # A 2-D call must not carry the key at all.
+    client.initialize_loading_pattern(
+        phase_path='phase/base/flat.pt', order='col', name='flat')
+    body2 = fake.captured_bodies('initialize_loading_pattern')[-1]
+    assert 'planes_z_rad' not in body2
+    # Empty list is treated as "no planes" -> 2-D request.
+    client.initialize_loading_pattern(
+        phase_path='phase/base/flat.pt', order='col', planes_z_rad=[])
+    assert 'planes_z_rad' not in fake.captured_bodies(
+        'initialize_loading_pattern')[-1]
+
+
+def test_fetch_or_refresh_3d_stores_layer_fields(patterns_dir, fake, client):
+    """A 3-D fetch persists the layer-major 3-D fields; knm stays (N,2) so 2-D
+    consumers are unaffected."""
+    reg = patterns_dir
+    rec = reg.fetch_or_refresh_pattern(
+        'two_layer', base_phase_path='phase/base/two_layer.pt', order='col',
+        planes_z_rad=[-3.07, 3.07], client=client)
+    assert rec is not None
+    assert rec['is_3d'] is True
+    assert rec['planes_z_rad'] == [-3.07, 3.07]
+    assert rec['n_per_plane'] == [2, 2]            # fake splits 4 sites / 2
+    assert rec['plane_of_site'] == [0, 0, 1, 1]
+    assert len(rec['z_rad']) == rec['n_sites']
+    assert len(rec['positions_knm3d']) == rec['n_sites']
+    # knm is still (N,2) — the 2-D detection grid is unchanged.
+    assert all(len(p) == 2 for p in rec['knm'])
+    # Compact view drops the big 3-D arrays.
+    compact = reg.list_patterns()['two_layer']
+    for big in ('positions_knm3d', 'z_rad', 'plane_of_site', 'knm', 'phases'):
+        assert big not in compact
+
+
+def test_fetch_or_refresh_planes_are_cache_key(patterns_dir, fake, client):
+    """A 2-D cached record must NOT satisfy a 3-D request, and vice versa."""
+    reg = patterns_dir
+    # 2-D first.
+    reg.fetch_or_refresh_pattern('q', base_phase_path='phase/base/q.pt',
+                                 order='col', client=client)
+    assert fake.hits('initialize_loading_pattern') == 1
+    # Same params + planes -> different identity -> re-derive.
+    reg.fetch_or_refresh_pattern('q', base_phase_path='phase/base/q.pt',
+                                 order='col', planes_z_rad=[-3.07, 3.07],
+                                 client=client)
+    assert fake.hits('initialize_loading_pattern') == 2
+    # Same 3-D params again -> cache hit, no network.
+    r = reg.fetch_or_refresh_pattern('q', base_phase_path='phase/base/q.pt',
+                                     order='col', planes_z_rad=[-3.07, 3.07],
+                                     client=client)
+    assert fake.hits('initialize_loading_pattern') == 2
+    assert r['is_3d'] is True
+    # Different depths -> re-derive.
+    reg.fetch_or_refresh_pattern('q', base_phase_path='phase/base/q.pt',
+                                 order='col', planes_z_rad=[-5.0, 5.0],
+                                 client=client)
+    assert fake.hits('initialize_loading_pattern') == 3
+    # Back to 2-D -> the 3-D cache must not satisfy it.
+    reg.fetch_or_refresh_pattern('q', base_phase_path='phase/base/q.pt',
+                                 order='col', client=client)
+    assert fake.hits('initialize_loading_pattern') == 4
+
+
+def test_legacy_2d_record_still_cache_hits(patterns_dir, fake, client):
+    """A pre-3-D record (no planes_z_rad key) must still satisfy a 2-D request
+    without a needless re-derive after deploy."""
+    reg = patterns_dir
+    rec = _record('legacy')
+    rec.pop('planes_z_rad', None)   # simulate an old on-disk record
+    reg.write_pattern(rec)
+    got = reg.fetch_or_refresh_pattern(
+        'legacy', base_phase_path='phase/base/legacy.pt', order='col',
+        client=client)
+    assert got is not None
+    assert fake.hits('initialize_loading_pattern') == 0   # served from disk

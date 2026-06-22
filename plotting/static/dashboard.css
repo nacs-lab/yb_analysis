@@ -27,6 +27,22 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
+/* Hide the VIEWPORT (page) scrollbar on the scrolling tabs (live / analysis /
+   logs). Those tabs scroll the page, and the bar sits at the right edge over
+   the always-on control panel, which looks broken. Scrolling still works
+   (wheel / keys / trackpad); only the bar is hidden. Inner scroll areas (logs
+   viewer, runs list, the panel itself) keep their own scrollbars. Scoped via
+   the <html data-tab> attribute (set in setTab) so Hardware is left untouched
+   -- it's handled separately. */
+html[data-tab="live"],
+html[data-tab="analysis"],
+html[data-tab="logs"] {
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* old Edge / IE */
+}
+html[data-tab="live"]::-webkit-scrollbar,
+html[data-tab="analysis"]::-webkit-scrollbar,
+html[data-tab="logs"]::-webkit-scrollbar { width: 0; height: 0; }  /* WebKit */
 body {
   background: var(--bg);
   color: var(--text);
@@ -135,13 +151,11 @@ header .status-pill .dot {
    sidebar lives as a position:fixed slide-in panel — see below).
    Only thing we strip from the chart cards is the border/background
    so plots flow without a visible box around each one. */
-.tab-pane.live-flat.sidebar-open {
-  padding-right: calc(20px + var(--live-sidebar-w, 260px));
-}
-.tab-pane.live-flat.sidebar-collapsed {
-  padding-right: 44px;
-}
-.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar):not(#card-affine) {
+/* (Reserve-space for the control sidebar moved to the BODY level -- see
+   `body.ctrl-open` near the .live-sidebar block -- so the always-on panel
+   pushes content aside on EVERY tab, not just Live. The old
+   `.live-flat.sidebar-open/.sidebar-collapsed` padding rules were removed.) */
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar):not(#card-affine):not(#card-thresholds):not(#card-hist-avg):not(#card-hist-reps) {
   background: transparent;
   border: none;
   padding: 0;
@@ -151,7 +165,7 @@ header .status-pill .dot {
    controls that live INSIDE h2 (Downsample switch on img1,
    array2-info hint, etc.) — collapse the h2 to a thin row that
    only shows its non-text children. */
-.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar):not(#card-affine) > h2 {
+.tab-pane.live-flat > .card:not(.status-strip):not(.live-sidebar):not(#card-affine):not(#card-thresholds):not(#card-hist-avg):not(#card-hist-reps) > h2 {
   font-size: 0;
   line-height: 1;
   margin: 0;
@@ -209,61 +223,88 @@ header .status-pill .dot {
    `padding-right: <sidebar-width>` or `44px` (handle only) to keep
    chart content out from under the panel. Hidden on every tab except
    Live via the [hidden] descendant rule below. */
-:root { --live-sidebar-w: 260px; }
-.live-sidebar {
+:root { --live-sidebar-w: 260px; --header-h: 56px; }
+/* The "Yb Control" sidebar is an always-on position:fixed right column shown on
+   EVERY tab. To "push content aside" (never overlay), reserve right-padding at
+   the BODY level so it applies to the 12-col grid tabs AND the full-bleed
+   Hardware iframes alike. Fixed elements ignore this padding, so the panel
+   stays pinned to the viewport's right edge while the tab content shrinks to
+   clear it. ctrl-open is set once on load and never removed (not hideable). */
+body.ctrl-open { padding-right: var(--live-sidebar-w); }
+/* Keep the sticky header FULL viewport width: cancel the body's right-padding
+   on the header with an equal negative right-margin so it spans edge-to-edge.
+   The panel hangs below the header's right portion (its top is pinned to the
+   header's bottom edge) and shares the header's colour, so it reads as a
+   continuation of the header. Only the tab CONTENT below the header is pushed
+   aside. */
+body.ctrl-open > header { margin-right: calc(-1 * var(--live-sidebar-w)); }
+/* NOTE: selector is `.live-sidebar.card` (not just `.live-sidebar`) on purpose.
+   The panel carries class="card live-sidebar", and the generic `.card` rule
+   (background:var(--bg-card); border:1px solid; border-radius:8px; padding:16px)
+   is declared LATER in this file with equal specificity -- so it would win the
+   cascade and re-impose the card bg + rounded corners. The two-class selector
+   out-specifies `.card`, letting these win. */
+.live-sidebar.card {
   position: fixed;
-  top: 64px;
+  /* Start at the BOTTOM of the (full-width, sticky) header so nothing is
+     covered. JS overrides top/height with the live-measured header height
+     (positionControlPanel) so it's exact regardless of header wrapping; these
+     are just the first-paint fallback. */
+  top: var(--header-h);
   right: 0;
   width: var(--live-sidebar-w);
-  height: calc(100vh - 72px);
+  height: calc(100vh - var(--header-h));
   z-index: 20;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-right: none;
-  border-top-left-radius: 8px;
-  border-bottom-left-radius: 8px;
-  box-shadow: -4px 0 14px rgba(0, 0, 0, 0.35);
+  /* Match the HEADER colour (darker than the card bg) so the panel reads as a
+     continuation of the header, not a separate floating card. */
+  background: var(--bg-alt);
+  /* Square + flat: only a left divider border. Explicitly reset `.card`'s full
+     border + 8px radius + any shadow. */
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 12px 14px;
+  /* Scrollable, but with the scrollbar hidden (scroll still works). */
   overflow-y: auto;
-  transition: transform 180ms ease;
+  scrollbar-width: none;        /* Firefox */
+  -ms-overflow-style: none;     /* old Edge / IE */
 }
-.live-sidebar.collapsed {
-  transform: translateX(calc(100% - 32px));
-}
-.live-sidebar-toggle {
-  position: absolute;
-  top: 12px;
-  left: -1px;
-  transform: translateX(-100%);
-  width: 28px;
-  height: 36px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-right: none;
-  border-top-left-radius: 6px;
-  border-bottom-left-radius: 6px;
-  color: var(--text-dim);
-  font-size: 16px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  user-select: none;
-}
-.live-sidebar-toggle:hover { color: var(--text); background: var(--bg-alt); }
-.live-sidebar.collapsed .live-sidebar-toggle::before { content: "‹"; }
-.live-sidebar:not(.collapsed) .live-sidebar-toggle::before { content: "›"; }
-/* Hide the fixed-positioned sidebar when its parent tab is hidden. */
-.tab-pane[hidden] .live-sidebar { display: none !important; }
+.live-sidebar::-webkit-scrollbar { width: 0; height: 0; }  /* Chromium / WebKit */
+/* (The old `.tab-pane[hidden] .live-sidebar { display:none }` rule was removed:
+   the panel is now hoisted to <body> on load and shown on EVERY tab, so it no
+   longer lives under a tab pane.) */
 .live-sidebar h2 { margin: 0 0 4px; }
 .live-sidebar .ctrl-row {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px;
+}
+/* Transport row: Start + Pause are quarter-width icon buttons; Abort fills
+   the remaining half on their right. */
+.live-sidebar .ctrl-row.ctrl-row-transport {
+  grid-template-columns: 1fr 1fr 2fr;
+}
+/* Restart Dash + Restart All + Shutdown share one three-up row; the labels
+   are long, so shrink the type a touch to keep each on (at most) two lines. */
+.live-sidebar .ctrl-row.ctrl-row-restarts {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+.live-sidebar .ctrl-row.ctrl-row-restarts .ctrl-btn {
+  font-size: 10.5px;
+  padding: 7px 3px;
+  letter-spacing: 0.2px;
+  line-height: 1.15;
+}
+/* Compact play/pause glyph buttons (Start / Pause). */
+.live-sidebar .ctrl-btn.ctrl-icon {
+  font-size: 14px;
+  line-height: 1;
+  padding: 6px 4px;
+  letter-spacing: 0;
 }
 .live-sidebar .ctrl-btn {
   background: var(--bg-deep);
@@ -292,20 +333,23 @@ header .status-pill .dot {
   color: #ff8585;
   border-color: rgba(248, 81, 73, 0.4);
 }
-.live-sidebar .ctrl-btn[data-kind="restart-all"] {
+/* Restart All + Shutdown are both yellow (warn). Restart Dash keeps the
+   neutral default colour. */
+.live-sidebar .ctrl-btn[data-kind="restart-all"],
+.live-sidebar .ctrl-btn[data-kind="shutdown"] {
   color: #f0bb50;
   border-color: rgba(210, 153, 34, 0.4);
 }
 /* Colored buttons need their OWN hover rules — the data-kind border-color
    above out-specifies the base :hover, so without these they don't react.
    Each brightens its border + adds a matching tint. */
-.live-sidebar .ctrl-btn[data-kind="abort"]:hover,
-.live-sidebar .ctrl-btn[data-kind="shutdown"]:hover {
+.live-sidebar .ctrl-btn[data-kind="abort"]:hover {
   border-color: var(--err);
   background: rgba(248, 81, 73, 0.14);
   color: #ffb3b3;
 }
-.live-sidebar .ctrl-btn[data-kind="restart-all"]:hover {
+.live-sidebar .ctrl-btn[data-kind="restart-all"]:hover,
+.live-sidebar .ctrl-btn[data-kind="shutdown"]:hover {
   border-color: var(--warn);
   background: rgba(210, 153, 34, 0.16);
   color: #ffd479;
@@ -473,6 +517,71 @@ header .status-pill .dot {
 .ctrl-status[data-state="idle"]      .ctrl-status-text,
 .ctrl-status[data-state="unknown"]   .ctrl-status-text { color: var(--text-dim); }
 
+/* ---- Per-shot health chip (status strip): green/yellow/red status light.
+   green=no failures, yellow=failed earlier (not now), red=actively failing,
+   grey=no info. A leading dot + a coloured value keep it readable at a glance. */
+.shot-health-tile .stat-value {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.shot-health-tile .stat-value::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+}
+.shot-health-tile[data-state="none"] .stat-value { color: var(--text-dim); }
+.shot-health-tile[data-state="ok"]   .stat-value { color: #56d364; }
+.shot-health-tile[data-state="ok"]   .stat-value::before { background: #3fb950; box-shadow: 0 0 5px #3fb950; }
+.shot-health-tile[data-state="warn"] .stat-value { color: #e3b341; }
+.shot-health-tile[data-state="warn"] .stat-value::before { background: #d29922; box-shadow: 0 0 5px #d29922; }
+.shot-health-tile[data-state="fail"] .stat-value { color: #ff7b72; }
+.shot-health-tile[data-state="fail"] .stat-value::before { background: #f85149; box-shadow: 0 0 6px #f85149; }
+.shot-health-tile[data-state="fail"] { animation: shot-fail-pulse 1.4s ease-in-out infinite; }
+@keyframes shot-fail-pulse {
+  0%, 100% { background: transparent; }
+  50%      { background: rgba(248, 81, 73, 0.16); }
+}
+/* Clickable shot-health chip -> opens the Logs tab (jumps to the error). */
+.shot-health-clickable { cursor: pointer; border-radius: 4px; }
+.shot-health-clickable:hover { background: rgba(255, 255, 255, 0.06); }
+/* scan_id / scan_name chips -> open the current run in Analysis (like a queue
+   row). Only clickable once a scan_id is known (.is-linked toggled in JS). */
+.stat-link-tile.is-linked { cursor: pointer; border-radius: 4px; }
+.stat-link-tile.is-linked:hover { background: rgba(255, 255, 255, 0.06); }
+/* Highlighted error line in the Logs viewer (jumped-to from the chip). */
+.log-hit {
+  background: rgba(248, 81, 73, 0.30);
+  color: inherit;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(248, 81, 73, 0.55);
+}
+
+/* Right-half per-site histogram card: 2x2 grid of best / worst / random + the
+   selected site. The selection cell stacks a compact one-line controls row
+   (picker + truncated info) over a slightly shorter plot so the cell lines up
+   with the three rep plots. */
+.hist-reps-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+.hist-sel-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.hist-sel-controls {
+  display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px;
+}
+.hist-sel-controls label { color: var(--text-dim); flex: 0 0 auto; }
+.hist-sel-controls input { width: 70px; flex: 0 0 auto; }
+.hist-sel-controls #site-info {
+  font-size: 10px; color: var(--text-dim); flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hist-sel-cell #plot-hist-site { height: 174px; }
+
 /* ---- Camera card ---- */
 .live-sidebar .cam-status {
   display: flex;
@@ -608,6 +717,15 @@ header .status-pill .dot {
   color: var(--text-dim);
   font-family: var(--mono);
 }
+/* Linked rows (carry a scan_id) open that run in Analysis on click. */
+.live-sidebar .ctrl-queue-list li.q-linked,
+.live-sidebar .ctrl-queue-active.q-linked { cursor: pointer; }
+.live-sidebar .ctrl-queue-list li.q-linked:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.live-sidebar .ctrl-queue-active.q-linked:hover {
+  filter: brightness(1.12);
+}
 .live-sidebar .ctrl-queue-list li.q-history { opacity: 0.7; }
 .live-sidebar .ctrl-queue-list li.q-history.q-ok    .q-mark { color: #56d364; }
 .live-sidebar .ctrl-queue-list li.q-history.q-err   .q-mark { color: #ff7b72; }
@@ -627,6 +745,29 @@ header .status-pill .dot {
   padding: 4px 6px;
   justify-content: center;
 }
+/* Re-queue buttons on each queued / history row (mirror the Queue tab's
+   re-queue + "+code"). Compact glyph buttons so they fit the narrow row. */
+.live-sidebar .ctrl-queue-list li .q-rq {
+  flex: 0 0 auto;
+  background: var(--bg-deep);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 9.5px;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.live-sidebar .ctrl-queue-list li .q-rq:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: rgba(88, 166, 255, 0.12);
+}
+.live-sidebar .ctrl-queue-list li .q-rq:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
 /* Full-bleed tab variant — drops the 12-col grid, max-width cap, and
    padding so a single child element (e.g. an iframe) can fill the
@@ -645,6 +786,170 @@ header .status-pill .dot {
   height: calc(100vh - var(--header-h, 56px));
   overflow: hidden;
 }
+
+/* Merged Hardware tab: a thin sub-tab bar on top, the active sub-view fills the
+   rest. Overrides fullbleed-tab's display:block so the bar + content stack. */
+.tab-pane.hw-merged { display: flex; flex-direction: column; }
+.hw-subtabs {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.hw-subtabs button {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.hw-subtabs button:hover { color: var(--text); background: var(--bg-input); }
+.hw-subtabs button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--bg-input);
+}
+/* Inline "open source ↗" on each sub-tab -- hidden until the tab is hovered or
+   active (like the scope dashboard's per-tab pencil). */
+.hw-subtab-open {
+  display: none;
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.hw-subtabs button:hover .hw-subtab-open,
+.hw-subtabs button.active .hw-subtab-open { display: inline-block; }
+.hw-subtab-open:hover { color: var(--accent); }
+#hw-sub-content { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+/* Each pane fills the sub-content area via absolute inset (a definite box that
+   a child / overflow can size against -- a percentage height here didn't
+   reliably resolve, so the Molecube grid couldn't scroll). Only the active
+   (non-hidden) pane shows. */
+.hw-pane { position: absolute; inset: 0; }
+/* [hidden] must beat .hw-pane-grid's display:grid (author vs author, higher
+   specificity), or a hidden Molecube pane would still render. */
+.hw-pane[hidden] { display: none; }
+/* Molecube sub-view: the native 12-col card grid (mirrors .tab-pane), scrolls
+   vertically within the fixed-height pane. left/right:0 (from inset) + margin
+   auto + max-width centers it. */
+.hw-pane-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+  padding: 20px 24px;
+  max-width: 1520px;
+  margin: 0 auto;
+  overflow-y: auto;
+}
+
+/* No visible scrollbars anywhere in the Hardware tab (everything still scrolls):
+   the Overview grid, the molecube mirror tiles, and the molecube cards pane all
+   scroll cleanly. Embedded iframes (SLM/scope) hide their own scrollbars in
+   their embed CSS. */
+#tab-hardware, #tab-hardware * { scrollbar-width: none; -ms-overflow-style: none; }
+#tab-hardware::-webkit-scrollbar, #tab-hardware ::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ---- Hardware Overview: free-form CANVAS of CHROME-LESS, resizable tiles ----
+   No title bar / border -- just the embedded view at whatever shape/size. Tiles
+   are absolutely positioned (free x/y) so position is stable + persisted (a flow
+   layout reflowed by width). A hover TOP STRIP (⠿ grip + label) drags the tile
+   anywhere (or onto the 🗑 to remove); a hover bottom-right corner resizes. Both
+   x/y and w/h persist per tile. */
+#hw-pane-overview { overflow: auto; }   /* .hw-pane is absolute inset:0 */
+.hw-overview-grid {
+  position: relative;      /* positioning context for the absolute tiles */
+  min-height: 100%;        /* JS grows it past 100% as tiles are placed lower */
+  width: 100%;
+}
+.hw-ov-empty { padding: 24px 8px; color: var(--text-dim); font-size: 13px; line-height: 1.7; }
+.hw-tile {
+  position: absolute;      /* left/top/width/height set inline (free-form, persisted) */
+  min-width: 200px;
+  min-height: 130px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.hw-tile-frame { width: 100%; height: 100%; border: 0; display: block; background: var(--bg); }
+/* Drag grip = a hover TOP STRIP across the tile (a big grab target; a real
+   overlay so the iframe doesn't swallow the pointerdown). Grabbing it reveals
+   the 🗑 immediately. The label is a hover-only hint (no permanent title). */
+.hw-tile-grip {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 3;
+  display: flex; align-items: center; gap: 6px;
+  height: 22px; padding: 0 8px;
+  cursor: grab; opacity: 0; transition: opacity 0.12s; user-select: none;
+  background: linear-gradient(rgba(10, 13, 18, 0.9), rgba(10, 13, 18, 0.45));
+  color: var(--text); font-size: 11px; line-height: 22px;
+}
+.hw-tile:hover .hw-tile-grip { opacity: 1; }
+.hw-tile-grip:active { cursor: grabbing; }
+.hw-grip-dots { color: var(--text-dim); flex: none; }
+.hw-grip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Resize corner (hover) -- custom (native CSS resize can't be grabbed over an iframe). */
+.hw-tile-resize {
+  position: absolute; right: 0; bottom: 0; z-index: 3;
+  width: 16px; height: 16px; cursor: nwse-resize; opacity: 0; transition: opacity 0.12s;
+  background: linear-gradient(135deg, transparent 45%, var(--text-dim) 45%, var(--text-dim) 55%, transparent 55%);
+}
+.hw-tile:hover .hw-tile-resize { opacity: 0.7; }
+/* While dragging/resizing, let the pointer glide over the tile content (iframes
+   AND the now-interactive molecube mirror) so the move isn't swallowed. */
+body.hw-dragging .hw-tile-frame, body.hw-resizing .hw-tile-frame,
+body.hw-dragging .hw-mc-mirror, body.hw-resizing .hw-mc-mirror { pointer-events: none; }
+.hw-tile-dragging { box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55); }
+/* Trash drop-zone: only visible while a tile is being dragged. */
+.hw-trash {
+  position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 80;
+  display: none; align-items: center; gap: 8px; padding: 10px 18px; font-size: 14px;
+  background: var(--bg-card); color: var(--text-dim);
+  border: 1px dashed var(--border); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.hw-trash span { font-size: 12px; }
+body.hw-dragging .hw-trash { display: flex; }
+.hw-trash:hover { color: #ff7b72; border-color: #ff7b72; }
+
+/* ★ "add to Overview" on each native molecube card (Hardware > Molecube). */
+.hw-mc-star {
+  background: none; border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text-dim); cursor: pointer; font-size: 13px; line-height: 1;
+  padding: 1px 6px; margin-right: 6px; flex: none;
+}
+.hw-mc-star:hover, .hw-mc-star.on { color: #f5b301; border-color: #f5b301; }
+/* A molecube Overview tile is a LIVE clone of the real card, and it is
+   INTERACTIVE (wired to the same DDS/TTL handlers as the real card -- see
+   mirrorMolecubeTiles). Size/shape agnostic: fills the tile and scrolls. (It is
+   made pointer-inert only while a tile is being dragged/resized -- see above.) */
+.hw-mc-mirror { width: 100%; height: 100%; overflow: auto; padding: 8px; }
+.hw-mc-mirror > .card { margin: 0; border: 0; background: transparent; padding: 0; max-width: none; width: 100%; }
+
+/* ---- Channels (molecube) sub-view sizing -------------------------------------
+   The pane is a 12-col grid (.hw-pane-grid) inside a FIXED-HEIGHT, absolutely
+   positioned box. With auto rows + scrollable card bodies, the grid was free to
+   crush every card down to fit one screen -- each table collapsed to a tiny 3-row
+   inner scroller (the "everything is cramped" bug). Fix: size rows to their
+   content (min-content) + align-content:start so the grid never distributes the
+   pane height into the rows, and drop the inner overflow so the cards grow to full
+   content and the PANE scrolls as a whole. The DDS (col-6) + NI DAC (col-6) pair
+   share a grid row and STRETCH to equal height (default align-items:stretch -- the
+   shorter table just gets trailing whitespace); a full-width card is alone in its
+   row so stretch == its content height. ---- */
+#hw-pane-molecube {
+  grid-auto-rows: min-content;
+  align-content: start;
+  padding-top: 16px; padding-bottom: 40px;
+}
+#hw-pane-molecube .mc-dds-body { max-height: none !important; overflow: visible !important; }
+#hw-pane-molecube #mc-startup-view { max-height: 60vh !important; }
+#hw-pane-molecube > .card { padding: 16px 18px; }
+
 .iframe-wrap {
   position: relative;
   width: 100%;
@@ -658,6 +963,135 @@ header .status-pill .dot {
   display: block;
   background: var(--bg);
 }
+/* Analysis Data/Sequence sub-view panes. display:contents so the cards
+   inside stay direct grid items of the 12-col tab grid (the wrapper
+   contributes no box of its own). The [hidden] rule must re-assert
+   display:none with id specificity, else display:contents would win. */
+#analysis-data-pane,
+#analysis-sequence-pane { display: contents; }
+#analysis-data-pane[hidden],
+#analysis-sequence-pane[hidden] { display: none; }
+
+/* Data/Sequence segmented toggle in the Run summary header. */
+.analysis-mode-toggle {
+  display: inline-flex;
+  margin-right: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  vertical-align: middle;
+}
+.analysis-mode-toggle button {
+  background: var(--bg-card);
+  color: var(--text-dim);
+  border: 0;
+  padding: 3px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.analysis-mode-toggle button + button { border-left: 1px solid var(--border); }
+.analysis-mode-toggle button:hover { color: var(--text); }
+.analysis-mode-toggle button.active { background: var(--accent-dim); color: #fff; }
+
+/* Full-queue popup (opened from the Live control sidebar). Docks to the LEFT
+   of the right-edge control sidebar, over part of the live view. Not a modal
+   (no backdrop) -- the live view stays interactive behind it. */
+.queue-popup {
+  position: fixed;
+  top: 120px;                         /* fallback; positionQueuePopup() sets the real top */
+  bottom: auto;
+  right: calc(var(--live-sidebar-w, 260px) + 18px);  /* gap leaves room for the caret */
+  width: min(1000px, 70vw);           /* wide enough that rows fit on one line, no h-scroll */
+  max-height: min(72vh, 720px);       /* bounded -- NOT full-screen-tall; centerable on the queue */
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.55);
+  overflow: visible;                  /* so the caret can sit outside the right edge */
+}
+.queue-popup[hidden] { display: none; }
+/* Caret on the right edge pointing at the control-panel queue section, so the
+   popup reads as a popout FROM it. --qp-caret-top is set by positionQueuePopup. */
+.queue-popup::after {
+  content: "";
+  position: absolute;
+  top: var(--qp-caret-top, 50%);
+  right: -9px;
+  margin-top: -9px;
+  width: 0;
+  height: 0;
+  border-top: 9px solid transparent;
+  border-bottom: 9px solid transparent;
+  border-left: 9px solid var(--border);
+}
+/* The WHOLE control-panel queue section is one clickable target (opens the
+   full-queue popup). It bleeds edge-to-edge (cancels the sidebar's 14px side
+   padding), and highlights as a single block on hover via a translucent
+   overlay that sits OVER the child backgrounds -- so the entire section tints,
+   not just the label gap between the active line and the list. The overlay is
+   pointer-events:none so clicks still reach the rows / re-queue buttons. */
+.live-sidebar .ctrl-queue-section {
+  position: relative;
+  cursor: pointer;
+  margin: 4px -14px 0;     /* -14px = sidebar side padding -> full-bleed */
+  padding: 8px 14px;       /* keep content aligned with the rest of the panel */
+}
+.ctrl-queue-section::after {
+  content: "";
+  position: absolute;
+  inset: 0;                /* covers the section edge-to-edge, below the divider */
+  pointer-events: none;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.ctrl-queue-section:hover::after { background: rgba(255, 255, 255, 0.06); }
+.queue-popup-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.queue-popup-title { font-weight: 650; font-size: 13px; }
+.queue-popup-head .ghost { padding: 2px 9px; font-size: 13px; line-height: 1; }
+/* Body fills the popup's remaining height and scrolls VERTICALLY only. */
+.queue-popup-body {
+  padding: 10px 12px 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+  min-height: 0;
+}
+.qp-section-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  font-weight: 650;
+  margin: 14px 0 6px;
+}
+.qp-active { margin-bottom: 4px; }
+.qp-active-name { font-size: 13px; margin-bottom: 6px; }
+.qp-active-detail .kv { margin: 0; }
+.qp-table { width: 100%; }
+/* Each job is ONE line: no cell wraps. EVERY data column truncates after a
+   fixed width (~18 chars); the full value shows on hover via the cell's title
+   (set in renderQueuePopup). The actions column is exempt (it holds buttons).
+   This keeps rows neat and avoids horizontal scroll. */
+.qp-table th, .qp-table td { white-space: nowrap; }
+.qp-table td:not(.qp-actions) {
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qp-table td.qp-actions { white-space: nowrap; }
+
 /* Floating action buttons (reload, open-in-new-tab) for the
    Hardware tab iframe. Positioned over the iframe's top-right corner;
    stay there as the operator scrolls inside the iframe. */
@@ -714,6 +1148,10 @@ header .status-pill .dot {
 .card.live-sidebar {
   overflow-x: hidden;
   overflow-y: auto;
+  /* Keep the sidebar's scroll fully independent of the main page: contain
+     stops scroll-chaining so wheel/inertial scroll started on the page can't
+     bleed into the panel when the cursor crosses over it (and vice-versa). */
+  overscroll-behavior: contain;
 }
 .card h2 {
   margin: 0 0 12px 0;
@@ -1036,6 +1474,23 @@ label.switch input:checked + .track::before { transform: translateX(14px); backg
   margin-bottom: 8px;
   white-space: pre-wrap;
 }
+/* Collapsible "description" note (run purpose/context). Small + dimmed so it sits
+   quietly under the run name; collapsed by default. */
+.run-desc-details {
+  margin: -2px 0 8px;
+}
+.run-desc-details > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-dim);
+  list-style-position: inside;
+  user-select: none;
+}
+.run-desc-details > summary:hover { color: var(--text); }
+.run-desc-details > .run-desc {
+  margin: 4px 0 0;
+  padding-left: 4px;
+}
 .run-meta {
   margin-top: 12px;
   font-size: 12px;
@@ -1131,6 +1586,17 @@ label.switch input:checked + .track::before { transform: translateX(14px); backg
   padding: 1px 5px;
   font-size: 11px;
 }
+/* Thresholds-card pattern selector: tinted by whether the chosen pattern is
+   the live img1 (green) or img2 (blue) frame of the running scan, or a loaded
+   pattern not used in this scan (gray). Set by colorThresholdPatternSelect(). */
+select.pattern-select { font-weight: 600; min-width: 90px; max-width: 220px; }
+select.pattern-select.is-img1 { border-color: #3fb950; color: #3fb950; }
+select.pattern-select.is-img2 { border-color: #58a6ff; color: #58a6ff; }
+select.pattern-select.is-other { border-color: var(--border); color: var(--text-dim); }
+select.pattern-select option { font-weight: 400; }
+select.pattern-select option.popt-img1 { color: #3fb950; }
+select.pattern-select option.popt-img2 { color: #58a6ff; }
+select.pattern-select option.popt-other { color: var(--text); }
 .stat-tile {
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -1145,10 +1611,10 @@ label.switch input:checked + .track::before { transform: translateX(14px); backg
    the card the same height as a single stat-tile, no empty space below. */
 .card.status-strip {
   display: grid;
-  /* Six base tiles + the optional (hidden-by-default) live-diag tile.
-     Fixed 7 columns so the strip is always exactly one row and never
-     reflows when the queue/diag state changes. */
-  grid-template-columns: repeat(7, 1fr);
+  /* Six info tiles + the shot-health chip + the HDF5 save-health chip
+     + the ZMQ delivery gap chip. Fixed 9 columns so the strip is always
+     exactly one row and never reflows when any state changes. */
+  grid-template-columns: repeat(9, 1fr);
   gap: 10px;
   padding: 12px 16px;
 }
@@ -1499,6 +1965,39 @@ table.runs-table tr.grouped td:first-child::before {
 }
 .run-picker .run-info .run-dim {
   color: var(--text-dim);
+}
+/* PRIMARY (first-selected) run: a darker shade of the group highlight + an
+   accent bar so it stands out from the rest of the selected group. */
+.run-picker .run-row.is-primary {
+  background: rgba(88, 166, 255, 0.22);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.run-picker .run-row.is-primary .run-add {
+  color: var(--accent); border-color: var(--accent);
+}
+/* Seq-availability badge. The unified picker is for Analysis too, so rows are
+   NEVER dimmed/disabled by seq state -- only the badge is tinted (ready=green,
+   reconstructable=amber, unrecoverable=grey). */
+.run-picker .seq-row-tag { color: var(--text-dim); font-size: 11px; }
+.run-picker .run-row.seq-row-ready .seq-row-tag { color: var(--ok); }
+.run-picker .run-row.seq-row-reconstructable .seq-row-tag { color: var(--warn); }
+.run-picker .run-row.seq-row-working { opacity: 0.6; }
+/* The row whose sequence is currently plotted on the Sequence tab. */
+.run-picker .run-row.seq-current { outline: 1px solid var(--accent-dim); outline-offset: -1px; }
+
+/* ---- Queue / History rows linked to a scan_id -------------------------
+   Clickable (opens Analysis); highlighted when selected, same scheme as the
+   picker (whole group lighter, primary darker). */
+#queue-table tr.q-linked, #history-table tr.q-linked { cursor: pointer; }
+#queue-table tr.q-linked:hover, #history-table tr.q-linked:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+#queue-table tr.in-tray, #history-table tr.in-tray {
+  background: rgba(88, 166, 255, 0.12);
+}
+#queue-table tr.is-primary, #history-table tr.is-primary {
+  background: rgba(88, 166, 255, 0.24);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 
 /* ---- Tray-as-header layout. The .runs-tray .runs-header div takes
@@ -1862,9 +2361,29 @@ table.runs-table tr.grouped td:first-child::before {
   color: var(--accent);
   background: rgba(88, 166, 255, 0.12);
 }
-.floating-analysis-host > #analysis-runs-card { --float-edge-label: "Runs"; }
+/* The unified picker (reparented into the LEFT scans host) is labelled "Scans". */
+.floating-analysis-host > #analysis-runs-card { --float-edge-label: "Scans"; }
 .floating-analysis-host > #analysis-filters   { --float-edge-label: "Filter"; }
 .floating-analysis-host > #sequence-chn-card  { --float-edge-label: "Channels"; }
+/* Left-docked Scans picker sizing: 30px edge tab + a tall, wide expanded list
+   (host-scoped so it applies to whatever card lives in the left host). */
+#floating-seqscan-host > .card[data-float-state="edge"] { width: 30px; }
+#floating-seqscan-host > .card[data-float-state="expanded"] {
+  width: 640px; min-width: 0; max-width: 72vw;
+  height: min(680px, 82vh); max-height: min(680px, 82vh);
+}
+/* Filter + Channels now share the LEFT column with Scans (reparented in
+   dashboard.js, stacked under Runs). Two things follow:
+   1. Per sub-mode only ONE of Filter/Channels is shown; toggling its [hidden]
+      must beat the base `.card { display:flex }` rule. */
+.floating-analysis-host > .card[hidden] { display: none !important; }
+/* 2. The Filter card's content is short -- give it an auto height instead of
+      inheriting the Scans picker's tall 640x680 expanded box. */
+#floating-seqscan-host > #analysis-filters[data-float-state="expanded"] {
+  width: 560px;
+  height: auto;
+  max-height: min(420px, calc(85vh - 80px));
+}
 
 /* ---- Sequence-tab floating channel picker ----
    Reuses the edge/peek/expanded frame above; just defines its header +
@@ -1940,14 +2459,21 @@ table.runs-table tr.grouped td:first-child::before {
   transform: none;
   justify-content: flex-start;
 }
+/* The RIGHT-docked Filter tab (Analysis) shares the base host's top:64px, which
+   left it sitting 28px ABOVE the LEFT-docked Scans tab (#floating-seqscan-host,
+   top:92px). Pin it to the same 92px so the two edge tabs line up across the
+   viewport. */
+#floating-analysis-host {
+  top: 92px;
+}
 .floating-analysis-host > #sequence-chn-card[data-float-state="expanded"] {
-  /* min-width:0 (not the base 280 / a floor): a min-width FLOOR can't animate
-     from the edge tab's `auto`, so it snapped the width to the floor at frame 0
-     -- THAT was the residual "bounce". With no floor, width glides 30->300px. */
-  width: 300px; min-width: 0; max-width: 340px;
+  /* Match the Filter/Runs expanded WIDTH (calc(50vw-48px), capped 720) so the
+     channel picker isn't a cramped 300px column. min-width:0 (no floor) keeps
+     the edge->expanded width glide smooth (a min-width floor snaps at frame 0). */
+  width: calc(50vw - 48px); min-width: 0; max-width: 720px;
   /* CONCRETE height (not auto) so the edge->expanded transition animates height
-     smoothly instead of snapping (the snap is what read as "bouncing"). Capped
-     against the viewport bottom (card is top-anchored at 92px). */
+     smoothly instead of snapping. Capped against the viewport bottom (card is
+     top-anchored at 92px). */
   height: min(560px, calc(100vh - 130px));
   max-height: min(560px, calc(100vh - 130px));
 }
@@ -1963,14 +2489,12 @@ table.runs-table tr.grouped td:first-child::before {
               height 260ms cubic-bezier(0.22, 0.61, 0.36, 1),
               padding 260ms cubic-bezier(0.22, 0.61, 0.36, 1);
 }
-/* Edge tabs: wider so the count is readable, and the CHANNELS tab is TALLER so its
-   vertical label + "● N" count don't clip (the count was getting cut off). */
-.floating-analysis-host > #sequence-chn-card[data-float-state="edge"],
+/* The LEFT-docked Scans edge tab stays a touch wider for its count. */
 .floating-analysis-host > #seqscan-card[data-float-state="edge"] { width: 30px; }
-.floating-analysis-host > #sequence-chn-card[data-float-state="edge"] { height: 168px; }
-.floating-analysis-host > #sequence-chn-card[data-float-state="edge"]::after {
-  font-size: 13px; letter-spacing: 0; font-weight: 700;
-}
+/* The Channels edge tab matches the Filter edge tab EXACTLY (same width,
+   height, and count font) so the two right-docked tabs are identical when
+   hidden -- it inherits the base edge geometry (22px x --floating-short-height)
+   and the base ::after font, so no overrides here. */
 
 /* ---- Floating "Scans" picker (Sequence tab): LEFT-docked in its own host
    (#floating-seqscan-host), vertically centered; hover-driven, wider (it holds
@@ -2584,7 +3108,13 @@ textarea::-webkit-scrollbar-thumb:hover,
 /* Viewport-relative height: the plot grows to use the window but always leaves
    room below for the focus/highlight region, so clicking a pulse frames both
    un-clipped (req 1/4). */
-#tab-sequence .plot-container { height: 62vh; min-height: 420px; max-height: 820px; }
+/* Target the plot by its stable id (NOT `#tab-sequence .plot-container`): the
+   sequence cards are reparented into the Analysis tab's Sequence pane, so a
+   #tab-sequence-scoped rule no longer matches -- which left the plot with zero
+   height (squished) and an unconstrained width (Plotly autosize ran away on
+   each resize). min-width:0 + the .plot-container's own width:100%/overflow
+   keep the grid track from being pushed wider by the SVG. */
+#plot-sequence { height: 62vh; min-height: 420px; max-height: 820px; min-width: 0; }
 /* Scan picker list: reuses the Analysis .run-picker / .run-row styling (the
    container carries both classes), just a shorter list here. */
 .seq-scan-table { max-height: 220px; }
@@ -2889,3 +3419,182 @@ textarea::-webkit-scrollbar-thumb:hover,
 .af-table th { color: var(--text-dim); text-transform: uppercase; font-size: 9px;
   letter-spacing: 0.5px; position: sticky; top: 0; background: var(--bg-card); }
 .af-table tr.af-cur td { color: var(--accent); }
+.af-table tr.tb-row-rej td { color: var(--err); }
+
+/* Detection-thresholds card: loud calibration-health warning banner. */
+.threshold-banner {
+  margin: 0 0 10px 0; padding: 8px 12px; border-radius: 6px;
+  font-size: 12px; font-weight: 600; border: 1px solid var(--border);
+}
+.threshold-banner.tb-bad {
+  background: color-mix(in srgb, var(--err) 16%, transparent);
+  border-color: var(--err); color: var(--err);
+}
+.threshold-banner.tb-warn {
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  border-color: var(--warn); color: var(--warn);
+}
+
+/* ============================ MOLECUBE TAB ============================ */
+/* FPGA1 DDS/TTL/clock control panel (/api/molecube/*). Matches the dark
+   theme; the whole API is master-gated, so the default view is the banner. */
+.mc-pill {
+  font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--text-dim);
+  background: var(--bg-input); text-transform: uppercase; letter-spacing: 0.4px;
+}
+/* Single-line card hint: clip to the card width with an ellipsis instead of
+   wrapping (full text stays available via the element's title= tooltip). */
+.mc-hint-1line {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.mc-pill-ok  { color: var(--ok);  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.mc-pill-warn{ color: var(--warn); border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.mc-pill-err { color: var(--err); border-color: var(--err);
+  background: color-mix(in srgb, var(--err) 14%, transparent); }
+.mc-pill-off { color: var(--text-dim); }
+
+.mc-banner {
+  margin: 4px 0 10px 0; padding: 10px 14px; border-radius: 6px; font-size: 12.5px;
+  border: 1px solid var(--warn); color: var(--text);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+.mc-banner code { color: var(--accent); }
+.mc-banner-info { border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); }
+/* Read-only mode: dim the write-only controls (they stay clickable so a click
+   gives the "writes disabled" toast). TTL chips are NOT dimmed -- they show
+   live state, which is a read. */
+.mc-readonly .mc-set, .mc-readonly .mc-ovr-btn,
+.mc-readonly [data-mc-reset], .mc-readonly #mc-clock-set,
+.mc-readonly .mc-name-save { opacity: 0.4; }
+.mc-readonly .mc-ttl-chip { cursor: not-allowed; }
+.mc-readonly .mc-name-in { opacity: 0.6; }
+
+/* DDS table */
+.mc-dds-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.mc-dds-table th {
+  text-align: left; color: var(--text-dim); text-transform: uppercase;
+  font-size: 9px; letter-spacing: 0.5px; padding: 4px 6px;
+  position: sticky; top: 0; background: var(--bg-card); border-bottom: 1px solid var(--border);
+}
+.mc-dds-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.mc-dds-table tr:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.mc-ch   { color: var(--text-dim); text-align: right; width: 28px; }
+.mc-name { color: var(--accent); white-space: nowrap; }
+/* Click-to-edit channel name (DDS table + TTL chips). Shows as plain text; clicking
+   the text swaps in an inline editor (a box + a ✓ button). */
+.mc-name-cell { white-space: nowrap; }
+.mc-name-field { display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  vertical-align: middle; }
+.mc-name-text { cursor: pointer; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; max-width: 150px; }
+.mc-name-text:hover { text-decoration: underline dotted; }
+.mc-name-empty { color: var(--text-dim); font-style: italic; opacity: 0.6; }
+.mc-name-editbox { display: none; align-items: center; gap: 4px; }
+.mc-name-field.editing .mc-name-text { display: none; }
+.mc-name-field.editing .mc-name-editbox { display: inline-flex; }
+.mc-name-editbox .mc-name-in {
+  width: 104px; min-width: 60px; padding: 3px 5px; font-size: 12px; user-select: text;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 4px;
+}
+.mc-name-save { flex: 0 0 auto; border-color: var(--accent-dim); }
+.mc-cell { white-space: nowrap; }
+.mc-cell.mc-ovr { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+/* Each editable cell lays its input + Set/ovr buttons out in a no-wrap flex row
+   with a gap, so they never overlap even on narrow columns. */
+.mc-cell-wrap { display: flex; align-items: center; gap: 5px; flex-wrap: nowrap; }
+/* Selector is intentionally more specific than the global
+   `input[type="number"] { width:100% }` (0,1,1) -- otherwise the field fills the
+   whole cell and overlaps the Set/ovr buttons. Fixed basis keeps the row tidy. */
+.mc-cell-wrap .mc-in {
+  width: 72px; flex: 0 0 72px; padding: 3px 5px; font-size: 12px;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+/* Per-field widths -- freq needs the most room (MHz, 6 decimals); amp (0-1) and
+   phase (deg) are short, so keep them compact. Matters now that DDS is a
+   half-width (col-6) card and the Set/ovr/Reset buttons must also fit. */
+.mc-cell-wrap .mc-in[data-mc-type="freq"]  { width: 80px; flex-basis: 80px; }
+.mc-cell-wrap .mc-in[data-mc-type="amp"]   { width: 54px; flex-basis: 54px; }
+.mc-cell-wrap .mc-in[data-mc-type="phase"] { width: 58px; flex-basis: 58px; }
+/* Drop the number-spinner arrows -- they eat ~16px and are useless for typed
+   freq/amp/phase values, so hiding them keeps the compact boxes readable. */
+.mc-cell-wrap .mc-in { -moz-appearance: textfield; appearance: textfield; }
+.mc-cell-wrap .mc-in::-webkit-outer-spin-button,
+.mc-cell-wrap .mc-in::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.mc-mini {
+  flex: 0 0 auto; font-size: 10px; padding: 3px 7px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-alt); color: var(--text);
+  white-space: nowrap;
+}
+.mc-mini:hover { filter: brightness(1.18); }
+.mc-set { border-color: var(--accent-dim); }
+.mc-ovr-btn.on { background: var(--warn); color: #0e1116; border-color: var(--warn); }
+.mc-ovr-tag { color: var(--warn); }
+
+/* Compact inline clock control (folded into the status card, not its own card). */
+.mc-clock-inline {
+  display: flex; align-items: center; gap: 8px; margin-top: 10px;
+  padding-top: 10px; border-top: 1px solid var(--border); flex-wrap: wrap;
+}
+.mc-clock-inline label { color: var(--text-dim); font-size: 12px; }
+.mc-clock-inline input {
+  width: 80px; padding: 3px 6px; font-size: 12px;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+
+/* NI DAC monitor (mc-nidaq card) -- reuses .mc-dds-table; just adds column tints.
+   This is a read-only readback, so no inputs/buttons like the molecube DDS rows. */
+.ni-default { color: var(--text-dim); text-align: right; }
+.ni-delta   { color: var(--text-dim); text-align: right; }
+.ni-delta-big { color: var(--warn); font-weight: 600; }   /* visibly off its default */
+.ni-cell-err { color: var(--err); }
+.ni-err { color: var(--err); cursor: help; }
+/* NI write cell: voltage input + Set. Selector beats the global
+   input[type="number"]{width:100%} so the field stays narrow. */
+.ni-set-cell { white-space: nowrap; }
+.ni-set-cell .ni-in {
+  width: 74px; padding: 3px 6px; font-size: 12px; margin-right: 5px;
+  background: var(--bg-input); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+
+/* TTL chip grid */
+.mc-ttl-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+  gap: 6px; margin-top: 8px;
+}
+.mc-ttl-chip {
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  padding: 6px 4px; border-radius: 6px; cursor: pointer; user-select: none;
+  border: 1px solid var(--border); background: var(--bg-input); color: var(--text-dim);
+  font-size: 11px; transition: background .12s ease, color .12s ease;
+}
+.mc-ttl-chip:hover { filter: brightness(1.15); }
+.mc-ttl-chip.on { background: color-mix(in srgb, var(--ok) 22%, transparent);
+  color: var(--ok); border-color: var(--ok); }
+.mc-ttl-chip.ovr-lo { box-shadow: inset 0 0 0 2px var(--err); }
+.mc-ttl-chip.ovr-hi { box-shadow: inset 0 0 0 2px var(--accent); }
+.mc-ttl-n  { font-weight: 700; font-family: var(--mono); }
+.mc-ttl-nm { font-size: 9px; opacity: 0.8; text-align: center; line-height: 1.05;
+  max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* TTL chip name: compact text under the channel number. Clicking it opens the inline
+   editor (shared .mc-name-field); the editor widens the chip (.mc-editing) so the box
+   + ✓ aren't cramped. Clicking the name never toggles the output (handled in JS). */
+.mc-ttl-chip .mc-name-field { max-width: 58px; margin-top: 1px; }
+.mc-ttl-chip .mc-name-text { font-size: 9px; opacity: 0.85; max-width: 56px;
+  text-align: center; line-height: 1.05; }
+.mc-ttl-chip.mc-editing { grid-column: span 3; cursor: default; }
+.mc-ttl-chip.mc-editing .mc-name-field { max-width: none; }
+.mc-ttl-chip .mc-name-editbox .mc-name-in { width: 92px; font-size: 11px; }
+
+/* legend keys in the hints */
+.mc-ovr-tag, .mc-ttl-lo-key, .mc-ttl-hi-key, .mc-ovr-key { font-weight: 600; }
+.mc-ttl-lo-key { color: var(--err); }
+.mc-ttl-hi-key { color: var(--accent); }
+.mc-ovr-key    { color: var(--warn); }

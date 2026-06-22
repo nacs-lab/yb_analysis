@@ -45,7 +45,7 @@ from yb_analysis.analysis.probabilities import (
     prob11, prob11_site_resolved,
     prob10, prob10_site_resolved,
     loading_rate, loading_rate_site_resolved,
-    per_shot_rate_stats,
+    per_shot_rate_stats, false_positive_rate,
 )
 from yb_analysis.analysis.unpack import unpack_scan_logicals
 
@@ -71,9 +71,87 @@ ANALYSIS_JSON = 'slm_analysis.json'   # Phase 5a closeout: cached SLM-side
 ANALYSIS_CACHE_JSON = 'analysis_cache.json'
 ANALYSIS_CACHE_VERSION = 1
 
+# Full default-view (unfiltered, no-recompute) analysis payload, cached to disk
+# keyed by actual shot count. Lets a page reload / tab-switch return the whole
+# rendered analysis in ~ms instead of re-reading the HDF5 + recomputing. Bumped
+# whenever the payload SHAPE changes (so stale caches are ignored, not mis-read).
+ANALYSIS_PAYLOAD_JSON = 'analysis_payload.json'
+# v2: default view now carries imaging_fidelity (from the throughout-run logged
+# infidelities) + rearrange_survival_cap; stale v1 payloads lack those fields.
+# v3: invalidates v2 payloads cached with `per_iteration: None`. Older backends
+# computed per_iteration only from the (interleaved) `logicals` array, which is
+# None for two-array scans -> the field cached as None and stuck (the cache key
+# is shot-count, which never changes once the run is done). The cache-write guard
+# below now also refuses to persist a payload whose per_iteration failed, so this
+# can't recur; the bump clears the already-poisoned v2 caches in one shot.
+ANALYSIS_PAYLOAD_VERSION = 3
+
 
 def _analysis_cache_path(scan_dir: Path) -> Path:
     return Path(scan_dir) / ANALYSIS_CACHE_JSON
+
+
+def _payload_cache_path(scan_dir: Path) -> Path:
+    return Path(scan_dir) / ANALYSIS_PAYLOAD_JSON
+
+
+def _probe_actual_shots(scan_dir: Path) -> Optional[int]:
+    """Cheap recorded-shot count = seq_ids dataset length (shape only, no data).
+
+    Mirrors ``runs_list._actual_shots`` but kept local to avoid a circular
+    import (runs_list imports this module). Returns None on any failure so the
+    payload fast-path simply falls through to a full analysis.
+    """
+    base = Path(scan_dir).name
+    h5_path = Path(scan_dir) / f'{base}.h5'
+    if not h5_path.is_file():
+        return None
+    try:
+        import h5py
+        with h5py.File(str(h5_path), 'r') as f:
+            for k in ('seq_ids', 'logicals_img1', 'logicals'):
+                if k in f:
+                    return int(f[k].shape[0])
+    except Exception:
+        return None
+    return None
+
+
+def _read_payload_cache(scan_dir: Path) -> Optional[dict]:
+    """Return the cached default-view payload wrapper, or None.
+
+    Shape: ``{'_version': int, 'n_shots': int, 'payload': <analysis dict>}``.
+    """
+    p = _payload_cache_path(scan_dir)
+    if not p.is_file():
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict) \
+                and data.get('_version') == ANALYSIS_PAYLOAD_VERSION \
+                and isinstance(data.get('payload'), dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _write_payload_cache(scan_dir: Path, payload: dict, n_shots) -> None:
+    """Persist the default-view payload (atomic). No-op on a bad/empty result."""
+    if not isinstance(n_shots, int) or n_shots <= 0:
+        return
+    if payload.get('unpack_error'):
+        return   # don't cache a broken analysis
+    p = _payload_cache_path(scan_dir)
+    try:
+        tmp = p.with_suffix('.json.tmp')
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'_version': ANALYSIS_PAYLOAD_VERSION,
+                       'n_shots': int(n_shots), 'payload': payload}, f)
+        os.replace(tmp, p)
+    except (OSError, TypeError, ValueError) as ex:
+        logger.warning('analysis payload cache write failed (%s): %s', p, ex)
 
 
 def _read_analysis_cache(scan_dir: Path) -> Optional[dict]:
@@ -108,7 +186,8 @@ def invalidate_analysis_cache(scan_dir) -> list:
     dashboard's "re-analyze" button."""
     scan_dir = Path(scan_dir)
     removed = []
-    for name in (ANALYSIS_CACHE_JSON, FOCUS_METRICS_JSON, AVG_IMAGE_PNG):
+    for name in (ANALYSIS_CACHE_JSON, ANALYSIS_PAYLOAD_JSON,
+                 FOCUS_METRICS_JSON, AVG_IMAGE_PNG):
         p = scan_dir / name
         try:
             if p.is_file():
@@ -248,6 +327,19 @@ def analyze_scan_dir(scan_dir,
     if not scan_dir.is_dir():
         raise RunAnalysisError(f"scan_dir not a directory: {scan_dir}")
 
+    # Fast path: the DEFAULT view (no filter, no recompute) of a scan whose
+    # data hasn't grown is served straight from the cached payload on disk, so
+    # a page reload / tab-switch returns in ~ms instead of re-reading the HDF5.
+    # Self-invalidates when the scan grows (shot-count key mismatch); busted by
+    # force_recache (which deletes the file just below).
+    _default_view = (filters is None and not recompute_infidelity)
+    if _default_view and not force_recache:
+        _cached = _read_payload_cache(scan_dir)
+        if _cached is not None:
+            _cur_shots = _probe_actual_shots(scan_dir)
+            if _cur_shots is not None and _cached.get('n_shots') == _cur_shots:
+                return _cached['payload']
+
     # "Re-analyze" button: drop the cached (expensive) results so they're
     # recomputed fresh this call.
     if force_recache:
@@ -328,7 +420,11 @@ def analyze_scan_dir(scan_dir,
     out['n_params'] = int(n_params)
     out['n_params_global']   = n_params_full
     out['n_shots']           = n_shots_actual
-    out['n_shots_scheduled'] = int(n_params_full * max_reps)
+    # "supposed to do" = the run PLAN from the config sidecar (n_shots_planned /
+    # len(Params), honoring an explicit rep), NOT n_params * observed-max_reps --
+    # the observed depth grows as data accumulates and shrinks on an abort, so it
+    # never reports a stable plan. Fall back to the legacy estimate for old sidecars.
+    out['n_shots_scheduled'] = _planned_shots(scan, fallback=int(n_params_full * max_reps))
     out['n_sites']  = int(n_sites)
     # Surface what shapes we got so the dashboard can pinpoint
     # data-loading issues (logicals shape, two-array layout, etc.).
@@ -420,7 +516,13 @@ def analyze_scan_dir(scan_dir,
                 'survival_mean':  None,
                 'fp_rate':        None,
             }
-            if logic2 is not None and logic2.size:
+            # Per-site survival/FP pair logic1[s] & logic2[s] site-for-site, so
+            # they're only defined when img1 and img2 share a grid. For a
+            # cross-grid rearrangement run (init pattern != target pattern) the
+            # target-aware per-site map (_per_site_from_lab_paths) supplies the
+            # survival map instead; here we keep the loading map (img1-only).
+            if (logic2 is not None and logic2.size
+                    and not _cross_grid_logicals(logic1, logic2)):
                 sr_per_param, _ = prob11_site_resolved(logic1, logic2)
                 with np.errstate(invalid='ignore'):
                     sr_mean = np.nanmean(np.asarray(sr_per_param, dtype=float),
@@ -463,6 +565,15 @@ def analyze_scan_dir(scan_dir,
 
     # ---- Code snapshot sidecar pointer ---------------------------------
     out['code'] = _code_info(scan_dir / CODE_JSON)
+    # The SLM model that ACTUALLY ran (the checkpoint the server snapshotted into
+    # slm_code.json) — the authoritative companion to the *requested* model in
+    # descriptor['runp'] (warmup_kwargs.model_filename). Surface it in Details so
+    # a rearrangement run records which model produced its data. Dedup by name.
+    _slm_model = (out.get('code') or {}).get('model_filename')
+    if _slm_model and not any(p['name'] == 'slm_model'
+                              for p in out['run_parameters']):
+        out['run_parameters'].append(
+            {'name': 'slm_model', 'value': str(_slm_model), 'group': 'slm'})
 
     # ---- Per-run grid sidecar (Phase 4 addition) -----------------------
     out['grid'] = _grid_info(scan_dir / GRID_JSON)
@@ -507,16 +618,31 @@ def analyze_scan_dir(scan_dir,
     # scrambled order the scan actually executed in. Computed here (after
     # paths_info + diag_path) so it can compute the rearrangement-correct
     # FP (target sites excluded) and attach per-shot numeric diag series.
+    # Tracks whether an OPTIONAL sub-computation failed recoverably. A failed
+    # per_iteration must NOT be persisted to the payload cache: the cache key is
+    # shot-count, so a one-time failure (transient, or older code) would stick
+    # forever and the dashboard would serve `per_iteration: None` on every later
+    # view (the bug this guards against). See _write_payload_cache.
+    cache_safe = True
     if include_per_iteration:
         try:
-            out['per_iteration'] = _per_iteration_time_order(
+            pit = _per_iteration_time_order(
                 scan, bundle, seq_ids, param_mask, filters,
                 paths_info=paths_info,
                 diag_path=diag_path if diag_path.is_file() else None)
+            out['per_iteration'] = pit
+            # A None return when logicals DID unpack (n_shots > 0) means the
+            # per-shot walk silently failed (e.g. an unhandled data layout) --
+            # treat it like an exception so the bad payload isn't cached.
+            if pit is None and out.get('unpack_error') is None \
+                    and (out.get('n_shots') or 0) > 0:
+                cache_safe = False
         except Exception as ex:
             logger.warning('per_iteration_time_order failed: %s', ex)
             out['per_iteration'] = None
+            cache_safe = False
     else:
+        # Intentionally skipped (caller asked for no per_iteration); still cache.
         out['per_iteration'] = None
 
     # ---- Legacy SLM analysis fallback (Phase 5a closeout) -------------
@@ -567,6 +693,13 @@ def analyze_scan_dir(scan_dir,
         out['summary']['survival_mean'] = target_aware['per_param_mean']
         out['summary']['survival_sem']  = target_aware['per_param_sem']
         out['summary']['survival_source'] = target_aware['source']
+        # Target-aware FP curve + overall (so the sweep plot + headline can
+        # show FP at non-target sites alongside TP).
+        if target_aware.get('per_param_fp') is not None:
+            out['summary']['fp_mean'] = target_aware['per_param_fp']
+            out['summary']['fp_sem']  = target_aware.get('per_param_fp_sem')
+            out['summary']['fp_overall'] = target_aware.get('fp_overall')
+            out['summary']['fp_source'] = 'rearrange'
     elif target_aware and target_aware.get('overall_mean') is not None:
         # No per-param mapping, but we know the overall TP rate. Annotate
         # the summary so the dashboard can show "overall TP=84.4%" even
@@ -707,45 +840,89 @@ def analyze_scan_dir(scan_dir,
     # double-Gaussian from THIS run's stored intensities so the metric
     # reflects the actual run, not the scan-start calibration (the dashboard's
     # "recompute from this run" button — non-destructive).
+    # Thresholds the run ACTUALLY used, reconstructed per-shot from the
+    # per-pattern update log (seeded with scan-start initThresholds). Drives
+    # the used-threshold imaging fidelity in BOTH views: the cheap default
+    # reads the logged infidelities, the recompute evaluates these per-segment
+    # thresholds against this run's freshly-fit Gaussians.
+    thr_timeline = _run_threshold_timeline(scan, scan_dir, out['n_shots'])
+    paths_for_cap = paths_info.get('paths_per_shot')
+
     disc = None
     imaging_fid = None
+    rearr_cap = None
     if recompute_infidelity:
         # The recompute (1068 double-Gaussian fits, ~5 s) is whole-scan and
         # filter-INDEPENDENT, so it's cached to disk keyed by shot count.
         # Filtering / reloading reuses the cache instead of refitting; a
         # live run's cache is discarded once n_shots grows (key mismatch). ONE
         # fit pass yields BOTH the recompute discrimination (optimal cut) and
-        # the imaging fidelity at the used thresholds.
+        # the imaging fidelity at the throughout-run thresholds.
         cache = _read_analysis_cache(scan_dir)
         if cache and cache.get('n_shots') == out['n_shots']:
             disc = cache.get('discrimination_recomputed')
             imaging_fid = cache.get('imaging_fidelity')
+            rearr_cap = cache.get('rearrange_survival_cap')
         if disc is None or imaging_fid is None:
-            disc2, imaging2 = _recompute_run_metrics(bundle, scan)
+            segs_for_fit = ([(s.get('weight', 0), s.get('thresholds'))
+                             for s in thr_timeline] if thr_timeline else None)
+            disc2, imaging2 = _recompute_run_metrics(bundle, scan, segs_for_fit)
             disc = disc or disc2
             imaging_fid = imaging_fid or imaging2
             _update_analysis_cache(scan_dir, out['n_shots'],
                                    discrimination_recomputed=disc,
                                    imaging_fidelity=imaging_fid)
+        # Loss #2: max rearrangement survival cap from source-site detection
+        # confidence (needs its own img1-only fit, so it rides the recompute).
+        if rearr_cap is None and paths_for_cap:
+            try:
+                rearr_cap = _rearrange_survival_cap(paths_for_cap, bundle, scan)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning('rearrange survival cap failed: %s', ex)
+                rearr_cap = None
+            if rearr_cap is not None:
+                _update_analysis_cache(scan_dir, out['n_shots'],
+                                       rearrange_survival_cap=rearr_cap)
+    else:
+        # Default view: cheap throughout-run imaging fidelity from the logged
+        # infidelities (no refit). Surface a cap cached by a prior recompute.
+        imaging_fid = _imaging_fidelity_from_logged_timeline(thr_timeline)
+        cache = _read_analysis_cache(scan_dir)
+        if cache and cache.get('n_shots') == out['n_shots']:
+            rearr_cap = cache.get('rearrange_survival_cap')
     if disc is None:
         disc = _discrimination_info(scan)
     out['discrimination'] = disc
     out['discrimination_global'] = disc   # alias: infidelity never filters
-    # Imaging fidelity (how good the run's actual bitstrings were) — only
-    # populated when recompute is active (rides the same fit pass).
+    # Imaging fidelity at the thresholds used THROUGHOUT the run — default view
+    # from the logged infidelities, recompute from this run's refit.
     out['imaging_fidelity'] = imaging_fid
+    # Loss #2 — max rearrangement survival cap (recompute-loaded / cached).
+    out['rearrange_survival_cap'] = rearr_cap
     # Attach per-site infidelity onto the per_site panel payload so the
     # dashboard can render an infidelity map alongside loading/survival/FP.
     # Done last so it survives the per_site overrides above; length-guarded
     # against the active per_site site count.
     if disc is not None and isinstance(out.get('per_site'), dict):
         ps_inf = disc['per_site']
-        ref = out['per_site'].get('loading_rate') or out['per_site'].get('x')
-        if ref is None or len(ps_inf) == len(ref):
-            out['per_site']['infidelity'] = ps_inf
-            if not out['per_site'].get('x') and disc.get('x'):
-                out['per_site']['x'] = disc['x']
-                out['per_site']['y'] = disc['y']
+        ps_ = out['per_site']
+        dx, dy = disc.get('x'), disc.get('y')
+        main_n = len(ps_['x']) if ps_.get('x') else None
+        if main_n is not None and len(ps_inf) == main_n:
+            # Infidelity is on the main per-site grid.
+            ps_['infidelity'] = ps_inf
+        elif dx and dy and len(ps_inf) == len(dx):
+            # Different grid than the main map (cross-grid run: infidelity is on
+            # the INIT detection grid, the map is the TARGET grid) — carry its
+            # own coords so the dashboard renders it on the init grid.
+            ps_['infidelity'] = ps_inf
+            ps_['infid_x'] = dx
+            ps_['infid_y'] = dy
+        elif main_n is None and dx:
+            # per_site had no coords (legacy) — adopt disc's grid.
+            ps_['infidelity'] = ps_inf
+            ps_['x'] = dx
+            ps_['y'] = dy
 
     # ---- Threshold provenance + summary (header) -----------------------
     if disc is not None and disc.get('source') == 'recomputed_from_run' \
@@ -812,17 +989,59 @@ def analyze_scan_dir(scan_dir,
         logger.warning('global target_aware failed: %s', ex)
         ta_global = None
     out['target_aware_global'] = ta_global
+
+    # Filtered TP: target survival with outlier bad-fidelity target spots
+    # dropped (so transport survival isn't dragged down by a few mis-detected
+    # targets). Cheap — uses the throughout-run logged per-site infidelities
+    # (collapsing to scan-start initInfidelities when nothing was logged), so it
+    # computes WITHOUT a recompute and shows for old runs on re-analyze.
+    out['target_aware_filtered'] = None
+    try:
+        per_site_infid = _throughout_run_per_site_infidelity(thr_timeline)
+        if per_site_infid is not None and paths_info.get('paths_per_shot'):
+            infid_src = ('throughout_run'
+                         if any(s.get('source') != 'scan_init'
+                                and s.get('weight', 0) > 0
+                                and s.get('infidelities') is not None
+                                for s in thr_timeline)
+                         else 'scan_start')
+            out['target_aware_filtered'] = _filtered_target_aware(
+                paths_info.get('paths_per_shot'), bundle, scan,
+                scan_params_full, reps_per_param=reps_per_param_full,
+                per_site_infid=per_site_infid, infid_source=infid_src)
+    except Exception as ex:
+        logger.warning('filtered target_aware failed: %s', ex)
+        out['target_aware_filtered'] = None
     if ta_global and ta_global.get('per_param_mean') is not None:
         out['summary_global']['survival_mean_per_site'] = \
             out['summary_global']['survival_mean']
         out['summary_global']['survival_mean'] = ta_global['per_param_mean']
         out['summary_global']['survival_sem']  = ta_global['per_param_sem']
         out['summary_global']['survival_source'] = ta_global['source']
+        if ta_global.get('per_param_fp') is not None:
+            out['summary_global']['fp_mean'] = ta_global['per_param_fp']
+            out['summary_global']['fp_sem']  = ta_global.get('per_param_fp_sem')
+            out['summary_global']['fp_overall'] = ta_global.get('fp_overall')
+            out['summary_global']['fp_source'] = 'rearrange'
     elif ta_global and ta_global.get('overall_mean') is not None:
         out['summary_global']['survival_overall_target_aware'] = \
             ta_global['overall_mean']
 
-    return to_jsonable(out)
+    # Align the per-param summary curves with the (sorted) sweep['values'] the
+    # dashboard plots them against. The unpacked param axis is in descriptor
+    # order, which inverts the curve for non-ascending sweeps (e.g. precompute
+    # [True, False]) -- see _reorder_summary_to_sweep. summary uses the FILTERED
+    # scan_params; summary_global uses the full set.
+    _reorder_summary_to_sweep(out.get('summary'), scan_params)
+    _reorder_summary_to_sweep(out.get('summary_global'), scan_params_full)
+
+    result = to_jsonable(out)
+    # Persist the default-view payload so the next reload/tab-switch is instant.
+    # Skip the write when a recoverable sub-computation failed (cache_safe) so a
+    # one-time failure can't get baked into the shot-count-keyed cache forever.
+    if _default_view and cache_safe:
+        _write_payload_cache(scan_dir, result, out.get('n_shots'))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1208,37 @@ def _str_or_none(v) -> Optional[str]:
     return s or None
 
 
+def _planned_shots(scan: dict, fallback: Optional[int] = None) -> Optional[int]:
+    """Total shots the scan was SET to run -- the "supposed to do" count.
+
+    Read from the config sidecar so it reflects the actual run PLAN, not the
+    recorded-data depth (``logic1.shape[2] = max_reps`` is what actually ran and
+    grows as data accumulates / shrinks on an abort -- never the plan). Prefers,
+    in order:
+
+      1. ``n_shots_planned`` -- pyctrl writes it explicitly (= len of the realized
+         run order = nseqs * StackNum, StackNum honoring an explicit ``rep``).
+      2. ``len(Params)`` -- the realized run order itself; present for pyctrl AND
+         MATLAB sidecars, so this covers runs saved before n_shots_planned existed.
+      3. ``fallback`` -- the caller's legacy estimate (e.g. nParams * observed reps).
+
+    Distinct from ACTUAL recovered shots (``len(seq_ids)``); pair the two as
+    "did / supposed-to-do"."""
+    try:
+        v = scan.get('n_shots_planned')
+        if v is not None:
+            return int(np.asarray(v).ravel()[0])
+    except Exception:
+        pass
+    try:
+        params = scan.get('Params')
+        if params is not None:
+            return int(np.asarray(params).shape[0])
+    except Exception:
+        pass
+    return fallback
+
+
 def _resolve_scan_name(scan: dict) -> Optional[str]:
     """Try multiple known fields to recover a clean scan name string."""
     # scanname / scanfilename are stored as uint16 char arrays at the
@@ -1084,6 +1334,51 @@ def _build_sweep(scan: dict, scan_params: np.ndarray,
     return {'cols': cols, 'values': values, 'dims': dims, 'n_dims': n_dims}
 
 
+def _reorder_summary_to_sweep(summary, scan_params) -> None:
+    """Reorder per-param summary arrays to ASCENDING param-value order, IN PLACE.
+
+    ``_build_sweep`` sorts the x-axis (``np.unique(scan_params)``), but the
+    unpacked param axis -- and therefore every per-param array in ``summary``
+    (survival_mean, loading_rate, fp_mean, the SEM/STD/n families, …) -- is in
+    scan-DESCRIPTOR (param-index) order. When the sweep wasn't defined ascending
+    (e.g. a boolean ``precompute`` sweep that unpacks as ``[True, False]`` =
+    ``[1.0, 0.0]``), the dashboard pairs each y with the WRONG x, inverting the
+    curve vs the live view (which sorts via ``compute_scan_curve``). Sorting the
+    summary arrays here aligns them with ``sweep['values']``. No-op when the
+    sweep is already ascending (the common case) or not 1-D.
+    """
+    if not isinstance(summary, dict) or scan_params is None:
+        return
+    sp = np.asarray(scan_params)
+    if sp.ndim != 1 or sp.size < 2:
+        return
+    perm = np.argsort(sp, kind='stable')
+    if np.array_equal(perm, np.arange(sp.size)):
+        return   # already ascending -> nothing to do
+    n = int(sp.size)
+    for key, val in list(summary.items()):
+        if isinstance(val, list) and len(val) == n:
+            summary[key] = [val[i] for i in perm]
+
+
+def _cross_grid_logicals(logic1, logic2) -> bool:
+    """True when img1 and img2 were detected on DIFFERENT grids.
+
+    A rearrangement scan whose initial loading pattern and final target
+    pattern differ (e.g. 47x47 loading -> 33x33 target) detects img1 on the
+    loading grid and img2 on the target grid, so the unpacked logicals have
+    different site counts. In that case the per-site survival / loss / FP
+    metrics -- which pair ``logic1[s] & logic2[s]`` site-for-site -- are
+    undefined (site s of img1 is a different physical trap than site s of
+    img2). The meaningful survival is the target-aware TP (``target_paired``
+    -> img2) computed in ``_target_aware_from_lab_paths``.
+    """
+    return (logic2 is not None
+            and getattr(logic1, 'ndim', 0) == 3
+            and getattr(logic2, 'ndim', 0) == 3
+            and logic1.shape[0] != logic2.shape[0])
+
+
 def _summary_stats(logic1: np.ndarray,
                    logic2: Optional[np.ndarray],
                    reps_per_param: Optional[np.ndarray] = None) -> dict:
@@ -1097,6 +1392,13 @@ def _summary_stats(logic1: np.ndarray,
         (each shot is one sample of the array-averaged rate; this is the
         dashboard default). ``*_n_shots`` is the eligible-shot count.
     """
+    # Cross-grid rearrangement (init pattern != target pattern): img1 and img2
+    # live on DIFFERENT detection grids, so per-site survival/loss/FP are
+    # undefined (and would crash on the shape mismatch). Drop to loading-only
+    # here; the target-aware TP override (in analyze_scan_dir) supplies the
+    # meaningful survival curve.
+    if _cross_grid_logicals(logic1, logic2):
+        logic2 = None
     if logic1.size == 0 or logic2 is None or logic2.size == 0:
         # Loading-only or empty scan: still report what we can.
         try:
@@ -1119,6 +1421,14 @@ def _summary_stats(logic1: np.ndarray,
         sr_mean, sr_sem = prob11(logic1, logic2)
         ls_mean, ls_sem = prob10(logic1, logic2)
         lr_mean, lr_sem = loading_rate(logic1, reps_per_param)
+        # Baseline (all-empty) false-positive rate. For rearrangement runs the
+        # caller OVERRIDES fp_mean/fp_sem with the target-aware version (which
+        # excludes target sites); this is what non-rearrange 2-image scans use.
+        try:
+            fp_mean, fp_sem = false_positive_rate(logic1, logic2)
+        except Exception as ex:
+            logger.warning('_summary_stats: false_positive_rate failed: %s', ex)
+            fp_mean = fp_sem = None
         out = {
             'survival_mean':     sr_mean.tolist(),
             'survival_sem':      sr_sem.tolist(),
@@ -1126,6 +1436,9 @@ def _summary_stats(logic1: np.ndarray,
             'loading_rate_sem':  lr_sem.tolist(),
             'loss_mean':         ls_mean.tolist(),
             'loss_sem':          ls_sem.tolist(),
+            'fp_mean':           fp_mean.tolist() if fp_mean is not None else None,
+            'fp_sem':            fp_sem.tolist() if fp_sem is not None else None,
+            'fp_source':         'all_empty',
         }
     # Per-shot error families (default for the dashboard).
     try:
@@ -1202,14 +1515,14 @@ def _diag_aggregate(diag_path: Path) -> Optional[dict]:
 def _code_info(code_json: Path) -> dict:
     if not code_json.is_file():
         return {'present': False, 'manifest_path': None,
-                'safe_run_id': None, 'n_files': 0}
+                'safe_run_id': None, 'n_files': 0, 'model_filename': None}
     try:
         with open(code_json, 'r', encoding='utf-8') as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError) as ex:
         logger.warning("_code_info: failed to read %s: %s", code_json, ex)
         return {'present': False, 'manifest_path': None,
-                'safe_run_id': None, 'n_files': 0}
+                'safe_run_id': None, 'n_files': 0, 'model_filename': None}
     manifest = payload.get('manifest') or {}
     files = manifest.get('files') or []
     return {
@@ -1217,6 +1530,9 @@ def _code_info(code_json: Path) -> dict:
         'manifest_path': payload.get('manifest_path'),
         'safe_run_id':   payload.get('safe_run_id'),
         'n_files':       len(files),
+        # The SLM model checkpoint the server actually loaded for this run —
+        # the authoritative record of which model produced the data.
+        'model_filename': manifest.get('model_filename'),
     }
 
 
@@ -1483,19 +1799,22 @@ def _update_analysis_cache(scan_dir, n_shots, **kv) -> None:
     _write_analysis_cache(scan_dir, cache)
 
 
-def _recompute_run_metrics(bundle: dict, scan: dict):
+def _recompute_run_metrics(bundle: dict, scan: dict, threshold_segments=None):
     """ONE double-Gaussian fit pass over THIS run's per-site intensities →
     ``(discrimination, imaging_fidelity)``.
 
     * ``discrimination`` — optimal-cut infidelity per site (the "recompute from
       this run" map/headline; the run's best-achievable discrimination).
     * ``imaging_fidelity`` — average fidelity (``1 - infidelity``) evaluated at
-      the **actually-used** thresholds (``initThresholds``), i.e. how good the
-      bitstrings/logicals the run actually produced were. Independent of any
-      recomputed thresholds — it just reuses the same fit, so it's free here.
+      the thresholds the run ACTUALLY used. When ``threshold_segments`` is given
+      (the per-shot threshold timeline reconstructed from the update log) the
+      infidelity is the shot-weighted average over those segments — i.e. the
+      thresholds in effect THROUGHOUT the run, not just at scan start. With no
+      timeline it falls back to the single scan-start ``initThresholds``. Either
+      way it reuses the same fit, so it's free here.
 
     Either element is ``None`` when its prerequisites are missing (no
-    intensities → both None; no ``initThresholds`` → imaging_fidelity None).
+    intensities → both None; no usable thresholds → imaging_fidelity None).
     """
     inten = bundle.get('intensities')
     if inten is None and bundle.get('two_array'):
@@ -1505,11 +1824,19 @@ def _recompute_run_metrics(bundle: dict, scan: dict):
     arr = np.asarray(inten, dtype=float)
     if arr.ndim != 2 or arr.size == 0:
         return None, None
-    used = np.asarray(scan.get('initThresholds', []), dtype=float).ravel()
     try:
-        from yb_analysis.detection.dynamical_threshold import fit_run_infidelities
-        opt_thr, opt_inf, used_inf = fit_run_infidelities(
-            arr, used if used.size else None)
+        from yb_analysis.detection.dynamical_threshold import (
+            fit_run_infidelities, fit_run_infidelities_timeline)
+        if threshold_segments:
+            opt_thr, opt_inf, used_inf = fit_run_infidelities_timeline(
+                arr, threshold_segments)
+            used_source = 'used_thresholds_throughout_run'
+        else:
+            used = np.asarray(scan.get('initThresholds', []),
+                              dtype=float).ravel()
+            opt_thr, opt_inf, used_inf = fit_run_infidelities(
+                arr, used if used.size else None)
+            used_source = 'used_thresholds_scan_start'
     except Exception as ex:
         logger.warning('_recompute_run_metrics failed: %s', ex)
         return None, None
@@ -1540,9 +1867,379 @@ def _recompute_run_metrics(bundle: dict, scan: dict):
                 'mean_infidelity':   float(np.mean(valid)),
                 'median_infidelity': float(np.median(valid)),
                 'n_sites':           int(valid.size),
-                'source':            'used_thresholds_on_run',
+                'source':            used_source,
             }
     return disc, imaging
+
+
+def _run_threshold_timeline(scan: dict, scan_dir, n_shots) -> list:
+    """Reconstruct the per-site thresholds (and any logged per-site
+    infidelities) that were ACTUALLY in effect during this run.
+
+    Seeds with the scan-start ``initThresholds`` / ``initInfidelities``, then
+    layers each ``cheap`` / ``fit`` update logged for THIS run's ``scan_id`` (in
+    the per-pattern ``update_logs/thresholds/<pattern>.jsonl``) at its ``seq_no``.
+    Each segment is weighted by the number of shots it was in effect; segment
+    infidelities are carried forward across ``cheap`` updates (which log a new
+    threshold but no fresh infidelity).
+
+    Returns a list of segment dicts ``{seq_start, weight, thresholds,
+    infidelities, infidelities_eff, source}``, or ``[]`` when there's no usable
+    threshold info at all. A pattern run with no in-run update (and a day-folder
+    scan with no per-pattern log) yields just the scan-start seed — correct,
+    since scan-start then held for the whole run.
+    """
+    def _vec(key):
+        v = scan.get(key)
+        if v is None:
+            return None
+        try:
+            a = np.asarray(v, dtype=float).ravel()
+        except (ValueError, TypeError):
+            return None
+        return a if a.size and np.any(np.isfinite(a)) else None
+
+    segs = [{'seq_start': 0, 'thresholds': _vec('initThresholds'),
+             'infidelities': _vec('initInfidelities'), 'source': 'scan_init'}]
+
+    scan_id = _scan_id_from_dir(Path(scan_dir))
+    patterns = _loading_pattern_names(scan)
+    records = []
+    if scan_id and patterns:
+        try:
+            from yb_analysis.analysis import update_log
+            for name in patterns:
+                recs = update_log.read_threshold_records(name, scan_id=scan_id)
+                if recs:
+                    records = recs
+                    break   # frame-0 loading pattern is what the live refit tracks
+        except Exception as ex:  # noqa: BLE001
+            logger.debug('threshold timeline read failed: %s', ex)
+
+    for r in records:
+        if r.get('source') == 'fit_rejected':
+            continue   # rejected fit was never applied — thresholds unchanged
+        thr = r.get('thresholds')
+        if thr is None:
+            continue
+        try:
+            thr = np.asarray(thr, dtype=float).ravel()
+        except (ValueError, TypeError):
+            continue
+        if thr.size == 0:
+            continue
+        inf = r.get('infidelities')
+        if inf is not None:
+            try:
+                inf = np.asarray(inf, dtype=float).ravel()
+            except (ValueError, TypeError):
+                inf = None
+        try:
+            seq = max(0, int(r.get('seq_no') or 0))
+        except (TypeError, ValueError):
+            seq = 0
+        segs.append({'seq_start': seq, 'thresholds': thr,
+                     'infidelities': inf, 'source': r.get('source') or 'update'})
+
+    segs.sort(key=lambda s: s['seq_start'])
+    total = max(int(n_shots or 0), segs[-1]['seq_start'] + 1)
+    last_inf = None
+    for i, s in enumerate(segs):
+        nxt = segs[i + 1]['seq_start'] if i + 1 < len(segs) else total
+        s['weight'] = max(0, int(nxt) - int(s['seq_start']))
+        if s['infidelities'] is not None:
+            last_inf = s['infidelities']
+        s['infidelities_eff'] = (s['infidelities']
+                                 if s['infidelities'] is not None else last_inf)
+    if sum(s['weight'] for s in segs) == 0:
+        segs[0]['weight'] = 1
+    usable = [s for s in segs if s['thresholds'] is not None
+              or s.get('infidelities_eff') is not None]
+    return usable
+
+
+def _throughout_run_per_site_infidelity(segs: list):
+    """Shot-weighted per-site infidelity vector over the run's threshold
+    timeline (scan-start ``initInfidelities`` seed + each full fit's logged
+    infidelities, carried forward across cheap updates). Returns an
+    ``(M,)`` float array (NaN where no segment contributed) or ``None`` when no
+    segment carries a per-site infidelity vector. Cheap — no Gaussian refit."""
+    if not segs:
+        return None
+    n_sites = None
+    for s in segs:
+        iv = s.get('infidelities_eff')
+        if iv is not None and iv.size:
+            n_sites = int(iv.size)
+            break
+    if n_sites is None:
+        return None
+    num = np.zeros(n_sites)
+    wsum = np.zeros(n_sites)
+    for s in segs:
+        iv = s.get('infidelities_eff')
+        w = s.get('weight', 0)
+        if iv is None or w <= 0 or iv.size != n_sites:
+            continue
+        m = np.isfinite(iv)
+        num[m] += w * iv[m]
+        wsum[m] += w
+    good = wsum > 0
+    if not good.any():
+        return None
+    per_site = np.full(n_sites, np.nan)
+    per_site[good] = num[good] / wsum[good]
+    return per_site
+
+
+def _imaging_fidelity_from_logged_timeline(segs: list) -> Optional[dict]:
+    """Default-view "imaging fidelity (used thresholds)" — cheap, NO Gaussian
+    refit. Mean of the shot-weighted per-site infidelity over the run's
+    threshold timeline (see :func:`_throughout_run_per_site_infidelity`), then
+    ``1 - mean``. Returns ``None`` when no per-site infidelity is available."""
+    per_site = _throughout_run_per_site_infidelity(segs)
+    if per_site is None:
+        return None
+    valid = per_site[np.isfinite(per_site)]
+    if valid.size == 0:
+        return None
+    in_run_updates = sum(1 for s in segs
+                         if s.get('source') != 'scan_init'
+                         and s.get('weight', 0) > 0)
+    with np.errstate(invalid='ignore'):
+        return {
+            'mean_fidelity':     float(1.0 - np.mean(valid)),
+            'median_fidelity':   float(1.0 - np.median(valid)),
+            'mean_infidelity':   float(np.mean(valid)),
+            'median_infidelity': float(np.median(valid)),
+            'n_sites':           int(valid.size),
+            'source':            'logged_throughout_run',
+            'n_in_run_updates':  int(in_run_updates),
+        }
+
+
+def _rearrange_survival_cap(paths_per_shot: list, bundle: dict,
+                            scan: dict) -> Optional[dict]:
+    """Maximum achievable rearrangement survival implied by source-site
+    detection confidence (loss #2).
+
+    Every rearrangement path starts at a SOURCE site the protocol believed held
+    an atom (it read loaded in img1). If that detection was a false positive (no
+    atom really there), the path cannot deliver an atom → the target stays empty
+    → survival is capped below 1 no matter how good the transport is. For each
+    path's source we evaluate the posterior ``P(atom present | its img1
+    intensity)`` from that site's double-Gaussian fit ("where the detection
+    falls relative to the Gaussians"). The whole-run cap is the mean of ``P``
+    over all paths; modelling each path's "had an atom" as an independent
+    Bernoulli(P), the expected number of nulled paths is ``Σ(1-P)`` and the 1σ
+    uncertainty on the cap is ``sqrt(Σ P(1-P)) / N``.
+
+    This quantifies the DETECTION-confidence part of loss #2 only — it does not
+    include physical loss of a correctly-detected source atom before transport
+    (not observable from the loading image). Returns ``None`` when prerequisites
+    are missing (no per-site intensities — e.g. MATLAB scans — or no paths).
+    """
+    if not paths_per_shot:
+        return None
+    num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
+    if bundle.get('two_array'):
+        inten = bundle.get('intensities_img1')
+        img1 = np.asarray(inten, dtype=float) if inten is not None else None
+    else:
+        inten = bundle.get('intensities')
+        if inten is None:
+            img1 = None
+        else:
+            a = np.asarray(inten, dtype=float)
+            img1 = a[0::num_images] if num_images >= 2 else a
+    if img1 is None or img1.ndim != 2 or img1.size == 0:
+        return None
+    n_shots_av, n_sites = img1.shape
+
+    seq_ids = bundle.get('seq_ids')
+    if seq_ids is None:
+        return None
+    seq_ids = np.asarray(seq_ids, dtype=np.int64).ravel()
+    n = min(len(seq_ids), n_shots_av)
+    if n == 0:
+        return None
+    seq_ids = seq_ids[:n]
+    img1 = img1[:n]
+    row_of_seq = {int(s): k for k, s in enumerate(seq_ids)}
+
+    try:
+        from yb_analysis.detection.dynamical_threshold import (
+            _fit_run_site_params, _gauss_pdf)
+        _, _, params_list = _fit_run_site_params(img1)
+    except Exception as ex:  # noqa: BLE001
+        logger.warning('_rearrange_survival_cap fit failed: %s', ex)
+        return None
+    if not params_list:
+        return None
+
+    src_sites, src_inten = [], []
+    n_shots_with_paths = 0
+    for entry in paths_per_shot:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get('seq_id')
+        if sid is None:
+            continue
+        row = row_of_seq.get(int(sid))
+        if row is None:
+            continue
+        lp = np.asarray(entry.get('loaded_paired') or [],
+                        dtype=np.int64).ravel()
+        lp = lp[(lp >= 0) & (lp < n_sites)]
+        if lp.size == 0:
+            continue
+        n_shots_with_paths += 1
+        for i in lp:
+            src_sites.append(int(i))
+            src_inten.append(float(img1[row, i]))
+    if not src_sites:
+        return None
+    src_sites = np.asarray(src_sites, dtype=np.int64)
+    src_inten = np.asarray(src_inten, dtype=np.float64)
+
+    # Posterior per source path (vectorised over the gathered (site, intensity)
+    # pairs). Sites whose fit failed/degenerate get P=1.0 (they WERE detected
+    # loaded — the optimistic, honest fallback) and are counted as `n_no_fit`.
+    mu_e = np.array([p[0] if p is not None else np.nan for p in params_list])
+    s_e  = np.array([p[1] if p is not None else np.nan for p in params_list])
+    A_e  = np.array([p[2] if p is not None else np.nan for p in params_list])
+    mu_a = np.array([p[3] if p is not None else np.nan for p in params_list])
+    s_a  = np.array([p[4] if p is not None else np.nan for p in params_list])
+    A_a  = np.array([p[5] if p is not None else np.nan for p in params_list])
+    se = s_e[src_sites]
+    sa = s_a[src_sites]
+    valid = np.isfinite(se) & np.isfinite(sa) & (se > 0) & (sa > 0)
+    P = np.ones(src_sites.size, dtype=np.float64)
+    if valid.any():
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pe = A_e[src_sites][valid] * _gauss_pdf(
+                src_inten[valid], mu_e[src_sites][valid], se[valid])
+            pa = A_a[src_sites][valid] * _gauss_pdf(
+                src_inten[valid], mu_a[src_sites][valid], sa[valid])
+            denom = pe + pa
+            pp = np.where(denom > 0, pa / denom, np.nan)
+        P[valid] = np.clip(pp, 0.0, 1.0)
+    n_no_fit = int((~valid).sum() + int(np.isnan(P).sum()))
+    P = np.where(np.isfinite(P), P, 1.0)
+
+    N = int(P.size)
+    sum_P = float(P.sum())
+    sum_PQ = float(np.sum(P * (1.0 - P)))
+    cap = sum_P / N
+    cap_sem = float(np.sqrt(max(sum_PQ, 0.0)) / N)
+    return {
+        'cap_mean':           cap,
+        'cap_sem':            cap_sem,
+        'expected_nulled':    float(N - sum_P),
+        'nulled_sem':         float(np.sqrt(max(sum_PQ, 0.0))),
+        'n_paths':            N,
+        'n_shots_with_paths': int(n_shots_with_paths),
+        'n_no_fit':           n_no_fit,
+        'mean_paths_per_shot': (float(N / n_shots_with_paths)
+                                if n_shots_with_paths else None),
+        'source':             'source_site_detection_posterior',
+    }
+
+
+# Filtered TP: a target site counts as an "outlier bad-fidelity" spot — and is
+# dropped from the filtered target survival — when its detection infidelity is
+# BOTH a robust outlier among the target sites (> median + K·1.4826·MAD) AND
+# above an absolute floor (so a uniformly-clean target set keeps every site).
+FILTERED_TP_MAD_K = 5.0
+FILTERED_TP_ABS_FLOOR = 0.02
+
+
+def _outlier_bad_fidelity_sites(per_site_infid, candidate_sites,
+                                mad_k=FILTERED_TP_MAD_K,
+                                abs_floor=FILTERED_TP_ABS_FLOOR):
+    """Among ``candidate_sites`` (indices into ``per_site_infid``), return the
+    indices whose infidelity marks them as outlier bad-fidelity spots: above
+    ``max(median + mad_k·1.4826·MAD, abs_floor)`` over the candidates' finite
+    infidelities. Returns ``(bad_idx (int64), threshold (float|None))``. Sites
+    with NaN / missing infidelity are NOT flagged (unknown ≠ bad)."""
+    cand = np.asarray(candidate_sites, dtype=np.int64).ravel()
+    psi = np.asarray(per_site_infid, dtype=float).ravel()
+    cand = cand[(cand >= 0) & (cand < psi.size)]
+    if cand.size == 0:
+        return np.empty(0, dtype=np.int64), None
+    vals = psi[cand]
+    finite = np.isfinite(vals)
+    if not finite.any():
+        return np.empty(0, dtype=np.int64), None
+    fv = vals[finite]
+    med = float(np.median(fv))
+    mad = float(np.median(np.abs(fv - med)))
+    thr = max(med + mad_k * 1.4826 * mad, float(abs_floor))
+    bad_mask = finite & (vals > thr)
+    return cand[bad_mask], thr
+
+
+def _filtered_target_aware(paths_per_shot, bundle, scan, scan_params, *,
+                           reps_per_param=None, per_site_infid=None,
+                           infid_source='throughout_run'):
+    """Target-aware (TP) survival recomputed with outlier bad-fidelity target
+    spots EXCLUDED.
+
+    Cheap — NO Gaussian refit: it uses the per-site infidelities already
+    available (the throughout-run logged values, which collapse to the
+    scan-start ``initInfidelities`` when the run logged no fit), so it shows in
+    the default view WITHOUT a recompute. Drops the outlier bad-fidelity target
+    sites (see :func:`_outlier_bad_fidelity_sites`) and re-runs the same cheap
+    lab-paths TP over the remaining good targets.
+
+    Returns a compact whole-run dict (overall TP over the good targets + what
+    was excluded), or ``None`` when it can't be computed (no lab paths, no
+    per-site infidelity, or no target sites)."""
+    if not paths_per_shot or per_site_infid is None:
+        return None
+    psi = np.asarray(per_site_infid, dtype=float).ravel()
+    if psi.size == 0 or not np.any(np.isfinite(psi)):
+        return None
+    # Candidate target sites = union over shots of the per-shot target indices
+    # (the direct-index primary; matches _entry_target_sites' first branch).
+    cand = set()
+    for e in paths_per_shot:
+        if not isinstance(e, dict):
+            continue
+        for key in ('target_site_indices', 'target_paired'):
+            ids = e.get(key)
+            if ids:
+                for i in ids:
+                    ii = int(i)
+                    if 0 <= ii < psi.size:
+                        cand.add(ii)
+                break
+    if not cand:
+        return None
+    cand_arr = np.array(sorted(cand), dtype=np.int64)
+    bad, thr = _outlier_bad_fidelity_sites(psi, cand_arr)
+    ta = _target_aware_from_lab_paths(
+        paths_per_shot, bundle, scan, scan_params,
+        reps_per_param=reps_per_param, param_mask=None,
+        exclude_sites=bad if bad.size else None)
+    if ta is None:
+        return None
+    n_excl = int(bad.size)
+    excl_infid = psi[bad][np.isfinite(psi[bad])] if n_excl else np.zeros(0)
+    return {
+        'source':               ta.get('source'),
+        'overall_mean':         ta.get('overall_mean'),
+        'overall_sem':          ta.get('overall_sem'),
+        'per_param_mean':       ta.get('per_param_mean'),
+        'per_param_sem':        ta.get('per_param_sem'),
+        'n_target_sites':       int(cand_arr.size),
+        'n_excluded':           n_excl,
+        'n_kept':               int(cand_arr.size - n_excl),
+        'infidelity_threshold': (float(thr) if thr is not None else None),
+        'excluded_max_infid':   (float(np.max(excl_infid))
+                                  if excl_infid.size else None),
+        'infid_source':         infid_source,
+    }
 
 
 def _intensity_hist(bundle: dict, n_bins: int = 120,
@@ -1664,6 +2361,37 @@ def _run_parameters(scan: dict, sweep_all) -> list:
                 if v is None:
                     continue
                 out.append({'name': name, 'value': v, 'group': 'base'})
+    # --- Everything ELSE that defines the run, so it is 100% reproducible -----
+    # The blocks above cover the swept axes + the fixed *sequence* params. But a
+    # pyctrl run also carries a RUN-SETTINGS block (descriptor['runp']) and a
+    # baseline device-config snapshot (expConfig) that were stored but never
+    # shown. In particular a rearrangement run records its SLM model checkpoint,
+    # warmup phases, compile flags, defocus, scramble, lock mode, ... ONLY in
+    # descriptor['runp'] (e.g. warmup_kwargs.model_filename). Surface them all,
+    # de-duped against what's already listed.
+    seen = {str(p['name']).replace('.', '_').lower() for p in out} | swept_norm
+    desc = scan.get('descriptor')
+    if isinstance(desc, dict):
+        # descriptor['params'] is a FLAT dotted dict (fixed leaves + sweep
+        # {scan,values} dicts). Skip the sweep leaves (already shown as 'swept').
+        dparams = desc.get('params')
+        if isinstance(dparams, dict):
+            for name, raw in dparams.items():
+                if not _is_sweep_desc(raw):
+                    _add_param(out, seen, name, raw, 'param')
+        # descriptor['runp'] is a FLAT dotted dict of run settings — the SLM
+        # model + warmup/compile/defocus/scramble/lock knobs live here.
+        runp = desc.get('runp')
+        if isinstance(runp, dict):
+            for name, raw in runp.items():
+                _add_param(out, seen, name, raw, 'runp')
+    # expConfig: the baseline device-config snapshot (NESTED) — imaging ROI,
+    # resonance freqs, MOT/LAC/Pushout/AWG/SLM settings. Embedded verbatim by
+    # pyctrl's scan_summary for provenance; flatten to dotted leaves.
+    ec = scan.get('expConfig')
+    if isinstance(ec, dict):
+        for name, raw in _flatten_dotted(ec):
+            _add_param(out, seen, name, raw, 'config')
     return out
 
 
@@ -1677,6 +2405,28 @@ def _flatten_dotted(d, prefix=''):
     else:
         out.append((prefix, d))
     return out
+
+
+def _is_sweep_desc(v):
+    """A descriptor sweep leaf: ``{"scan": dim, "values": [...]}`` (rendered as a
+    swept axis, so skipped when listing the descriptor's fixed params)."""
+    return isinstance(v, dict) and 'scan' in v and 'values' in v
+
+
+def _add_param(out, seen, name, raw, group):
+    """Append ``{name, value, group}`` to ``out`` unless ``name`` (case/dot-
+    insensitive) was already listed or the value isn't display-able. Mutates
+    ``seen``. Keeps the Details panel free of confusing duplicate rows (an
+    operative scan value wins over a baseline snapshot of the same key) while
+    surfacing every otherwise-unshown parameter."""
+    key = str(name).replace('.', '_').lower()
+    if key in seen:
+        return
+    v = _fmt_param_value(raw)
+    if v is None:
+        return
+    seen.add(key)
+    out.append({'name': str(name), 'value': v, 'group': group})
 
 
 def _loading_pattern_names(scan: dict) -> list:
@@ -1814,10 +2564,20 @@ def _calibration_age_info(scan: dict, scan_dir) -> dict:
 
 
 def _scan_description(scan: dict) -> Optional[str]:
-    """Best-effort free-text description / note attached to the scan."""
+    """Best-effort free-text description / note attached to the scan.
+
+    Reads the top-level sidecar keys first (pyctrl stamps ``description`` there from the
+    descriptor; MATLAB/legacy scans may use ``note``/``comment``/...), then falls back to the
+    self-contained reconstruction ``descriptor`` block if a run only carries it there. Returns
+    None when no description was set (every pre-feature scan)."""
     for k in ('scannote', 'scanNote', 'ScanNote', 'comment', 'Comment',
               'description', 'Description', 'note', 'notes'):
         s = _str_or_none(scan.get(k))
+        if s:
+            return s
+    desc = scan.get('descriptor')
+    if isinstance(desc, dict):
+        s = _str_or_none(desc.get('description'))
         if s:
             return s
     return None
@@ -1939,7 +2699,8 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
                                   scan_params: np.ndarray,
                                   *,
                                   reps_per_param: Optional[np.ndarray] = None,
-                                  param_mask: Optional[np.ndarray] = None
+                                  param_mask: Optional[np.ndarray] = None,
+                                  exclude_sites: Optional[np.ndarray] = None
                                   ) -> Optional[dict]:
     """Lab-side target-aware TP using paths_per_shot + lab img2.
 
@@ -1979,6 +2740,16 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
         return None
     n_sites = int(img2.shape[1])
 
+    # Lab img1 (loaded) — for the target-aware FP (spurious atoms at empty
+    # NON-target sites). Same layout handling as img2; None if unavailable.
+    if raw1 is not None and raw2 is not None:
+        img1 = np.asarray(raw1, dtype=np.uint8)
+    elif raw is not None:
+        _a1 = np.asarray(raw, dtype=np.uint8)
+        img1 = _a1[0::num_images] if num_images >= 2 else _a1
+    else:
+        img1 = None
+
     # Lab-side site coords from Scan.initGridLocationsX/Y are OPTIONAL: the
     # primary target path (target_site_indices / target_paired) indexes the
     # logicals DIRECTLY, so a run with no baked grid (e.g. a legacy pyctrl run
@@ -2000,6 +2771,8 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
     n_shots_avail = min(len(seq_ids), img2.shape[0])
     seq_ids = seq_ids[:n_shots_avail]
     img2 = img2[:n_shots_avail]
+    if img1 is not None:
+        img1 = img1[:n_shots_avail]
 
     # Map seq_id -> 0-indexed scan-param (via Scan.Params, MATLAB 1-indexed).
     params_arr = np.asarray(scan.get('Params', [])).ravel().astype(int)
@@ -2027,9 +2800,13 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
         n_params_unfilt = int(sp_tmp.shape[0])
     sum_tp = np.zeros(n_params_unfilt, dtype=np.float64)
     n_eligible = np.zeros(n_params_unfilt, dtype=np.int64)
-    # Per-shot TP for the per-iteration override (indexed 0..n_shots_avail-1
-    # matching bundle's processed-shot order, i.e. lab seq_ids order).
+    # Target-aware FP: spurious atoms at empty NON-target sites (per param).
+    sum_fp = np.zeros(n_params_unfilt, dtype=np.float64)
+    n_fp_elig = np.zeros(n_params_unfilt, dtype=np.int64)
+    # Per-shot TP / FP for the per-iteration override (indexed
+    # 0..n_shots_avail-1 matching bundle's processed-shot order).
     per_shot_tp = [None] * n_shots_avail
+    per_shot_fp = [None] * n_shots_avail
 
     # Build a seq_id -> path entry index map (paths_per_shot may not be
     # ordered by seq_id, and may include rows with empty targets).
@@ -2058,6 +2835,26 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
             _spacing_ta = 1.0
         tol2_ta = (2.0 * _spacing_ta) ** 2
 
+    # Cross-grid run (init pattern != target pattern): img2 is detected ON the
+    # target grid, so EVERY target-grid site is an atom destination. The
+    # run-level ACTIVE-target set (every site ever targeted) then defines the
+    # NON-target sites for FP -- a target site left unfilled on a low-loading
+    # shot is an unfilled target, NOT a false-positive site. For a full-array
+    # target there are no non-target sites and FP is undefined (as expected).
+    cross_grid = (img1 is not None and img1.shape[1] != n_sites)
+    active_union = None
+    if cross_grid:
+        active_union = np.zeros(n_sites, dtype=bool)
+        for entry in by_seq.values():
+            aidx = _entry_target_sites(entry, site_xy, n_sites_ta, tol2_ta)
+            if aidx.size:
+                active_union[aidx[(aidx >= 0) & (aidx < n_sites)]] = True
+
+    # Optional site exclusion (filtered TP: drop outlier bad-fidelity target
+    # spots so transport survival isn't biased by mis-detected targets).
+    excl_arr = (np.asarray(exclude_sites, dtype=np.int64).ravel()
+                if exclude_sites is not None and len(exclude_sites) else None)
+
     n_with_targets = 0
     for k in range(n_shots_avail):
         sid = int(seq_ids[k])
@@ -2067,6 +2864,8 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
         # Target lab sites this shot: target_paired bit indices (sidecar-free
         # primary) or target_xy->nearest (legacy fallback).
         idx = _entry_target_sites(entry, site_xy, n_sites_ta, tol2_ta)
+        if excl_arr is not None and idx.size:
+            idx = idx[~np.isin(idx, excl_arr)]
         if idx.size == 0:
             continue
         # TP this shot: of the target sites, how many showed an atom in img2?
@@ -2081,6 +2880,29 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
         sum_tp[p0] += tp_this_shot
         n_eligible[p0] += 1
         n_with_targets += 1
+        # Target-aware FP this shot: of the EMPTY non-target sites, what
+        # fraction spuriously showed an atom in img2? (atoms moved into
+        # targets are NOT false positives — matches per_iteration fp_source.)
+        #   * same grid (img1 width == img2 width): eligible = sites empty in
+        #     img1 AND not in the target set.
+        #   * cross grid (init pattern != target pattern): img1 lives on a
+        #     DIFFERENT grid, so its per-site emptiness can't be indexed by an
+        #     img2 site; eligible = the img2 (target-grid) sites NOT in the
+        #     active target set (those are meant to be empty post-rearrange).
+        tmask = np.zeros(n_sites, dtype=bool)
+        tmask[idx[(idx >= 0) & (idx < n_sites)]] = True
+        if not cross_grid and img1 is not None and img1.shape[1] == n_sites:
+            base = (~img1[k].astype(bool)) & (~tmask)
+        else:
+            # Cross-grid: non-target = sites never part of the target pattern
+            # (run-level), so unfilled targets aren't miscounted as FP.
+            base = (~active_union) if active_union is not None else ~tmask
+        nb = int(base.sum())
+        if nb > 0:
+            fp_s = float((img2[k].astype(bool) & base).sum()) / nb
+            per_shot_fp[k] = fp_s
+            sum_fp[p0] += fp_s
+            n_fp_elig[p0] += 1
 
     if n_with_targets == 0:
         return None
@@ -2120,6 +2942,26 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
     else:
         overall, overall_sem, total_eligible = None, None, 0
 
+    # Target-aware FP per param + eligibility-weighted overall (same filter
+    # handling as TP). NaN where no empty-non-target sites were eligible.
+    with np.errstate(invalid='ignore', divide='ignore'):
+        fp_mean_unfilt = np.where(n_fp_elig > 0, sum_fp / n_fp_elig, np.nan)
+        fp_sem_unfilt  = np.where(n_fp_elig > 0,
+                                   np.sqrt(np.clip(fp_mean_unfilt, 0, 1)
+                                           * (1 - np.clip(fp_mean_unfilt, 0, 1))
+                                           / np.maximum(1, n_fp_elig)), np.nan)
+    if param_mask is not None and fp_mean_unfilt.size == param_mask.size:
+        fp_mean = fp_mean_unfilt[param_mask]
+        fp_sem  = fp_sem_unfilt[param_mask]
+        fp_elig = n_fp_elig[param_mask]
+    else:
+        fp_mean, fp_sem, fp_elig = fp_mean_unfilt, fp_sem_unfilt, n_fp_elig
+    fvalid = np.isfinite(fp_mean)
+    if fvalid.any() and fp_elig[fvalid].sum():
+        fp_overall = float(np.average(fp_mean[fvalid], weights=fp_elig[fvalid]))
+    else:
+        fp_overall = None
+
     return {
         'source':          'lab_paths',
         'per_param_mean':  per_mean.tolist(),
@@ -2127,10 +2969,11 @@ def _target_aware_from_lab_paths(paths_per_shot: list,
         'overall_mean':    overall,
         'overall_sem':     overall_sem,
         'loss_overall':    (1.0 - overall) if overall is not None else None,
-        'fp_overall':      None,        # lab-computed FP needs the non-target
-                                         # site convention -- skipped here; the
-                                         # per_site fp_rate (when present from
-                                         # SLM cache) covers it for now.
+        # Target-aware FP (spurious atoms at empty non-target sites).
+        'fp_overall':      fp_overall,
+        'per_param_fp':    fp_mean.tolist(),
+        'per_param_fp_sem': fp_sem.tolist(),
+        'per_shot_fp':     per_shot_fp,
         'axes_matched':    ([] if scan.get('ScanVar') is None
                             else list(np.atleast_1d(scan.get('ScanVar')))),
         'axes_lab':        list((scan_params.shape[1] if scan_params.ndim==2
@@ -2453,6 +3296,61 @@ def _paths_overlay_summary(paths_per_shot: Optional[list]) -> Optional[dict]:
     }
 
 
+def _target_grid_camera_xy(scan: dict, n_target_sites: int):
+    """Camera-pixel coords for the TARGET (img2) grid of a cross-grid run.
+
+    A rearrangement scan whose initial loading pattern and final target
+    pattern differ bakes only the INITIAL (loading) grid into the scan config
+    (``initGridLocationsX/Y``); the target grid lives in the per-pattern
+    registry as knm-1024 coords. We recover an affine knm -> camera from the
+    INITIAL pattern (its registry knm vs the run's own ``initGridLocations``,
+    same col-major order) and apply it to the TARGET pattern's knm grid so the
+    per-site survival/FP map can be drawn on the camera image.
+
+    Returns ``(n_target_sites, 2)`` (y, x) camera px, or ``None`` when any
+    input is missing / the affine can't be fit / the counts don't line up.
+    """
+    try:
+        from yb_analysis.analysis import pattern_registry as _pr
+    except Exception:   # noqa: BLE001 -- registry optional
+        return None
+    names = _loading_pattern_names(scan)
+    if len(names) < 2:
+        return None
+    init_rec = _pr.get_pattern(names[0])
+    tgt_rec  = _pr.get_pattern(names[-1])
+    if not init_rec or not tgt_rec:
+        return None
+    try:
+        k_init = np.asarray(init_rec.get('knm') or [], dtype=float)
+        k_tgt  = np.asarray(tgt_rec.get('knm') or [], dtype=float)
+    except (ValueError, TypeError):
+        return None
+    if (k_init.ndim != 2 or k_init.shape[1] != 2
+            or k_tgt.ndim != 2 or k_tgt.shape[1] != 2
+            or k_tgt.shape[0] != int(n_target_sites)):
+        return None
+    gx, gy = _site_grid_xy(scan)
+    if not gx or not gy:
+        return None
+    cam = np.column_stack([np.asarray(gy, float), np.asarray(gx, float)])
+    if cam.shape[0] != k_init.shape[0]:
+        return None
+    # Fit the knm -> camera affine from the initial pattern (registry knm and
+    # the run's own initGridLocations share col-major order). Verify with the
+    # residual: a real lattice<->lattice affine fits to << 1 px; a bad
+    # correspondence/order blows up to many px and is rejected.
+    X = np.column_stack([k_init, np.ones(len(k_init))])
+    try:
+        A, *_ = np.linalg.lstsq(X, cam, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    rms = float(np.sqrt((((X @ A) - cam) ** 2).sum(1).mean()))
+    if not np.isfinite(rms) or rms > 5.0:
+        return None
+    return np.column_stack([k_tgt, np.ones(len(k_tgt))]) @ A   # (n, 2) (y, x)
+
+
 def _per_site_from_lab_paths(paths_per_shot: list,
                               bundle: dict,
                               scan: dict) -> Optional[dict]:
@@ -2475,14 +3373,6 @@ def _per_site_from_lab_paths(paths_per_shot: list,
     """
     if not paths_per_shot or bundle is None:
         return None
-    gx, gy = _site_grid_xy(scan)
-    if not gx or not gy:
-        return None
-    site_xy = np.column_stack([np.asarray(gy, dtype=float),
-                                np.asarray(gx, dtype=float)])
-    n_sites = site_xy.shape[0]
-    if n_sites == 0:
-        return None
 
     raw1 = bundle.get('logicals_img1')
     raw2 = bundle.get('logicals_img2')
@@ -2501,6 +3391,30 @@ def _per_site_from_lab_paths(paths_per_shot: list,
             img2 = np.zeros_like(a)
     else:
         return None
+
+    # Detection grid for the INITIAL (loading) image, baked into the scan
+    # config as initGridLocationsX/Y.
+    gx, gy = _site_grid_xy(scan)
+    init_site_xy = (np.column_stack([np.asarray(gy, dtype=float),
+                                     np.asarray(gx, dtype=float)])
+                    if (gx and gy) else None)
+
+    # Cross-grid run (init pattern != target pattern): img2 is detected on the
+    # TARGET grid (different site count than the loading grid), so the per-site
+    # SURVIVAL/FP map lives on the target grid. Recover its camera coords by
+    # affine-mapping the target pattern's registry knm grid. Per-site loading
+    # stays an init-grid quantity and is omitted from this (target-grid) map.
+    cross_grid = (init_site_xy is not None
+                  and img2.shape[1] != init_site_xy.shape[0])
+    if cross_grid:
+        site_xy = _target_grid_camera_xy(scan, img2.shape[1])
+        loading_on_grid = False
+    else:
+        site_xy = init_site_xy
+        loading_on_grid = True
+    if site_xy is None or site_xy.shape[0] == 0:
+        return None
+    n_sites = site_xy.shape[0]
     if img2.shape[1] != n_sites:
         return None
 
@@ -2523,10 +3437,12 @@ def _per_site_from_lab_paths(paths_per_shot: list,
     by_seq = {int(e['seq_id']): e for e in paths_per_shot
                if isinstance(e, dict) and 'seq_id' in e}
 
-    # Build per-shot boolean target mask. Memory: n_shots × n_sites
-    # bytes — 1000×3270 = 3 MB max.
-    target_mask = np.zeros((n_shots, n_sites), dtype=bool)
-    has_paths   = np.zeros(n_shots, dtype=bool)
+    # Per-shot PLACED-target mask (drives TP) + the run-level ACTIVE-target set
+    # (every site EVER targeted -> drives which sites are non-targets for FP).
+    # Memory: n_shots × n_sites bytes — 1000×3270 = 3 MB max.
+    target_mask  = np.zeros((n_shots, n_sites), dtype=bool)
+    active_union = np.zeros(n_sites, dtype=bool)
+    has_paths    = np.zeros(n_shots, dtype=bool)
     # Median site spacing for the matching tolerance (rejects targets
     # too far from any lab site, e.g. coord-frame mismatches).
     ssub = site_xy[: min(n_sites, 1000)]
@@ -2543,6 +3459,7 @@ def _per_site_from_lab_paths(paths_per_shot: list,
         if idx.size == 0:
             continue
         target_mask[k, idx] = True
+        active_union[idx] = True
         has_paths[k] = True
 
     # Only count shots that actually had paths data. (Legacy-style empty
@@ -2551,26 +3468,39 @@ def _per_site_from_lab_paths(paths_per_shot: list,
         return None
     img1_used = img1[has_paths]
     img2_used = img2[has_paths]
+    img2b = img2_used.astype(bool)
     tmask_used = target_mask[has_paths]
-    nontmask_used = ~tmask_used
-    target_elig    = tmask_used.sum(axis=0).astype(np.int64)
-    nontarget_elig = nontmask_used.sum(axis=0).astype(np.int64)
-    tp_hits = (img2_used.astype(bool) & tmask_used).sum(axis=0).astype(np.int64)
-    fp_hits = (img2_used.astype(bool) & nontmask_used).sum(axis=0).astype(np.int64)
+    target_elig = tmask_used.sum(axis=0).astype(np.int64)
+    tp_hits = (img2b & tmask_used).sum(axis=0).astype(np.int64)
+    # False positives = spurious atoms at sites NOT part of the target pattern.
+    # The non-target set is the complement of the run-level ACTIVE-target set
+    # (every site ever targeted), NOT the per-shot placed pairs: a target site
+    # left unfilled on a low-loading shot is an UNFILLED TARGET, not a
+    # false-positive site. For a full-array target (every site targeted) there
+    # are no non-target sites, so FP is undefined everywhere (as expected).
+    if cross_grid:
+        nontarget_site = ~active_union
+        n_pshots = int(has_paths.sum())
+        nontarget_elig = np.where(nontarget_site, n_pshots, 0).astype(np.int64)
+        fp_hits = np.where(nontarget_site,
+                           img2b.sum(axis=0), 0).astype(np.int64)
+    else:
+        nontmask_used = ~tmask_used
+        nontarget_elig = nontmask_used.sum(axis=0).astype(np.int64)
+        fp_hits = (img2b & nontmask_used).sum(axis=0).astype(np.int64)
 
     with np.errstate(invalid='ignore', divide='ignore'):
         tp_rate = np.where(target_elig > 0, tp_hits / target_elig, np.nan)
         fp_rate = np.where(nontarget_elig > 0, fp_hits / nontarget_elig, np.nan)
-        loading = img1_used.mean(axis=0).astype(float)
+        loading = img1_used.mean(axis=0).astype(float)   # init-grid quantity
 
     def _opt_float_list(arr):
         return [None if (isinstance(x, float) and x != x) else float(x)
                 for x in arr.tolist()]
 
-    return {
+    out = {
         'x': site_xy[:, 1].tolist(),   # image-x
         'y': site_xy[:, 0].tolist(),   # image-y
-        'loading_rate':       _opt_float_list(loading),
         'survival_mean':      _opt_float_list(tp_rate),
         'tp_rate':            _opt_float_list(tp_rate),
         'fp_rate':            _opt_float_list(fp_rate),
@@ -2581,6 +3511,20 @@ def _per_site_from_lab_paths(paths_per_shot: list,
         'source':             'lab_paths',
         'n_shots_with_paths': int(has_paths.sum()),
     }
+    if loading_on_grid:
+        # Same grid: loading shares the main per-site grid.
+        out['loading_rate'] = _opt_float_list(loading)
+    else:
+        # Cross-grid: the main map is the TARGET grid, but loading lives on the
+        # INIT (loading) grid. Carry it with its own coords so the dashboard's
+        # loading panel renders on the init grid (survival/FP stay on target).
+        out['loading_rate'] = None
+        if (init_site_xy is not None
+                and init_site_xy.shape[0] == loading.shape[0]):
+            out['loading_init'] = _opt_float_list(loading)
+            out['loading_x'] = init_site_xy[:, 1].tolist()
+            out['loading_y'] = init_site_xy[:, 0].tolist()
+    return out
 
 
 def _per_site_from_slm_analysis(slm_an: dict) -> Optional[dict]:
@@ -3302,8 +4246,23 @@ def _survival_vs_distance(paths_info: Optional[dict],
         img2 = a[(num_images - 1)::num_images] if num_images >= 2 else a
     else:
         return None
-    if img2.size == 0 or img2.shape[1] != site_xy.shape[0]:
+    # Target grid: the lab (init) grid for a same-pattern run; for a
+    # cross-pattern run (initial != final pattern) img2 lives on the
+    # differently-sized TARGET grid -- recover its camera coords by affine-
+    # mapping the target pattern's registry knm (as the per-site map does), so
+    # transit distance ||target - init|| works across the two grids. init
+    # endpoints (loaded_paired) index site_xy; target endpoints (target_paired,
+    # + img2) index tgt_xy.
+    cross_grid = bool(img2.size) and img2.shape[1] != site_xy.shape[0]
+    if cross_grid:
+        tgt_xy = _target_grid_camera_xy(scan, img2.shape[1])
+        if tgt_xy is None:
+            return None
+    else:
+        tgt_xy = site_xy
+    if img2.size == 0 or img2.shape[1] != tgt_xy.shape[0]:
         return None
+    n_tgt = tgt_xy.shape[0]
 
     seq_ids = bundle.get('seq_ids')
     if seq_ids is None:
@@ -3353,12 +4312,13 @@ def _survival_vs_distance(paths_info: Optional[dict],
         if n_idx:
             for i in range(n_idx):
                 si = int(lpaired[i]); ti = int(tpaired[i])
-                if not (0 <= si < n_sites and 0 <= ti < n_sites):
+                # si -> init/lab grid (site_xy); ti -> target grid (tgt_xy + img2).
+                if not (0 <= si < n_sites and 0 <= ti < n_tgt):
                     continue
                 n_total_pairs += 1
                 used_lab_grid = True
-                dist = float(np.hypot(site_xy[ti, 0] - site_xy[si, 0],
-                                      site_xy[ti, 1] - site_xy[si, 1]))
+                dist = float(np.hypot(tgt_xy[ti, 0] - site_xy[si, 0],
+                                      tgt_xy[ti, 1] - site_xy[si, 1]))
                 distances.append(dist)
                 per_step_dists.append(dist / ns if (ns and ns > 0)
                                       else float('nan'))
@@ -3668,23 +4628,33 @@ def _per_iteration_time_order(scan: dict,
     # rearrangement run, via paths_per_shot target_paired/target_site_indices,
     # which index the logicals directly — no grid needed); otherwise the
     # plain "empty in img1 → occupied in img2" FP is correct.
+    # Cross-grid rearrangement: img1 (loading grid) and img2 (target grid)
+    # have different site counts, so the per-site survival (img1 & img2) and
+    # the img1-emptiness FP are undefined. survival is left None (the
+    # target-aware per-shot TP override in analyze_scan_dir fills it); FP is
+    # measured over the img2 (target-grid) NON-target sites.
+    cross_grid = (img2f is not None and img1f.size and img2f.size
+                  and img1f.shape[1] != img2f.shape[1])
+    # The target mask lives in the grid the targets index: img2 for cross-grid
+    # runs (target_paired -> img2), else the shared img1/img2 grid.
+    tmask_width = (img2f.shape[1] if (cross_grid and img2f is not None)
+                   else (img1f.shape[1] if img1f.size else 0))
     target_mask_f = None
     fp_is_rearrange = False
     paths_list = (paths_info or {}).get('paths_per_shot') or []
-    if paths_list and img1f.size:
+    if paths_list and img1f.size and tmask_width:
         by_seq = {}
         for e in paths_list:
             if isinstance(e, dict) and e.get('seq_id') is not None:
                 by_seq[int(e['seq_id'])] = e
-        n_sites_pi = img1f.shape[1]
-        tmask = np.zeros(img1f.shape, dtype=bool)
+        tmask = np.zeros((img1f.shape[0], tmask_width), dtype=bool)
         for r, sid in enumerate(kept_seq_ids):
             e = by_seq.get(int(sid))
             if e is None:
                 continue
-            idx = _entry_target_sites(e, None, n_sites_pi, 0.0)  # index path
+            idx = _entry_target_sites(e, None, tmask_width, 0.0)  # index path
             if idx.size:
-                tmask[r, idx[(idx >= 0) & (idx < n_sites_pi)]] = True
+                tmask[r, idx[(idx >= 0) & (idx < tmask_width)]] = True
                 fp_is_rearrange = True
         if fp_is_rearrange:
             target_mask_f = tmask
@@ -3694,13 +4664,20 @@ def _per_iteration_time_order(scan: dict,
         n_sites_per_shot = img1f.shape[1] if img1f.size else 0
         loaded_frac = (loaded / max(1, n_sites_per_shot)).astype(float)
         survival = fp = None
-        if img2f is not None:
+        if img2f is not None and not cross_grid:
             survived = (img1f & img2f).sum(axis=1)
             survival = np.where(loaded > 0, survived / loaded, np.nan)
             empty_base = (~img1f) & (~target_mask_f) if target_mask_f is not None \
                 else ~img1f
             empty  = empty_base.sum(axis=1)
             falsep = (img2f & empty_base).sum(axis=1)
+            fp     = np.where(empty > 0, falsep / empty, np.nan)
+        elif img2f is not None and cross_grid and target_mask_f is not None:
+            # survival left None -> filled by the target-aware per-shot TP
+            # override. FP = spurious atoms at img2 sites NOT in the target set.
+            base   = ~target_mask_f
+            empty  = base.sum(axis=1)
+            falsep = (img2f & base).sum(axis=1)
             fp     = np.where(empty > 0, falsep / empty, np.nan)
 
     out = {

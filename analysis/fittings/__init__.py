@@ -5,6 +5,7 @@ from .lorentzian import (
     lorentzian_peak,
     double_lorentzian_dip,
     fit_lorentzian,
+    fit_double_lorentzian,
     fit_lorentzian_site_resolved,
 )
 from .exponential import exponential_decay, fit_exponential

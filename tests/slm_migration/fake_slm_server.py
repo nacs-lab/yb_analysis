@@ -157,7 +157,7 @@ class FakeSlmServer:
 
         # ---- Phase 1 POST endpoints (body capture for MATLAB tests) ----
 
-        def _resp_post(name):
+        def _resp_post(name, augment=None):
             with self._lock:
                 self._hits[name] += 1
                 try:
@@ -172,7 +172,41 @@ class FakeSlmServer:
                 fail = self._fail_status.get(name)
                 if fail:
                     return jsonify({'error': f'forced {fail}'}), fail
-                return jsonify(self._post_payloads[name])
+                payload = self._post_payloads[name]
+                if augment is not None:
+                    payload = augment(dict(payload), body)
+                return jsonify(payload)
+
+        def _augment_loading(payload, body):
+            """Mimic the real server's 3-D vs 2-D response: when the request
+            carries a non-empty ``planes_z_rad`` the server splits the sites
+            across the declared planes (layer-major) and echoes the 3-D
+            fields; otherwise every 3-D field is null (the legacy 2-D shape)."""
+            planes = body.get('planes_z_rad')
+            pos2d = payload.get('positions_knm', []) or []
+            n = payload.get('n_sites', len(pos2d))
+            if planes:
+                k = len(planes)
+                n_per_plane = [n // k] * k
+                for i in range(n - (n // k) * k):
+                    n_per_plane[i] += 1
+                plane_of_site, z_rad = [], []
+                for li, (npl, z) in enumerate(zip(n_per_plane, planes)):
+                    plane_of_site += [li] * npl
+                    z_rad += [float(z)] * npl
+                pos3d = [[p[0], p[1], z_rad[i]] for i, p in enumerate(pos2d)]
+                payload.update({
+                    'is_3d': True, 'z_rad': z_rad, 'positions_knm3d': pos3d,
+                    'planes_z_rad': [float(z) for z in planes],
+                    'n_per_plane': n_per_plane, 'plane_of_site': plane_of_site,
+                })
+            else:
+                payload.update({
+                    'is_3d': False, 'z_rad': None, 'positions_knm3d': None,
+                    'planes_z_rad': None, 'n_per_plane': None,
+                    'plane_of_site': None,
+                })
+            return payload
 
         @self._app.route('/slm/rearrange', methods=['POST'])
         def _rearrange():
@@ -188,7 +222,8 @@ class FakeSlmServer:
 
         @self._app.route('/slm/initialize_loading_pattern', methods=['POST'])
         def _init_loading():
-            return _resp_post('initialize_loading_pattern')
+            return _resp_post('initialize_loading_pattern',
+                              augment=_augment_loading)
 
         @self._app.route('/slm/write_loading_phase', methods=['POST'])
         def _write_loading():

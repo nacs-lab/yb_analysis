@@ -25,8 +25,20 @@ the base dir via ``$YB_PATTERNS_DIR``). Persistence mirrors
      "phases": [...],                 # (N,) per-site phase (rad)
      "lattice": {rows, cols, n_rows, n_cols, pitch_x, pitch_y,
                  row_basis, col_basis, tilt_deg, n_missing, x0, y0},
+     # --- 3-D (present/non-null ONLY for a 3-D extraction; None for 2-D) ---
+     "planes_z_rad": [...] | null,    # declared layer depths (ANSI rad)
+     "is_3d": false,                  # true iff planes_z_rad was supplied
+     "z_rad": [...] | null,           # (N,) per-site depth (rad), layer-major
+     "positions_knm3d": [[y, x, z], ...] | null,   # (N,3), layer-major
+     "n_per_plane": [n0, n1, ...] | null,          # sites per declared layer
+     "plane_of_site": [...] | null,                # (N,) layer index per site
      "source_endpoint": "/slm/initialize_loading_pattern",
      "created_iso": "...", "updated_iso": "..."}
+
+The 2-D ``knm`` stays (N,2) in BOTH cases — every existing consumer reads
+only that, so a 3-D record is a strict superset and 2-D detection is
+unchanged. Site order for a 3-D record is LAYER-MAJOR (declared plane order,
+then within-layer ``order``).
 
 Public API::
 
@@ -54,8 +66,10 @@ logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
 _RECORD_FILENAME = 'record.json'
-# Big per-site arrays omitted from list_patterns() metadata.
-_BIG_KEYS = ('knm', 'phases')
+# Big per-site arrays omitted from list_patterns() metadata. The 3-D arrays
+# (positions_knm3d/z_rad/plane_of_site) are N-length too, so they're dropped
+# from the compact view alongside the 2-D ones.
+_BIG_KEYS = ('knm', 'phases', 'positions_knm3d', 'z_rad', 'plane_of_site')
 
 
 def _patterns_dir() -> Path:
@@ -185,7 +199,8 @@ def delete_pattern(name: str) -> bool:
 
 
 def _params_match(rec: dict, *, base_phase_path, order, fft_shape, threshold,
-                  min_dist, legacy_zerniked, baked_zernike) -> bool:
+                  min_dist, legacy_zerniked, baked_zernike,
+                  planes_z_rad=None) -> bool:
     """True if a cached record was derived with the same inputs. The base
     `.pt` content (sha) can only change server-side, so a same-path record
     is treated as valid unless the caller passes force=True."""
@@ -202,6 +217,15 @@ def _params_match(rec: dict, *, base_phase_path, order, fft_shape, threshold,
     if bool(rec.get('legacy_zerniked', False)) != bool(legacy_zerniked):
         return False
     if list(rec.get('baked_zernike') or []) != list(baked_zernike or []):
+        return False
+    # 3-D layer depths are part of the extraction identity: a 2-D cache hit
+    # must NOT satisfy a 3-D request (and vice versa). Normalise None/missing
+    # -> [] so a pre-3-D record still matches a 2-D request (no needless
+    # re-derive on deploy). Compare element-wise as floats to ignore
+    # int-vs-float / list-vs-tuple drift.
+    cached_p = [float(z) for z in (rec.get('planes_z_rad') or [])]
+    want_p = [float(z) for z in (planes_z_rad or [])]
+    if cached_p != want_p:
         return False
     return bool(rec.get('base_sha256'))  # only trust a successfully-derived rec
 
@@ -245,7 +269,8 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
                              default_loading_zernike=None, order='col',
                              fft_shape=(4096, 4096), threshold=0.30,
                              min_dist=None, legacy_zerniked=False,
-                             baked_zernike=None, client=None, force=False):
+                             baked_zernike=None, planes_z_rad=None,
+                             client=None, force=False):
     """Return the registry record for ``name``, deriving it from the SLM
     server only when needed.
 
@@ -255,13 +280,24 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
     is the scan's job, not the registry's), build and persist the record,
     and return it. On SLM error, fall back to the last-known-good record if
     present (logged); otherwise re-raise.
+
+    ``planes_z_rad`` (OPTIONAL, list of ANSI ``2*rho^2-1`` radians): when
+    given (non-empty) the server does a 3-D, per-plane extraction and the
+    record gains the 3-D fields (``is_3d``/``z_rad``/``positions_knm3d``/
+    ``planes_z_rad``/``n_per_plane``/``plane_of_site``). It is part of the
+    cache key, so changing it forces a re-derive; ``None`` is the legacy 2-D
+    path and leaves the 3-D fields null.
     """
     fft_shape = (int(fft_shape[0]), int(fft_shape[1]))
+    # Normalise once so the cache key, the request, and the stored record all
+    # agree (an empty list means "no planes" == 2-D).
+    planes = ([float(z) for z in planes_z_rad] if planes_z_rad else None)
     existing = get_pattern(name)
     if existing and not force and _params_match(
             existing, base_phase_path=base_phase_path, order=order,
             fft_shape=fft_shape, threshold=threshold, min_dist=min_dist,
-            legacy_zerniked=legacy_zerniked, baked_zernike=baked_zernike):
+            legacy_zerniked=legacy_zerniked, baked_zernike=baked_zernike,
+            planes_z_rad=planes):
         return existing
 
     if client is None:
@@ -273,7 +309,8 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
             phase_path=base_phase_path, loading_zernike=None,
             baked_zernike=baked_zernike, legacy_zerniked=legacy_zerniked,
             order=order, fft_shape=fft_shape, threshold=threshold,
-            min_dist=min_dist, write_to_slm=False, name=name)
+            min_dist=min_dist, write_to_slm=False, name=name,
+            planes_z_rad=planes)
     except Exception as ex:  # noqa: BLE001 — network/HTTP; fall back if we can
         if existing:
             logger.warning('pattern_registry: refresh %s failed (%s); '
@@ -304,6 +341,16 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
         'knm': resp.get('positions_knm'),
         'phases': resp.get('phases'),
         'lattice': resp.get('lattice'),
+        # 3-D fields: echo what the server returned. For a 2-D request the
+        # server leaves these null (or omits them), so this is a no-op vs the
+        # old record shape. ``planes_z_rad`` mirrors the REQUESTED planes (the
+        # cache key) so a refresh round-trips identically.
+        'planes_z_rad': planes,
+        'is_3d': bool(resp.get('is_3d')),
+        'z_rad': resp.get('z_rad'),
+        'positions_knm3d': resp.get('positions_knm3d'),
+        'n_per_plane': resp.get('n_per_plane'),
+        'plane_of_site': resp.get('plane_of_site'),
         'source_endpoint': '/slm/initialize_loading_pattern',
         'created_iso': (existing or {}).get('created_iso') or _now_iso(),
         'updated_iso': _now_iso(),

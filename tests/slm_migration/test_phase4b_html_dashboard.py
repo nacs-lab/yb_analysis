@@ -354,20 +354,20 @@ def test_main_html_served_at_root(dash_app):
     assert 'tab-btn-live' in text
     assert 'tab-btn-hardware' in text
     assert 'tab-btn-analysis' in text
-    assert 'tab-btn-queue' in text
     # SLM-styled body classes present.
     assert 'class="card' in text
-    # Submit-scan textarea exists.
-    assert 'submit-scan-json' in text
 
 
-def test_main_html_includes_seq_catalog_panel(dash_app):
+def test_main_html_includes_queue_popup(dash_app):
+    # The standalone Queue tab (+ submit-scan / seq-catalog panels) was removed;
+    # the full queue now lives in a popout opened from the Live control sidebar.
     r = dash_app.get('/')
     text = r.get_data(as_text=True)
-    # Seq catalog panel (the analog to handoff's "Custom protocols").
-    assert 'queue-seq-catalog' in text
-    assert 'seq-catalog-table' in text
-    assert 'fill-template-btn' in text
+    assert 'id="queue-popup"' in text
+    assert 'id="pq-queue-table"' in text
+    assert 'id="pq-history-table"' in text
+    assert 'id="ctrl-queue-section"' in text   # the clickable queue area
+    assert 'tab-btn-queue' not in text          # tab is gone
 
 
 def test_static_css_served(dash_app):
@@ -380,7 +380,7 @@ def test_static_js_served(dash_app):
     r = dash_app.get('/static/dashboard/dashboard.js')
     assert r.status_code == 200
     assert b'pollLive' in r.get_data()
-    assert b'loadSeqCatalog' in r.get_data()
+    assert b'renderQueuePopup' in r.get_data()
 
 
 def test_api_live_figures_empty(dash_app):

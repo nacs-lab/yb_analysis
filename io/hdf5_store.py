@@ -4,6 +4,18 @@ Replaces MATLAB matfile() incremental write pattern.
 """
 
 import os
+import time
+
+# The live data dir lives under a OneDrive-synced folder. OneDrive (and AV, or a
+# concurrent reader) can hold a transient lock on the .h5 file; HDF5's own file
+# locking then fails the open with a Windows ERROR_LOCK_VIOLATION
+# (GetLastError()=33), which silently dropped a whole block of saved data
+# (see problem-memory bug-hdf5-append-lock-onedrive-silent-loss). Disabling
+# HDF5's lock is safe here — the writer is already serialized by
+# DataManager._save_lock — and removes that failure mode at the source. Set
+# before h5py imports the HDF5 C library (HDF5 also re-reads it per open).
+os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
+
 import numpy as np
 
 try:
@@ -11,9 +23,41 @@ try:
 except ImportError:
     h5py = None
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _open_h5_append(path, retries=12, base_delay=0.1, max_delay=1.0):
+    """Open ``path`` in append mode, retrying transient OS-level file locks.
+
+    Even with HDF5's own locking disabled, an external process (OneDrive sync,
+    antivirus, a concurrent reader) can briefly hold the file, so a single open
+    can still fail with OSError (Windows ERROR_LOCK_VIOLATION /
+    ERROR_SHARING_VIOLATION). Retry with exponential backoff (~8 s worst case)
+    so a transient lock no longer silently loses a block of data. Re-raises the
+    last error if every attempt fails (the caller records it as save_health).
+    """
+    if h5py is None:
+        raise ImportError("h5py is required for HDF5 storage")
+    delay = base_delay
+    last = None
+    for attempt in range(retries):
+        try:
+            return h5py.File(path, 'a')
+        except OSError as e:
+            last = e
+            if attempt < retries - 1:
+                logger.warning('HDF5 open (append) locked, retry %d/%d in %.2fs: %s',
+                               attempt + 1, retries, delay, e)
+                time.sleep(delay)
+                delay = min(max_delay, delay * 1.7)
+    raise last
+
 
 def create_scan_file(path, scan_config, frame_size, num_sites,
-                     two_array=False, num_sites_img2=0):
+                     two_array=False, num_sites_img2=0,
+                     img2_logicals_source=None):
     """Create a new HDF5 scan file with resizable datasets.
 
     Parameters
@@ -35,6 +79,14 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
     num_sites_img2 : int
         Number of tweezer sites in image-2's grid (required when
         ``two_array=True``).
+    img2_logicals_source : str or None
+        Provenance for how ``logicals_img2`` was produced. When set (e.g.
+        ``'gmm_shape_model_C'``), ``logicals_img2`` came from a spot-shape
+        MODEL rather than an intensity threshold; a ``certainties_img2``
+        dataset (per-site posterior P(loaded), same shape as
+        ``logicals_img2``) is created alongside, and the tag is stored as the
+        ``logicals_img2_source`` file + dataset attribute. None -> threshold
+        detection (no certainties dataset), the default.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -68,6 +120,18 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
                 'intensities_img2', shape=(0, num_sites_img2),
                 maxshape=(None, num_sites_img2), dtype='float64',
                 chunks=(64, max(num_sites_img2, 1)))
+            # img2 logicals from a spot-shape MODEL -> record provenance and a
+            # per-site posterior "% certainty" dataset alongside the logicals.
+            if img2_logicals_source:
+                src = str(img2_logicals_source)
+                f.attrs['logicals_img2_source'] = src
+                f['logicals_img2'].attrs['source'] = src
+                cert = f.create_dataset(
+                    'certainties_img2', shape=(0, num_sites_img2),
+                    maxshape=(None, num_sites_img2), dtype='float32',
+                    chunks=(64, max(num_sites_img2, 1)))
+                cert.attrs['source'] = src
+                cert.attrs['meaning'] = 'per-site P(loaded) posterior for logicals_img2'
         else:
             # Legacy single-array layout: (nFrames, num_sites) interleaved.
             f.create_dataset(
@@ -101,7 +165,7 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
 
 def append_block(path, imgs_block, logicals_block, intensities_block,
                  seq_ids_block, logicals_img2_block=None,
-                 intensities_img2_block=None):
+                 intensities_img2_block=None, proba_img2_block=None):
     """Append a block of data to an existing HDF5 file.
 
     Parameters
@@ -120,13 +184,17 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
         If non-None, two-array mode: shape (NSeqs, M2), image-2 logicals.
     intensities_img2_block : ndarray or None
         If non-None, two-array mode: shape (NSeqs, M2), image-2 intensities.
+    proba_img2_block : ndarray or None
+        If non-None, two-array mode: shape (NSeqs, M2), the spot-shape model's
+        per-site posterior P(loaded) for ``logicals_img2`` (the "% certainty"),
+        appended to the ``certainties_img2`` dataset.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
 
     two_array = logicals_img2_block is not None
 
-    with h5py.File(path, 'a') as f:
+    with _open_h5_append(path) as f:
         # Always append the imgs block as-is (interleaved frames).
         if 'imgs' not in f:
             shape = (0,) + imgs_block.shape[1:]
@@ -147,6 +215,9 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
                 ('intensities_img1', intensities_block),
                 ('intensities_img2', intensities_img2_block),
             ]
+            if proba_img2_block is not None:
+                pairs.append(('certainties_img2',
+                              np.asarray(proba_img2_block, dtype='float32')))
         else:
             pairs = [
                 ('logicals', logicals_block),

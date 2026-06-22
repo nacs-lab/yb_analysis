@@ -48,3 +48,49 @@ def append(rel_path: str, record: dict) -> None:
                 f.write(json.dumps(rec, default=float) + '\n')
     except Exception:  # noqa: BLE001 — audit logging must never raise
         pass
+
+
+def _digits(v) -> str:
+    """Digits-only normalisation so a string ``scan_id`` and an int ``scan_id``
+    compare equal regardless of how each side stamped it."""
+    return ''.join(ch for ch in str(v) if ch.isdigit())
+
+
+def read_threshold_records(pattern, scan_id=None, max_lines: int = 50000):
+    """Read per-pattern threshold-update records (the full per-site
+    ``thresholds`` / ``infidelities`` vectors are retained).
+
+    Returns the parsed records in file (chronological) order. When ``scan_id``
+    is given, only records stamped with that run are returned (digit-normalised
+    match). Best-effort: returns ``[]`` on any read / parse failure or when the
+    log doesn't exist (e.g. a day-folder scan that declared no loading pattern).
+    """
+    try:
+        import yb_analysis.analysis.pattern_registry as reg
+        name = reg._sanitize_name(pattern)
+    except Exception:  # noqa: BLE001
+        name = str(pattern)
+    path = os.path.join(_logs_dir(), 'thresholds', '%s.jsonl' % name)
+    if not os.path.isfile(path):
+        return []
+    want = _digits(scan_id) if scan_id is not None else None
+    out = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if max_lines and len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except (ValueError, TypeError):
+                continue
+            if want is not None and _digits(rec.get('scan_id')) != want:
+                continue
+            out.append(rec)
+    except OSError:
+        return []
+    return out

@@ -206,6 +206,19 @@ def test_fit_run_infidelities_used_threshold():
     assert DT.imaging_infidelity_at_thresholds(inten, [0.0])[0] > 0.3
 
 
+def test_false_positive_rate_all_empty():
+    """Baseline (all-empty) FP = P(img2=1 | img1=0), site-averaged per param."""
+    # (nSites=2, nParams=2, nReps=2). Site0 empty in both params; one spurious
+    # atom at site0/param0/rep0 → site0 FP = 1/2 at param0. Site1 loaded → NaN
+    # (no empty reps). Site-average ignores the NaN site → param0 FP = 0.5.
+    l1 = np.zeros((2, 2, 2), dtype=bool)
+    l1[1, :, :] = True                 # site1 always loaded (no empties)
+    l2 = np.zeros((2, 2, 2), dtype=bool)
+    l2[0, 0, 0] = True                 # site0 param0 rep0: empty → occupied
+    mean, sem = P.false_positive_rate(l1, l2)
+    assert abs(mean[0] - 0.5) < 1e-9 and abs(mean[1] - 0.0) < 1e-9
+
+
 def test_live_scan_curve_target_aware():
     """compute_scan_curve uses per-shot diag targets (TP) when given, matching
     the Analysis tab; falls back to per-site survival otherwise (unchanged)."""
@@ -444,3 +457,232 @@ def test_shots_tag_actual_only():
 
 def test_shots_tag_none():
     assert RL._shots_tag(None, None) is None
+
+
+# --- throughout-run thresholds: timeline + posterior + cap -----------------
+
+def test_atom_posterior_basic():
+    # empty N(0,3) A=0.4 ; atom N(100,5) A=0.6
+    params = [0.0, 3.0, 0.4, 100.0, 5.0, 0.6]
+    assert DT.atom_posterior(100.0, params) > 0.99       # deep in atom peak
+    assert DT.atom_posterior(0.0, params) < 0.01         # deep in empty peak
+    # vectorised
+    post = DT.atom_posterior(np.array([0.0, 100.0]), params)
+    assert post.shape == (2,) and post[0] < 0.01 and post[1] > 0.99
+    # degenerate fit / missing params → NaN
+    assert np.isnan(DT.atom_posterior(50.0, None))
+    assert np.isnan(DT.atom_posterior(50.0, [0, 0, 0.5, 100, 5, 0.5]))
+
+
+def test_fit_run_infidelities_timeline_matches_single():
+    rng = np.random.default_rng(7)
+    col = np.concatenate([rng.normal(0, 3, 400), rng.normal(100, 5, 400)])
+    inten = np.column_stack([col])
+    _, _, used_single = DT.fit_run_infidelities(inten, [50.0])
+    _, _, used_tl = DT.fit_run_infidelities_timeline(inten, [(1.0, [50.0])])
+    # One full-weight segment at the same cut == the single-threshold metric.
+    assert np.allclose(used_single, used_tl, atol=1e-9, equal_nan=True)
+    # Half the run at a bad cut (on the empty peak) → strictly worse average.
+    _, _, used_mix = DT.fit_run_infidelities_timeline(
+        inten, [(1.0, [50.0]), (1.0, [0.0])])
+    assert used_mix[0] > used_single[0]
+    # Zero-weight / None-threshold segments contribute nothing → NaN here.
+    _, _, used_none = DT.fit_run_infidelities_timeline(
+        inten, [(0.0, [50.0]), (5.0, None)])
+    assert np.isnan(used_none[0])
+
+
+def test_read_threshold_records_filters_by_scan(tmp_path, monkeypatch):
+    from yb_analysis import config as cfg
+    from yb_analysis.analysis import update_log as UL
+    monkeypatch.setattr(cfg, 'PATH_PREFIX', str(tmp_path))
+    UL.append('thresholds/testpat.jsonl',
+              {'scan_id': '20260611120000', 'seq_no': 0, 'source': 'fit',
+               'thresholds': [1.0, 2.0], 'infidelities': [0.01, 0.02]})
+    UL.append('thresholds/testpat.jsonl',
+              {'scan_id': '20260611120000', 'seq_no': 10, 'source': 'cheap',
+               'thresholds': [1.1, 2.1]})
+    UL.append('thresholds/testpat.jsonl',
+              {'scan_id': '20260611999999', 'seq_no': 0, 'source': 'fit',
+               'thresholds': [9.0, 9.0]})
+    assert len(UL.read_threshold_records('testpat')) == 3
+    mine = UL.read_threshold_records('testpat', scan_id='20260611120000')
+    assert len(mine) == 2
+    assert all(r['scan_id'] == '20260611120000' for r in mine)
+    # Unknown pattern / scan → empty (never raises).
+    assert UL.read_threshold_records('nope') == []
+    assert UL.read_threshold_records('testpat', scan_id='00000000000000') == []
+
+
+def test_run_threshold_timeline_seed_and_updates(tmp_path, monkeypatch):
+    from yb_analysis import config as cfg
+    from yb_analysis.analysis import update_log as UL
+    monkeypatch.setattr(cfg, 'PATH_PREFIX', str(tmp_path))
+    UL.append('thresholds/testpat.jsonl',
+              {'scan_id': '20260611120000', 'seq_no': 20, 'source': 'fit',
+               'thresholds': [10.0, 10.0], 'infidelities': [0.02, 0.04]})
+    UL.append('thresholds/testpat.jsonl',
+              {'scan_id': '20260611120000', 'seq_no': 40, 'source': 'cheap',
+               'thresholds': [11.0, 11.0]})
+    scan = {'initThresholds': [5.0, 5.0], 'initInfidelities': [0.5, 0.5],
+            'imagePatternsJson': '[{"name": "testpat"}]'}
+    sd = tmp_path / 'data_20260611_120000'
+    sd.mkdir()
+    segs = RA._run_threshold_timeline(scan, str(sd), n_shots=60)
+    assert len(segs) == 3
+    assert [s['weight'] for s in segs] == [20, 20, 20]   # 0-20, 20-40, 40-60
+    assert [s['source'] for s in segs] == ['scan_init', 'fit', 'cheap']
+    # Cheap update logs no infidelity → carry the last fit's forward.
+    assert segs[2]['infidelities'] is None
+    assert np.allclose(segs[2]['infidelities_eff'], [0.02, 0.04])
+    # Thresholds applied in order.
+    assert np.allclose(segs[1]['thresholds'], [10.0, 10.0])
+
+
+def test_run_threshold_timeline_seed_only_no_log(tmp_path, monkeypatch):
+    from yb_analysis import config as cfg
+    monkeypatch.setattr(cfg, 'PATH_PREFIX', str(tmp_path))
+    scan = {'initThresholds': [5.0, 5.0], 'initInfidelities': [0.3, 0.3],
+            'imagePatternsJson': '[{"name": "testpat"}]'}
+    sd = tmp_path / 'data_20260611_120000'
+    sd.mkdir()
+    segs = RA._run_threshold_timeline(scan, str(sd), n_shots=100)
+    assert len(segs) == 1 and segs[0]['source'] == 'scan_init'
+    assert segs[0]['weight'] == 100
+
+
+def test_imaging_fidelity_from_logged_timeline():
+    segs = [
+        {'weight': 10, 'thresholds': np.array([5.0, 5.0]),
+         'infidelities': np.array([0.5, 0.5]),
+         'infidelities_eff': np.array([0.5, 0.5]), 'source': 'scan_init'},
+        {'weight': 30, 'thresholds': np.array([10.0, 10.0]),
+         'infidelities': np.array([0.1, 0.1]),
+         'infidelities_eff': np.array([0.1, 0.1]), 'source': 'fit'},
+    ]
+    out = RA._imaging_fidelity_from_logged_timeline(segs)
+    # per-site infid = (10*0.5 + 30*0.1)/40 = 0.2 ; fidelity = 0.8
+    assert abs(out['mean_infidelity'] - 0.2) < 1e-9
+    assert abs(out['mean_fidelity'] - 0.8) < 1e-9
+    assert out['source'] == 'logged_throughout_run'
+    assert out['n_in_run_updates'] == 1
+    assert out['n_sites'] == 2
+    # No infidelity vectors anywhere → None.
+    assert RA._imaging_fidelity_from_logged_timeline(
+        [{'weight': 5, 'thresholds': np.array([1.0]),
+          'infidelities': None, 'infidelities_eff': None,
+          'source': 'scan_init'}]) is None
+
+
+def _cap_bundle(n_atom=100, n_empty=100, seed=3):
+    rng = np.random.default_rng(seed)
+    # One site: first n_atom shots are real atoms (~100), the rest empty (~0).
+    col = np.concatenate([rng.normal(100, 5, n_atom),
+                          rng.normal(0, 3, n_empty)])
+    img1 = col.reshape(-1, 1)
+    seq_ids = np.arange(1, n_atom + n_empty + 1, dtype=np.int64)
+    bundle = {'two_array': False, 'intensities': img1, 'seq_ids': seq_ids}
+    return bundle, {'NumImages': 1}
+
+
+def test_rearrange_survival_cap_high_when_sources_loaded():
+    bundle, scan = _cap_bundle()
+    # Paths only on the real-atom shots (seq_ids 1..100) → posterior ≈ 1.
+    paths = [{'seq_id': k, 'loaded_paired': [0]} for k in range(1, 101)]
+    cap = RA._rearrange_survival_cap(paths, bundle, scan)
+    assert cap is not None
+    assert cap['n_paths'] == 100 and cap['n_shots_with_paths'] == 100
+    assert cap['cap_mean'] > 0.95
+    assert cap['expected_nulled'] < 5.0
+    assert cap['cap_sem'] >= 0.0
+
+
+def test_rearrange_survival_cap_low_when_sources_empty():
+    bundle, scan = _cap_bundle()
+    # Paths on the EMPTY shots (seq_ids 101..200) — these source sites were
+    # false positives → posterior ≈ 0 → cap ≈ 0, most paths nulled.
+    paths = [{'seq_id': k, 'loaded_paired': [0]} for k in range(101, 201)]
+    cap = RA._rearrange_survival_cap(paths, bundle, scan)
+    assert cap is not None and cap['n_paths'] == 100
+    assert cap['cap_mean'] < 0.05
+    assert cap['expected_nulled'] > 95.0
+
+
+def test_rearrange_survival_cap_two_array_and_guards():
+    rng = np.random.default_rng(4)
+    col = np.concatenate([rng.normal(100, 5, 60), rng.normal(0, 3, 60)])
+    bundle = {'two_array': True, 'intensities_img1': col.reshape(-1, 1),
+              'seq_ids': np.arange(1, 121, dtype=np.int64)}
+    scan = {'NumImages': 2}
+    paths = [{'seq_id': k, 'loaded_paired': [0]} for k in range(1, 61)]
+    cap = RA._rearrange_survival_cap(paths, bundle, scan)
+    assert cap is not None and cap['cap_mean'] > 0.95
+    # No paths → None. No intensities (MATLAB scan) → None.
+    assert RA._rearrange_survival_cap([], bundle, scan) is None
+    assert RA._rearrange_survival_cap(
+        paths, {'two_array': False, 'intensities': None,
+                'seq_ids': np.arange(1, 61)}, scan) is None
+
+
+# --- filtered TP (exclude outlier bad-fidelity target spots) ---------------
+
+def test_throughout_run_per_site_infidelity_vector():
+    segs = [
+        {'weight': 10, 'source': 'scan_init',
+         'infidelities': np.array([0.5, 0.5]),
+         'infidelities_eff': np.array([0.5, 0.5])},
+        {'weight': 30, 'source': 'fit',
+         'infidelities': np.array([0.1, 0.1]),
+         'infidelities_eff': np.array([0.1, 0.1])},
+    ]
+    v = RA._throughout_run_per_site_infidelity(segs)
+    assert np.allclose(v, [0.2, 0.2])             # (10*0.5+30*0.1)/40
+    assert RA._throughout_run_per_site_infidelity([]) is None
+
+
+def test_outlier_bad_fidelity_sites():
+    psi = np.array([0.001, 0.002, 0.5, 0.001, np.nan])
+    bad, thr = RA._outlier_bad_fidelity_sites(psi, np.array([0, 1, 2, 3, 4]))
+    assert list(bad) == [2]                        # only the 0.5 spot
+    assert thr is not None and thr >= RA.FILTERED_TP_ABS_FLOOR
+    # Uniformly clean targets → nothing flagged (abs floor protects them).
+    bad2, _ = RA._outlier_bad_fidelity_sites(
+        np.array([0.001, 0.002, 0.003]), np.array([0, 1, 2]))
+    assert bad2.size == 0
+    # NaN-only candidates → nothing flagged, no threshold.
+    bad3, thr3 = RA._outlier_bad_fidelity_sites(
+        np.array([np.nan, np.nan]), np.array([0, 1]))
+    assert bad3.size == 0 and thr3 is None
+
+
+def test_filtered_target_aware_excludes_bad_spot():
+    # 4 sites, targets {0,1,2}; site 2 is the bad-fidelity spot that always
+    # reads empty in img2. 2 shots, 1 per param.
+    logicals = np.array([[1, 1, 1, 1], [1, 1, 0, 0],
+                         [1, 1, 1, 1], [1, 1, 0, 0]], dtype=np.uint8)
+    bundle = {'logicals': logicals, 'seq_ids': np.array([1, 2]),
+              'two_array': False, 'mat_path': None}
+    scan = {'NumImages': 2, 'Params': [1, 2]}
+    paths = [{'seq_id': 1, 'target_site_indices': [0, 1, 2]},
+             {'seq_id': 2, 'target_site_indices': [0, 1, 2]}]
+    sp = np.array([1.0, 2.0])
+    out = RA._filtered_target_aware(
+        paths, bundle, scan, sp, reps_per_param=np.array([1, 1]),
+        per_site_infid=np.array([0.001, 0.002, 0.5, 0.001]))
+    assert out is not None
+    assert out['n_target_sites'] == 3
+    assert out['n_excluded'] == 1 and out['n_kept'] == 2
+    assert abs(out['overall_mean'] - 1.0) < 1e-9   # bad target dropped → all good
+    assert abs(out['excluded_max_infid'] - 0.5) < 1e-9
+    # No bad spots → equals the unfiltered TP (2/3).
+    out2 = RA._filtered_target_aware(
+        paths, bundle, scan, sp, reps_per_param=np.array([1, 1]),
+        per_site_infid=np.array([0.001, 0.002, 0.003, 0.001]))
+    assert out2['n_excluded'] == 0
+    assert abs(out2['overall_mean'] - 2.0 / 3.0) < 1e-9
+    # No per-site infidelity / no paths → None.
+    assert RA._filtered_target_aware(
+        paths, bundle, scan, sp, per_site_infid=None) is None
+    assert RA._filtered_target_aware(
+        [], bundle, scan, sp,
+        per_site_infid=np.array([0.001, 0.002, 0.5, 0.001])) is None

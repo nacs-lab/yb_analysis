@@ -57,6 +57,10 @@
       "type": "string",
       "description": "Optional human label for queue UI; falls back to seq name."
     },
+    "description": {
+      "type": "string",
+      "description": "Optional free-text PURPOSE/CONTEXT for the run (NOT the name): why it was run, which test group it belongs to, what it measures. Stamped into the scan-config sidecar (top-level 'description') so the analysis dashboard shows it (collapsible) and runs are searchable by it. Inert for the byte/seq path."
+    },
     "code_snapshot": {
       "description": "Optional reproducibility pin (#3): replay the experiment code (YbSeqs/YbSteps/YbScans) captured for a prior run instead of the live tree. Set by 're-queue (orig code)'. Inert for normal runs; honored by the pyctrl run loop, ignored by the MATLAB backend.",
       "type": "object",

@@ -36,9 +36,32 @@ def _bare_dm(num_sites, day_dir, scan_id='20260101000000', seq_total=0):
     dm.loaded_infidelities = np.full(num_sites, np.nan)
     dm.loaded_gauss_fits = None
     dm._thr_place_ratio = None
+    # Structural-guard state (see data_manager): the cheap tracker only runs with
+    # an accepted-fit anchor (placement ratio + per-site valley clamp band).
+    dm._thr_clamp_lo = None
+    dm._thr_clamp_hi = None
+    dm._thr_has_accepted_fit = False
     dm._day_dir = str(day_dir)
     dm.is_two_array = False
     return dm
+
+
+def _prime_anchor(dm, empty_mu, atom_mu, ratio=0.5):
+    """Give the bare DM an ACCEPTED-fit anchor (placement ratio + per-site valley
+    clamp band) so the guarded cheap tracker will run. Band derived from the peak
+    positions exactly as _valley_clamp_band does from a full fit."""
+    from yb_analysis.config import THRES_LIVE_VALLEY_MARGIN as m
+    n = dm.num_sites
+    sep = atom_mu - empty_mu
+    dm._thr_place_ratio = np.full(n, ratio)
+    dm._thr_clamp_lo = np.full(n, empty_mu + m * sep)
+    dm._thr_clamp_hi = np.full(n, atom_mu - m * sep)
+    # Last full-fit cut (the valley) + the fit-window medians below/above it that the
+    # cheap tracker shifts the cut by (their measured drift).
+    dm._thr_fit_anchor = np.full(n, empty_mu + ratio * sep)
+    dm._thr_fit_med_below = np.full(n, empty_mu)
+    dm._thr_fit_med_above = np.full(n, atom_mu)
+    dm._thr_has_accepted_fit = True
 
 
 def _bimodal(rng, n_sites, k, empty_mu, atom_mu, load=0.6):
@@ -63,24 +86,27 @@ def test_placement_ratio_midpoint_for_symmetric(state):
 def test_cheap_threshold_is_stable_and_tracks_drift(state):
     rng = np.random.default_rng(0)
     dm = _bare_dm(16, state)
-    dm._thr_place_ratio = np.full(16, 0.5)
+    _prime_anchor(dm, 50, 200)
     dm.live_thresholds = np.full(16, 125.0)
     # stable populations -> threshold stays near the 125 midpoint
     dm._intensity_accum = _bimodal(rng, 16, 120, 50, 200)
     for _ in range(20):
         dm._update_thresholds_live_cheap()
     assert 115 < dm.thresholds.mean() < 135
-    # both peaks drift up by +60 -> threshold follows up
+    # both peaks drift up by +60 -> threshold follows up toward the valley clamp
+    # ceiling (the band is from the last accepted fit; a real fit re-anchors it).
     dm._intensity_accum = _bimodal(rng, 16, 120, 110, 260)
     for _ in range(30):
         dm._update_thresholds_live_cheap()
     assert dm.thresholds.mean() > 160
+    # ...but never escapes the valley clamp (structural anti-runaway guard).
+    assert np.all(dm.thresholds <= dm._thr_clamp_hi + 1e-9)
 
 
 def test_cheap_threshold_saves_per_pattern_and_logs(state):
     rng = np.random.default_rng(1)
     dm = _bare_dm(10, state, scan_id='20260102123456', seq_total=77)
-    dm._thr_place_ratio = np.full(10, 0.5)
+    _prime_anchor(dm, 50, 200)
     dm.live_thresholds = np.full(10, 125.0)
     dm._intensity_accum = _bimodal(rng, 10, 100, 50, 200)
     dm._update_thresholds_live_cheap()
@@ -107,7 +133,7 @@ def test_cheap_save_preserves_existing_gauss_fits(state):
     dm.live_gauss_fits = None  # before first full fit
     dm.loaded_gauss_fits = [{'params': np.array([50, 8, .4, 200, 15, .6])}
                             for _ in range(n)]
-    dm._thr_place_ratio = np.full(n, 0.5)
+    _prime_anchor(dm, 50, 200)
     dm._intensity_accum = _bimodal(rng, n, 80, 50, 200)
     dm._update_thresholds_live_cheap()
     import yb_analysis.analysis.pattern_registry as reg

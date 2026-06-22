@@ -124,6 +124,39 @@ def prob10(logic1, logic2):
     return mean, sem
 
 
+# ---- False-positive rate: P(img2=1 | img1=0) ----
+
+def false_positive_site_resolved(logic1, logic2):
+    """Site-resolved false-positive rate P(img2=1 | img1=0) — spurious
+    detection at sites that were EMPTY in img1.
+
+    This is the "all-empty" convention; for REARRANGEMENT use the
+    target-aware FP that excludes target sites (atoms moved into a target
+    aren't false positives). Parameters/returns mirror ``prob10``."""
+    empty = np.sum(~logic1, axis=2)
+    spur = np.sum(~logic1 & logic2, axis=2)
+    mean_sr = np.full(empty.shape, np.nan)
+    sem_sr = np.full(empty.shape, np.nan)
+    mask = empty > 0
+    p = spur[mask] / empty[mask]
+    mean_sr[mask] = p
+    sem_sr[mask] = np.sqrt(p * (1 - p) / empty[mask])
+    return mean_sr, sem_sr
+
+
+def false_positive_rate(logic1, logic2):
+    """Site-averaged false-positive rate (all-empty convention).
+
+    Returns
+    -------
+    mean, sem : ndarray (nParams,)
+    """
+    mean_sr, _ = false_positive_site_resolved(logic1, logic2)
+    mean = np.nanmean(mean_sr, axis=0)
+    sem = _inter_site_sem(mean_sr)
+    return mean, sem
+
+
 # ---- Loading rate: P(img1=1) ----
 
 def loading_rate_site_resolved(logic1, reps_per_param=None):

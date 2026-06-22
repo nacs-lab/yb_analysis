@@ -40,6 +40,7 @@ def _drop_safety_dm(pSeq=2):
     dm._seq_ids_to_process = []
     dm._img_cnt_grid = dm._img_cnt_refit = dm._img_cnt_loading = 0
     dm._img_cnt_affine = dm._img_cnt_thres_live = 0
+    dm._img_cnt_refit_img2 = 0            # img2 distinct-pattern refit cadence
     dm._diag_pull_cnt = 0                 # incremented in store_new_data (live-target pull cadence)
     return dm
 
@@ -106,6 +107,7 @@ def _save_dm(tmp_path, pSeq=2, num_sites=3, num_sites_img2=3):
     dm.fname = str(tmp_path / 'data_test.h5')
     dm._file_created = True
     dm._save_lock = threading.Lock()
+    dm._proba_img2_to_save = []          # img2 model certainties buffer (empty -> none)
     create_scan_file(dm.fname, {}, dm.frame_size, num_sites,
                      two_array=True, num_sites_img2=num_sites_img2)
     return dm

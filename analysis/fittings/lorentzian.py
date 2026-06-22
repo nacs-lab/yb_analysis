@@ -87,6 +87,96 @@ def fit_lorentzian(x, y, yerr=None, mode='dip'):
         return None
 
 
+def fit_double_lorentzian(x, y, yerr=None, mode='dip'):
+    """Fit two overlapping Lorentzian dips (e.g. an mj-split / two-component line).
+
+    Mirrors :func:`fit_lorentzian` (same weighting convention) but for the
+    seven-parameter :func:`double_lorentzian_dip` model. Components are returned
+    sorted by center frequency.
+
+    Parameters
+    ----------
+    x, y : ndarray
+        Data points.
+    yerr : ndarray, optional
+        Error bars for the weighted fit.
+    mode : 'dip'
+        Only 'dip' is supported (the spectroscopy push-out convention).
+
+    Returns
+    -------
+    dict with: params ([y0, A1, x01, w1, A2, x02, w2]), pcov, model, x_fit,
+    y_fit, comp1_fit, comp2_fit (the two single-component curves over x_fit),
+    r_squared, centers (sorted ascending), widths (matched to centers),
+    splitting (|x02 - x01|). Returns None if too few points, the fit fails, or
+    the two components collapse onto each other (degenerate -> use the single fit).
+    """
+    if mode != 'dip':
+        raise ValueError("fit_double_lorentzian supports mode='dip' only")
+
+    mask = np.isfinite(y) & np.isfinite(x)
+    x, y = x[mask], y[mask]
+    if yerr is not None:
+        yerr = yerr[mask]
+
+    if len(x) < 7:  # 7 free parameters
+        return None
+
+    span = x.max() - x.min()
+    # baseline ~ off-resonant survival; seed two components straddling the minimum
+    y0_g = np.percentile(y, 90)
+    idx_min = np.argmin(y)
+    A_g = max(y0_g - y[idx_min], 0.01)
+    x0 = x[idx_min]
+    x1_g, x2_g = x0 - span / 10, x0 + span / 10
+    w_g = span / 8
+
+    p0 = [y0_g, A_g, x1_g, w_g, A_g, x2_g, w_g]
+    lo = [-np.inf, 0, x.min(), 1e-9, 0, x.min(), 1e-9]
+    hi = [np.inf, np.inf, x.max(), span, np.inf, x.max(), span]
+
+    try:
+        sigma = 1.0 / yerr if yerr is not None and np.all(yerr > 0) else None
+        popt, pcov = curve_fit(double_lorentzian_dip, x, y, p0=p0, sigma=sigma,
+                               absolute_sigma=True, maxfev=100000, bounds=(lo, hi))
+    except Exception:
+        return None
+
+    y0, A1, x01, w1, A2, x02, w2 = popt
+    # Degenerate: components merged (centers closer than half a combined HWHM) ->
+    # the doublet collapsed to a single peak; caller should prefer the 1-peak fit.
+    if abs(x02 - x01) < 0.25 * (abs(w1) + abs(w2)):
+        return None
+
+    x_fit = np.linspace(x.min(), x.max(), 400)
+    y_fit = double_lorentzian_dip(x_fit, *popt)
+    comp1 = lorentzian_dip(x_fit, y0, A1, x01, w1)
+    comp2 = lorentzian_dip(x_fit, y0, A2, x02, w2)
+    ss_res = np.sum((y - double_lorentzian_dip(x, *popt)) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    # sort the two components by center
+    comps = sorted([(x01, abs(w1), A1), (x02, abs(w2), A2)], key=lambda c: c[0])
+    centers = np.array([comps[0][0], comps[1][0]])
+    widths = np.array([comps[0][1], comps[1][1]])
+
+    return {
+        'params': popt,
+        'pcov': pcov,
+        'model': double_lorentzian_dip,
+        'x_fit': x_fit,
+        'y_fit': y_fit,
+        'comp1_fit': comp1,
+        'comp2_fit': comp2,
+        'r_squared': r2,
+        'centers': centers,
+        'widths': widths,
+        'amplitudes': np.array([comps[0][2], comps[1][2]]),
+        'splitting': float(abs(x02 - x01)),
+    }
+
+
 def fit_lorentzian_site_resolved(scan_params, prob_sr, sem_sr=None, mode='dip'):
     """Fit Lorentzian to each site independently.
 

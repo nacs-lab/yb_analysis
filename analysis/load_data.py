@@ -99,6 +99,10 @@ def _load_from_h5(h5_path, scan_dir, base):
     logicals = intensities = None
     logicals_img1 = logicals_img2 = None
     intensities_img1 = intensities_img2 = None
+    # img2 detector provenance + per-site posterior "% certainty" (only present
+    # when img2 was detected by the spot-shape model, distinct-pattern runs).
+    logicals_img2_source = None
+    certainties_img2 = None
 
     with h5py.File(h5_path, 'r') as f:
         two_array = bool(f.attrs.get('two_array', False))
@@ -109,6 +113,11 @@ def _load_from_h5(h5_path, scan_dir, base):
                 intensities_img1 = f['intensities_img1'][:]
             if 'intensities_img2' in f:
                 intensities_img2 = f['intensities_img2'][:]
+            src = f.attrs.get('logicals_img2_source')
+            logicals_img2_source = src.decode() if isinstance(src, bytes) else (
+                str(src) if src is not None else None)
+            if 'certainties_img2' in f:
+                certainties_img2 = f['certainties_img2'][:]
         else:
             logicals = f['logicals'][:] if 'logicals' in f else None
             intensities = f['intensities'][:] if 'intensities' in f else None
@@ -131,6 +140,8 @@ def _load_from_h5(h5_path, scan_dir, base):
         'logicals_img2': logicals_img2,
         'intensities_img1': intensities_img1,
         'intensities_img2': intensities_img2,
+        'logicals_img2_source': logicals_img2_source,
+        'certainties_img2': certainties_img2,
         'seq_ids': seq_ids.ravel() if seq_ids is not None else None,
         'imgs_shape': imgs_shape,
         'path': h5_path,

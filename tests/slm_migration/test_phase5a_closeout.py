@@ -495,6 +495,288 @@ def test_lab_paths_falls_back_when_no_targets(tmp_path):
         f'expected SLM fallback, got {ta["source"]!r}')
 
 
+# ---------------------------------------------------------------------------
+# Cross-grid rearrangement: init pattern != target pattern
+# (img1 loaded on the 47x47 grid, img2 detected on the 33x33 target grid).
+# img1 / img2 have DIFFERENT site counts (two_array layout) so per-site
+# survival/loss/FP are undefined; the meaningful survival is the target-aware
+# TP (target_paired -> img2). Regression guard for the crash where
+# analyze_scan_dir blew up at prob11(logic1, logic2) on the shape mismatch.
+# ---------------------------------------------------------------------------
+
+def _make_cross_grid_fixture(tmp_path, n_init=12, n_target=6, n_shots=4):
+    """Two_array scan whose img1 (loading) and img2 (target) grids differ in
+    site count. ``target_paired`` indexes the img2 (target) grid directly.
+
+    img1 loads every init site; img2 fills target sites per shot. Each shot is
+    its own scan-param. Returns (scan_dir, expected_per_shot_tp).
+    """
+    scan_id = '20260611153013'
+    day, hms = scan_id[:8], scan_id[8:]
+    scan_dir = tmp_path / f'data_{day}_{hms}'
+    scan_dir.mkdir()
+
+    # target_paired indexes img2 (0..n_target-1). Per-shot target sets +
+    # which of them survive in img2 -> expected TP = survived/targeted.
+    target_paired_per_shot = [[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]
+    img2_survive_sites     = [[0, 1, 2], [0, 1],    [0],       []]
+    expected_tp = [1.0, 2 / 3, 1 / 3, 0.0]
+
+    img1 = np.ones((n_shots, n_init), dtype=bool)          # 47x47 analogue
+    img2 = np.zeros((n_shots, n_target), dtype=bool)       # 33x33 analogue
+    for k, sites in enumerate(img2_survive_sites):
+        for s in sites:
+            img2[k, s] = True
+    seq_ids = np.arange(1, n_shots + 1, dtype=np.int64)
+
+    with h5py.File(scan_dir / f'data_{day}_{hms}.h5', 'w') as f:
+        f.attrs['two_array'] = True
+        f.create_dataset('logicals_img1', data=img1)
+        f.create_dataset('logicals_img2', data=img2)
+        f.create_dataset('intensities_img1',
+                          data=np.full((n_shots, n_init), 0.5, dtype=float))
+        f.create_dataset('intensities_img2',
+                          data=np.full((n_shots, n_target), 0.5, dtype=float))
+        f.create_dataset('seq_ids', data=seq_ids)
+    with h5py.File(scan_dir / f'data_{day}_{hms}.mat', 'w') as f:
+        scan = f.create_group('Scan')
+        scan.create_dataset('SaveOK',      data=np.array([[1.0]]))
+        scan.create_dataset('NumImages',   data=np.array([[2.0]]))
+        scan.create_dataset('NumPerGroup', data=np.array([[1.0]]))
+        scan.create_dataset('Params', data=np.array([[1.0], [2.0], [3.0], [4.0]]))
+        scan.create_dataset('ScanType', data=np.array([[1.0]]))
+        # Lab detection grid is the INIT (img1) grid: n_init sites.
+        scan.create_dataset('initGridLocationsX',
+                            data=np.arange(n_init, dtype=float))
+        scan.create_dataset('initGridLocationsY',
+                            data=np.zeros(n_init, dtype=float))
+
+    from yb_analysis.slm_sync.sync import _append_rows_to_h5
+    rows = []
+    for k in range(n_shots):
+        rows.append({
+            'seq_id': int(seq_ids[k]),
+            'retry_count': 0, 'ts_iso': '', 'ts_epoch': 0.0,
+            'run_id': 'test', 'client_id': 'test',
+            'diag': {
+                'n_loaded': n_init,
+                # loaded_paired indexes img1 (init); target_paired indexes img2.
+                'loaded_paired': list(range(len(target_paired_per_shot[k]))),
+                'target_paired': target_paired_per_shot[k],
+            },
+        })
+    _append_rows_to_h5(scan_dir / 'slm_diag.h5', rows)
+    return scan_dir, expected_tp
+
+
+def test_cross_grid_logicals_detection():
+    """_cross_grid_logicals flags differing img1/img2 site counts only."""
+    from yb_analysis.analysis.run_analysis import _cross_grid_logicals
+    a = np.ones((10, 3, 2), dtype=bool)
+    b = np.ones((6, 3, 2), dtype=bool)
+    same = np.ones((10, 3, 2), dtype=bool)
+    assert _cross_grid_logicals(a, b) is True
+    assert _cross_grid_logicals(a, same) is False
+    assert _cross_grid_logicals(a, None) is False
+
+
+def test_cross_grid_analyze_does_not_crash_and_tp_is_target_aware(tmp_path):
+    """A rearrangement scan with DIFFERENT init/target patterns (img1 and img2
+    on different grids) analyzes without crashing, and the headline survival is
+    the target-aware TP (target_paired -> img2), not the undefined per-site
+    survival that would otherwise crash at prob11(logic1, logic2)."""
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    scan_dir, expected_tp = _make_cross_grid_fixture(tmp_path)
+    result = analyze_scan_dir(str(scan_dir), sync_slm_diag=False)
+    assert result.get('unpack_error') is None
+    # Different widths survived unpack.
+    ds = result['data_shapes']
+    assert ds['logicals_img1'][0] != ds['logicals_img2'][0] or \
+        ds['logicals_img1'][1] != ds['logicals_img2'][1]
+    ta = result['target_aware']
+    assert ta is not None and ta['source'] == 'lab_paths'
+    means = ta['per_param_mean']
+    assert len(means) == len(expected_tp)
+    for got, want in zip(means, expected_tp):
+        assert abs(got - want) < 1e-6, f'expected {want}, got {got}'
+    # Overall = mean of per-shot TP = (1 + 2/3 + 1/3 + 0)/4 = 0.5
+    assert abs(ta['overall_mean'] - 0.5) < 1e-6
+    # The summary survival curve is OVERRIDDEN to the target-aware values
+    # (per-site survival is undefined across grids).
+    assert result['summary'].get('survival_source') == 'lab_paths'
+    for got, want in zip(result['summary']['survival_mean'], expected_tp):
+        assert abs(got - want) < 1e-6
+    # Loading rate still comes from img1 (every init site loaded -> 1.0).
+    for lr in result['summary']['loading_rate']:
+        assert abs(lr - 1.0) < 1e-6
+    # per_iteration didn't crash; survival is the target-aware TP override.
+    pi = result.get('per_iteration')
+    assert pi is not None
+    assert pi.get('survival_source') == 'lab_paths'
+
+
+def test_target_grid_camera_xy_affine_maps_registry(monkeypatch, tmp_path):
+    """_target_grid_camera_xy fits knm->camera from the INIT pattern and maps
+    the TARGET pattern's registry knm into camera px."""
+    from yb_analysis.analysis import pattern_registry as pr
+    from yb_analysis.analysis.run_analysis import _target_grid_camera_xy
+    monkeypatch.setenv('YB_PATTERNS_DIR', str(tmp_path / 'patterns'))
+    # init = 3x3 knm lattice; target = 2x2 knm sub-lattice. (y, x).
+    init_knm = [[y, x] for y in (0, 10, 20) for x in (0, 10, 20)]   # 9
+    tgt_knm  = [[y, x] for y in (5, 15) for x in (5, 15)]           # 4
+    pr.write_pattern({'name': 'initpat', 'knm': init_knm})
+    pr.write_pattern({'name': 'tgtpat',  'knm': tgt_knm})
+    # Known affine cam = 2*knm + [5, 7] (applied to the init grid coords).
+    import numpy as np
+    ik = np.asarray(init_knm, float)
+    cam = 2 * ik + np.array([5.0, 7.0])
+    scan = {
+        'imagePatternsJson': json.dumps(
+            [{'name': 'initpat'}, {'name': 'tgtpat'}]),
+        'initGridLocationsY': cam[:, 0].tolist(),
+        'initGridLocationsX': cam[:, 1].tolist(),
+    }
+    out = _target_grid_camera_xy(scan, 4)
+    assert out is not None and out.shape == (4, 2)
+    want = 2 * np.asarray(tgt_knm, float) + np.array([5.0, 7.0])
+    assert np.allclose(out, want, atol=1e-6)
+
+
+def test_cross_grid_per_site_map_on_target_grid(monkeypatch, tmp_path):
+    """A cross-grid rearrangement run produces a per-site SURVIVAL/FP map on
+    the TARGET (img2) grid, with camera coords from the affine-mapped registry
+    knm. Loading is omitted (an init-grid quantity)."""
+    import numpy as np
+    from yb_analysis.analysis import pattern_registry as pr
+    from yb_analysis.analysis.run_analysis import _per_site_from_lab_paths
+    monkeypatch.setenv('YB_PATTERNS_DIR', str(tmp_path / 'patterns'))
+    init_knm = [[y, x] for y in (0, 10, 20) for x in (0, 10, 20)]   # 9 init sites
+    tgt_knm  = [[y, x] for y in (5, 15) for x in (5, 15)]           # 4 target sites
+    pr.write_pattern({'name': 'initpat', 'knm': init_knm})
+    pr.write_pattern({'name': 'tgtpat',  'knm': tgt_knm})
+    cam = 2 * np.asarray(init_knm, float) + np.array([5.0, 7.0])
+    scan = {
+        'NumImages': 2,
+        'imagePatternsJson': json.dumps(
+            [{'name': 'initpat'}, {'name': 'tgtpat'}]),
+        'initGridLocationsY': cam[:, 0].tolist(),
+        'initGridLocationsX': cam[:, 1].tolist(),
+    }
+    n_shots = 4
+    img1 = np.ones((n_shots, 9), dtype=np.uint8)        # 47x47 analogue (9)
+    # Target site occupancy per shot -> per-site TP = 1.0, 0.75, 0.5, 0.0.
+    img2 = np.array([
+        [1, 1, 1, 0],
+        [1, 1, 0, 0],
+        [1, 1, 1, 0],
+        [1, 0, 0, 0],
+    ], dtype=np.uint8)
+    seq_ids = np.arange(1, n_shots + 1, dtype=np.int64)
+    bundle = {
+        'two_array': True, 'logicals_img1': img1, 'logicals_img2': img2,
+        'seq_ids': seq_ids,
+    }
+    paths = [{'seq_id': int(s), 'target_paired': [0, 1, 2, 3]} for s in seq_ids]
+    ps = _per_site_from_lab_paths(paths, bundle, scan)
+    assert ps is not None and ps['source'] == 'lab_paths'
+    assert len(ps['x']) == 4 and len(ps['y']) == 4
+    # Coords are the target grid mapped through the init affine.
+    want_xy = 2 * np.asarray(tgt_knm, float) + np.array([5.0, 7.0])
+    assert np.allclose(ps['y'], want_xy[:, 0], atol=1e-6)
+    assert np.allclose(ps['x'], want_xy[:, 1], atol=1e-6)
+    # Survival (TP) per target site.
+    assert np.allclose(ps['survival_mean'], [1.0, 0.75, 0.5, 0.0], atol=1e-6)
+    assert all(ps['is_target_site'])          # every site is a target every shot
+    # Target is the whole array -> NO non-target sites -> FP undefined.
+    assert not any(ps['is_nontarget_site'])
+    assert all(v is None for v in ps['fp_rate'])
+    # Loading lives on the INIT grid, carried separately so the dashboard can
+    # still render the loading map (survival/FP stay on the target grid).
+    assert ps['loading_rate'] is None
+    assert ps.get('loading_init') is not None and len(ps['loading_init']) == 9
+    assert len(ps['loading_x']) == 9 and len(ps['loading_y']) == 9
+
+
+def test_cross_grid_unfilled_target_not_false_positive(monkeypatch, tmp_path):
+    """On a low-loading shot the rearrange places fewer atoms than target
+    sites, so some target sites are UNFILLED that shot. Those are unfilled
+    targets, NOT false-positive sites: a spurious atom there must not be
+    counted as FP. The non-target set is the run-level union of targeted
+    sites, so an unfilled-this-shot but targeted-elsewhere site is never FP."""
+    import numpy as np
+    from yb_analysis.analysis import pattern_registry as pr
+    from yb_analysis.analysis.run_analysis import _per_site_from_lab_paths
+    monkeypatch.setenv('YB_PATTERNS_DIR', str(tmp_path / 'patterns'))
+    init_knm = [[y, x] for y in (0, 10, 20) for x in (0, 10, 20)]   # 9
+    tgt_knm  = [[y, x] for y in (5, 15) for x in (5, 15)]           # 4
+    pr.write_pattern({'name': 'initpat', 'knm': init_knm})
+    pr.write_pattern({'name': 'tgtpat',  'knm': tgt_knm})
+    cam = 2 * np.asarray(init_knm, float) + np.array([5.0, 7.0])
+    scan = {
+        'NumImages': 2,
+        'imagePatternsJson': json.dumps(
+            [{'name': 'initpat'}, {'name': 'tgtpat'}]),
+        'initGridLocationsY': cam[:, 0].tolist(),
+        'initGridLocationsX': cam[:, 1].tolist(),
+    }
+    n_shots = 3
+    img1 = np.ones((n_shots, 9), dtype=np.uint8)
+    # Site 3 is targeted on shots 1,2 but UNFILLED on shot 3 (low loading).
+    # On shot 3 img2 shows a spurious atom at site 3 -> must NOT count as FP.
+    img2 = np.array([
+        [1, 1, 1, 1],
+        [1, 1, 1, 1],
+        [1, 1, 1, 1],   # site 3 occupied even though not placed this shot
+    ], dtype=np.uint8)
+    seq_ids = np.arange(1, n_shots + 1, dtype=np.int64)
+    bundle = {'two_array': True, 'logicals_img1': img1,
+              'logicals_img2': img2, 'seq_ids': seq_ids}
+    paths = [
+        {'seq_id': 1, 'target_paired': [0, 1, 2, 3]},
+        {'seq_id': 2, 'target_paired': [0, 1, 2, 3]},
+        {'seq_id': 3, 'target_paired': [0, 1, 2]},   # site 3 unplaced this shot
+    ]
+    ps = _per_site_from_lab_paths(paths, bundle, scan)
+    assert ps is not None
+    # Site 3 is part of the target pattern (targeted on shots 1,2) -> NOT a
+    # non-target / FP site, despite being unfilled on shot 3.
+    assert ps['is_nontarget_site'] == [False, False, False, False]
+    assert all(v is None for v in ps['fp_rate'])
+
+
+def test_reorder_summary_to_sweep_fixes_inversion():
+    """A non-ascending sweep (e.g. boolean precompute that unpacks as
+    [True, False] = [1.0, 0.0]) leaves the per-param summary arrays in
+    descriptor order while sweep['values'] is sorted -> the dashboard pairs
+    each y with the wrong x (curve inverted vs the live view). Reordering the
+    summary to ascending param-value order fixes the pairing."""
+    import numpy as np
+    from yb_analysis.analysis.run_analysis import _reorder_summary_to_sweep
+    # precompute False(0.0)=0.9215, True(1.0)=0.9675; descriptor order [True, False].
+    summary = {
+        'survival_mean': [0.9675, 0.9215],
+        'fp_mean':       [0.04, 0.02],
+        'survival_n_shots': [130, 132],
+        'survival_source': 'lab_paths',     # non-list: must be left untouched
+    }
+    scan_params = np.array([1.0, 0.0])      # unpack (descriptor) order
+    _reorder_summary_to_sweep(summary, scan_params)
+    # Now aligned with sweep values sorted([0.0, 1.0]) = [False, True].
+    assert summary['survival_mean'] == [0.9215, 0.9675]   # False, True
+    assert summary['fp_mean'] == [0.02, 0.04]
+    assert summary['survival_n_shots'] == [132, 130]
+    assert summary['survival_source'] == 'lab_paths'
+
+
+def test_reorder_summary_to_sweep_noop_when_ascending():
+    """Already-ascending sweeps (e.g. nsteps [100,140,180]) are untouched."""
+    import numpy as np
+    from yb_analysis.analysis.run_analysis import _reorder_summary_to_sweep
+    summary = {'survival_mean': [0.80, 0.85, 0.90]}
+    _reorder_summary_to_sweep(summary, np.array([100.0, 140.0, 180.0]))
+    assert summary['survival_mean'] == [0.80, 0.85, 0.90]
+
+
 if __name__ == '__main__':
     import sys
     sys.exit(pytest.main([__file__, '-v']))

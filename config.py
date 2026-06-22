@@ -57,8 +57,15 @@ MATLAB_EXE = _default_matlab_exe()
 MATLAB_ROOT = os.environ.get(
     'YB_MATLAB_ROOT',
     os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'matlab_new')))
+# Stable per-user location (NOT the OS temp dir, which Storage Sense / cleanup
+# wipes — that silently reset the scan queue/history on restart). Mirrors
+# ExptServer._state_dir(); the engine's ExptServer.QUEUE_PATH is the file of
+# record, this constant is kept consistent for any future consumer.
 RUNNER_QUEUE_PATH = os.path.join(
-    tempfile.gettempdir(), 'nacsctl', 'runner_queue.json')
+    os.environ.get('YB_NACSCTL_DIR')
+    or os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'),
+                    'nacsctl'),
+    'runner_queue.json')
 
 # ---- Sequence backend selection ---------------------------------------------
 # The monitor is a backend-agnostic ZMQ client: it talks to whichever backend
@@ -84,23 +91,27 @@ def _default_pyctrl_python():
     if override:
         return override
     # Prefer the pyctrl engine venv: it has BOTH the libnacs engine AND pylablib
-    # (the Orca camera dependency). The bare Python38 fallbacks below have the
-    # engine but NOT pylablib, so a backend spawned with them boots camera-less
-    # and the monitor's Camera card shows "camera unavailable (pylablib not opened)".
+    # (the Orca camera dependency). Default to the Python 3.12 venv
+    # (.venv-engine-py312); fall back to the legacy Python 3.8 venv (.venv-engine),
+    # then to a bare Python38 (which has the engine but NOT pylablib, so a backend
+    # spawned with it boots camera-less and the monitor's Camera card shows
+    # "camera unavailable (pylablib not opened)").
     pyctrl_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), '..', 'pyctrl'))
     if os.name == 'nt':
-        venv = os.path.join(pyctrl_root, '.venv-engine', 'Scripts', 'python.exe')
-        if os.path.exists(venv):
-            return venv
+        for venv_name in ('.venv-engine-py312', '.venv-engine'):
+            venv = os.path.join(pyctrl_root, venv_name, 'Scripts', 'python.exe')
+            if os.path.exists(venv):
+                return venv
         for p in (r'C:\Users\Ybtweezer-PC2\AppData\Local\Programs\Python\Python38\python.exe',
                   r'C:\Python38\python.exe'):
             if os.path.exists(p):
                 return p
         return r'C:\Python38\python.exe'
-    venv = os.path.join(pyctrl_root, '.venv-engine', 'bin', 'python')
-    if os.path.exists(venv):
-        return venv
+    for venv_name in ('.venv-engine-py312', '.venv-engine'):
+        venv = os.path.join(pyctrl_root, venv_name, 'bin', 'python')
+        if os.path.exists(venv):
+            return venv
     return 'python3'
 
 
@@ -209,6 +220,78 @@ THRES_LIVE_WINDOW = 100          # recent shots used for each cheap threshold es
 THRES_LIVE_EMA = 0.1             # EWMA weight for the cheap threshold update
 THRES_LIVE_MIN_PER_SIDE = 3      # min recent shots on each side of the threshold to trust a site
 
+# ---- Structural threshold-fit guard (degenerate-fit rejection + drift clamp) ----
+# A full double-Gaussian refit is REJECTED (thresholds NOT replaced, NOT saved to
+# either store) when the fitted empty/atom peaks are not credibly separated — the
+# failure mode where a low-loading / near-unimodal histogram collapses both
+# Gaussians onto one peak and the cheap tracker then explodes the per-site spread.
+# Separation must exceed BOTH an absolute floor AND a multiple of the empty width,
+# for at least THRES_FIT_MIN_SEP_FRAC of the converged sites; the pooled loaded
+# fraction (at the new thresholds) must also be plausible.
+THRES_FIT_MIN_SEP_ABS = 1.5      # ADU: absolute min (mu_atom - mu_empty) for an accepted site
+THRES_FIT_MIN_SEP_SIGMA = 2.0    # also require separation >= this * sigma_empty
+THRES_FIT_MIN_SEP_FRAC = 0.5     # >= this fraction of converged sites must clear the separation
+THRES_FIT_MIN_LOADING = 0.05     # min pooled loaded-fraction (at the new thresholds) to trust a fit
+# Cheap inter-fit tracker: each per-site threshold is clamped to stay at least
+# this fraction of (mu_atom - mu_empty) inside EACH peak, so a threshold can never
+# drift onto or past a peak (the spread-explosion mechanism). Requires a valid
+# placement-ratio anchor from an ACCEPTED full fit; with no anchor the cheap update
+# holds the loaded thresholds rather than flying blind on r=0.5.
+THRES_LIVE_VALLEY_MARGIN = 0.15  # keep threshold within [mu_e + m*sep, mu_a - m*sep]
+# On-load sanity: a stored per-pattern threshold vector whose per-site std exceeds
+# this (ADU) is flagged degraded (the symptom of a corrupted store) and surfaced as
+# a loud dashboard + log warning; it is re-anchored by the first ACCEPTED full fit
+# rather than swapped for the (pattern-ambiguous) day-folder thresholds.
+THRES_LOADED_MAX_SPREAD = 1.5    # ADU
+# Cross-run accumulation: carry frame-0 (loading) intensities for the SAME pattern
+# across DataManager (scan) boundaries so the 200-shot full fit can fire over
+# several short runs, as long as they are within this many seconds of each other.
+# In-memory only (module scope); lost on process restart.
+THRES_ACCUM_CROSS_RUN_WINDOW_S = 3600   # ~1 hour
+THRES_ACCUM_CROSS_RUN_MAX = 2000        # cap carried shots per pattern (== UPDATE_HIST_BATCH_SIZE)
+
+# ---- Blank / dropped-frame rejection ----
+# A camera/acquisition glitch occasionally yields a whole-frame ~0 image: every
+# masked-site intensity reads essentially 0 because the camera (or ZMQ) returned no
+# real frame (e.g. the 2026-06-19 47x47_feedbackwarm4 runs whose imgs were a
+# degenerate 4x4 of background and whose intensities were exactly 0). Such a shot
+# carries NO atom information, yet a double-Gaussian threshold refit reads the
+# 0-vs-pedestal toggle as "empty vs atom", lands per-site cuts in the empty gap
+# (corrupting detection), and stretches the per-site histograms so wide the real
+# empty/atom doublet collapses into a single bar. A shot whose MAX masked intensity
+# is below this floor is treated as blank and EXCLUDED from the threshold-fit
+# accumulators (live + cross-run) and the per-site histograms. Set well below any
+# real masked sum (which always sits on the camera pedestal) but above pure zero, so
+# a legitimately-empty atom shot (still on the pedestal) is never rejected.
+BLANK_FRAME_FLOOR = 1.0          # ADU: shot is blank/dropped if max(intensities) < this
+# Backstop in the full-fit guard: reject a refit when more than this fraction of the
+# accumulated shots are blank (whole-frame ~0), in case a blank slips past the
+# ingestion filter (e.g. a cross-run buffer carried in before the filter existed).
+THRES_FIT_MAX_BLANK_FRAC = 0.02
+# Cap the shots used per full Gaussian refit AND per histogram rebuild. The per-site
+# double-Gaussian fit (one bounded least-squares per site) is the dominant live cost;
+# beyond a few hundred shots more data barely improves a per-site histogram while the
+# histogram/percentile passes keep scaling with shot count (the cross-run buffer can
+# reach 2000). Use the most recent THRES_FIT_MAX_SHOTS only.
+THRES_FIT_MAX_SHOTS = 400
+# Robust per-site histogram range (DISPLAY + the bins the fit reads): clip each site's
+# intensities to this central percentile band before choosing the 50-bin range, so a
+# single hot pixel / outlier shot can't stretch the bins so wide the empty/atom
+# doublet collapses into one bar. (lo, hi) in percent.
+HIST_DISPLAY_CLIP_PCT = (0.5, 99.5)
+
+# --- img2 spot-shape GMM detector (yb_analysis/detection/spot_shape_model.py) ---
+# img2 (the post-protocol frame) is detected by a spot-SHAPE GMM classifier
+# rather than an intensity threshold: when nearly every site is loaded the img2
+# intensity histogram is unimodal and has no clean cut, but the spot shape still
+# discriminates loaded vs empty. Set to '' (empty) to disable and fall back to
+# intensity thresholding for img2. Artifacts live in spot_shape_ml/model/
+# (override the dir with $YB_SPOT_SHAPE_ML_DIR). Variants: 'A' = full 81-D
+# patch shape, curated training (decisive / near-binary posteriors); 'B' =
+# PCA-5, whole dataset; 'C' = PCA-5, curated (graded posteriors). The per-site
+# posterior P(loaded) is stored as the "% certainty" alongside the logicals.
+IMG2_SHAPE_MODEL_VARIANT = os.environ.get('YB_IMG2_SHAPE_MODEL', 'A')
+
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
 
@@ -222,6 +305,19 @@ QUEUE_HISTORY_DISPLAY = 30
 # vars if those change or for a different deployment.
 SLM_URL = os.environ.get('YB_SLM_URL', 'http://100.114.207.118:8551')
 SLM_VERIFY_TLS = os.environ.get('YB_SLM_VERIFY_TLS', '0') == '1'
+
+# The scope_control dashboard is hosted OUT OF PROCESS (on whichever PC can reach
+# the bench scopes -- currently the rearrangement / SLM-server box over Tailscale).
+# The dashboard's "Scope" tab just iframes its embed page ("{SCOPE_URL}/dashboard").
+# No port is opened here. Override the host with YB_SCOPE_URL when it moves.
+SCOPE_URL = os.environ.get('YB_SCOPE_URL', 'http://100.114.207.118:8600')
+
+# The yb_monitor service (oven temp + wavemeter + laser PID locks) runs OUT OF
+# PROCESS on the temp-monitor PC (tailnet-only). The "Monitor" tab iframes its
+# embed page ("{MONITOR_URL}/dashboard?embed=1") DIRECTLY -- never server-side
+# proxied: the monitor's control gate trusts the viewer's tailnet IP, which only a
+# direct browser iframe preserves. Override the host with YB_MONITOR_URL.
+MONITOR_URL = os.environ.get('YB_MONITOR_URL', 'http://100.118.221.34:8060')
 SLM_PASSWORD_PATH = os.environ.get('YB_SLM_PASSWORD_PATH', None)
 LAB_PC_TAILSCALE_IP = os.environ.get('YB_LAB_TAILSCALE_IP', '100.86.15.43')
 
@@ -240,3 +336,52 @@ SLM_POLL_INTERVALS_MS = {
 # Connect is tight: Tailscale handshake is fast or it's not happening at all.
 # Read is more generous: PNG / JSON responses may be 50–500ms.
 SLM_HTTP_TIMEOUT_S = (2.0, 5.0)
+
+# ---- Molecube (FPGA1 DDS/TTL/clock) control daemon ----
+#
+# FPGA1's DDS / TTL / clock are fronted by the molecube2 C++ ZMQ daemon (the same
+# daemon the libnacs engine submits sequences to, and that the Next.js page at
+# https://yb.nigrp.org/s/zynq/1/dds drives). The dashboard's /api/molecube/* routes
+# talk to it through yb_analysis.control.molecube_client -- ALWAYS through the daemon,
+# never the devices directly.
+#
+# !!! These endpoints are MASTER-GATED (closed) by default for safety -- see the
+#     MOLECUBE GATE block in plotting/dashboard.py. This URL is only used once the
+#     gate is opened. Point YB_MOLECUBE_URL at the local mock for development.
+MOLECUBE_URL = os.environ.get('YB_MOLECUBE_URL', 'tcp://192.168.0.174:7777')
+MOLECUBE_TIMEOUT_MS = int(os.environ.get('YB_MOLECUBE_TIMEOUT_MS', '2000'))
+
+
+def _read_molecube_max_ttl_chn():
+    """Authoritative TTL channel count for the dashboard's Molecube panel.
+
+    The molecube daemon's own ``get_max_ttl`` is unreliable here (an older daemon
+    build replies with the 1-byte error status, read as ``1`` -> only ch 0-1), so
+    we take the count from the SAME engine ``config.yml`` the libnacs zynq backend
+    uses (``FPGA1.config.max_ttl_chn``, currently 55 -> channels 0..55, 2 banks).
+    Env override: ``YB_MOLECUBE_MAX_TTL_CHN``."""
+    override = os.environ.get('YB_MOLECUBE_MAX_TTL_CHN')
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    import re
+    here = os.path.dirname(__file__)
+    for p in (os.path.join(here, '..', 'pyctrl', 'config.yml'),
+              os.path.join(MATLAB_ROOT, 'config.yml')):
+        try:
+            with open(os.path.normpath(p)) as f:
+                m = re.search(r'max_ttl_chn:\s*(\d+)', f.read())
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+    return 55
+
+
+MOLECUBE_MAX_TTL_CHN = _read_molecube_max_ttl_chn()
+# Public web UI for the molecube daemon (the Next.js page above). The Hardware
+# tab's Molecube sub-view links its "open source" (↗) action here, mirroring how
+# the iframe sub-views link to their standalone dashboards. Override per host.
+MOLECUBE_WEB_URL = os.environ.get('YB_MOLECUBE_WEB_URL', 'https://yb.nigrp.org/s/zynq/1/dds')

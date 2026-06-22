@@ -134,6 +134,66 @@ def _fit_site_threshold(site_data, num_bins=50, outlier_clip_mad=5.0):
         return float(np.median(site_data)), np.nan, None, counts, bin_centers
 
 
+def _fit_run_site_params(intensities, num_bins=50, outlier_clip_mad=5.0):
+    """One double-Gaussian fit per site over a ``(n_shots, n_sites)`` intensity
+    array — the shared fit body for the used-threshold / timeline / posterior
+    metrics.
+
+    Returns ``(opt_thr (M,), opt_inf (M,), params (list[M]))`` where
+    ``params[s]`` is the 6-vector ``[mu_e, s_e, A_e, mu_a, s_a, A_a]`` (empty
+    peak first, ``_fit_site_threshold`` already orders ``mu1 < mu2``) or
+    ``None`` when that site's fit failed.
+    """
+    arr = np.asarray(intensities, dtype=np.float64)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.zeros(0), np.zeros(0), []
+    n_sites = arr.shape[1]
+    opt_thr = np.zeros(n_sites)
+    opt_inf = np.zeros(n_sites)
+    params_list = [None] * n_sites
+    for s in range(n_sites):
+        t, f, params, _, _ = _fit_site_threshold(
+            arr[:, s], num_bins=num_bins, outlier_clip_mad=outlier_clip_mad)
+        opt_thr[s] = t
+        opt_inf[s] = f
+        params_list[s] = params
+    return opt_thr, opt_inf, params_list
+
+
+def _infidelity_at(params, thr):
+    """Tail-overlap infidelity ``(1 - Phi(thr; empty)) + Phi(thr; atom)`` at a
+    cut ``thr`` given fit ``params`` (empty peak first). NaN if ``params`` is
+    missing / degenerate."""
+    if params is None:
+        return np.nan
+    mu1, s1, mu2, s2 = params[0], params[1], params[3], params[4]
+    if not (s1 > 0 and s2 > 0):
+        return np.nan
+    return float((1.0 - norm.cdf(thr, mu1, s1)) + norm.cdf(thr, mu2, s2))
+
+
+def atom_posterior(intensity, params):
+    """Posterior ``P(atom present | measured masked intensity)`` under the
+    per-site two-Gaussian mixture ``params = [mu_e, s_e, A_e, mu_a, s_a, A_a]``
+    (empty peak first). The fitted areas ``A_e``/``A_a`` are the mixing weights
+    (≈ this site's empty / loaded fractions), so the posterior folds in the
+    site's loading rate. Returns NaN if ``params`` is missing / degenerate or
+    the mixture density vanishes. Accepts a scalar or an array of intensities.
+    """
+    if params is None:
+        return np.nan
+    mu_e, s_e, A_e = params[0], params[1], params[2]
+    mu_a, s_a, A_a = params[3], params[4], params[5]
+    if not (s_e > 0 and s_a > 0):
+        return np.nan
+    pe = A_e * _gauss_pdf(intensity, mu_e, s_e)
+    pa = A_a * _gauss_pdf(intensity, mu_a, s_a)
+    denom = pe + pa
+    with np.errstate(invalid='ignore', divide='ignore'):
+        post = np.where(denom > 0, pa / denom, np.nan)
+    return np.clip(post, 0.0, 1.0)
+
+
 def fit_run_infidelities(intensities, used_thresholds=None,
                          num_bins=50, outlier_clip_mad=5.0):
     """One double-Gaussian fit per site → both infidelity metrics in one pass.
@@ -147,26 +207,65 @@ def fit_run_infidelities(intensities, used_thresholds=None,
         ``initThresholds``): ``(1 - Phi(thr; empty)) + Phi(thr; atom)``. NaN
         when ``used_thresholds`` is None / missing for a site, or the fit failed.
     """
-    arr = np.asarray(intensities, dtype=np.float64)
-    if arr.ndim != 2 or arr.size == 0:
-        return np.zeros(0), np.zeros(0), np.zeros(0)
-    n_sites = arr.shape[1]
+    opt_thr, opt_inf, params_list = _fit_run_site_params(
+        intensities, num_bins=num_bins, outlier_clip_mad=outlier_clip_mad)
+    n_sites = opt_thr.size
     used = (np.asarray(used_thresholds, dtype=np.float64).ravel()
             if used_thresholds is not None else None)
-    opt_thr = np.zeros(n_sites)
-    opt_inf = np.zeros(n_sites)
     used_inf = np.full(n_sites, np.nan)
-    for s in range(n_sites):
-        t, f, params, _, _ = _fit_site_threshold(
-            arr[:, s], num_bins=num_bins, outlier_clip_mad=outlier_clip_mad)
-        opt_thr[s] = t
-        opt_inf[s] = f
-        if used is not None and s < used.size and np.isfinite(used[s]) \
-                and params is not None:
-            mu1, s1, mu2, s2 = params[0], params[1], params[3], params[4]
-            if s1 > 0 and s2 > 0:
-                used_inf[s] = float((1.0 - norm.cdf(used[s], mu1, s1))
-                                    + norm.cdf(used[s], mu2, s2))
+    if used is not None:
+        for s in range(n_sites):
+            if s < used.size and np.isfinite(used[s]):
+                used_inf[s] = _infidelity_at(params_list[s], used[s])
+    return opt_thr, opt_inf, used_inf
+
+
+def fit_run_infidelities_timeline(intensities, threshold_segments,
+                                  num_bins=50, outlier_clip_mad=5.0):
+    """Like :func:`fit_run_infidelities` but the used-threshold infidelity is
+    the SHOT-WEIGHTED average over a sequence of ``(weight, threshold-vector)``
+    segments — i.e. evaluated at the thresholds ACTUALLY in effect THROUGHOUT
+    the run, not a single scan-start snapshot.
+
+    ``threshold_segments`` is a list of ``(weight, thr_vec)`` where ``thr_vec``
+    is a length-``M`` array (or None). Returns ``(opt_thr, opt_inf, used_inf)``
+    with ``used_inf[s] = Σ_seg w·infid(thr_seg[s]) / Σ_seg w`` over segments
+    whose ``weight > 0`` and ``thr_seg[s]`` is finite. NaN where no segment
+    contributes (e.g. the site's fit failed)."""
+    opt_thr, opt_inf, params_list = _fit_run_site_params(
+        intensities, num_bins=num_bins, outlier_clip_mad=outlier_clip_mad)
+    n_sites = opt_thr.size
+    used_inf = np.full(n_sites, np.nan)
+    if not threshold_segments or n_sites == 0:
+        return opt_thr, opt_inf, used_inf
+    # Vectorise per segment: pull each site's empty/atom mu+sigma once, then
+    # evaluate the whole site vector against the segment's threshold vector.
+    mu_e = np.array([p[0] if p is not None else np.nan for p in params_list])
+    s_e  = np.array([p[1] if p is not None else np.nan for p in params_list])
+    mu_a = np.array([p[3] if p is not None else np.nan for p in params_list])
+    s_a  = np.array([p[4] if p is not None else np.nan for p in params_list])
+    valid_site = (np.isfinite(mu_e) & np.isfinite(mu_a)
+                  & (s_e > 0) & (s_a > 0))
+    num = np.zeros(n_sites)
+    wsum = np.zeros(n_sites)
+    for weight, thr_vec in threshold_segments:
+        if not weight or weight <= 0 or thr_vec is None:
+            continue
+        tv = np.asarray(thr_vec, dtype=np.float64).ravel()
+        if tv.size < n_sites:
+            tv = np.concatenate([tv, np.full(n_sites - tv.size, np.nan)])
+        else:
+            tv = tv[:n_sites]
+        m = valid_site & np.isfinite(tv)
+        if not m.any():
+            continue
+        with np.errstate(invalid='ignore'):
+            f = ((1.0 - norm.cdf(tv[m], mu_e[m], s_e[m]))
+                 + norm.cdf(tv[m], mu_a[m], s_a[m]))
+        num[m] += weight * f
+        wsum[m] += weight
+    good = wsum > 0
+    used_inf[good] = num[good] / wsum[good]
     return opt_thr, opt_inf, used_inf
 
 

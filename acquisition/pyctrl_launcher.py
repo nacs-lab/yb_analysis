@@ -70,8 +70,23 @@ class PyctrlLauncher:
         # Free the port in case a stale binder (a dead backend of either kind)
         # is still holding it. The MATLAB side is torn down by the previous
         # monitor's _on_close before we get here; this is a belt-and-braces
-        # scrub so the bind never races.
+        # scrub so the bind never races. kill_port now WAITS for the killed
+        # process to fully exit, so its single DCAM camera handle is released
+        # before we spawn below.
         kill_port(_url_to_port(self._url))
+        # Settle: even after the old process is gone, the USB/DCAM device needs
+        # a moment to re-enumerate. Spawning the replacement too eagerly makes
+        # its camera open race the release, and a contended DCAM open blocks the
+        # new backend indefinitely (the "Orca not responding to the controller"
+        # wedge). Override with YB_BACKEND_SPAWN_SETTLE_S (seconds; 0 disables).
+        try:
+            settle = float(os.environ.get('YB_BACKEND_SPAWN_SETTLE_S', '1.5'))
+        except (TypeError, ValueError):
+            settle = 1.5
+        if settle > 0:
+            logger.info('Settling %.1fs after port clear so the DCAM handle '
+                        'is free before spawn', settle)
+            time.sleep(settle)
 
         env = os.environ.copy()
         # Put the pyctrl package root on sys.path so `-m <module>` resolves

@@ -212,7 +212,7 @@ class SlmSyncClient:
                                    order='col', fft_shape=(4096, 4096),
                                    threshold=0.30, min_dist=None,
                                    write_to_slm=False, name=None,
-                                   timeout=(3.0, 60.0)):
+                                   planes_z_rad=None, timeout=(3.0, 60.0)):
         """POST /slm/initialize_loading_pattern.
 
         Simulate a base loading WGS phase, extract trap positions +
@@ -225,6 +225,14 @@ class SlmSyncClient:
         ``phase_b64`` + ``phase_shape``. ``loading_zernike`` is the defocus
         applied on write; ``baked_zernike`` + ``legacy_zerniked=True`` lets
         the server recover the base from a still-zerniked .pt.
+
+        ``planes_z_rad`` (OPTIONAL): a list of axial layer depths in radians
+        of the ANSI ``2*rho^2-1`` defocus map. When given (and non-empty) the
+        server does a 3-D, per-plane extraction and the response additionally
+        carries ``is_3d``/``z_rad``/``positions_knm3d``/``planes_z_rad``/
+        ``n_per_plane``/``plane_of_site`` (site order LAYER-MAJOR). When
+        ``None`` the call is byte-for-byte the legacy 2-D request and the
+        response has no populated 3-D keys — 2-D behaviour is unchanged.
         """
         body = {
             'order': order,
@@ -246,6 +254,11 @@ class SlmSyncClient:
             body['min_dist'] = int(min_dist)
         if name is not None:
             body['name'] = name
+        # 3-D layer depths are sent only when explicitly requested; an empty
+        # list is treated as "no planes" so a degenerate declaration can't
+        # silently flip a 2-D pattern onto the 3-D server path.
+        if planes_z_rad:
+            body['planes_z_rad'] = [float(z) for z in planes_z_rad]
         try:
             r = self._post('/slm/initialize_loading_pattern', body,
                            timeout=timeout)

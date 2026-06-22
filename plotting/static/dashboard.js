@@ -22,10 +22,29 @@
   // load off the SLM server -- the operator can hit "Refresh" for
   // an immediate update.
   const POLL = {
-    live:     3000,
+    live:     500,
+    // The coherent SINGLE-SHOT group (both camera frames + that frame's intensities +
+    // the scan-result red current-cell outline) on its OWN loop, fetched together so
+    // they always show ONE shot (pollSnapshot / group=snapshot). Gated by the ~5 MB
+    // image payload, so it may skip shots -- but coherently. The fast `live` loop
+    // streams everything else (maps/histograms) independently. setTimeout-after-
+    // completion, so the real period is (fetch time + this gap) -- keep it small so the
+    // shot view refreshes ~as fast as the images can stream.
+    snapshot: 500,
     hardware: 10000,
-    queue:    3000,
-    // analysis is on-demand only (no auto-poll)
+    queue:    500,
+    // Shared "Scans" picker (Analysis + Sequence tabs): cheap incremental list
+    // refresh so it self-updates as scans complete. List-only (analysis re-run
+    // is gated to shot growth), and the rebuild is skipped when unchanged.
+    scans:    3000,
+    molecube: 1500,
+    // NI DAC monitor (Hardware/Molecube sub-view). Slower than molecube: each
+    // poll spawns an engine-python subprocess to read the card, server-cached
+    // ~5 s, so a tight loop would just re-serve the cache.
+    nidaq: 6000,
+    // Global control-panel refresh on NON-Live tabs (queue / runner / camera).
+    // Live is covered by pollLive's 500ms; elsewhere this keeps it fresh.
+    ctrlpanel: 1500,
   };
 
   // ---- DOM helpers ----
@@ -43,10 +62,24 @@
     if (s < 3600) return (s / 60).toFixed(0) + "m ago";
     return (s / 3600).toFixed(1) + "h ago";
   };
+  // Ultra-compact elapsed-since, no suffix: "5s" / "3m" / "2h" / "4d".
+  const fmtAgoShort = (epoch) => {
+    if (!epoch) return "";
+    const s = (Date.now() / 1000 - epoch);
+    if (s < 60)    return Math.round(s) + "s";
+    if (s < 3600)  return Math.round(s / 60) + "m";
+    if (s < 86400) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
+  };
   const fmtPct = (v) => (v == null || Number.isNaN(v))
     ? "—" : (100 * v).toFixed(1) + "%";
   const fmtNum = (v, n) => (v == null || Number.isNaN(v))
     ? "—" : v.toFixed(n || 2);
+  // ~`sig` significant figures, trailing zeros trimmed (nice but informative).
+  const fmtSig = (v, sig) => (v == null || !isFinite(v))
+    ? "—" : (v === 0 ? "0" : String(Number(v.toPrecision(sig || 2))));
+  // Error bar as a percentage at ~2 sig figs (e.g. 0.0123 → "1.2%").
+  const errPct = (v) => (v == null || !isFinite(v)) ? null : fmtSig(100 * v, 2) + "%";
   const setText = (id, t) => { const el = $(id); if (el) el.textContent = t; };
 
   // ---- Discrimination-infidelity formatting (matches the LIVE view:
@@ -54,6 +87,17 @@
   // green<1% / yellow<5% / red). See dashboard.py:_fig_infid. ----
   const fmtInfid = (v) => (v == null || Number.isNaN(v))
     ? "—" : Number(v).toExponential(1);
+  // Fidelity = 1 − infidelity, as a percent to 1 decimal. Never reads 100%
+  // unless infidelity is exactly 0 — anything above 99.9% is clamped to 99.9%
+  // (e.g. infidelity 1.8e-2 → 98.2%, 4e-4 → 99.9%, 0 → 100.0%).
+  const fmtFidelity = (v) => {
+    if (v == null || Number.isNaN(v)) return "—";
+    if (v <= 0) return "100.0%";
+    let pct = 100 * (1 - v);
+    if (pct > 99.9) pct = 99.9;
+    if (pct < 0) pct = 0;
+    return pct.toFixed(1) + "%";
+  };
   const infidColor = (v) => (v == null || Number.isNaN(v)) ? "var(--text-dim)"
     : (v < 0.01 ? "#4cc762" : v < 0.05 ? "#d29922" : "#f85149");
 
@@ -73,7 +117,7 @@
   const SWEEP_PREFS_KEY = "yb_dash_analysis_sweep_prefs";
   const sweepPrefs = (() => {
     const defaults = { errMode: "sem_pershot", view: "both",
-                       axisSwap: false, square: false };
+                       axisSwap: false, square: false, cbarAuto: false };
     try {
       const saved = JSON.parse(localStorage.getItem(SWEEP_PREFS_KEY) || "{}");
       return Object.assign(defaults, saved || {});
@@ -127,29 +171,52 @@
   }
 
   // ---- Tab switching ----
-  const TABS = ["live", "hardware", "analysis", "queue", "sequence", "logs"];
+  const TABS = ["live", "analysis", "hardware", "logs"];
+  // Hardware is a merged tab with four sub-views; "monitor"/"molecube"/"scope"
+  // are no longer top tabs (they redirect into Hardware -- see setTab).
+  const HW_SUBVIEWS = ["overview", "slm", "monitor", "molecube", "scope"];
   let activeTab = "live";
+  // Analysis tab sub-view: "data" (the analysis cards) or "sequence" (the
+  // flattened-sequence viewer folded in from the old Sequence tab).
+  let analysisSubMode = "data";
+  // Whether the loaded run has any swept axis (-> the Filter picker has chips
+  // to show). renderAnalysisFilters sets it; updateAnalysisFloatingHosts uses
+  // it so we don't pop an empty Filter card open just because we're in Data
+  // sub-mode. (The Filter card moved into the shared LEFT column, so its
+  // visibility is now decided centrally rather than by a lone wrap.hidden.)
+  let _filterHasAxes = false;
+  // Hardware tab sub-view: one of HW_SUBVIEWS (slm / monitor / molecube / scope).
+  let hwSubview = "slm";
 
   function setTab(tab) {
+    // The full-queue popup is a Live-tab overlay (fixed-position, outside
+    // #tab-live); hide it on ANY tab switch so it doesn't float over other tabs.
+    // This also covers clicking a popup run row (which calls setTab("analysis")).
+    closeQueuePopup();
+    // The Sequence view lives INSIDE the Analysis tab as a sub-mode; the
+    // standalone Sequence tab was removed. This redirect keeps any lingering
+    // setTab("sequence") / "#sequence" deep-link working.
+    if (tab === "sequence") { setTab("analysis"); setAnalysisSubMode("sequence"); return; }
+    // Monitor / Molecube / Scope merged into the Hardware tab as sub-views;
+    // redirect their old top-tab names / "#..." deep-links into Hardware.
+    if (tab === "monitor" || tab === "molecube" || tab === "scope") {
+      setTab("hardware"); setHwSubview(tab); return;
+    }
     if (!TABS.includes(tab)) return;
     activeTab = tab;
+    // Expose the active tab on <html> so CSS can hide the page scrollbar on the
+    // scrolling tabs (live / analysis / logs) -- it would otherwise sit over the
+    // always-on right control panel. (Hardware is handled separately.)
+    document.documentElement.dataset.tab = tab;
     TABS.forEach((t) => {
       $("tab-btn-" + t).classList.toggle("active", t === tab);
       $("tab-btn-" + t).setAttribute("aria-selected", String(t === tab));
       $("tab-" + t).hidden = (t !== tab);
     });
-    // Floating analysis overlay (Runs + Filter cards) tracks the
-    // active tab -- only visible when Analysis is selected. No-op if
-    // FLOATING_ANALYSIS_CARDS=false: the host stays hidden anyway.
-    const floatHost = document.getElementById("floating-analysis-host");
-    if (floatHost) floatHost.hidden = (tab !== "analysis");
-    // The Sequence tab's floating pickers live in TWO hosts now: Channels
-    // docked right (#floating-sequence-host), Scans docked left
-    // (#floating-seqscan-host). Both track the Sequence tab.
-    const seqFloatHost = document.getElementById("floating-sequence-host");
-    if (seqFloatHost) seqFloatHost.hidden = (tab !== "sequence");
-    const seqScanHost = document.getElementById("floating-seqscan-host");
-    if (seqScanHost) seqScanHost.hidden = (tab !== "sequence");
+    // Floating overlays (Scans picker, Filter card, Channels picker) track the
+    // active tab AND the Analysis sub-mode (Data vs Sequence). Centralized so
+    // the sub-toggle and tab switch stay in sync.
+    updateAnalysisFloatingHosts(tab);
     if (location.hash !== "#" + tab) location.hash = "#" + tab;
     // Render once on tab switch in case the poll interval hasn't fired.
     pollOnceForTab(tab);
@@ -165,11 +232,461 @@
   }
 
   function initTabs() {
+    // Seed the <html> data-tab attribute for the default tab (no #hash case,
+    // where setTab isn't called on load) so the scrollbar-hiding CSS applies
+    // immediately.
+    document.documentElement.dataset.tab = activeTab;
     TABS.forEach((t) => {
       $("tab-btn-" + t).addEventListener("click", () => setTab(t));
     });
     const hash = location.hash.replace("#", "");
     if (TABS.includes(hash)) setTab(hash);
+  }
+
+  // ---- Hardware tab sub-views (SLM / Monitor / Molecube / Scope) ----
+  // One Hardware tab with a sub-tab bar. SLM/Monitor/Scope are full-bleed
+  // iframes; Molecube is the native cards UI (reparented in from #tab-molecube
+  // at load -- IDs preserved so all /api/molecube wiring still works).
+  // Friendly labels for the Channels (molecube) cards (used as Overview tile labels).
+  const MC_LABELS = { "mc-status": "Channels · Status", "mc-dds": "Channels · DDS",
+                      "mc-ttl": "Channels · TTL", "mc-startup": "Channels · Startup",
+                      "mc-nidaq": "NI DAC · Dev1" };
+
+  function foldHardwareSubtabs() {
+    const pane = document.getElementById("hw-pane-molecube");
+    const src = document.getElementById("tab-molecube");
+    if (pane && src) Array.from(src.children).forEach((c) => pane.appendChild(c));
+    // ★ "add to Overview" on each molecube card. Molecube is native (not an
+    // iframe), so the star toggles hwTiles directly (no postMessage). The tile
+    // in the Overview is a live, read-only clone of the card (mirrorMolecubeTiles).
+    if (pane) $$("section.card[data-card-id]", pane).forEach((card) => {
+      const h2 = card.querySelector("h2");
+      const id = card.dataset.cardId;
+      if (!h2 || !id || h2.querySelector(".hw-mc-star")) return;
+      const star = document.createElement("button");
+      star.className = "hw-mc-star"; star.dataset.mcCard = id; star.textContent = "☆";
+      star.title = "Star — add to the Hardware Overview";
+      star.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleHwStar("molecube", id, MC_LABELS[id] || id);
+      });
+      h2.insertBefore(star, h2.firstChild);
+    });
+    refreshMcStars();
+  }
+
+  // Reflect which molecube cards are starred (★) vs not (☆).
+  function refreshMcStars() {
+    $$(".hw-mc-star").forEach((s) => {
+      const on = hwTiles.some((t) => t.source === "molecube" && t.tab === s.dataset.mcCard);
+      s.textContent = on ? "★" : "☆";
+      s.classList.toggle("on", on);
+    });
+  }
+
+  // A molecube Overview tile shows a LIVE clone of the real card (molecube is
+  // native + single-instance, so we can't iframe it -- we mirror its DOM instead,
+  // ID-stripped to avoid duplicate ids). It is INTERACTIVE: the mirror is wired
+  // to the same DDS/TTL handlers (mcControlClick/Keydown), which are container-
+  // relative so they work despite the stripped ids. Refreshed each molecube poll
+  // + on (re)render -- but a mirror holding the focused field is left alone so we
+  // don't wipe a value mid-edit (same idea as the real card's focus guard).
+  function mirrorMolecubeTiles() {
+    const grid = $("hw-overview-grid");
+    if (!grid) return;
+    $$(".hw-mc-mirror", grid).forEach((m) => {
+      const card = document.querySelector(
+        '#hw-pane-molecube section.card[data-card-id="' + m.dataset.mcCard + '"]');
+      if (!card) { m.textContent = "(molecube card unavailable)"; return; }
+      if (!m._mcWired) {   // wire once per mirror element (survives child rebuilds)
+        m._mcWired = true;
+        m.addEventListener("click", mcControlClick);
+        m.addEventListener("keydown", mcControlKeydown);
+        m.addEventListener("mousedown", mcControlMousedown);
+        m.addEventListener("focusout", mcNameFocusOut);
+      }
+      if (m.contains(document.activeElement)) return;   // editing here -> don't clobber
+      const clone = card.cloneNode(true);
+      clone.querySelectorAll("[id]").forEach((e) => e.removeAttribute("id"));
+      clone.querySelectorAll(".hw-mc-star").forEach((e) => e.remove());
+      m.replaceChildren(clone);
+    });
+  }
+
+  function setHwSubview(view) {
+    if (!HW_SUBVIEWS.includes(view)) return;
+    hwSubview = view;
+    try { localStorage.setItem("ybHwSubview", view); } catch (e) {}
+    HW_SUBVIEWS.forEach((v) => {
+      const pane = document.getElementById("hw-pane-" + v);
+      if (pane) pane.hidden = (v !== view);
+    });
+    const bar = document.querySelector(".hw-subtabs");
+    if (bar) bar.querySelectorAll("button").forEach((b) => {
+      const on = b.dataset.hwview === view;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", String(on));
+    });
+    // Molecube readback: poll immediately when it (or an Overview molecube tile)
+    // becomes visible (the recurring poll is gated in startPolling).
+    if (view === "molecube" && activeTab === "hardware") {
+      refreshMcStars();
+      try { pollMolecube().then(mirrorMolecubeTiles); } catch (e) {}
+      // NI DAC monitor lives in this sub-view too (separate data path -- not molecube).
+      try { pollNidaq().then(mirrorMolecubeTiles); } catch (e) {}
+    }
+    if (view === "overview") {
+      renderHwOverview();   // also calls mirrorMolecubeTiles
+      if (hwTiles.some((t) => t.source === "molecube") && activeTab === "hardware") {
+        try { pollMolecube().then(mirrorMolecubeTiles); } catch (e) {}
+      }
+    }
+  }
+
+  function initHwSubtabs() {
+    foldHardwareSubtabs();
+    const bar = document.querySelector(".hw-subtabs");
+    if (bar) bar.addEventListener("click", (e) => {
+      // The inline ↗ opens that view's source in a new tab (no sub-view switch).
+      const opener = e.target.closest(".hw-subtab-open");
+      if (opener) {
+        e.stopPropagation();
+        const url = opener.closest("button").dataset.openUrl;
+        if (url) window.open(url, "_blank", "noopener");
+        return;
+      }
+      const btn = e.target.closest("button[data-hwview]");
+      if (btn) setHwSubview(btn.dataset.hwview);
+    });
+    let saved = "overview";
+    try { saved = localStorage.getItem("ybHwSubview") || "overview"; } catch (e) {}
+    setHwSubview(HW_SUBVIEWS.includes(saved) ? saved : "overview");
+    initHwOverview();   // load starred tiles + wire the cross-origin star protocol
+  }
+
+  // ---- Hardware Overview: starred tiles aggregated from the sub-views ----
+  // Sources come from the #yb-hw-sources JSON (single source of truth). Each
+  // iframe source emits ★ toggles over postMessage; molecube is native. The
+  // tile list (order = layout) is persisted server-side via /api/hw/overview.
+  const HW_SOURCES = (() => {
+    try { return JSON.parse(document.getElementById("yb-hw-sources").textContent); }
+    catch (e) { return {}; }
+  })();
+  // iframe element id <-> source id (for postMessage sync back to the embeds).
+  const HW_SOURCE_IFRAME = { slm: "hw-iframe", monitor: "mon-iframe", scope: "scope-iframe" };
+  let hwTiles = [];   // [{source, tab, label}] -- server-persisted; order == layout
+
+  async function initHwOverview() {
+    window.addEventListener("message", onHwTileMessage);
+    try {
+      const r = await api("/api/hw/overview");
+      hwTiles = Array.isArray(r.tiles) ? r.tiles : [];
+    } catch (e) { hwTiles = []; }
+    renderHwOverview();
+    broadcastHwStars();   // tell each embed which of its tabs are starred
+    refreshMcStars();     // reflect starred state on the native molecube cards
+  }
+
+  async function saveHwTiles() {
+    try {
+      await api("/api/hw/overview", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tiles: hwTiles }),
+      });
+    } catch (e) { /* best-effort; next load re-syncs */ }
+  }
+
+  function hwTileIndex(source, tab) {
+    return hwTiles.findIndex((t) => t.source === source && t.tab === tab);
+  }
+  function toggleHwStar(source, tab, label) {
+    const i = hwTileIndex(source, tab);
+    if (i >= 0) hwTiles.splice(i, 1);
+    else hwTiles.push({ source, tab, label: label || tab });
+    saveHwTiles();
+    renderHwOverview();
+    broadcastHwStars(source);
+    refreshMcStars();   // keep the native molecube card ★ in sync
+  }
+
+  // Reply to a source embed (or all) with the list of ITS starred tabs, so the
+  // embed renders ★/☆ correctly. Origin-agnostic post (the embeds filter on yb).
+  function broadcastHwStars(only) {
+    Object.keys(HW_SOURCE_IFRAME).forEach((source) => {
+      if (only && source !== only) return;
+      const ifr = $(HW_SOURCE_IFRAME[source]);
+      if (!ifr || !ifr.contentWindow) return;
+      const stars = hwTiles.filter((t) => t.source === source).map((t) => t.tab);
+      try { ifr.contentWindow.postMessage({ yb: "hwtile", action: "sync", stars }, "*"); }
+      catch (e) {}
+    });
+  }
+
+  function _hwOriginTrusted(origin, source) {
+    const base = (HW_SOURCES[source] || {}).base || "";
+    return !origin || !base || base.indexOf(origin) === 0 || origin === location.origin;
+  }
+  function onHwTileMessage(e) {
+    const d = e.data || {};
+    if (!d || d.yb !== "hwtile") return;
+    if (d.source && !_hwOriginTrusted(e.origin, d.source)) return;   // ignore foreign posts
+    if (d.action === "ready") { broadcastHwStars(d.source); return; }
+    if (d.action === "toggle" && d.source && d.tab) {
+      toggleHwStar(d.source, String(d.tab), d.label);
+    }
+  }
+
+  // CHROME-LESS, freely-placed, resizable tiles on an absolute canvas: just the
+  // embedded view (no title bar / border). A hover top strip (the ⠿ grip + a
+  // label hint) drags the tile to ANY x/y; a hover bottom-right corner resizes.
+  // Both position (x,y) AND size (w,h) persist per tile in hwTiles. Drag a tile
+  // onto the 🗑 (shown the moment you grab any tile) to remove it.
+  function renderHwOverview() {
+    const grid = $("hw-overview-grid");
+    if (!grid) return;
+    if (!hwTiles.length) {
+      grid.innerHTML =
+        '<div class="hw-ov-empty">No starred views yet.<br>Open a hardware sub-tab ' +
+        '(SLM / Scope / Molecube) and click the ★ on a view to pin it here.<br>' +
+        'Click a tile&rsquo;s top strip to open its full view; hold &amp; drag it to ' +
+        'move (or onto the 🗑 to remove); drag the bottom-right corner to resize. ' +
+        'Position + size are saved.</div>';
+      grid.style.minHeight = "";
+      return;
+    }
+    // Auto-place any tile with no saved position (newly starred), packing left
+    // to right / top to bottom; explicit drags override this afterward.
+    const gw = grid.clientWidth || 1200;
+    let ax = 12, ay = 0, rh = 0, placed = false;   // ay=0: no top margin on the overview canvas
+    hwTiles.forEach((t) => {
+      if (!t.w) t.w = 440;
+      if (!t.h) t.h = 300;
+      if (t.x == null || t.y == null) {
+        if (ax + t.w > gw - 12 && ax > 12) { ax = 12; ay += rh + 12; rh = 0; }
+        t.x = ax; t.y = ay; ax += t.w + 12; rh = Math.max(rh, t.h); placed = true;
+      }
+    });
+    grid.innerHTML = hwTiles.map((t) => {
+      const src = HW_SOURCES[t.source] || {};
+      const inner = src.native
+        ? '<div class="hw-mc-mirror" data-mc-card="' + escHtml(t.tab) + '"></div>'
+        : '<iframe class="hw-tile-frame" src="' +
+            escHtml((src.base || "") + "?embed=1&tab=" + encodeURIComponent(t.tab)) +
+            '" referrerpolicy="no-referrer" allow="fullscreen"></iframe>';
+      const label = escHtml((src.label || t.source) + " · " + (t.label || t.tab));
+      return '<div class="hw-tile" data-src="' + escHtml(t.source) + '" data-tab="' +
+        escHtml(t.tab) + '" style="left:' + t.x + "px;top:" + t.y + "px;width:" +
+        t.w + "px;height:" + t.h + 'px">' +
+        '<div class="hw-tile-grip" title="Click to open this view · hold &amp; drag to move (or onto the trash to remove)">' +
+          '<span class="hw-grip-dots">⠏</span>' +
+          '<span class="hw-grip-label">' + label + "</span></div>" +
+        inner +
+        '<div class="hw-tile-resize" title="Drag to resize"></div></div>';
+    }).join("");
+    _hwUpdateCanvasHeight();
+    wireHwTiles();
+    mirrorMolecubeTiles();   // fill any molecube tiles with the current card content
+    if (placed) saveHwTiles();   // persist the initial auto-placement
+  }
+
+  // Grow the canvas so tiles placed low are reachable by scrolling.
+  function _hwUpdateCanvasHeight() {
+    const grid = $("hw-overview-grid");
+    if (!grid) return;
+    let maxB = 0;
+    hwTiles.forEach((t) => { if (t.y != null && t.h) maxB = Math.max(maxB, t.y + t.h); });
+    // No bottom pad: canvas = exactly the lowest tile's bottom. With the grid's
+    // CSS min-height:100%, a set of tiles that fits the pane needs no scroll at all.
+    grid.style.minHeight = maxB ? maxB + "px" : "";
+  }
+
+  function _hwTileRec(tile) {
+    return hwTiles.find((t) => t.source === tile.dataset.src && t.tab === tile.dataset.tab);
+  }
+
+  function wireHwTiles() {
+    const grid = $("hw-overview-grid");
+    if (!grid) return;
+    $$(".hw-tile-grip", grid).forEach((g) => g.addEventListener("pointerdown", startHwDrag));
+    $$(".hw-tile-resize", grid).forEach((h) => h.addEventListener("pointerdown", startHwResize));
+  }
+
+  // The grip is dual-purpose:
+  //   * a quick CLICK opens that source's full Hardware sub-view (SLM / Monitor /
+  //     Scope / Molecube) -- like clicking the sub-tab itself;
+  //   * a press-and-HOLD (or a drag past a few px) enters rearrange mode and
+  //     free-moves the tile.
+  // Drag mode arms on EITHER a short hold timer OR movement past a threshold, so
+  // a fast drag still feels immediate while a plain tap navigates. The grip is a
+  // real (non-iframe) overlay, so we get the pointerdown; while dragging,
+  // .hw-tile-frame is pointer-events:none (CSS via body.hw-dragging) so the move
+  // glides over iframes. The 🗑 shows the moment drag mode arms; dropping onto it
+  // removes the tile, else the new x/y persists.
+  const HW_DRAG_HOLD_MS = 200;   // press-and-hold this long -> rearrange mode
+  const HW_DRAG_MOVE_PX = 6;     // ...or move this far first
+  function startHwDrag(e) {
+    e.preventDefault(); e.stopPropagation();
+    const tile = e.target.closest(".hw-tile");
+    if (!tile) return;
+    const x0 = e.clientX, y0 = e.clientY, l0 = tile.offsetLeft, t0 = tile.offsetTop;
+    let dragging = false, holdTimer = 0;
+    const arm = () => {
+      if (dragging) return;
+      dragging = true;
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+      document.body.classList.add("hw-dragging");   // reveal the trash
+      tile.classList.add("hw-tile-dragging");
+      tile.style.zIndex = "10";
+    };
+    holdTimer = setTimeout(arm, HW_DRAG_HOLD_MS);   // held in place -> rearrange
+    const move = (ev) => {
+      if (!dragging) {
+        if (Math.abs(ev.clientX - x0) < HW_DRAG_MOVE_PX &&
+            Math.abs(ev.clientY - y0) < HW_DRAG_MOVE_PX) return;
+        arm();   // moved far enough -> rearrange
+      }
+      tile.style.left = Math.max(0, l0 + (ev.clientX - x0)) + "px";
+      tile.style.top = Math.max(0, t0 + (ev.clientY - y0)) + "px";
+    };
+    const up = (ev) => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; }
+      if (!dragging) {
+        // A plain click (no hold, no drag) -> open that source's sub-view.
+        setHwSubview(tile.dataset.src);
+        return;
+      }
+      // Hit-test the trash BEFORE hiding it: the 🗑 is display:none unless
+      // body.hw-dragging is set, and a display:none element reports an all-zero
+      // rect -- so the test must happen while the class is still on the body.
+      const trash = $("hw-trash");
+      let onTrash = false;
+      if (trash) {
+        const r = trash.getBoundingClientRect();
+        onTrash = ev.clientX >= r.left && ev.clientX <= r.right &&
+                  ev.clientY >= r.top && ev.clientY <= r.bottom;
+      }
+      document.body.classList.remove("hw-dragging");
+      tile.classList.remove("hw-tile-dragging");
+      tile.style.zIndex = "";
+      if (onTrash) {
+        toggleHwStar(tile.dataset.src, tile.dataset.tab);   // dropped on 🗑 -> remove
+        return;
+      }
+      const t = _hwTileRec(tile);
+      if (t) { t.x = tile.offsetLeft; t.y = tile.offsetTop; }
+      _hwUpdateCanvasHeight();
+      saveHwTiles();
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  }
+
+  // Custom resize (a corner handle z-above the iframe; native CSS resize can't be
+  // grabbed over an iframe). pointer-events:none on the iframe during the drag so
+  // it doesn't swallow the move. Size persisted on release.
+  function startHwResize(e) {
+    e.preventDefault(); e.stopPropagation();
+    const tile = e.target.closest(".hw-tile");
+    if (!tile) return;
+    const x0 = e.clientX, y0 = e.clientY, w0 = tile.offsetWidth, h0 = tile.offsetHeight;
+    document.body.classList.add("hw-resizing");
+    const move = (ev) => {
+      tile.style.width = Math.max(220, w0 + (ev.clientX - x0)) + "px";
+      tile.style.height = Math.max(140, h0 + (ev.clientY - y0)) + "px";
+    };
+    const up = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      document.body.classList.remove("hw-resizing");
+      const t = _hwTileRec(tile);
+      if (t) { t.w = tile.offsetWidth; t.h = tile.offsetHeight; }
+      _hwUpdateCanvasHeight();
+      saveHwTiles();
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  }
+
+  // ---- Analysis Data/Sequence sub-view ----
+  // The Sequence view is folded into the Analysis tab as a sub-mode. The run
+  // summary card is shared; the Data and Sequence panes below it swap. The
+  // Scans picker (left dock) is shared; the Filter card (right dock) is Data-
+  // only; the Channels picker (right dock) is Sequence-only.
+
+  // One-time: move the flattened-sequence viewer cards out of #tab-sequence
+  // into the Analysis "Sequence" pane, so there is a single sequence view.
+  // IDs are preserved (getElementById is location-independent), so all the
+  // sequence wiring keeps working. #tab-sequence is left empty; its top-tab
+  // button redirects into Analysis+Sequence (see setTab).
+  function foldSequenceIntoAnalysis() {
+    const pane = document.getElementById("analysis-sequence-pane");
+    const seqTab = document.getElementById("tab-sequence");
+    if (!pane || !seqTab) return;
+    Array.from(seqTab.children).forEach((c) => pane.appendChild(c));
+  }
+
+  // Show/hide the three floating overlays for the current tab + sub-mode.
+  function updateAnalysisFloatingHosts(tab) {
+    const inAnalysis = (tab === "analysis");
+    // All three pickers now live in the LEFT host (#floating-seqscan-host),
+    // stacked. Show the host on the Analysis tab; toggle the per-mode CARDS
+    // (Filter = Data sub-mode, Channels = Sequence sub-mode) individually.
+    // Runs is always shown in Analysis.
+    const scanHost = document.getElementById("floating-seqscan-host");
+    const filtCard = document.getElementById("analysis-filters");
+    const chanCard = document.getElementById("sequence-chn-card");
+    if (scanHost) scanHost.hidden = !inAnalysis;
+    // Filter shows only when in Analysis+Data AND the run actually has a swept
+    // axis (otherwise there are no chips -- don't pop an empty card).
+    if (filtCard) filtCard.hidden =
+      !(inAnalysis && analysisSubMode === "data" && _filterHasAxes);
+    if (chanCard) chanCard.hidden = !(inAnalysis && analysisSubMode === "sequence");
+    // The old RIGHT-docked hosts are now empty (Filter + Channels moved left).
+    const rFilt = document.getElementById("floating-analysis-host");
+    const rChan = document.getElementById("floating-sequence-host");
+    if (rFilt) rFilt.hidden = true;
+    if (rChan) rChan.hidden = true;
+  }
+
+  function setAnalysisSubMode(mode) {
+    if (mode !== "data" && mode !== "sequence") return;
+    analysisSubMode = mode;
+    try { localStorage.setItem("ybAnalysisSubMode", mode); } catch (e) {}
+    const dataPane = document.getElementById("analysis-data-pane");
+    const seqPane  = document.getElementById("analysis-sequence-pane");
+    if (dataPane) dataPane.hidden = (mode !== "data");
+    if (seqPane)  seqPane.hidden  = (mode !== "sequence");
+    const tg = document.getElementById("analysis-mode-toggle");
+    if (tg) tg.querySelectorAll("button").forEach((b) => {
+      const on = b.dataset.mode === mode;
+      b.classList.toggle("active", on);
+      b.setAttribute("aria-selected", String(on));
+    });
+    updateAnalysisFloatingHosts(activeTab);
+    // Lazily load the view that just became visible.
+    if (mode === "sequence") { try { loadSequence(); } catch (e) {} }
+    else { try { ensureAnalysisShown(); } catch (e) {} }
+    // Re-fit Plotly plots now that their container is visible.
+    setTimeout(() => {
+      if (!window.Plotly) return;
+      const pane = mode === "sequence" ? seqPane : dataPane;
+      if (pane) $$(".plot-container", pane).forEach((el) => {
+        try { Plotly.Plots.resize(el); } catch (e) {}
+      });
+    }, 60);
+  }
+
+  function initAnalysisModeToggle() {
+    const tg = document.getElementById("analysis-mode-toggle");
+    if (tg) tg.querySelectorAll("button").forEach((b) => {
+      b.addEventListener("click", () => setAnalysisSubMode(b.dataset.mode));
+    });
+    // Restore the last-used sub-view across reloads (default Data).
+    let saved = "data";
+    try { saved = localStorage.getItem("ybAnalysisSubMode") || "data"; } catch (e) {}
+    setAnalysisSubMode(saved === "sequence" ? "sequence" : "data");
   }
 
   // ---- Calibration card: global SLM->camera affine + loading patterns ----
@@ -223,17 +740,21 @@
   const timers = {};
 
   function pollOnceForTab(tab) {
-    if (tab === "live")     return pollLive();
-    // Hardware tab is just an iframe wrapping the SLM dashboard;
-    // no lab-side polling needed -- the iframe drives its own.
-    if (tab === "queue")    return pollQueue();
+    if (tab === "live")     { pollSnapshot(); return pollLive(); }   // coherent shot on switch-in; stream now
+    // Hardware tab: the SLM/Monitor/Scope sub-views are self-driving iframes;
+    // only the native Molecube sub-view needs a lab-side poll.
+    if (tab === "hardware") { if (hwSubview === "molecube") return pollMolecube(); return; }
+    // (The Queue tab was removed; the full-queue popup is driven by pollLive.)
     if (tab === "logs")     return pollLogs();
     if (tab === "sequence") return loadSequence();
-    // Analysis: the top-right Refresh re-fetches the runs list and reloads
-    // the current analysis (otherwise it's a no-op on this tab).
+    // Analysis: refresh the (cheap, incremental) runs list and sync the view to
+    // the current selection. We do NOT unconditionally re-analyze here -- that's
+    // the item-2 fix: ensureAnalysisShown() is a no-op when the selection is
+    // already on screen, and loadRunsList re-analyzes the selected run only when
+    // its shot count grew (a live scan). So a reload/poll has no delay.
     if (tab === "analysis") {
       loadRunsList();
-      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+      ensureAnalysisShown();
       return;
     }
   }
@@ -242,9 +763,11 @@
   // at bootstrap, not here).
 
   function startPolling() {
-    function loop(tab, fn, interval) {
+    // gate() (optional) overrides the default "this tab is active" check -- used
+    // by the Molecube sub-view, which is active only on Hardware + its sub-tab.
+    function loop(tab, fn, interval, gate) {
       const tick = async () => {
-        if (autoRefresh && activeTab === tab) {
+        if (autoRefresh && (gate ? gate() : activeTab === tab)) {
           try { await fn(); } catch (e) { console.warn(tab, e); }
         }
         timers[tab] = setTimeout(tick, interval);
@@ -252,14 +775,45 @@
       tick();
     }
     loop("live",     pollLive,     POLL.live);
+    // The coherent single-shot group (frames + intensities + scan red-outline) on its
+    // own loop, gated to the Live tab. Fetched together so they always show ONE shot;
+    // the fast `live` loop above streams the aggregate maps/histograms independently.
+    loop("snapshot", pollSnapshot,  POLL.snapshot,   () => activeTab === "live");
     // Hardware tab is a self-contained iframe to the SLM dashboard --
     // it owns its own polling. We DON'T poll /api/slm/* here, or we
     // get null-querySelector crashes against UI elements that only
     // existed in the old manual-port version of this tab.
-    loop("queue",    pollQueue,    POLL.queue);
+    // (The Queue tab was removed; the full-queue popup refreshes via pollLive.)
+    // Analysis + Sequence: keep the shared "Scans" picker self-updating as new
+    // scans complete. loadRunsList is the cheap incremental cached path; it's
+    // list-only (the analysis re-run is gated to actual shot growth), so this
+    // doesn't churn the analysis. Skips the DOM rebuild when nothing changed.
+    loop("analysis", loadRunsList, POLL.scans);
+    loop("sequence", loadRunsList, POLL.scans);
     // Logs tab: re-list + refresh the open file every 5 s so an open log
     // "follows" a running server (tail mode auto-scrolls to the bottom).
     loop("logs",     pollLogs,     5000);
+    // Molecube is a Hardware sub-view now: poll only when it's the active one.
+    // Molecube polls when its sub-view is open OR the Overview has molecube
+    // tile(s) to keep live; mirror the cards into those tiles after each poll.
+    loop("molecube",
+         async () => { await pollMolecube(); mirrorMolecubeTiles(); },
+         POLL.molecube,
+         () => activeTab === "hardware" &&
+               (hwSubview === "molecube" ||
+                (hwSubview === "overview" && hwTiles.some((t) => t.source === "molecube"))));
+    // NI DAC monitor: same gate as molecube (it shares the sub-view) but its own
+    // slower cadence. Not via molecube -- a separate /api/nidaq/monitor poll.
+    loop("nidaq",
+         async () => { await pollNidaq(); mirrorMolecubeTiles(); },
+         POLL.nidaq,
+         () => activeTab === "hardware" &&
+               (hwSubview === "molecube" ||
+                (hwSubview === "overview" && hwTiles.some((t) => t.source === "molecube"))));
+    // The "Yb Control" sidebar is shown on EVERY tab now. pollLive refreshes it
+    // on the Live tab; this loop keeps its queue / runner-state / camera live on
+    // the OTHER tabs. Gated to non-Live so the two never double-poll.
+    loop("ctrlpanel", pollControlPanel, POLL.ctrlpanel, () => activeTab !== "live");
     // Connection-status pill polls every 5s regardless of active tab.
     setInterval(updateConnStatus, 5000);
     updateConnStatus();
@@ -321,6 +875,20 @@
     });
   }
 
+  // Current run's scan_id (from /api/snapshot), so the scan_id / scan_name
+  // status chips can open it in Analysis -- the same row-click behaviour the
+  // Queue tab has. Set each live poll in pollLive.
+  let _liveScanId = null;
+  ["tile-scan-id", "tile-scan-name"].forEach((id) => {
+    const tile = document.getElementById(id);
+    if (!tile) return;
+    tile.addEventListener("click", () => {
+      if (!_liveScanId) return;
+      selectPrimary(_liveScanId);   // sets primary + loads analysis (background)
+      setTab("analysis");           // then reveal it
+    });
+  });
+
   // ---- Connection status (top-bar pills) ----
   // Labels stay short and stable ("lab" / "SLM" / "runner") -- the dot
   // color carries the state. No more "ok" suffix, no label churn.
@@ -380,8 +948,30 @@
     ["rep0",      "plot-hist-rep0"],
     ["rep1",      "plot-hist-rep1"],
     ["rep2",      "plot-hist-rep2"],
-    ["rep3",      "plot-hist-rep3"],
+    // rep3 (a 2nd "random") was dropped: the right-half histogram grid is now
+    // best / worst / random + the selected site (#plot-hist-site).
   ];
+
+  // The camera/tweezer-array panels bake the frame as a Plotly layout image
+  // (a data: URI). If the browser can't decode that image, Plotly leaves the
+  // broken-image "frowny" glyph on a white box -- which breaks the dashboard's
+  // dark format. These panels get validated before rendering (see
+  // renderArrayPanel) and degrade to a clean "no data" panel instead.
+  const ARRAY_PANELS = new Set(["array", "array_mid", "array2"]);
+  // Per-panel image-validation cache: divId -> {sig, ok}. Lets a poll skip
+  // re-probing an unchanged frame (same baked data URI string).
+  const _arrayImgState = {};
+
+  // Two live fetch groups (see POLL.snapshot / POLL.live). SNAPSHOT = the coherent
+  // single-shot view: both camera frames + THAT frame's per-site intensities + the
+  // scan-result panel (red current-cell outline). Fetched + rendered together
+  // (pollSnapshot / group=snapshot) so they always show ONE shot. STREAM = everything
+  // else (survival/loading maps, histograms) -- aggregate data that just accumulates,
+  // streamed fast + independently (pollLive / group=stream). Derived from
+  // LIVE_FIG_PANELS so the split stays in sync if a panel is added/removed above.
+  const SNAPSHOT_NAMES = new Set(["array", "array_mid", "array2", "intens", "scan"]);
+  const SNAPSHOT_FIG_PANELS = LIVE_FIG_PANELS.filter(([name]) => SNAPSHOT_NAMES.has(name));
+  const STREAM_FIG_PANELS   = LIVE_FIG_PANELS.filter(([name]) => !SNAPSHOT_NAMES.has(name));
 
   // Currently-selected site for the per-site histogram panel.
   let selectedSiteIdx = 1;
@@ -435,6 +1025,17 @@
   }
 
   async function pollLive() {
+    // Queue first: the status strip's "shot # / total" + "shot length" tiles
+    // read the running entry's scheduled total + start_ts. renderSidebarQueue
+    // also sets queueActiveRunning, which pollLiveDiag needs further down.
+    let q = null;
+    try {
+      q = await api("/api/queue");
+      renderSidebarQueue(q);
+      if (queuePopupOpen) renderQueuePopup(q);   // keep the full-queue popup live
+    } catch (e) { /* keep last-known state on transient error */ }
+    const running = q && q.running;
+
     // Status card uses /api/snapshot (small fields).
     let snap = null;
     try { snap = await api("/api/snapshot"); } catch (e) {
@@ -443,14 +1044,49 @@
     if (snap) {
       setText("kv-scan-id",    snap.scan_id != null ? String(snap.scan_id) : "—");
       setText("kv-scan-name",  snap.scan_name || snap.scan_filename || "—");
-      setText("kv-shot",       snap.n_accum_shots ?? "—");
-      setText("kv-sites",      snap.num_sites ?? "—");
+      // Remember the current run's scan_id so the scan_id / scan_name chips can
+      // open it in Analysis (like a queue row). The snapshot is the reliable
+      // source -- the queue's running entry often has no scan_id yet.
+      _liveScanId = snap.scan_id != null ? String(snap.scan_id) : null;
+      ["tile-scan-id", "tile-scan-name"].forEach((id) => {
+        const t = $(id);
+        if (t) t.classList.toggle("is-linked", !!_liveScanId);
+      });
+      // shot # / total = did / supposed-to-do: numerator = the per-run shot
+      // stamp (actual shots so far); denominator = the scan's PLANNED total
+      // (nseqs x StackNum, StackNum honoring an explicit rep -- see
+      // scan_summary.build_descriptor_summary). total_per_group is the correct
+      // plan (num_per_group is often a run-until-stopped sentinel). null total
+      // (run-forever, no finite plan) -> show just the actual count.
+      const cur = snap.shots_this_run ?? snap.n_accum_shots ?? null;
+      const total = (running && running.summary && running.summary.total_per_group)
+        ? running.summary.total_per_group : null;
+      setText("kv-shot",
+        cur == null ? "—" : (total ? `${cur} / ${total}` : String(cur)));
+      // avg shot length (s) = elapsed since the run started / shots so far.
+      // Replaces the old num_sites tile (deprecated: a scan can span multiple
+      // loading patterns across images, so one site count is meaningless).
+      let shotLen = null;
+      if (running && running.start_ts && cur) {
+        const elapsed = (running.finish_ts || Date.now() / 1000) - running.start_ts;
+        if (elapsed > 0) shotLen = elapsed / cur;
+      }
+      setText("kv-shot-length", shotLen == null ? "—"
+        : (shotLen >= 60 ? fmtDur(shotLen)
+           : shotLen.toFixed(shotLen < 10 ? 2 : 1) + "s"));
       const lr = avg(snap.loading_rates);
       setText("kv-loading-rate", lr != null ? fmtPct(lr) : "—");
-      if ($("scan-progress")) {
-        const cur = snap.n_accum_shots || 0;
-        $("scan-progress").textContent = `${cur} shots`;
-      }
+      // Overall survival (per-shot TP) averaged over all recent shots this run,
+      // replacing the old "progress" tile (which just echoed the shot #). Blank
+      // for 1-image scans (no survival; loading has its own tile). NOTE:
+      // survival_history is an OBJECT {target_aware, values:[...]}, not a bare
+      // array -- the per-shot fractions live under .values.
+      const survSeries = snap.survival_history;
+      const survVals = (survSeries && Array.isArray(survSeries.values)
+        ? survSeries.values : []).filter((v) => Number.isFinite(v));
+      const survMean = survVals.length
+        ? survVals.reduce((a, b) => a + b, 0) / survVals.length : null;
+      setText("kv-survival", survMean != null ? fmtPct(survMean) : "—");
       // Show/hide the middle-image card. It appears only when the scan
       // produces a middle frame (NumImages >= 3) AND the operator hasn't
       // turned it off via the "Middle frame" switch. applyMidVisibility()
@@ -466,14 +1102,30 @@
       }
       renderSiteInfo(snap, selectedSiteIdx);
       renderControlSidebar(snap);
+      renderSaveHealthChip(snap.save_health);
+      renderSeqGapChip(snap.seq_reconciliation);
+      // img2-panel detector badge: when img2 is detected by the spot-shape
+      // model (distinct-pattern runs) show the model + mean % certainty;
+      // otherwise leave it blank (img2 used the intensity threshold).
+      const info2 = $("array2-info");
+      if (info2) {
+        const src2 = snap.logicals2_source;
+        if (src2) {
+          const c = snap.logicals2_certainty_mean;
+          const label = String(src2).replace("gmm_shape_model_", "GMM ");
+          info2.textContent = "det: " + label
+            + (c != null && isFinite(c) ? " · ⌀" + fmtPct(c) + " cert" : "");
+          info2.title = "img2 detected by the spot-shape GMM model (not an "
+            + "intensity threshold). ⌀ = mean per-site P(loaded); the full "
+            + "per-site certainties are stored as certainties_img2 in the .h5.";
+        } else {
+          info2.textContent = "";
+          info2.title = "";
+        }
+      }
     }
-    // Queue preview in the Yb Control sidebar (running + next-up + recent
-    // history). Same /api/queue source as the Queue tab. Sets
-    // queueActiveRunning, which pollLiveDiag relies on below.
-    try {
-      const q = await api("/api/queue");
-      renderSidebarQueue(q);
-    } catch (e) { /* keep last-known state on transient error */ }
+    // (Queue already fetched + rendered at the top of pollLive so the status
+    // strip could read the running entry; queueActiveRunning is set there.)
     // Live diag pull-poll (after the queue render: needs queueActiveRunning).
     await pollLiveDiag(snap);
     // Auto-shrink the top-row status values to fit their tiles (the diag
@@ -490,6 +1142,8 @@
     await pollSiteHist();
     // Affine-alignment card (small JSON; re-renders only when it changes).
     await pollAffine();
+    // Detection-thresholds & calibration card (per-pattern audit log + health).
+    await pollThresholds();
   }
 
   // Compact queue preview in the Yb Control sidebar — mirrors the Tkinter
@@ -535,23 +1189,58 @@
         actText.textContent =
           `${state === "loading" ? "loading… " : ""}${label}`;
         queueActiveRunning = (state === "running");
+        // Click the active line to open the running scan in Analysis (it carries
+        // a scan_id once it starts producing data). Mirrors the Queue-tab rows.
+        if (running.scan_id) {
+          actEl.dataset.scanId = running.scan_id;
+          actEl.classList.add("q-linked");
+          actEl.title = "Open this run in Analysis";
+        } else {
+          delete actEl.dataset.scanId;
+          actEl.classList.remove("q-linked");
+          actEl.removeAttribute("title");
+        }
       } else {
         actEl.dataset.state = "idle";
         actText.textContent = "(idle)";
         queueActiveRunning = false;
+        delete actEl.dataset.scanId;
+        actEl.classList.remove("q-linked");
+        actEl.removeAttribute("title");
       }
     }
+
+    // Re-queue button(s) for a row, mirroring the Queue tab: "↻" replays the
+    // entry's stored descriptor (same params); "+code" (history rows with a
+    // code snapshot) also pins the original run's captured experiment code.
+    // Only entries that carry a descriptor can be re-queued.
+    const rqBtns = (e, withCode) => {
+      if (!e || !e.descriptor) return "";
+      let h = `<button class="q-rq" data-sb-requeue="${e.id}"` +
+              ` title="Re-queue a copy with the same parameters">↻</button>`;
+      if (withCode && e.file_id) {
+        h += `<button class="q-rq" data-sb-requeue-code="${e.id}"` +
+             ` title="Re-queue with the EXACT original code (replays this run's code snapshot)">+code</button>`;
+      }
+      return h;
+    };
 
     // --- Preview list: next-up queued + recent history ---
     const listEl = $("ctrl-queue-list");
     if (!listEl) return;
     const rows = [];
+    // A linked row (carries a scan_id) opens that run in Analysis on click —
+    // same affordance as the Queue tab. Stamped via data-scan-id + q-linked.
+    const linkAttrs = (e) =>
+      e && e.scan_id
+        ? ` data-scan-id="${e.scan_id}" class="q-linked` : ' class="';
     queued.slice(0, SIDEBAR_QUEUE_MAX).forEach((e) => {
       const label = e.label || e.seqName || `#${e.id}`;
       rows.push(
-        `<li class="q-queued"><span class="q-mark">·</span>` +
+        `<li${linkAttrs(e)} q-queued"><span class="q-mark">·</span>` +
         `<span class="q-name">${escHtml(label)}</span>` +
-        `<span class="q-status">#${e.id}</span></li>`);
+        `<span class="q-status">#${e.id}</span>` +
+        rqBtns(e, false) + `</li>`);
     });
     if (queued.length > SIDEBAR_QUEUE_MAX) {
       rows.push(`<li class="q-sep">+${queued.length - SIDEBAR_QUEUE_MAX} more queued</li>`);
@@ -562,18 +1251,76 @@
         const label = e.label || e.seqName || `#${e.id}`;
         const ok = (e.status || e.state) === "ok";
         const mark = ok ? "+" : "×";
+        // The +/× mark already conveys ok-vs-error, so the status slot shows
+        // how long ago the run STARTED (start_ts) in compact form ("5m"/"2h"/
+        // "3d"); the full status text rides along as the hover title.
+        const ago = fmtAgoShort(e.start_ts);
         const statusTxt = ok ? "ok" : (e.status || e.state || "err");
         rows.push(
-          `<li class="q-history ${ok ? "q-ok" : "q-err"}">` +
+          `<li${linkAttrs(e)} q-history ${ok ? "q-ok" : "q-err"}">` +
           `<span class="q-mark">${mark}</span>` +
           `<span class="q-name">${escHtml(label)}</span>` +
-          `<span class="q-status">${escHtml(statusTxt)}</span></li>`);
+          `<span class="q-status" title="${escHtml(statusTxt)}">` +
+          `${escHtml(ago)}</span>` +
+          rqBtns(e, true) + `</li>`);
       });
     }
     listEl.innerHTML = rows.length
       ? rows.join("")
       : `<li class="ctrl-queue-empty">queue empty</li>`;
   }
+
+  // Re-queue an entry straight from the Yb Control sidebar queue preview
+  // (mirrors the Queue tab's re-queue / "+code"). Replays the stored
+  // descriptor; withCode also pins the source run's captured code snapshot.
+  async function sidebarRequeue(btn, id, withCode) {
+    if (!id) return;
+    if (!controlsAllowed) {
+      toast("Remote controls disabled on this interface", "bad");
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/queue/requeue/${id}${withCode ? "?code=1" : ""}`,
+                          {method: "POST"});
+      toast(`Re-queued #${id} → #${r.descriptor_id}${withCode ? " (orig code)" : ""}`);
+      // Refresh the sidebar preview now; refresh the full-queue popup too if open.
+      try { renderSidebarQueue(await api("/api/queue")); } catch (e) { /* next poll */ }
+      try { if (queuePopupOpen) refreshQueuePopup(); } catch (e) { /* next pollLive */ }
+    } catch (e) {
+      toast("Re-queue failed: " + (e.message || e), "bad");
+      btn.disabled = false;
+    }
+  }
+
+  // Open a sidebar queue/history row's run in Analysis — mirrors the Queue
+  // tab's row-click. The element carries data-scan-id (server-stamped from
+  // file_id); buttons inside it act on their own and are skipped by the caller.
+  function sidebarOpenAnalysis(sid) {
+    if (!sid) return;
+    selectPrimary(sid);   // sets primary + loads analysis (background)
+    setTab("analysis");   // then reveal it
+  }
+
+  // Delegated click handler for the sidebar queue preview. Only the per-row
+  // re-queue / +code buttons act here (distinct sb-requeue attrs avoid clashing
+  // with the Queue tab's document-wide [data-requeue] wiring). Clicking anywhere
+  // ELSE in the queue section opens the full-queue popup -- wired in
+  // wireQueuePopup() on #ctrl-queue-section, which this handler defers to by
+  // returning without stopping propagation.
+  (function wireSidebarQueue() {
+    const listEl = document.getElementById("ctrl-queue-list");
+    if (listEl) {
+      listEl.addEventListener("click", (e) => {
+        const rc = e.target.closest("[data-sb-requeue-code]");
+        if (rc) { sidebarRequeue(rc, rc.dataset.sbRequeueCode, true); return; }
+        const rq = e.target.closest("[data-sb-requeue]");
+        if (rq) { sidebarRequeue(rq, rq.dataset.sbRequeue, false); return; }
+        // Anything else falls through to the #ctrl-queue-section handler,
+        // which opens the popup.
+      });
+    }
+  })();
 
   function renderSiteInfo(snap, idx1) {
     const info = $("site-info");
@@ -583,12 +1330,16 @@
     const inf = (snap.infidelities || [])[i];
     const rate = (snap.loading_rates || [])[i];
     const lines = [
-      `site = ${idx1}`,
-      `threshold = ${t != null ? fmtNum(t) : "—"}`,
-      `loading   = ${rate != null ? fmtPct(rate) : "—"}`,
-      `infidelity = ${inf != null ? inf.toExponential(2) : "—"}`,
+      `site ${idx1}`,
+      `thr ${t != null ? fmtNum(t) : "—"}`,
+      `load ${rate != null ? fmtPct(rate) : "—"}`,
+      `infid ${inf != null ? inf.toExponential(2) : "—"}`,
     ];
-    info.innerHTML = lines.map(escHtml).join("<br>");
+    // Single compact line (the readout now lives inline in the per-site
+    // histogram card's selection cell); full detail shows on hover.
+    const txt = lines.join("  ·  ");
+    info.textContent = txt;
+    info.title = txt;
   }
 
   // --- Control sidebar (Phase 5.5 Track A) ---------------------------
@@ -634,6 +1385,7 @@
     if (st.seq_id != null) setText("ctrl-seq-id", String(st.seq_id));
     if (st.state) setText("ctrl-runner-state", String(st.state));
     renderRunnerStatusBanner(st.state);
+    renderShotHealthChip(st.state, st.shot_health);
 
     // Backend toggle: highlight the active backend and disable its button
     // (switching to the already-active backend is a no-op).
@@ -670,6 +1422,26 @@
     }
   }
 
+  // Lightweight refresh of the GLOBAL control-panel sidebar (queue preview,
+  // runner state, backend, dummy mode, camera) for tabs OTHER than Live. The
+  // Live poll (pollLive) already does all of this plus the heavy live figures;
+  // this is the subset the sidebar needs so it stays current on Analysis /
+  // Hardware / Logs without dragging in the live-image pipeline.
+  async function pollControlPanel() {
+    if (activeTab === "live") return;   // pollLive owns the Live tab
+    try {
+      const q = await api("/api/queue");
+      renderSidebarQueue(q);
+      if (queuePopupOpen) renderQueuePopup(q);
+    } catch (e) { /* keep last-known on transient error */ }
+    try {
+      const snap = await api("/api/snapshot");
+      if (snap) renderControlSidebar(snap);
+    } catch (e) { /* keep last-known */ }
+    await pollControlStatus();
+    await pollCameraStatus();
+  }
+
   // Map a runner-status string to a data-state class. Mirrors
   // control_panel.py's _STATUS_COLORS (Idle (last seq) → blue,
   // Idle (last fallback) → amber, plain Idle → gray, Running → green,
@@ -691,6 +1463,117 @@
     if (!banner || !text) return;
     text.textContent = state || "—";
     banner.dataset.state = statusToState(state);
+  }
+
+  // Per-shot health chip (status strip). Three lit states + a neutral one:
+  //   green  "ok"   -> no shot errors recorded this scan
+  //   yellow "warn" -> errors happened earlier but we're NOT currently failing
+  //                    (recovered, or the count stopped climbing, or idle now)
+  //   red    "fail" -> ACTIVELY failing: state is Running AND the per-scan error
+  //                    count is still climbing
+  //   grey   "none" -> backend reports no health info (e.g. MATLAB backend)
+  // "Currently failing" keys off a CLIMBING count, not the server's
+  // seconds_since_last: /api/control/status serves the LAST-PUBLISHED snapshot
+  // from a temp file, so during a backend restart (or any publish stall) it
+  // re-serves a frozen snapshot whose seconds_since_last never grows and would
+  // read "recent" forever. A frozen total simply never increases -> never red.
+  const SHOT_FAIL_WINDOW_S = 20;
+  let _shotFail = { scanId: null, total: 0, lastClimbMs: 0 };
+  // Last shot_health payload, so the click handler (open-logs) can jump to the
+  // most recent error message when the chip is in a failed/failing state.
+  let _lastShotHealth = null;
+  function renderShotHealthChip(state, sh) {
+    const tile = $("shot-health-tile");
+    if (!tile) return;
+    _lastShotHealth = (sh && typeof sh === "object") ? sh : null;
+    if (!sh || typeof sh !== "object") {
+      tile.dataset.state = "none";
+      setText("shot-health-readout", "—");
+      return;
+    }
+    const total = sh.total || 0;
+    const scanId = sh.scan_id != null ? String(sh.scan_id) : null;
+    if (scanId !== _shotFail.scanId) {
+      // New scan (or first sample): start delta tracking fresh -- don't
+      // retro-flag a count we've only just begun observing.
+      _shotFail = { scanId: scanId, total: total, lastClimbMs: 0 };
+    } else if (total > _shotFail.total) {
+      _shotFail.total = total;
+      _shotFail.lastClimbMs = Date.now();
+    }
+    const running = statusToState(state) === "running";
+    const climbing = _shotFail.lastClimbMs > 0 &&
+      (Date.now() - _shotFail.lastClimbMs) < SHOT_FAIL_WINDOW_S * 1000;
+    const since = sh.seconds_since_last, sinceOk = sh.seconds_since_ok;
+    const recovered = sinceOk != null && since != null && sinceOk < since;
+    const activelyFailing = running && total > 0 && climbing && !recovered;
+
+    let stateCls, text;
+    if (activelyFailing)  { stateCls = "fail"; text = `failing · ${total}`; }
+    else if (total > 0)   { stateCls = "warn"; text = `${total} failed`; }
+    else                  { stateCls = "ok";   text = "ok"; }
+    tile.dataset.state = stateCls;
+    setText("shot-health-readout", text);
+    tile.title = (total > 0 && sh.last_message)
+      ? `Per-shot health — last error: ${sh.last_message}`
+      : "Per-shot health: green = no failures · yellow = failed earlier, not now · red = currently failing";
+  }
+
+  // HDF5 save-health chip (status strip). Monitor-side, from /api/snapshot's
+  // save_health (DataManager._save_health). The save runs in a daemon thread;
+  // if append_block ultimately fails (e.g. a OneDrive lock that outlasts the
+  // retries) a block of shots is lost from disk. States:
+  //   green  "ok"        -> every block saved
+  //   yellow "recovered" -> a block was lost earlier but saves are flowing now
+  //   red    "fail"      -> a save just failed (shots being lost to disk)
+  //   grey   "none"      -> no DataManager / no save info yet
+  function renderSaveHealthChip(sh) {
+    const tile = $("save-health-tile");
+    if (!tile) return;
+    if (!sh || typeof sh !== "object") {
+      tile.dataset.state = "none";
+      setText("save-health-readout", "—");
+      tile.title = "HDF5 save health: green = all saved · yellow = recovered after an earlier loss · red = saves failing (shots lost to disk)";
+      return;
+    }
+    const lost = sh.lost_seqs || 0;
+    const state = sh.state || "ok";
+    let stateCls, text;
+    if (state === "fail")          { stateCls = "fail"; text = lost ? `lost ${lost}` : "failing"; }
+    else if (lost > 0)             { stateCls = "warn"; text = `lost ${lost}`; }   // recovered
+    else                           { stateCls = "ok";   text = "ok"; }
+    tile.dataset.state = stateCls;
+    setText("save-health-readout", text);
+    tile.title = sh.reason
+      ? `HDF5 save — ${sh.reason}`
+      : "HDF5 save health: green = all saved · yellow = recovered after an earlier loss · red = saves failing (shots lost to disk)";
+  }
+
+  // ZMQ delivery gap chip: detects seq_ids that were never received because
+  // a grab_imgs() poll timeout raced a large buffer drain from the server.
+  //   green  "ok"       -> no missing shots this scan
+  //   yellow "lost N"   -> N shots inferred missing from seq_id gap(s)
+  //   grey   "none"     -> no DataManager yet
+  function renderSeqGapChip(sr) {
+    const tile = $("seq-gap-tile");
+    if (!tile) return;
+    if (!sr || typeof sr !== "object") {
+      tile.dataset.state = "none";
+      setText("seq-gap-readout", "—");
+      tile.title = "ZMQ delivery: green = no missing shots -- yellow = shots lost to timeout this scan";
+      return;
+    }
+    const n = sr.gap_count || 0;
+    if (n > 0) {
+      tile.dataset.state = "warn";
+      setText("seq-gap-readout", "lost " + n);
+      const ids = (sr.gap_ids || []).slice(0, 10).join(", ");
+      tile.title = "ZMQ delivery gap: " + n + " shot(s) not delivered this scan (get_imgs timeout when large batch accumulated). First missing: " + ids;
+    } else {
+      tile.dataset.state = "ok";
+      setText("seq-gap-readout", "ok");
+      tile.title = "ZMQ delivery: no missing shots detected this scan";
+    }
   }
 
   // --- Camera card (Phase 5.5) — mirrors the Tkinter CameraPane --------
@@ -949,15 +1832,14 @@
       return;
     }
     let resp = null;
-    // Autoscale switch (scan card) rides on the batch fetch: the /api/live/
-    // figures endpoint reads cbar_scale and applies it to the scan figure.
-    const figUrl = scanAutoscale
-      ? "/api/live/figures?cbar_scale=auto"
-      : "/api/live/figures";
-    try { resp = await api(figUrl); }
+    // group=stream: the aggregate maps + histograms (survival/loading/infidelity + the
+    // hist panels). These just accumulate, so they stream fast + independently here.
+    // The coherent single-shot group (frames + intensities + scan red-outline) is
+    // fetched separately by pollSnapshot so those always show ONE shot.
+    try { resp = await api("/api/live/figures?group=stream"); }
     catch (e) {
-      console.warn("figures fetch failed", e);
-      LIVE_FIG_PANELS.forEach(([name, divId]) => {
+      console.warn("stream figures fetch failed", e);
+      STREAM_FIG_PANELS.forEach(([name, divId]) => {
         const el = $(divId);
         if (el && !el.querySelector(".plotly")) {
           el.innerHTML =
@@ -967,8 +1849,41 @@
       });
       return;
     }
-    const figures = (resp && resp.figures) || {};
-    LIVE_FIG_PANELS.forEach(([name, divId]) => {
+    renderFigurePanels((resp && resp.figures) || {}, STREAM_FIG_PANELS);
+  }
+
+  // The coherent SINGLE-SHOT group: both camera frames + THAT frame's per-site
+  // intensities + the scan-result panel (red current-cell outline). Fetched TOGETHER
+  // (group=snapshot -> one server-side _read_data snapshot) so they always show ONE
+  // shot -- never img2 ahead of img1, nor the red outline ahead of the images. On its
+  // own loop (POLL.snapshot), gated by the ~5 MB image payload, so it may skip shots
+  // but stays coherent. Autoscale (scan colorbar) rides this fetch -- scan lives here.
+  async function pollSnapshot() {
+    if (!window.Plotly || window.__plotlyLoadFailed) return;   // the stream loop owns the missing-Plotly banner
+    let resp = null;
+    const url = scanAutoscale
+      ? "/api/live/figures?group=snapshot&cbar_scale=auto"
+      : "/api/live/figures?group=snapshot";
+    try { resp = await api(url); }
+    catch (e) {
+      console.warn("snapshot figures fetch failed", e);
+      SNAPSHOT_FIG_PANELS.forEach(([name, divId]) => {
+        const el = $(divId);
+        if (el && !el.querySelector(".plotly")) {
+          el.innerHTML =
+            '<div class="hint" style="padding:24px;text-align:center;color:#f85149;">' +
+            'fetch failed: ' + escHtml(e.message || String(e)) + '</div>';
+        }
+      });
+      return;
+    }
+    renderFigurePanels((resp && resp.figures) || {}, SNAPSHOT_FIG_PANELS);
+  }
+
+  // Render a batch of {name: figure} into the given [name, divId] panels. Shared by
+  // the light (per-shot curves) and heavy (camera images) live loops above.
+  function renderFigurePanels(figures, panels) {
+    panels.forEach(([name, divId]) => {
       const el = $(divId);
       if (!el) return;
       const f = figures[name];
@@ -977,6 +1892,13 @@
           el.innerHTML =
             '<div class="hint" style="padding:24px;text-align:center;">waiting…</div>';
         }
+        return;
+      }
+      // Camera/array panels: validate the baked frame image loads before
+      // showing it, so a broken/undecodable data URI becomes a clean dark
+      // "no data" panel instead of the browser's broken-image frowny glyph.
+      if (ARRAY_PANELS.has(name)) {
+        renderArrayPanel(el, divId, f);
         return;
       }
       // f.data is an array (possibly empty for _waiting() placeholders).
@@ -1001,6 +1923,69 @@
           'render error: ' + escHtml(err.message || String(err)) + '</div>';
       }
     });
+  }
+
+  // Render a camera/array panel, guarding against a baked layout image that
+  // the browser can't load. The frame is baked into f.layout.images[0].source
+  // as a data: URI; if it's missing/empty/undecodable the browser would show
+  // the broken-image "frowny" glyph, so we substitute a clean "no data" panel.
+  function renderArrayPanel(el, divId, f) {
+    const layout = f.layout || {};
+    const cfg = { displayModeBar: false, responsive: true };
+    const imgs = layout.images;
+    const hasImgEntry = Array.isArray(imgs) && imgs.length > 0;
+    // No image baked -> the server already returned a clean placeholder
+    // (annotation-only "Waiting for data..." figure); render it as-is.
+    if (!hasImgEntry) {
+      try { Plotly.react(el, f.data, layout, cfg); } catch (e) {}
+      return;
+    }
+    const src = (imgs[0] && imgs[0].source) || null;
+    if (!src) {
+      // An image entry with no usable source would render as a broken glyph.
+      renderNoData(el, layout.title);
+      return;
+    }
+    // Cheap signature so we don't O(n)-compare a multi-MB data URI each poll.
+    const sig = src.length + "|" + src.slice(0, 24) + src.slice(-24);
+    const st = _arrayImgState[divId];
+    if (st && st.sig === sig) {
+      if (st.ok) { try { Plotly.react(el, f.data, layout, cfg); } catch (e) {} }
+      else       { renderNoData(el, layout.title); }
+      return;
+    }
+    // New frame: confirm the data URI actually decodes before we show it.
+    const probe = new Image();
+    probe.onload = () => {
+      _arrayImgState[divId] = { sig, ok: true };
+      try { Plotly.react(el, f.data, layout, cfg); } catch (e) {}
+    };
+    probe.onerror = () => {
+      _arrayImgState[divId] = { sig, ok: false };
+      renderNoData(el, layout.title);
+    };
+    probe.src = src;
+  }
+
+  // A dark "no data" placeholder matching the server's _waiting() panel
+  // (PANEL bg + muted annotation), used when an array frame can't be shown.
+  function renderNoData(el, title) {
+    try {
+      Plotly.react(el, [], {
+        paper_bgcolor: "#0d1220", plot_bgcolor: "#0d1220",
+        font: { color: "#e0e0e0", size: 10 },
+        margin: { l: 40, r: 15, t: 35, b: 30 },
+        title: title || "",
+        xaxis: { visible: false }, yaxis: { visible: false },
+        annotations: [{
+          text: "no data", x: 0.5, y: 0.5, xref: "paper", yref: "paper",
+          showarrow: false, font: { size: 14, color: "#666" },
+        }],
+      }, { displayModeBar: false, responsive: true });
+    } catch (e) {
+      el.innerHTML =
+        '<div class="hint" style="padding:24px;text-align:center;">no data</div>';
+    }
   }
 
   function renderLiveArray(divId, snap, shapeKey, vloKey, vhiKey,
@@ -1432,7 +2417,9 @@
     Plotly.react(el, [{
       x, y, mode, type: "scattergl",
       marker: { size: sz, color: logInf,
-                colorscale: "Magma", reversescale: true,
+                // Plain Magma (not reversed): bright/colorful = HIGH infidelity
+                // = bad; dark = low infidelity = good.
+                colorscale: "Magma", reversescale: false,
                 cmin: -4, cmax: -0.3,
                 colorbar: { title: { text: "log10" }, len: 0.9 },
                 line: { width: 0.5, color: "white" }},
@@ -1683,6 +2670,287 @@
       <tbody>${rows}</tbody></table>`;
   }
 
+  // ===== Detection thresholds & calibration (per-pattern history + health) =====
+  const THRESHOLD_METRICS = [
+    {key: "mean_thr", label: "mean threshold", unit: "ADU"},
+    {key: "std_thr", label: "spread (std)", unit: "ADU"},
+    {key: "mean_infidelity", label: "mean infidelity", unit: ""},
+    {key: "n_updated", label: "sites updated", unit: ""},
+  ];
+  const THRESHOLD_SRC_COLOR = {cheap: "#58a6ff", fit: "#3fb950", fit_rejected: "#f85149"};
+  let thresholdData = null;
+  let thresholdPlotsKey = null;
+  // Which pattern's threshold history the card shows. null => follow the live
+  // img1 pattern (the default). Set by the pattern dropdown. Deliberately a
+  // plain JS var (not persisted), so it RESETS to the img1 pattern on a page
+  // refresh but is KEPT across live polls (new data never clobbers the choice).
+  let selectedThresholdPattern = null;
+
+  async function pollThresholds() {
+    let resp = null;
+    const q = selectedThresholdPattern
+      ? ("?pattern=" + encodeURIComponent(selectedThresholdPattern)) : "";
+    try { resp = await api("/api/thresholds/history" + q); }
+    catch (e) { return; }
+    thresholdData = resp || null;
+    renderThresholds();   // badges + banner refresh every poll (live countdown)
+  }
+
+  // Build/refresh the pattern dropdown: img1 first, then img2 (if a distinct
+  // loading pattern), then every other loaded pattern. Defaults the selection
+  // to the img1 pattern. Rebuilds <option>s only when the set changes so an
+  // open dropdown isn't clobbered each poll.
+  function syncThresholdPatternDropdown() {
+    const sel = $("threshold-pattern");
+    if (!sel || !thresholdData) return;
+    const img1 = thresholdData.active_pattern || null;
+    const img2 = thresholdData.active_pattern_img2 || null;   // distinct img2 only
+    const all = Array.isArray(thresholdData.all_patterns) ? thresholdData.all_patterns : [];
+    if (selectedThresholdPattern == null) {
+      selectedThresholdPattern = img1 || thresholdData.pattern || null;
+    }
+    const seen = new Set();
+    const opts = [];
+    const add = (name, role) => {
+      if (!name || seen.has(name)) return;
+      seen.add(name); opts.push({name: name, role: role});
+    };
+    add(img1, "img1");
+    add(img2, "img2");
+    all.forEach((n) => add(n, "other"));
+    add(selectedThresholdPattern, "other");   // ensure the selection is listable
+    const key = opts.map((o) => o.role + ":" + o.name).join("|");
+    if (sel.dataset.optKey !== key) {
+      sel.dataset.optKey = key;
+      sel.innerHTML = opts.map((o) => {
+        const tag = o.role === "img1" ? " (img1)" : o.role === "img2" ? " (img2)" : "";
+        return `<option value="${escHtml(o.name)}" class="popt-${o.role}">`
+             + `${escHtml(o.name)}${tag}</option>`;
+      }).join("");
+      sel.onchange = () => {
+        selectedThresholdPattern = sel.value || null;
+        colorThresholdPatternSelect();
+        pollThresholds();   // re-fetch the selected pattern's history at once
+      };
+    }
+    if (selectedThresholdPattern && sel.value !== selectedThresholdPattern) {
+      sel.value = selectedThresholdPattern;
+    }
+    colorThresholdPatternSelect();
+  }
+
+  // Tint the select green/blue/gray by whether the chosen pattern is the live
+  // img1 / img2 frame of the running scan, or not used in this scan.
+  function colorThresholdPatternSelect() {
+    const sel = $("threshold-pattern");
+    if (!sel || !thresholdData) return;
+    const v = sel.value;
+    const img1 = thresholdData.active_pattern || null;
+    const img2 = thresholdData.active_pattern_img2 || null;
+    sel.classList.remove("is-img1", "is-img2", "is-other");
+    sel.classList.add(v && v === img1 ? "is-img1"
+                      : v && v === img2 ? "is-img2" : "is-other");
+  }
+
+  function renderThresholds() {
+    const qWrap = $("threshold-quality");
+    if (!qWrap || !thresholdData) return;
+    const active = thresholdData.active || {};
+    const health = thresholdData.health || {};
+    const hist = thresholdData.history || [];
+    const fmt = (v, d) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+
+    // active loading pattern + defocus chip. `pat` is the pattern whose history
+    // is shown (the live one when a scan is running, else the most-recent one);
+    // `livePat` is the currently-running pattern (null when idle).
+    const livePat = active.pattern || thresholdData.active_pattern;
+    const pat = thresholdData.pattern || livePat;
+    const defoc = active.defocus;
+    const idleSfx = (pat && !livePat) ? " · idle (last run)" : "";
+    setText("threshold-active",
+      pat ? (`${pat}` + (defoc == null ? "" : ` · defocus ${fmt(defoc, 0)}`) + idleSfx)
+          : "no loading pattern");
+
+    // loud warning banner (A3/A5)
+    const banner = $("threshold-banner");
+    if (banner) {
+      const st = health.state || active.state;
+      if (st === "degraded") {
+        banner.hidden = false;
+        banner.className = "threshold-banner tb-bad";
+        banner.innerHTML = `⚠ thresholds DEGRADED — ${escHtml(health.reason || "")}`
+          + ` · holding &amp; re-anchoring from live data (not using day folder)`;
+      } else if (st === "unknown_pattern" || st === "unknown") {
+        banner.hidden = false;
+        banner.className = "threshold-banner tb-warn";
+        banner.innerHTML = `⚠ ${escHtml(health.reason || "no loading pattern declared")}`
+          + ` — using ${escHtml(active.source || "day-folder")} thresholds`;
+      } else {
+        banner.hidden = true; banner.innerHTML = "";
+      }
+    }
+
+    // health badges
+    const spread = active.spread != null ? active.spread : health.spread;
+    const spreadCls = spread == null ? "ab-neutral"
+      : spread <= 0.6 ? "ab-good" : spread <= 1.0 ? "ab-warn" : "ab-bad";
+    const mi = active.mean_infidelity != null ? active.mean_infidelity : health.mean_infidelity;
+    const miCls = mi == null ? "ab-neutral"
+      : mi <= 0.05 ? "ab-good" : mi <= 0.15 ? "ab-warn" : "ab-bad";
+    const lastFit = hist.slice().reverse().find((e) => e.source === "fit");
+    const fitAge = (lastFit && lastFit.ts) ? isoAgeHuman(lastFit.ts) : null;
+    const nextIn = active.next_fit_in;
+    const rejects = hist.filter((e) => e.source === "fit_rejected");
+    const lastReject = rejects.length ? rejects[rejects.length - 1] : null;
+    const stateCls = (health.state === "ok") ? "ab-good"
+      : (health.state === "degraded") ? "ab-bad"
+      : (health.state === "unknown_pattern" || health.state === "unknown") ? "ab-warn"
+      : "ab-neutral";
+    const badges = [
+      _affineBadge("calibration", escHtml(health.state || "—"), stateCls,
+        "ok = a clean full fit anchors detection; degraded = stored thresholds rejected/holding."),
+      _affineBadge("spread (std)", spread == null ? "—" : `${fmt(spread, 2)} ADU`, spreadCls,
+        "Per-site threshold spread. Tight (≤0.6) good; a wide spread is the corruption symptom."),
+      _affineBadge("mean infidelity", mi == null ? "—" : fmt(mi, 4), miCls,
+        "Mean per-site discrimination infidelity at the last accepted full fit."),
+      _affineBadge("last full fit", fitAge ? `${fitAge} ago` : "—", "ab-neutral",
+        lastFit ? `accepted fit at seq ${lastFit.seq_no} (scan ${lastFit.scan_id})` : "no accepted fit yet"),
+      _affineBadge("next fit in", nextIn == null ? "—" : `${nextIn} shots`, "ab-neutral",
+        "Shots until the next full Gaussian refit (counts across runs of this pattern)."),
+      _affineBadge("rejections", String(rejects.length), rejects.length ? "ab-bad" : "ab-good",
+        lastReject ? `last: ${escHtml(lastReject.reason || "")}` : "no rejected fits"),
+    ];
+    qWrap.innerHTML = badges.join("");
+
+    const age = active.updated_iso ? isoAgeHuman(active.updated_iso) : null;
+    setText("threshold-info",
+      (pat ? `pattern ${pat}` : "no pattern")
+      + (active.source ? ` · ${escHtml(active.source)}` : "")
+      + (age ? ` · health ${age} ago` : "")
+      + ` · ${hist.length} updates`);
+
+    const sel = $("threshold-metric");
+    if (sel && !sel.options.length) {
+      sel.innerHTML = THRESHOLD_METRICS.map((m) =>
+        `<option value="${m.key}">${escHtml(m.label)}${m.unit ? ` (${m.unit})` : ""}</option>`).join("");
+      sel.value = "mean_thr";
+      sel.onchange = drawThresholdTrend;
+    }
+
+    // Pattern selector (img1 / img2 / other loaded patterns); drives which
+    // pattern's history this card fetches + plots.
+    syncThresholdPatternDropdown();
+
+    // Redraw the heavy plots/table only when the history actually changed.
+    const key = (hist.length ? (hist[hist.length - 1].ts || "") : "") + "|" + hist.length;
+    if (key !== thresholdPlotsKey) {
+      thresholdPlotsKey = key;
+      drawThresholdTrend();
+      drawThresholdEvents();
+      renderThresholdTable();
+    }
+  }
+
+  function drawThresholdTrend() {
+    if (!window.Plotly) return;
+    const el = $("plot-threshold-trend");
+    if (!el || !thresholdData) return;
+    const hist = thresholdData.history || [];
+    const sel = $("threshold-metric");
+    const key = (sel && sel.value) || "mean_thr";
+    const meta = THRESHOLD_METRICS.find((m) => m.key === key) || THRESHOLD_METRICS[0];
+    if (!hist.length) {
+      Plotly.purge(el);
+      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">no threshold history for this pattern yet</div>';
+      return;
+    }
+    const x = hist.map((e, i) => e.ts || String(i));
+    const y = hist.map((e) => {
+      const v = e[key];
+      return (v == null || !isFinite(v)) ? null : Number(v);
+    });
+    const colors = hist.map((e) => THRESHOLD_SRC_COLOR[e.source] || "#8b949e");
+    const traces = [{
+      // SVG scatter (NOT scattergl): the page already has many WebGL plots
+      // (per-site maps, histograms, sequence channels); adding more exhausts the
+      // browser's WebGL-context limit -> the "frowny face" placeholder. This
+      // history is tiny (<=400 pts) so SVG is plenty fast.
+      x: x, y: y, mode: "lines+markers", type: "scatter",
+      line: {width: 1.4, color: "#30363d"}, marker: {size: 6, color: colors},
+      connectgaps: false, name: meta.label,
+      text: hist.map((e) => e.source + (e.reason ? ` — ${e.reason}` : "")),
+      hovertemplate: "%{y}<br>%{text}<extra></extra>",
+    }];
+    Plotly.react(el, traces, plotLayoutFlush({
+      margin: {l: 64, r: 16, t: 26, b: 60},
+      title: {text: `${meta.label} over threshold updates`, font: {size: 12}},
+      xaxis: {title: {text: "update (time)"}, type: "category", gridcolor: "#2a3242"},
+      yaxis: {title: {text: meta.unit || meta.label}, gridcolor: "#2a3242"},
+      showlegend: false,
+    }), plotConfig());
+  }
+
+  function drawThresholdEvents() {
+    if (!window.Plotly) return;
+    const el = $("plot-threshold-events");
+    if (!el || !thresholdData) return;
+    const hist = thresholdData.history || [];
+    if (!hist.length) {
+      Plotly.purge(el);
+      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">no update events</div>';
+      return;
+    }
+    const SRC = ["cheap", "fit", "fit_rejected"];
+    const yrow = {cheap: 0, fit: 1, fit_rejected: 2};
+    const traces = SRC.map((s) => {
+      const pts = hist.filter((e) => e.source === s);
+      return {
+        x: pts.map((e) => e.ts), y: pts.map(() => yrow[s]),
+        mode: "markers", type: "scatter", name: s,   // SVG, not WebGL (see trend)
+        marker: {size: 9, color: THRESHOLD_SRC_COLOR[s],
+                 symbol: s === "fit_rejected" ? "x" : "circle"},
+        text: pts.map((e) => e.reason ? `${s} — ${e.reason}` : s),
+        hovertemplate: "%{x}<br>%{text}<extra></extra>",
+      };
+    });
+    Plotly.react(el, traces, plotLayoutFlush({
+      margin: {l: 90, r: 16, t: 26, b: 50},
+      title: {text: "update events (cheap · fit · rejected)", font: {size: 12}},
+      xaxis: {title: {text: "time"}, type: "category", gridcolor: "#2a3242"},
+      yaxis: {tickvals: [0, 1, 2], ticktext: ["cheap", "fit", "rejected"],
+              gridcolor: "#2a3242", range: [-0.5, 2.5]},
+      showlegend: false,
+    }), plotConfig());
+  }
+
+  function renderThresholdTable() {
+    const wrap = $("threshold-table");
+    if (!wrap || !thresholdData) return;
+    const hist = (thresholdData.history || []).slice().reverse();   // newest first
+    if (!hist.length) { wrap.innerHTML = ""; return; }
+    const fmt = (v, d) => (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d);
+    const rows = hist.slice(0, 60).map((e, i) => {
+      const isCur = (i === 0);
+      const when = e.ts ? escHtml(e.ts.replace("T", " ").slice(0, 19)) : "—";
+      const rejCls = e.source === "fit_rejected" ? "tb-row-rej" : "";
+      return `<tr class="${isCur ? "af-cur" : ""} ${rejCls}">
+        <td>${escHtml(e.source || "—")}</td>
+        <td class="mono">${when}</td>
+        <td class="mono">${e.scan_id ? escHtml(String(e.scan_id)) : "—"}</td>
+        <td class="mono">${e.seq_no == null ? "—" : e.seq_no}</td>
+        <td class="mono">${fmt(e.mean_thr, 2)}</td>
+        <td class="mono">${fmt(e.std_thr, 2)}</td>
+        <td class="mono">${e.mean_infidelity == null ? "—" : fmt(e.mean_infidelity, 4)}</td>
+        <td class="mono">${e.n_updated == null ? "—" : e.n_updated}</td>
+        <td>${e.reason ? escHtml(e.reason) : ""}</td>
+      </tr>`;
+    }).join("");
+    wrap.innerHTML = `<table class="af-table"><thead><tr>
+      <th>source</th><th>time</th><th>scan</th><th>seq</th><th>mean</th>
+      <th>std</th><th>infid</th><th>sites</th><th>note</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  }
+
   // Avg histogram — port of _fig_avghist (live bars + fit curves).
   function renderAvgHist(snap) {
     if (!window.Plotly) return;
@@ -1738,11 +3006,11 @@
     }), plotConfig());
   }
 
-  // Per-site rep histograms — port of _figs_reps + _build_hist.
+  // Per-site rep histograms — port of _figs_reps + _build_hist. (rep3, a 2nd
+  // "random", was dropped; the 4th grid cell is now the selected-site hist.)
   function renderRepHists(snap) {
-    const targets = ["plot-hist-rep0", "plot-hist-rep1",
-                     "plot-hist-rep2", "plot-hist-rep3"];
-    const labels = ["Best", "Worst", "Random", "Random"];
+    const targets = ["plot-hist-rep0", "plot-hist-rep1", "plot-hist-rep2"];
+    const labels = ["Best", "Worst", "Random"];
     const sites = snap.hist_rep_sites || [];
     const liveHist = snap.live_hist_data || [];
     targets.forEach((id, k) => {
@@ -2069,6 +3337,11 @@
       .replace(/&/g, "&amp;").replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
   }
+  // escHtml + quote-escaping, so a value is safe inside a single- OR double-quoted
+  // HTML attribute (channel names can contain ' or ").
+  function escAttr(s) {
+    return escHtml(s).replace(/'/g, "&#39;").replace(/"/g, "&quot;");
+  }
 
   // =====================================================================
   // ANALYSIS TAB
@@ -2077,21 +3350,72 @@
   let selectedScanId = null;
   let groupsCache = {};
   let activeGroupId = null;
+  // What the Analysis tab is currently RENDERING: a scan_id, or "grp:<ids>" for
+  // a group view. Lets ensureAnalysisShown() skip a redundant re-render when the
+  // selection already matches what's on screen (cross-tab sync without churn).
+  let _analysisShownFor = null;
+  // Signature of the last-rendered picker list; lets a poll skip the rebuild
+  // when nothing changed (avoids disrupting hover/scroll every few seconds).
+  let _runsSig = null;
+  // Every available data day (YYYYMMDD, newest-first), from /api/runs/dates.
+  // Populates the date dropdown so ANY historical day is reachable -- the
+  // polled list itself stays a bounded recent window (the picker only loads
+  // the whole multi-year archive one chosen day at a time). See loadRunsList.
+  let allDates = [];
+  // scan_id -> recorded-shot count at the last analysis. The reload/poll gate
+  // (item 2): a run is only re-analyzed when its shot count GROWS (a live
+  // scan). A completed/unchanged run is never re-fetched on a poll or reload,
+  // so reloads are instant (the backend payload cache makes the one first-paint
+  // fetch ~ms too). Cleared per-scan when (re)analyzed.
+  let lastAnalyzedShots = {};
 
-  async function loadRunsList() {
+  // Recorded-shot count for a run as the runs list currently knows it (the
+  // SAME quantity analyze_scan reports as n_shots, so the live-growth gate
+  // compares apples to apples). None when unknown.
+  function _rowShots(scanId) {
+    const row = runsCache.find((r) => r.scan_id === scanId);
+    return (row && row.n_actual_shots != null) ? row.n_actual_shots : null;
+  }
+
+  // opts.force -> Full rescan (clears the backend enrichment cache, re-enriches
+  // every scan). Normal calls use the cheap incremental cached path.
+  async function loadRunsList(opts) {
+    opts = opts || {};
     // Only flip status to "loading list" if we're not already mid-analysis
     // for some specific scan -- the analysis status takes precedence.
     if (!selectedScanId) {
       setAnalysisStatus("loading", "loading runs…", "warn");
     }
     try {
-      const data = await api("/api/runs/list");
-      runsCache = data.runs || [];
-      renderRunsTable();
-      populateDateFilter();
-      setText("runs-count", String(runsCache.length));
-      // Auto-pick a run for first paint. Only fires if no run is currently
-      // selected. Priority:
+      // The unified picker uses /api/sequence/scans -- the SUPERSET: every run
+      // (Analysis fields) PLUS per-run seq availability (has_seq/n_seq/
+      // snapshot/descriptor) for the Sequence-tab badge + click. Shares the
+      // backend enrichment cache, so it's cheap; ?force=1 = Full rescan.
+      // A selected date scopes the fetch to that ONE day server-side (bounded),
+      // so picking an old day never walks/enriches the whole archive; empty =
+      // the default recent window. This is what extends past the 500-row cap.
+      const qs = [];
+      const day = (($("runs-date-filter") || {}).value) || "";
+      if (day) qs.push("date=" + encodeURIComponent(day));
+      if (opts.force) qs.push("force=1");
+      const data = await api("/api/sequence/scans" + (qs.length ? "?" + qs.join("&") : ""));
+      runsCache = data.scans || data.runs || [];
+      // Skip the (DOM-rebuilding) re-render when nothing the picker shows has
+      // changed -- so the 3 s auto-poll doesn't disrupt a hover/scroll. The
+      // signature folds in the fields a row renders (id, shot count, seq state).
+      const sig = runsCache.map((r) =>
+        `${r.scan_id}:${r.n_actual_shots == null ? "" : r.n_actual_shots}:` +
+        `${r.has_seq ? 1 : 0}:${r.n_seq || 0}`).join("|");
+      if (sig !== _runsSig || opts.force) {
+        _runsSig = sig;
+        renderRunsTable();
+        populateDateFilter();
+        setText("runs-count", String(runsCache.length));
+      } else {
+        // unchanged: keep highlights fresh (selection may have changed), no rebuild
+        syncTrayHighlight();
+      }
+      // Auto-pick a run for FIRST paint only (nothing selected yet). Priority:
       //   1. A saved MULTI-run tray -> restore every chip + re-run the
       //      group analysis (so a refresh holds the whole selection, not
       //      one of them).
@@ -2121,6 +3445,17 @@
             loadAnalysis(pick);
           }
         }
+      } else if (selectedScanId && traySet.size <= 1) {
+        // Live-growth gate (item 2): re-analyze the SELECTED run only when its
+        // recorded shot count has grown since we last analyzed it (i.e. it's a
+        // running scan still accumulating). Completed/unchanged runs are never
+        // re-fetched here, so polls + reloads don't churn the analysis.
+        const cur  = _rowShots(selectedScanId);
+        const prev = lastAnalyzedShots[selectedScanId];
+        if (cur != null && prev != null && cur > prev) {
+          // Silent: refresh in place (no blank/purge/"analyzing…" flash).
+          loadAnalysis(selectedScanId, {keepFilters: true, silent: true});
+        }
       }
     } catch (e) {
       const wrap = $("runs-table");
@@ -2128,15 +3463,131 @@
     }
   }
   function populateDateFilter() {
-    const dates = Array.from(new Set(
-      runsCache.map((r) => (r.scan_id || "").slice(0, 8))
-    )).filter(Boolean).sort().reverse();
     const sel = $("runs-date-filter");
+    if (!sel) return;
+    // Full archive date list (every day, from /api/runs/dates) UNIONed with the
+    // dates present in the currently-loaded rows -- so a brand-new day shows up
+    // immediately even before the next dates refresh. Selecting a day re-fetches
+    // just that day server-side (see loadRunsList), so reaching any historical
+    // run no longer depends on it being inside the recent 500-row window.
+    const fromRows = runsCache.map((r) => (r.scan_id || "").slice(0, 8));
+    const dates = Array.from(new Set([...allDates, ...fromRows]))
+      .filter((d) => d && d.length === 8).sort().reverse();
     const cur = sel.value;
-    sel.innerHTML = '<option value="">All dates</option>' +
-      dates.map((d) => `<option value="${d}">${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}</option>`).join("");
+    const opt = (d) =>
+      `<option value="${d}">${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}</option>`;
+    sel.innerHTML = '<option value="">All dates (recent)</option>' +
+      dates.map(opt).join("");
+    // Preserve the current selection even if it isn't in the (possibly stale) list.
+    if (cur && !dates.includes(cur)) sel.insertAdjacentHTML("beforeend", opt(cur));
     sel.value = cur;
   }
+  // Fetch the full list of archived days (cheap: a dir listing, no enrichment)
+  // so the date dropdown can reach the whole multi-year archive, not just the
+  // days inside the recent window.
+  async function fetchRunDates() {
+    try {
+      const d = await api("/api/runs/dates");
+      allDates = (d && d.dates) || [];
+      populateDateFilter();
+    } catch (e) { /* keep the dates the loaded rows already provide */ }
+  }
+  // ---- Unified selection model (primary + group) -----------------------
+  // The "tray" (traySet, insertion-ordered) IS the selected GROUP; the FIRST
+  // member is the PRIMARY. The primary drives the Sequence tab + is rendered
+  // slightly darker; the whole group drives the Analysis tab (group analysis)
+  // and every member is highlighted (picker + Queue). One picker, shared across
+  // Analysis + Sequence.
+  function trayPrimary() { return traySet.size ? Array.from(traySet)[0] : null; }
+
+  function persistSelected(sid) {
+    try { localStorage.setItem("yb_dashboard_selected_scan", sid || ""); }
+    catch { /* private mode */ }
+    const pasteEl = document.getElementById("manual-scan-id");
+    if (pasteEl && sid) pasteEl.value = sid;
+  }
+
+  // Seq-availability badge + 3-state (Ready / Reconstructable / Unrecoverable),
+  // mirrored from the old Sequence picker so a row in the unified picker still
+  // tells you whether a Sequence-tab click will plot or reconstruct.
+  function _seqState(r) {
+    if (r.has_seq) return {state: "ready", tag: `${r.n_seq || ""} seq`.trim()};
+    if (r.has_snapshot && r.has_descriptor)
+      return {state: "reconstructable", tag: "reconstruct ⟳"};
+    if (r.has_snapshot) return {state: "unrecoverable", tag: "no descriptor"};
+    return {state: "unrecoverable", tag: "no dump"};
+  }
+
+  // Load the primary's SEQUENCE (Sequence tab): plot the .seq dump if present,
+  // else reconstruct from the code snapshot, else explain why it can't.
+  function seqLoadForScan(sid) {
+    if (!sid) return;
+    const r = runsCache.find((x) => x.scan_id === sid);
+    if (!r) { toast("scan not in list — Refresh", "warn"); return; }
+    const st = _seqState(r).state;
+    if (st === "ready") {
+      const fin = $("seq-folder"); if (fin) fin.value = "";
+      seqLoad({ scan_id: sid }).then(renderRunsTable);
+    } else if (st === "reconstructable") {
+      seqReconstruct(sid, null);
+    } else {
+      toast("no .seq dump and no reconstructable snapshot for this scan", "warn");
+    }
+  }
+
+  // Make the analysis view match the current selection (single -> loadAnalysis,
+  // group -> group analysis). No-op when it's already showing the right thing.
+  function _desiredAnalysisKey() {
+    if (traySet.size > 1) return "grp:" + Array.from(traySet).join(",");
+    return trayPrimary();
+  }
+  function ensureAnalysisShown(opts) {
+    const want = _desiredAnalysisKey();
+    if (!want) return;
+    if (_analysisShownFor === want) return;
+    if (traySet.size > 1) analyzeTrayGroup();
+    else loadAnalysis(trayPrimary(), opts && opts.analysisOpts);
+  }
+  // Make the Sequence tab show the primary's sequence (if not already).
+  function ensureSeqShown() {
+    const p = trayPrimary();
+    if (!p) return;
+    if (seqState.query && seqState.query.scan_id === p) return;
+    seqLoadForScan(p);
+  }
+  // Debounced group re-analysis so a burst of "+" clicks coalesces.
+  let _grpAnalyzeTimer = null;
+  function scheduleGroupAnalyze() {
+    if (_grpAnalyzeTimer) clearTimeout(_grpAnalyzeTimer);
+    _grpAnalyzeTimer = setTimeout(() => {
+      _grpAnalyzeTimer = null;
+      if (activeTab === "analysis") ensureAnalysisShown();
+    }, 350);
+  }
+
+  // Select `sid` as the SOLE primary (clears the group) and drive the active
+  // tab. Used by a plain row-click (analysis OR sequence) + the paste box.
+  function selectPrimary(sid) {
+    if (!sid) return;
+    trayReplace(sid);                 // group = {sid}; renderTray -> highlights
+    selectedScanId = sid;
+    setText("selected-scan-id", sid);
+    persistSelected(sid);
+    syncSelectionEverywhere();
+    // Drive the sequence viewer when it's the visible view (legacy Sequence
+    // tab OR the new Analysis "Sequence" sub-mode); otherwise the data view.
+    const seqVisible = activeTab === "sequence" ||
+      (activeTab === "analysis" && analysisSubMode === "sequence");
+    if (seqVisible) seqLoadForScan(sid);
+    else ensureAnalysisShown();
+  }
+
+  // Highlight the selected group + primary across the picker AND the queue.
+  function syncSelectionEverywhere() {
+    syncTrayHighlight();
+    syncQueueSelectionHighlight();
+  }
+
   function renderRunsTable() {
     const wrap = $("runs-table");
     if (!wrap) return;
@@ -2145,7 +3596,8 @@
     const filtered = runsCache.filter((r) => {
       if (date && (r.scan_id || "").slice(0, 8) !== date) return false;
       if (search) {
-        const blob = ((r.scan_id || "") + " " + (r.name || "")).toLowerCase();
+        const blob = ((r.scan_id || "") + " " + (r.name || "") + " " +
+                      (r.description || "")).toLowerCase();
         if (!blob.includes(search)) return false;
       }
       return true;
@@ -2155,63 +3607,79 @@
         '<div class="run-row"><div class="run-info muted">no runs match</div></div>';
       return;
     }
-    // SLM-style row: [+] button | scan_id | name | dim-swept-info.
-    // Clicking the [+] adds/toggles in tray; clicking elsewhere on the
-    // row REPLACES the tray with just that run.
+    const primary = trayPrimary();
+    const curSeq = (seqState && seqState.query && seqState.query.scan_id) || "";
+    // SLM-style row: [+] button | when | name | swept | seq-availability badge.
+    // Click the [+] to toggle a run into the GROUP; click elsewhere to make it
+    // the sole PRIMARY. Behaviour is tab-aware (Analysis vs Sequence).
     wrap.innerHTML = filtered.map((r) => {
       const id = r.scan_id || "";
       const idShort = id.length === 14
         ? `${id.slice(4,6)}/${id.slice(6,8)} ${id.slice(8,10)}:${id.slice(10,12)}:${id.slice(12,14)}`
         : id;
       const inTray = traySet.has(id);
+      const isPrimary = id === primary;
+      const seq = _seqState(r);
+      const cls = ["run-row", `seq-row-${seq.state}`];
+      if (inTray) cls.push("in-tray");
+      if (isPrimary) cls.push("is-primary");
+      if (id === curSeq) cls.push("seq-current");
       return `
-        <div class="run-row ${inTray ? "in-tray" : ""}"
-             data-scan-id="${id}">
+        <div class="${cls.join(" ")}" data-scan-id="${id}" data-seq-state="${seq.state}">
           <button class="run-add" data-tray-toggle="${id}"
-                  title="${inTray ? "Remove from tray" : "Add to tray"}">${inTray ? "✓" : "+"}</button>
+                  title="${inTray ? "Remove from group" : "Add to group"}">${inTray ? "✓" : "+"}</button>
           <div class="run-info" title="${id}">
             ${idShort}
             <span class="run-dim"> · ${escHtml(r.name || "—")}</span>
             <span class="run-dim"> · ${escHtml(r.swept || "—")}</span>
+            <span class="seq-row-tag"> · ${escHtml(seq.tag)}</span>
           </div>
         </div>`;
     }).join("");
     $$(".run-row", wrap).forEach((row) => {
+      if (!row.dataset.scanId) return;
+      // Full-info hover tooltip (reused from the old Sequence picker).
+      const sInfo = runsCache.find((x) => (x.scan_id || "") === row.dataset.scanId);
+      if (sInfo) {
+        row.addEventListener("mouseenter", (e) => seqShowScanTip(e, sInfo));
+        row.addEventListener("mousemove", seqMoveScanTip);
+        row.addEventListener("mouseleave", seqHideScanTip);
+      }
       row.addEventListener("click", (e) => {
-        // Add-button click is its own handler.
-        if (e.target.closest(".run-add")) return;
-        // STOP propagation -- loadAnalysis synchronously calls
-        // renderRunsTable which detaches the clicked .run-row from
-        // the DOM. By the time the click bubbles to the document
-        // handler, e.target is no longer inside any card, and the
-        // document handler would collapse the runs card to peek
-        // (then edge). Stop bubbling here so the card state stays
-        // exactly where it was when the user clicked.
+        if (e.target.closest(".run-add")) return;   // its own handler
+        // Stop the click bubbling to the float-card document handler (which
+        // would collapse the card). The row stays put -- selectPrimary updates
+        // highlights via class-toggle, it no longer rebuilds the table.
         e.stopPropagation();
-        const sid = row.dataset.scanId;
-        trayReplace(sid);
-        loadAnalysis(sid);
+        seqHideScanTip();
+        selectPrimary(row.dataset.scanId);
       });
     });
     $$(".run-add", wrap).forEach((btn) => {
       btn.addEventListener("click", (e) => {
-        // Same rationale as the row click above: renderRunsTable
-        // rebuilds the DOM, detaches this button -- stop propagation
-        // so the document/card handlers don't see the click as
-        // "outside" and collapse the runs card.
         e.stopPropagation();
         const sid = btn.dataset.trayToggle;
-        trayToggle(sid);
-        renderRunsTable();
+        trayToggle(sid);            // add/remove from the GROUP
+        syncSelectionEverywhere();  // class-toggle, no full rebuild
+        // Keep the picker chips/labels in sync (+ / ✓) without detaching rows.
+        const b2 = wrap.querySelector(`.run-add[data-tray-toggle="${sid}"]`);
+        if (b2) b2.textContent = traySet.has(sid) ? "✓" : "+";
+        if (activeTab === "analysis") scheduleGroupAnalyze();
       });
     });
     syncTrayHighlight();
   }
   $("runs-search").addEventListener("input", renderRunsTable);
-  $("runs-date-filter").addEventListener("change", renderRunsTable);
+  // A date change re-FETCHES server-side (that one day, or the recent window for
+  // "All dates"), not just a client-side filter of the loaded rows -- that's how
+  // an older day is brought into the picker at all.
+  $("runs-date-filter").addEventListener("change", () => loadRunsList());
   $("runs-refresh").addEventListener("click", () => {
-    loadRunsList();
-    toast("Runs refreshed", "warn");
+    // Full rescan: clear the backend enrichment cache and re-enrich every scan
+    // (picks up edits / new days the incremental path wouldn't re-stat).
+    loadRunsList({force: true});
+    fetchRunDates();   // a new day may have appeared since the last dates fetch
+    toast("Rescanning all runs…", "warn");
   });
 
   // Click-to-copy on scan_id tiles (Analysis tab + anywhere else
@@ -2293,10 +3761,21 @@
 
   async function loadAnalysis(scanId, opts) {
     opts = opts || {};
+    // Silent = a background live-growth refresh (the selected run is still
+    // accumulating shots). Keep the current view ON SCREEN: don't blank the
+    // body, purge the plots, or flash "analyzing…". The post-fetch render*()
+    // calls all use Plotly.react (in-place diff), so the new data swaps in
+    // atomically once it arrives -- a live scan updates smoothly instead of
+    // disappearing every poll.
+    const silent = !!opts.silent;
     selectedScanId = scanId;
     setText("selected-scan-id", scanId);
-    setAnalysisStatus("analyzing", "analyzing…", "warn");
-    renderRunsTable();
+    if (!silent) setAnalysisStatus("analyzing", "analyzing…", "warn");
+    // Update row highlights WITHOUT rebuilding the table. The old
+    // renderRunsTable() here detached the just-clicked .run-row mid-click
+    // (the source of the "glitchy load" + the stopPropagation workaround);
+    // a class-toggle leaves the DOM intact.
+    syncTrayHighlight();
     // Mirror the loaded scan into the paste-box so the user can see /
     // copy the canonical 14-digit form. (Doesn't fire the listener
     // attached below because we set .value directly.)
@@ -2307,11 +3786,13 @@
     catch { /* private mode */ }
     if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; }
     const body = $("analysis-detail-body");
-    body.innerHTML = '<div class="hint">loading…</div>';
-    ["plot-analysis-scan", "plot-analysis-scan-lines", "plot-site-loading",
-     "plot-site-survival", "plot-site-fp", "plot-site-infid",
-     "plot-site-inthist", "plot-per-iter", "plot-per-iter-hist",
-     "plot-svd", "plot-avg-image", "plot-rearrange-scatter"].forEach(safePurge);
+    if (!silent) {
+      body.innerHTML = '<div class="hint">loading…</div>';
+      ["plot-analysis-scan", "plot-analysis-scan-lines", "plot-site-loading",
+       "plot-site-survival", "plot-site-fp", "plot-site-infid",
+       "plot-site-inthist", "plot-per-iter", "plot-per-iter-hist",
+       "plot-svd", "plot-avg-image", "plot-rearrange-scatter"].forEach(safePurge);
+    }
     try {
       let url = `/api/runs/${scanId}/analysis`;
       const qs = [];
@@ -2326,6 +3807,10 @@
         throw new Error("server returned non-object response");
       }
       activeAnalysis = r;
+      _analysisShownFor = scanId;   // cross-tab sync: this single run is on screen
+      // Remember the shot count we just analyzed so the live-growth gate only
+      // re-analyzes this run when it actually grows (item 2).
+      lastAnalyzedShots[scanId] = (typeof r.n_shots === "number") ? r.n_shots : null;
       renderAnalysisDetail(r);
       renderAnalysisFilters(r);
       renderPerSiteMaps(r);
@@ -2343,6 +3828,10 @@
         `analyzed · ${ns.toLocaleString()} shot${ns === 1 ? "" : "s"}`, "ok");
     } catch (e) {
       console.error("analysis fetch failed", e);
+      // On a silent live-refresh, a transient fetch error must NOT blow away
+      // the on-screen view -- keep the last good render and just flag the pill;
+      // the next poll retries.
+      if (silent) { setAnalysisStatus("analyzed", "live · update failed", "warn"); return; }
       setAnalysisStatus("error", "error", "bad");
       const status = e.status != null ? ` (HTTP ${e.status})` : "";
       const detail = e.body && e.body.error ? `\n${e.body.error}` : "";
@@ -2465,7 +3954,17 @@
     const targetAware = !!(sg.survival_source
                             || (ta && ta.overall_mean != null));
     const disc = r.discrimination || null;
-    const imf = r.imaging_fidelity || null;   // only set when recompute pressed
+    // Imaging fidelity at the thresholds used THROUGHOUT the run. Default view
+    // = from the logged infidelities; recompute = refit from this run's data.
+    const imf = r.imaging_fidelity || null;
+    // Loss #2: max rearrangement survival cap from source-site detection
+    // confidence (recompute-loaded / cached).
+    const cap = r.rearrange_survival_cap || null;
+    // Filtered TP survival: target survival with outlier bad-fidelity target
+    // spots excluded (no recompute needed — uses available per-site infids).
+    const taf = (r.target_aware_filtered
+                 && r.target_aware_filtered.overall_mean != null)
+                ? r.target_aware_filtered : null;
     // 1-image (loading-only) scans have no img2 → no survival. Show
     // loading as the headline and turn the discrimination map on by
     // default (the "is this data trash?" check).
@@ -2543,14 +4042,30 @@
     // not falsely read as "great" (operator request).
     const discColor = discFromRun ? infidColor(discVal) : "var(--text-dim)";
     const discTitle = discFromRun
-      ? `median per-site infidelity from THIS run's data. Lower is better. mean=${fmtInfid(disc.mean_infidelity)}, max=${fmtInfid(disc.max_infidelity)}.`
-      : `STORED scan-start calibration infidelity${calAge ? ` — calibrated ${calAge} before this run` : ""}. MAY BE STALE: the run's actual value can differ — click "recompute from this run". mean=${fmtInfid(disc.mean_infidelity)}.`;
+      ? `median per-site discrimination fidelity (1 − infidelity) from THIS run's data. Higher is better; capped at 99.9% unless infidelity is exactly 0. infidelity mean=${fmtInfid(disc.mean_infidelity)}, max=${fmtInfid(disc.max_infidelity)}.`
+      : `STORED scan-start calibration fidelity (1 − infidelity)${calAge ? ` — calibrated ${calAge} before this run` : ""}. MAY BE STALE: the run's actual value can differ — click "recompute from this run". infidelity mean=${fmtInfid(disc.mean_infidelity)}.`;
     const discTile = disc ? `
         <div class="stat-tile" title="${discTitle}">
-          <span class="stat-label">infidelity&darr; <span class="src-badge src-${discFromRun ? "lab" : "slm"}">${discSrc}</span></span>
-          <span class="stat-value" style="color:${discColor}">${fmtInfid(discVal)}${
+          <span class="stat-label">fidelity&uarr; <span class="src-badge src-${discFromRun ? "lab" : "slm"}">${discSrc}</span></span>
+          <span class="stat-value" style="color:${discColor}">${fmtFidelity(discVal)}${
             discFromRun ? "" : ` <span class="muted" style="font-size:10px;">cal${calAge ? " · " + escHtml(calAge) : ""}</span>`
           }</span>
+        </div>` : "";
+    // False-positive headline (↓ better). Target-aware (excludes target
+    // sites) when available, else all-empty. Shown for any 2-image scan.
+    const fpSrc = sg.fp_source || ((ta && ta.fp_overall != null) ? "rearrange" : "all_empty");
+    const fpVal = (ta && ta.fp_overall != null) ? ta.fp_overall
+                  : (sg.fp_overall != null ? sg.fp_overall : avg(sg.fp_mean));
+    const fpTile = (!oneImg && fpVal != null && isFinite(fpVal)) ? `
+        <div class="stat-tile" title="${
+          fpSrc === "rearrange"
+            ? "False positives at empty NON-target sites (target-aware) — whole-scan"
+            : "False positives: atoms at sites empty in img1 (all-empty) — whole-scan"
+        }">
+          <span class="stat-label">FP&darr;${
+            fpSrc === "rearrange" ? ' <span class="src-badge src-lab">target</span>' : ""
+          }</span>
+          <span class="stat-value" style="color:${infidColor(fpVal)}">${fmtPct(fpVal)}</span>
         </div>` : "";
     const params = r.run_parameters || [];
     body.innerHTML = warnHtml + `
@@ -2558,7 +4073,7 @@
         <span class="run-name" title="${escHtml(r.scan_filename || "")}">${escHtml(r.scan_name || "(unnamed scan)")}</span>
         ${dateStr ? `<span class="run-date mono">${dateStr}</span>` : ""}
       </div>
-      ${r.scan_description ? `<div class="run-desc">${escHtml(r.scan_description)}</div>` : ""}
+      ${r.scan_description ? `<details class="run-desc-details"><summary>description</summary><div class="run-desc">${escHtml(r.scan_description)}</div></details>` : ""}
       <div class="run-head-body">
       <div class="stat-grid">
         <div class="stat-tile">
@@ -2573,10 +4088,10 @@
         </div>
         <div class="stat-tile">
           <span class="stat-label">shots</span>
-          <span class="stat-value" title="actual recorded shots${
-            r.n_shots_scheduled != null ? ` · scheduled ${r.n_shots_scheduled}` : ""
+          <span class="stat-value" title="actual recorded / planned ('supposed to do') shots${
+            r.n_shots_scheduled != null ? ` · planned ${r.n_shots_scheduled}` : ""
           }">${r.n_shots}${
-            r.n_shots_scheduled != null && r.n_shots_scheduled !== r.n_shots
+            r.n_shots_scheduled != null
               ? ` <span class="muted" style="font-size:11px;">/ ${r.n_shots_scheduled}</span>` : ""
           }</span>
         </div>
@@ -2586,11 +4101,7 @@
           <span class="stat-value">${fmtPct(avg(sg.loading_rate))}</span>
         </div>
         ${discTile}
-        ${targetAware && ta && ta.fp_overall != null ? `
-        <div class="stat-tile">
-          <span class="stat-label">FP</span>
-          <span class="stat-value">${fmtPct(ta.fp_overall)}</span>
-        </div>` : ""}
+        ${fpTile}
         ${diag ? `
         <div class="stat-tile">
           <span class="stat-label">mean total_ms</span>
@@ -2615,17 +4126,43 @@
           · grid sidecar: <span class="${grid.present ? "ok" : "muted"}">${grid.present ? grid.n_sites + " sites" : "none"}</span>
           ${disc ? `· discrimination: <span class="src-badge src-${discFromRun ? "lab" : "slm"}">${discSrc}</span>
             <button class="ghost" id="recompute-infid"
-                title="Refit per-site discrimination from THIS run's intensities (also computes imaging fidelity at the used thresholds). Non-destructive; cached after the first run; default uses the scan-start calibration.">${
+                title="Refit per-site discrimination from THIS run's intensities — also re-derives the imaging fidelity at the throughout-run thresholds and the rearrangement max-survival cap. Non-destructive; cached after the first run; default discrimination uses the scan-start calibration.">${
               discFromRun ? "✓ using this run (click for scan-start)" : "recompute from this run"
             }</button>` : ""}
           · <button class="ghost" id="reanalyze-btn"
               title="Clear this run's cached analysis (double-Gaussian fits, focus metrics) and recompute from scratch.">↻ re-analyze</button>
         </div>
-        ${imf ? `<div title="Discrimination fidelity at the ACTUALLY-USED thresholds (initThresholds), measured on THIS run's intensities — i.e. how trustworthy the bitstrings/logicals the run actually produced were. 1 − infidelity at the used cut, averaged over sites.">
-          imaging fidelity (used thresholds, this run):
+        ${imf ? `<div title="${
+          imf.source === "logged_throughout_run"
+            ? `Discrimination fidelity at the thresholds the run ACTUALLY used, averaged over every shot using the per-site infidelities logged THROUGHOUT this run (scan-start seed + each live refit). How trustworthy the bitstrings/logicals the run produced were. ${imf.n_in_run_updates || 0} in-run threshold update${(imf.n_in_run_updates === 1) ? "" : "s"}. Press “recompute from this run” to re-derive it from this run's own intensities.`
+            : "Discrimination fidelity at the thresholds used THROUGHOUT the run (per-shot threshold timeline), measured on THIS run's refit intensities — i.e. how trustworthy the bitstrings/logicals the run actually produced were. 1 − infidelity at the used cut, averaged over sites."
+        }">
+          imaging fidelity (used thresholds${
+            imf.source === "logged_throughout_run" ? ", throughout run · logged" : ", throughout run · this run"
+          }):
           <span style="color:${infidColor(1 - (imf.mean_fidelity || 0))};font-weight:600;">${fmtPct(imf.mean_fidelity)}</span>
           mean · ${fmtPct(imf.median_fidelity)} median
-          <span class="muted">(${imf.n_sites} sites)</span>
+          <span class="muted">(${imf.n_sites} sites${
+            imf.source === "logged_throughout_run" && imf.n_in_run_updates != null
+              ? `, ${imf.n_in_run_updates} update${imf.n_in_run_updates === 1 ? "" : "s"}` : ""
+          })</span>
+        </div>` : ""}
+        ${cap ? `<div title="Maximum rearrangement survival this run COULD reach given source-site detection confidence (loss #2). Each path starts at a site detected as loaded in img1; if that detection was a false positive the path can't deliver an atom and the target stays empty. Per source we take the posterior P(atom | its img1 intensity) from that site's double-Gaussian fit; cap = mean of P over all ${cap.n_paths} paths, ± sqrt(Σ P(1−P))/N. Detection-confidence only — excludes physical loss of a correctly-detected source atom.">
+          max survival cap (source loading):
+          <span style="color:${infidColor(1 - (cap.cap_mean || 0))};font-weight:600;">${fmtPct(cap.cap_mean)}</span>
+          &plusmn; ${fmtPct(cap.cap_sem)}
+          <span class="muted">(~${fmtNum(cap.expected_nulled, 1)} of ${cap.n_paths} paths likely had no atom${
+            cap.n_no_fit ? `; ${cap.n_no_fit} no-fit→1.0` : ""
+          })</span>
+        </div>` : ""}
+        ${taf ? `<div title="Target-aware (TP) survival recomputed with outlier bad-fidelity target spots EXCLUDED — so transport survival isn't dragged down by a few mis-detected targets. A target is dropped when its detection infidelity is both a robust outlier among the targets and above an absolute floor (cut here: infid > ${fmtInfid(taf.infidelity_threshold)}). Per-site infidelities from the ${taf.infid_source === "throughout_run" ? "throughout-run logged values" : "scan-start calibration"} — no recompute needed.">
+          filtered TP survival (good targets):
+          <span style="color:${infidColor(1 - (taf.overall_mean || 0))};font-weight:600;">${fmtPct(taf.overall_mean)}</span>${
+            taf.overall_sem != null ? ` &plusmn; ${fmtPct(taf.overall_sem)}` : ""
+          }
+          <span class="muted">(${taf.n_excluded} of ${taf.n_target_sites} target spot${taf.n_target_sites === 1 ? "" : "s"} excluded${
+            taf.n_excluded && taf.excluded_max_infid != null ? `, worst infid ${fmtInfid(taf.excluded_max_infid)}` : ""
+          })</span>
         </div>` : ""}
       </div>
       </div>
@@ -2705,6 +4242,14 @@
     const useY = isSurv ? sm : lr;
     const useE = _errArray(summary, isSurv, sweepPrefs.errMode);
     const targetAware = !!summary.survival_source;
+    // FP overlay (false-positive rate vs param) — discoverable on the sweep
+    // curve like on the per-shot timeseries. Faint red, same 0–1 axis; only
+    // for 2-image scans that carry an fp_mean curve.
+    const fpm = summary.fp_mean || [];
+    const fpSem = summary.fp_sem || [];
+    const fpHasData = isSurv && fpm.some((v) => v != null && isFinite(v));
+    const fpName = (summary.fp_source === "rearrange") ? "FP (target)" : "FP";
+    const _num = (v) => (v == null || !isFinite(v)) ? null : v;
     const yLabel = isSurv
         ? (targetAware ? "TP (target survival)" : "survival")
         : "loading rate";
@@ -2731,21 +4276,38 @@
     if (nDimsReal === 0) {
       const yMean = useY.length ? useY[0] : null;
       const yErr  = useE && useE.length ? useE[0] : null;
-      Plotly.react(el, [{
+      const fpVal0 = fpHasData ? _num(fpm[0]) : null;
+      const fpErr0 = fpHasData ? _num(fpSem[0]) : null;
+      const hasFp0 = fpVal0 != null;
+      const traces0d = [{
         x: [0, r.n_shots || 1], y: [yMean, yMean], mode: "lines",
         line: {color: "#58a6ff", width: 2, dash: "dash"}, name: yLabel,
-      }], plotLayoutFlush({
+      }];
+      if (hasFp0) {
+        traces0d.push({
+          x: [0, r.n_shots || 1], y: [fpVal0, fpVal0], mode: "lines",
+          line: {color: "#f85149", width: 1.5, dash: "dot"}, name: fpName, opacity: 0.7,
+        });
+      }
+      const annText = `${yLabel} = ${fmtPct(yMean)}`
+        + (errPct(yErr) ? " ± " + errPct(yErr) : "")
+        + (hasFp0 ? `   ·   ${fpName} = ${fmtPct(fpVal0)}`
+                    + (errPct(fpErr0) ? " ± " + errPct(fpErr0) : "") : "");
+      Plotly.react(el, traces0d, plotLayoutFlush({
         margin: baseMargin,
         xaxis: { title: { text: "shot # (0d, single point)" }, tickformat: ".0f" },
         yaxis: { title: { text: yLabel }, range: [-0.05, 1.05], tickformat: ".2f" },
+        showlegend: hasFp0,
+        legend: {x: 0.01, y: 0.99, bgcolor: "rgba(0,0,0,0.3)", font: {size: 10}},
         annotations: [{
-          text: `${yLabel} = ${fmtNum(yMean, 3)}${yErr != null ? " ± " + fmtNum(yErr, 3) : ""}`,
+          text: annText,
           xref: "paper", yref: "paper", x: 0.5, y: 0.5,
           showarrow: false, font: { size: 14, color: "#ffdd44" },
           bgcolor: "rgba(20,20,40,0.7)",
         }],
       }), plotConfig());
-      setText("analysis-scan-info", `0d · ${r.n_shots || 0} shots · ${_errLabel(sweepPrefs.errMode)}`);
+      setText("analysis-scan-info", `0d · ${r.n_shots || 0} shots · ${_errLabel(sweepPrefs.errMode)}`
+        + (hasFp0 ? " · +FP" : ""));
       return;
     }
 
@@ -2756,19 +4318,44 @@
       const axisIdx = Math.max(0, dims.findIndex((d) => d > 1));
       const xs = (sweep.values && sweep.values[axisIdx]) || useY.map((_, i) => i + 1);
       const xLabel = cols[axisIdx] || "scan param";
-      Plotly.react(el, [{
-        x: xs, y: useY,
+      // Combined per-point hover: TP (or loading) ± err AND FP ± err, errors
+      // at ~2 sig figs. Same string on both traces so either is hoverable.
+      const hovText = useY.map((_, i) => {
+        const tpE = errPct(useE && useE[i]);
+        let s = `${xLabel} = ${fmtNum(xs[i], 4)}<br>${yLabel} = ${fmtPct(useY[i])}`
+                + (tpE ? ` ± ${tpE}` : "");
+        if (fpHasData) {
+          const fE = errPct(fpSem[i]);
+          s += `<br>${fpName} = ${fmtPct(fpm[i])}` + (fE ? ` ± ${fE}` : "");
+        }
+        return s;
+      });
+      const traces1d = [{
+        x: xs, y: useY, text: hovText,
         error_y: useE ? {type: "data", array: useE, visible: true, color: "#1f6feb"} : undefined,
-        mode: "markers+lines",
+        mode: "markers+lines", name: yLabel,
         marker: {size: 8, color: "#58a6ff"}, line: {color: "#1f6feb", width: 2},
-        hovertemplate: `${xLabel}=%{x:.4g}<br>${yLabel}=%{y:.3f}<extra></extra>`,
-      }], plotLayoutFlush({
+        hovertemplate: "%{text}<extra></extra>",
+      }];
+      if (fpHasData) {
+        traces1d.push({
+          x: xs, y: fpm, text: hovText, mode: "markers+lines", name: fpName, opacity: 0.7,
+          error_y: fpSem.length ? {type: "data", array: fpSem, visible: true, color: "#f85149"} : undefined,
+          marker: {size: 5, color: "#f85149"},
+          line: {color: "#f85149", width: 1, dash: "dot"},
+          hovertemplate: "%{text}<extra></extra>",
+        });
+      }
+      Plotly.react(el, traces1d, plotLayoutFlush({
         margin: baseMargin,
         xaxis: { title: { text: xLabel } },
         yaxis: { title: { text: yLabel }, range: [-0.05, 1.05], tickformat: ".2f" },
+        showlegend: fpHasData,
+        legend: {x: 0.01, y: 0.99, bgcolor: "rgba(0,0,0,0.3)", font: {size: 10}},
       }), plotConfig());
       setText("analysis-scan-info",
-        `1d · ${xLabel} · ${dims[axisIdx]} pts · ${_errLabel(sweepPrefs.errMode)}`);
+        `1d · ${xLabel} · ${dims[axisIdx]} pts · ${_errLabel(sweepPrefs.errMode)}`
+        + (fpHasData ? " · FP overlay" : ""));
       _wireSweepZoomFilter(el, r, [{prefix: "xaxis", col: axisIdx}]);
       return;
     }
@@ -2804,21 +4391,42 @@
       return useY[lin] ?? null;
     };
 
+    const linAt = (ix, jy) => {
+      const i0 = swap ? jy : ix, i1 = swap ? ix : jy;
+      return i1 * dim0orig + i0;
+    };
     if (showHeat) {
       const z = [];
+      const cd = [];   // per-cell hover: TP ± err (+ FP ± err)
       for (let jy = 0; jy < ny; jy++) {
-        const row = [];
-        for (let ix = 0; ix < nx; ix++) row.push(valAt(ix, jy));
-        z.push(row);
+        const row = [], cdrow = [];
+        for (let ix = 0; ix < nx; ix++) {
+          row.push(valAt(ix, jy));
+          const lin = linAt(ix, jy);
+          const tpE = errPct(useE && useE[lin]);
+          let s = `${yLabel} = ${fmtPct(useY[lin])}` + (tpE ? ` ± ${tpE}` : "");
+          if (fpHasData) {
+            const fE = errPct(fpSem[lin]);
+            s += `<br>${fpName} = ${fmtPct(fpm[lin])}` + (fE ? ` ± ${fE}` : "");
+          }
+          cdrow.push(s);
+        }
+        z.push(row); cd.push(cdrow);
       }
       // Square cells = categorical equal spacing; default = numeric
       // coords (cells sized by the separation between sweep values).
       const sq = sweepPrefs.square;
+      // Colorbar range: OFF (default) pins 0–1; ON lets Plotly autoscale to the
+      // data range (mirrors the live Scan-curve "Autoscale" toggle).
+      const cbarPinned = !sweepPrefs.cbarAuto;
       const trace = {
-        z, type: "heatmap", colorscale: "Viridis", zmin: 0, zmax: 1,
+        z, customdata: cd, type: "heatmap", colorscale: "Viridis",
+        zauto: !cbarPinned,
+        zmin: cbarPinned ? 0 : undefined, zmax: cbarPinned ? 1 : undefined,
         colorbar: {title: {text: yLabel}, len: 0.9, tickformat: ".2f"},
         x: sq ? xVals.map((v) => Number(v).toPrecision(4)) : xVals,
         y: sq ? yVals.map((v) => Number(v).toPrecision(4)) : yVals,
+        hovertemplate: `${xLabel}=%{x}<br>${yLabel2}=%{y}<br>%{customdata}<extra></extra>`,
       };
       Plotly.react(el, [trace], plotLayoutFlush({
         margin: baseMargin,
@@ -2855,7 +4463,8 @@
       _wireSweepZoomFilter(elLines, r, [{prefix: "xaxis", col: ax0}]);
     }
     setText("analysis-scan-info",
-      `2d · ${xLabel} × ${yLabel2} · ${nx}×${ny}${sweepPrefs.square ? " · square" : ""}`);
+      `2d · ${xLabel} × ${yLabel2} · ${nx}×${ny}${sweepPrefs.square ? " · square" : ""}`
+      + (sweepPrefs.cbarAuto ? " · autoscale" : ""));
   }
 
   // Zoom-to-filter: box-zoom on a sweep plot maps the visible range of each
@@ -2928,7 +4537,8 @@
   // the current analysis (no refetch needed — all data is already local).
   (function wireSweepControls() {
     const elErr = $("sweep-err"), elView = $("sweep-view"),
-          elSwap = $("sweep-swap"), elSq = $("sweep-square");
+          elSwap = $("sweep-swap"), elSq = $("sweep-square"),
+          elAuto = $("sweep-autoscale");
     const rerender = () => { if (activeAnalysis) plotAnalysisScanCurve(activeAnalysis); };
     if (elErr) {
       elErr.value = sweepPrefs.errMode;
@@ -2951,6 +4561,12 @@
         sweepPrefs.square = elSq.checked; saveSweepPrefs(); rerender();
       });
     }
+    if (elAuto) {
+      elAuto.checked = !!sweepPrefs.cbarAuto;
+      elAuto.addEventListener("change", () => {
+        sweepPrefs.cbarAuto = elAuto.checked; saveSweepPrefs(); rerender();
+      });
+    }
   })();
 
   // =====================================================================
@@ -2959,7 +4575,6 @@
   // refetch of /api/runs/<id>/analysis with the filter encoded.
   // =====================================================================
   function renderAnalysisFilters(r) {
-    const wrap = $("analysis-filters");
     const body = $("filter-body");
     // ALWAYS use the unfiltered sweep so chips show every possible
     // value -- the user has to know what they can still pick after
@@ -2969,10 +4584,14 @@
     const cols  = sweep.cols   || [];
     const vals  = sweep.values || [];
     if (!cols.length || !vals.length) {
-      wrap.hidden = true;
+      // No swept axis -> no chips. Record it + let the central visibility logic
+      // hide the (now LEFT-docked) Filter card.
+      _filterHasAxes = false;
+      updateAnalysisFloatingHosts(activeTab);
       return;
     }
-    wrap.hidden = false;
+    _filterHasAxes = true;
+    updateAnalysisFloatingHosts(activeTab);
     let html = "";
     cols.forEach((name, axisIdx) => {
       const axisVals = vals[axisIdx] || [];
@@ -3230,8 +4849,11 @@
     const haveInfid = Array.isArray(ps.infidelity) && ps.infidelity.length > 0;
     if (infidCard) infidCard.hidden = !haveInfid;
     if (haveInfid) {
+      // Infidelity may live on a different grid than the survival/FP maps
+      // (cross-grid rearrangement: infidelity is on the init detection grid).
       plotSiteMap("plot-site-infid", "site-infid-info",
-        ps.x, ps.y, ps.infidelity, "Magma", "infidelity", {mode: "infid"});
+        ps.infid_x || ps.x, ps.infid_y || ps.y, ps.infidelity,
+        "Magma", "infidelity", {mode: "infid"});
     } else {
       const ie = $("plot-site-infid");
       if (ie) Plotly.purge(ie);
@@ -3243,7 +4865,8 @@
         const el = $(id); if (el) Plotly.purge(el);
       });
       plotSiteMap("plot-site-loading", "site-loading-info",
-        ps.x, ps.y, ps.loading_rate, "Cividis", "loading", {});
+        ps.loading_x || ps.x, ps.loading_y || ps.y,
+        ps.loading_init || ps.loading_rate, "Cividis", "loading", {});
       setupPathsOverlay(null);
       return;
     }
@@ -3262,16 +4885,30 @@
     // pattern without losing the array context.
     const tgtMask = ps.is_target_site || null;
     const ntgtMask = ps.is_nontarget_site || null;
+    // Loading may live on a different grid than survival/FP (cross-grid run:
+    // loading on the init grid, survival/FP on the target grid).
     plotSiteMap("plot-site-loading", "site-loading-info",
-      ps.x, ps.y, ps.loading_rate, "Cividis", "loading", {infoSuffix});
+      ps.loading_x || ps.x, ps.loading_y || ps.y,
+      ps.loading_init || ps.loading_rate, "Cividis", "loading", {infoSuffix});
     plotSiteMap("plot-site-survival", "site-survival-info",
       ps.x, ps.y, ps.survival_mean, "Viridis",
       tgtMask ? "TP (target survival)" : "survival",
       {mask: tgtMask, maskLabel: "target site", infoSuffix,
        pathsOverlay: currentPathsOverlaySegments()});
-    plotSiteMap("plot-site-fp", "site-fp-info",
-      ps.x, ps.y, ps.fp_rate, "Plasma", "FP",
-      {mask: ntgtMask, maskLabel: "non-target site", infoSuffix});
+    // No non-target sites at all (e.g. the target IS the whole final array)
+    // => false positives are undefined everywhere. Hide the FP card rather
+    // than show an all-grey map.
+    const noNonTarget = Array.isArray(ntgtMask) && ntgtMask.length > 0
+      && !ntgtMask.some(Boolean);
+    if (noNonTarget) {
+      if (fpCard) fpCard.hidden = true;
+      const fe = $("plot-site-fp");
+      if (fe) Plotly.purge(fe);
+    } else {
+      plotSiteMap("plot-site-fp", "site-fp-info",
+        ps.x, ps.y, ps.fp_rate, "Plasma", "FP",
+        {mask: ntgtMask, maskLabel: "non-target site", infoSuffix});
+    }
   }
 
   // Returns the trace index that holds the colored per-site markers
@@ -3333,30 +4970,38 @@
     toggle.checked = pathsOverlayState.enabled;
   }
 
-  // Toggle / shot-picker handlers — re-render only the survival map.
-  // Phase 5.5 prep: control sidebar toggle. The sidebar is
-   // position:fixed on the right edge; the Live tab pane reserves
-   // padding-right for it so chart content isn't covered. Default
-   // OPEN (Phase 5.5 spec). Operator preference persists in
-   // localStorage so a closed-then-refresh stays closed.
-  (function wireLiveSidebarToggle() {
-    const tab     = document.getElementById("tab-live");
+  // Globalize the "Yb Control" sidebar. It's position:fixed on the right edge
+  // and shown on EVERY tab: we hoist it out of #tab-live to <body> so the old
+  // .tab-pane[hidden] rule can't hide it. It is ALWAYS shown (not hideable) and
+  // reads as a fixed continuation of the header (square corners, header-matched
+  // colour -- see dashboard.css). Reserve-space ("push content aside") is
+  // applied at the BODY level (body.ctrl-open) so it works for the grid tabs
+  // AND the full-bleed Hardware iframes alike. Its TOP is pinned to the BOTTOM
+  // of the (sticky, full-width) header -- measured from the live DOM so it's
+  // exact regardless of the header's rendered height (CSS --header-h is only a
+  // first-paint fallback).
+  (function globalizeControlPanel() {
     const sidebar = document.querySelector(".live-sidebar");
-    const btn     = document.getElementById("live-sidebar-toggle");
-    if (!tab || !sidebar || !btn) return;
-    const KEY = "yb-dash-live-sidebar-collapsed";
-    let collapsed = (() => {
-      try { return localStorage.getItem(KEY) === "1"; }
-      catch { return false; }
-    })();
-    const apply = () => {
-      sidebar.classList.toggle("collapsed", collapsed);
-      tab.classList.toggle("sidebar-collapsed", collapsed);
-      tab.classList.toggle("sidebar-open", !collapsed);
-      try { localStorage.setItem(KEY, collapsed ? "1" : "0"); } catch {}
+    if (!sidebar) return;
+    // Hoist to <body> once so it lives outside every tab pane. Idempotent.
+    if (sidebar.parentElement !== document.body) document.body.appendChild(sidebar);
+    // Always reserve its width; never collapse.
+    document.body.classList.add("ctrl-open");
+    document.body.classList.remove("ctrl-collapsed");
+    // Pin the panel's top to the header's bottom edge so nothing is covered.
+    const positionControlPanel = () => {
+      const header = document.querySelector("header");
+      if (!header) return;
+      const h = Math.round(header.getBoundingClientRect().height);
+      if (!h) return;
+      sidebar.style.top = h + "px";
+      sidebar.style.height = "calc(100vh - " + h + "px)";
     };
-    btn.addEventListener("click", () => { collapsed = !collapsed; apply(); });
-    apply();
+    positionControlPanel();
+    // Re-measure once fonts/layout settle and whenever the header may reflow.
+    window.addEventListener("load", positionControlPanel);
+    window.addEventListener("resize", positionControlPanel);
+    setTimeout(positionControlPanel, 300);
   })();
 
   // Live-tab image-row switches: Downsample (img1) + Middle frame (img2).
@@ -3404,7 +5049,7 @@
         scanAutoscale = auto.checked;
         try { localStorage.setItem("yb-dash-scan-autoscale", scanAutoscale ? "1" : "0"); }
         catch {}
-        pollLiveFigures();
+        pollSnapshot();   // the scan figure (cbar_scale) lives in the snapshot group now
       });
     }
   })();
@@ -3441,8 +5086,11 @@
     Object.entries(SIMPLE).forEach(([kind, path]) => {
       const btn = sidebar.querySelector(`.ctrl-btn[data-kind="${kind}"]`);
       if (!btn) return;
+      // Start / Pause are glyph-only icon buttons, so prefer the aria-label
+      // for the toast (otherwise it would read e.g. "▶ sent").
+      const lbl = btn.getAttribute("aria-label") || btn.textContent.trim();
       btn.addEventListener("click", async () => {
-        try { await postControl(path); toast(btn.textContent.trim() + " sent"); }
+        try { await postControl(path); toast(lbl + " sent"); }
         catch (e) { toast(e.message || "control failed", "bad"); }
       });
     });
@@ -3745,8 +5393,9 @@
     }
     if (infid) {
       // Log-scale infidelity (matches the live view _fig_infid): color by
-      // log10 of the clipped infidelity, Magma_r, range [-4, -0.3];
-      // raw value shown via customdata in scientific notation.
+      // log10 of the clipped infidelity, plain Magma, range [-4, -0.3].
+      // Plain (un-reversed) Magma => bright/colorful = HIGH infidelity = bad,
+      // dark = low infidelity = good. Raw value shown via customdata.
       const logv = vIn.map((v) => Math.log10(
         Math.min(1, Math.max(1e-6, (v == null || !isFinite(v)) ? 1e-6 : v))));
       traces.push({
@@ -3758,7 +5407,7 @@
         customdata: vIn.map((v, j) => [iIn[j], v]),
         marker: {
           size: siteDotSize, color: logv, colorscale: "Magma",
-          reversescale: true, cmin: -4, cmax: -0.3, line: {width: 0},
+          reversescale: false, cmin: -4, cmax: -0.3, line: {width: 0},
           colorbar: {title: {text: "log10 infid"}, len: 0.9},
         },
         hovertemplate: "site %{customdata[0]}: %{customdata[1]:.2e}<extra></extra>",
@@ -4577,12 +6226,32 @@
   const savedTrayAtLoad = loadSavedTray();
 
   function syncTrayHighlight() {
-    // Highlight rows in the SLM-style .run-picker that are in the tray.
+    // Highlight rows in the .run-picker: whole GROUP = .in-tray, the PRIMARY
+    // (first-selected) also gets .is-primary (slightly darker). Class-toggle
+    // only -- never rebuilds the table, so a click never detaches its row.
+    const primary = trayPrimary();
     $$("#runs-table .run-row").forEach((row) => {
-      row.classList.toggle("in-tray", traySet.has(row.dataset.scanId));
+      const sid = row.dataset.scanId;
+      row.classList.toggle("in-tray", traySet.has(sid));
+      row.classList.toggle("is-primary", sid === primary);
       const addBtn = row.querySelector(".run-add");
-      if (addBtn) addBtn.textContent = traySet.has(row.dataset.scanId) ? "✓" : "+";
+      if (addBtn) addBtn.textContent = traySet.has(sid) ? "✓" : "+";
     });
+  }
+
+  // Highlight Queue/History rows whose scan_id is in the selected group (same
+  // colour scheme; primary darker). Queue rows carry data-scan-id (server
+  // stamps it from file_id). Cheap class-toggle, called on every selection
+  // change + after each queue render.
+  function syncQueueSelectionHighlight() {
+    const primary = trayPrimary();
+    $$('#queue-table tr[data-scan-id], #history-table tr[data-scan-id], ' +
+       '#pq-queue-table tr[data-scan-id], #pq-history-table tr[data-scan-id]')
+      .forEach((row) => {
+        const sid = row.dataset.scanId;
+        row.classList.toggle("in-tray", traySet.has(sid));
+        row.classList.toggle("is-primary", sid === primary);
+      });
   }
 
   function renderTray() {
@@ -4598,6 +6267,7 @@
       wrap.innerHTML =
         '<span class="tray-empty">none yet — click a row below</span>';
       syncTrayHighlight();
+      syncQueueSelectionHighlight();
       return;
     }
     wrap.innerHTML = Array.from(traySet).map((sid) => `
@@ -4613,6 +6283,7 @@
       });
     });
     syncTrayHighlight();
+    syncQueueSelectionHighlight();
   }
 
   function trayToggle(sid) {
@@ -4657,6 +6328,7 @@
       // combined view shows per-site maps, survival-vs-distance, and the
       // pooled seq-specific focus curve -- same as a single-run load.
       activeAnalysis = r2;
+      _analysisShownFor = "grp:" + Array.from(traySet).join(",");
       renderAnalysisDetail(r2);
       renderPerSiteMaps(r2);
       renderSurvivalVsDistance(r2);
@@ -4676,18 +6348,21 @@
   }
 
   $("tray-analyze").addEventListener("click", async () => {
-    // Paste-box takes precedence: if a 14-digit scan_id is sitting
-    // there AND doesn't match the current selection, treat Analyze as
-    // "load that scan into the tray then analyze it".
+    // Paste-box takes precedence: a 14-digit scan_id there (not the current
+    // selection) becomes the sole PRIMARY and loads -- list-independent, so it
+    // works for ANY scan ever recorded, not just the most-recent in the picker.
     const pasted = ($("manual-scan-id").value || "").trim();
     if (/^\d{14}$/.test(pasted) && pasted !== selectedScanId) {
       trayReplace(pasted);
+      selectedScanId = pasted;
+      persistSelected(pasted);
+      syncSelectionEverywhere();
       loadAnalysis(pasted);
       return;
     }
     if (!traySet.size) { toast("tray is empty", "warn"); return; }
     if (traySet.size === 1) {
-      loadAnalysis(Array.from(traySet)[0]);
+      loadAnalysis(trayPrimary());
       return;
     }
     await analyzeTrayGroup();
@@ -4794,7 +6469,7 @@
       renderQueueStatus(q);
     } catch (e) {
       $("queue-table").querySelector("tbody").innerHTML =
-        `<tr><td colspan="6" class="muted">runner unreachable: ${escHtml(e.message)}</td></tr>`;
+        `<tr><td colspan="10" class="muted">runner unreachable: ${escHtml(e.message)}</td></tr>`;
     }
   }
 
@@ -4830,6 +6505,71 @@
     }
   }
 
+  // Shared formatting for the queue/history tables. "#seq" is the actual
+  // sequence count after StackNum stacking (summary.total_per_group — the same
+  // number the Tk monitor's "Reps" column shows); "t/seq" = run duration / that
+  // count, shown only once a job has finished (a running job's elapsed/total
+  // under-counts because not all sequences have run yet).
+  const fmtDur = (secs) => {
+    if (secs == null || !isFinite(secs) || secs < 0) return "";
+    secs = Math.floor(secs);
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = secs % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  };
+  const entryNseq = (r) => {
+    const s = r.summary || {};
+    return s.total_per_group || s.num_per_group || "";
+  };
+  // "#seq" cell = actual sequences run / submitted total. Actual = r.seq_num
+  // from the ExptServer (live delta while running, frozen for history; 0 for a
+  // not-yet-started queued job); submitted = total_per_group.
+  const entrySeqCount = (r) => {
+    const sub = entryNseq(r);
+    let act = r.seq_num;
+    if (act == null && r.state === "queued") act = 0;
+    if (!sub && act == null) return "";
+    return `${act != null ? act : "?"} / ${sub || "?"}`;
+  };
+  const entryDurSecs = (r) => {
+    if (!r.start_ts) return null;
+    const end = r.finish_ts || (Date.now() / 1000);
+    return Math.max(0, end - r.start_ts);
+  };
+  const entryDur = (r) => {
+    const d = entryDurSecs(r);
+    return d == null ? "" : fmtDur(d);
+  };
+  const entryPerSeq = (r) => {
+    if (!r.start_ts || !r.finish_ts) return "";   // only meaningful once finished
+    // Divide by sequences ACTUALLY run (seq_num), NOT the planned total — for
+    // run-until-stopped scans the planned total is a huge sentinel and would
+    // make t/seq meaninglessly small.
+    const n = r.seq_num;
+    if (!n || n <= 0) return "";
+    const t = (r.finish_ts - r.start_ts) / n;
+    if (!isFinite(t) || t < 0) return "";
+    return t >= 60 ? fmtDur(t) : t.toFixed(t < 10 ? 2 : 1) + "s";
+  };
+  // Full date+time (started/finished can span days, so include the date).
+  const fmtTsFull = (epoch) =>
+    epoch ? new Date(epoch * 1000).toLocaleString() : "—";
+  // Hover tooltip for a queue/history row's status cell — mirrors the Tk
+  // monitor's status-column tooltip (Added / Started / Duration), plus the
+  // explicit Finished time.
+  const entryTimesTitle = (r) => {
+    const lines = [];
+    if (r.enqueued_ts) lines.push(`Added:    ${fmtTsFull(r.enqueued_ts)}`);
+    if (r.start_ts)    lines.push(`Started:  ${fmtTsFull(r.start_ts)}`);
+    if (r.finish_ts)   lines.push(`Finished: ${fmtTsFull(r.finish_ts)}`);
+    else if (r.start_ts) lines.push(`Finished: (in progress)`);
+    const d = entryDur(r);
+    if (d) lines.push(`Duration: ${d}`);
+    return lines.join("\n");
+  };
+
   function renderQueueTable(q) {
     const queued = q.queued || [];
     const running = q.running ? [q.running] : [];
@@ -4837,10 +6577,14 @@
     setText("queue-counts",
       `${queued.length} queued · ${running.length} running · ${history.length} history`);
     const rows = [...running, ...queued].map((r) => `
-      <tr>
+      <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
         <td class="mono">${r.id}</td>
         <td>${r.kind || "job"}</td>
-        <td>${r.state}</td>
+        <td class="mono">${fmtTs(r.enqueued_ts)}</td>
+        <td class="mono">${entryDur(r)}</td>
+        <td class="mono">${entrySeqCount(r)}</td>
+        <td class="mono">${entryPerSeq(r)}</td>
+        <td title="${escHtml(entryTimesTitle(r))}">${r.state}</td>
         <td>${escHtml(r.label || r.seqName || "")}</td>
         <td class="mono">${r.file_id || ""}</td>
         <td>
@@ -4848,13 +6592,17 @@
             <button class="ghost" data-cancel="${r.id}" style="font-size:10px;padding:2px 8px;">cancel</button>
             <button class="ghost" data-move-up="${r.id}" style="font-size:10px;padding:2px 8px;">↑</button>
             <button class="ghost" data-move-down="${r.id}" style="font-size:10px;padding:2px 8px;">↓</button>
-          ` : ""}
+          ` : `
+            <button class="ghost q-abort" data-abort-running="${r.id}"
+              title="Abort the running scan — stops after the current shot (advances to the next queued scan, if any)"
+              style="font-size:10px;padding:2px 8px;color:#ff8585;border-color:rgba(248,81,73,0.4);">abort</button>
+          `}
           ${r.descriptor ? `<button class="ghost" data-requeue="${r.id}" title="Queue a new copy with exactly the same parameters" style="font-size:10px;padding:2px 8px;">re-queue</button>` : ""}
         </td>
       </tr>
     `).join("");
     $("queue-table").querySelector("tbody").innerHTML =
-      rows || '<tr><td colspan="6" class="muted">queue empty</td></tr>';
+      rows || '<tr><td colspan="10" class="muted">queue empty</td></tr>';
     $$("[data-cancel]", $("queue-table")).forEach((btn) => {
       btn.addEventListener("click", async () => {
         try { await api(`/api/queue/cancel/${btn.dataset.cancel}`, {method: "POST"});
@@ -4870,20 +6618,42 @@
         catch (e) { toast("Move failed", "bad"); }
       });
     });
+    // Abort the RUNNING scan (destructive → confirm-token then POST, same as
+    // the Live-tab control sidebar). Stops after the current shot.
+    $$("[data-abort-running]", $("queue-table")).forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        if (!confirm("Abort the running scan? It stops after the current shot"
+                     + " (then advances to the next queued scan, if any).")) return;
+        btn.disabled = true;
+        try {
+          const tok = await api("/api/control/confirm_token?action=abort");
+          await api(`/api/control/abort?confirm=${encodeURIComponent(tok.token)}`,
+                    {method: "POST"});
+          toast("Abort sent");
+          pollQueue();
+        } catch (e) {
+          toast(e.message || "abort failed", "bad");
+          btn.disabled = false;
+        }
+      });
+    });
     // History
     $("history-table").querySelector("tbody").innerHTML =
       history.slice(0, 30).map((r) => `
-        <tr>
+        <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
           <td class="mono">${r.id}</td>
           <td>${r.kind || "job"}</td>
           <td>${escHtml(r.label || r.seqName || "")}</td>
-          <td class="${r.status === "ok" ? "ok" : "bad"}">${escHtml(r.status || r.state || "")}</td>
+          <td class="mono">${fmtTs(r.enqueued_ts)}</td>
+          <td class="mono">${entryDur(r)}</td>
+          <td class="mono">${entrySeqCount(r)}</td>
+          <td class="mono">${entryPerSeq(r)}</td>
+          <td class="${r.status === "ok" ? "ok" : "bad"}" title="${escHtml(entryTimesTitle(r))}">${escHtml(r.status || r.state || "")}</td>
           <td class="mono">${r.file_id || ""}</td>
-          <td class="mono">${r.built_job_id != null ? r.built_job_id : ""}</td>
           <td class="muted">${escHtml((r.error_message || "").slice(0, 80))}</td>
           <td>${r.descriptor ? `<button class="ghost" data-requeue="${r.id}" title="Queue a new copy with exactly the same parameters (uses today's code)" style="font-size:10px;padding:2px 8px;">re-queue</button>${r.file_id ? `<button class="ghost" data-requeue-code="${r.id}" title="Re-queue with the EXACT code that ran originally — replays this run's code snapshot (YbSeqs/YbSteps/YbScans)" style="font-size:10px;padding:2px 6px;">+code</button>` : ""}` : ""}</td>
         </tr>`).join("")
-      || '<tr><td colspan="8" class="muted">empty</td></tr>';
+      || '<tr><td colspan="11" class="muted">empty</td></tr>';
     // Re-queue buttons live in both the queue and history tables: replay the original
     // descriptor (same params). "+code" also pins the source run's code snapshot so the
     // runner replays the EXACT experiment source that ran originally (reproducibility).
@@ -4905,168 +6675,243 @@
     $$("[data-requeue-code]").forEach((btn) => {
       btn.addEventListener("click", () => doRequeue(btn, btn.dataset.requeueCode, true));
     });
+    // Click a linked queue/history row (anywhere but its action buttons) to
+    // open that run in Analysis. The row carries data-scan-id (server-stamped
+    // from file_id).
+    $$('tr.q-linked', $("queue-table")).concat($$('tr.q-linked', $("history-table")))
+      .forEach((row) => {
+        row.style.cursor = "pointer";
+        row.addEventListener("click", (e) => {
+          if (e.target.closest("button")) return;   // let action buttons act
+          const sid = row.dataset.scanId;
+          if (!sid) return;
+          selectPrimary(sid);   // sets primary + loads analysis (background)
+          setTab("analysis");   // then reveal it
+        });
+      });
+    // Reflect the current selection on the freshly-rendered rows.
+    syncQueueSelectionHighlight();
   }
 
-  $("queue-refresh-btn").addEventListener("click", pollQueue);
+  // ---- Full-queue popup (opened from the Live sidebar's "full ›") ----
+  // A side panel docked left of the control sidebar showing the SAME detail as
+  // the Queue tab (active job, queued+running, history; re-queue / +code /
+  // cancel / move / abort; click a row to open it in Analysis). Self-contained
+  // pq-* ids + delegated wiring so it never collides with the Queue tab's
+  // document-wide [data-requeue]/[data-cancel] handlers. Reuses the queue-table
+  // formatting helpers above. Kept live by pollLive while open. (The standalone
+  // Queue tab is intentionally kept for now.)
+  let queuePopupOpen = false;
 
-  $("submit-scan-btn").addEventListener("click", async () => {
-    const txt = $("submit-scan-json").value;
-    if (!txt.trim()) { toast("descriptor empty", "warn"); return; }
-    let payload;
-    try { payload = JSON.parse(txt); }
-    catch (e) {
-      $("submit-scan-result").textContent = "invalid JSON: " + e.message;
-      $("submit-scan-result").style.color = "var(--err)";
-      return;
-    }
-    // Auto-fill label from the seq picker if user left it.
-    if (!payload.label && $("submit-label").value.trim()) {
-      payload.label = $("submit-label").value.trim();
-    }
-    try {
-      const r = await api("/api/queue/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      $("submit-scan-result").textContent = `submitted descriptor_id=${r.descriptor_id}`;
-      $("submit-scan-result").style.color = "var(--ok)";
-      toast("Submitted #" + r.descriptor_id);
-      pollQueue();
-    } catch (e) {
-      $("submit-scan-result").textContent = "submit failed: " + e.message;
-      $("submit-scan-result").style.color = "var(--err)";
-    }
-  });
-  $("format-json-btn").addEventListener("click", () => {
-    const txt = $("submit-scan-json").value;
-    try { $("submit-scan-json").value = JSON.stringify(JSON.parse(txt), null, 2); }
-    catch (e) { toast("invalid JSON", "warn"); }
-  });
-
-  // ---- Seq catalog ----
-  async function loadSeqCatalog() {
-    try {
-      const r = await api("/api/seqs/list");
-      seqCatalog = r.seqs || [];
-      renderSeqCatalog();
-      populateSeqSelect();
-    } catch (e) {
-      $("seq-catalog-table").querySelector("tbody").innerHTML =
-        `<tr><td colspan="4" class="muted">catalog unavailable: ${escHtml(e.message)}</td></tr>`;
-    }
-  }
-  function renderSeqCatalog() {
-    const filter = ($("seq-filter").value || "").toLowerCase();
-    const tbody = $("seq-catalog-table").querySelector("tbody");
-    const filtered = seqCatalog.filter((s) =>
-      !filter || s.name.toLowerCase().includes(filter));
-    if (!filtered.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="muted">no match</td></tr>';
-      return;
-    }
-    tbody.innerHTML = filtered.map((s) => `
-      <tr class="selectable ${s.name === selectedSeqName ? "selected" : ""}"
-          data-seq="${s.name}">
-        <td class="mono">${escHtml(s.name)}</td>
-        <td class="right">${s.n_steps}</td>
-        <td class="right">${s.n_params}</td>
-        <td><button class="ghost" data-use="${s.name}"
-              style="font-size:10px;padding:2px 8px;">Use</button></td>
-      </tr>
-    `).join("");
-    $$("tr.selectable", tbody).forEach((tr) => {
-      tr.addEventListener("click", (e) => {
-        if (e.target.tagName === "BUTTON") return;
-        loadSeqDetail(tr.dataset.seq);
-      });
-    });
-    $$("[data-use]", tbody).forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        useSeqAsTemplate(btn.dataset.use);
-      });
-    });
-  }
-  function populateSeqSelect() {
-    const sel = $("submit-seq-select");
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">— pick a sequence —</option>' +
-      seqCatalog.map((s) => `<option value="${s.name}">${s.name}</option>`).join("");
-    sel.value = cur;
-  }
-  async function loadSeqDetail(name) {
-    selectedSeqName = name;
-    renderSeqCatalog();
-    const wrap = $("seq-detail");
-    wrap.style.display = "";
-    if (!seqDetailCache[name]) {
-      try { seqDetailCache[name] = await api(`/api/seqs/${name}`); }
-      catch (e) {
-        $("seq-detail-name").textContent = name;
-        $("seq-detail-file").textContent = "fetch failed: " + e.message;
-        return;
+  function renderQueuePopup(q) {
+    if (!q) return;
+    const queued  = q.queued || [];
+    const running = q.running ? [q.running] : [];
+    const history = q.history || [];
+    setText("pq-counts",
+      `${queued.length} queued · ${running.length} running · ${history.length} history`);
+    const r0 = q.running;
+    const nameEl = $("pq-active-name");
+    const detEl  = $("pq-active-detail-body");
+    if (nameEl && detEl) {
+      if (r0) {
+        nameEl.innerHTML =
+          `${escHtml(r0.label || r0.seqName || "—")} <span class="badge mono">#${r0.id}</span>`;
+        detEl.innerHTML = `
+          <dl class="kv">
+            <dt>id</dt><dd class="mono">${r0.id}</dd>
+            <dt>kind</dt><dd>${r0.kind || "job"}</dd>
+            <dt>seq</dt><dd class="mono">${escHtml(r0.seqName || "—")}</dd>
+            <dt>label</dt><dd>${escHtml(r0.label || "—")}</dd>
+            <dt>started</dt><dd>${fmtTs(r0.start_ts)}</dd>
+            <dt>file_id</dt><dd class="mono">${r0.file_id || "—"}</dd>
+          </dl>`;
+      } else {
+        nameEl.innerHTML = '<span class="muted">(none)</span>';
+        detEl.innerHTML  = '<span class="muted">(no active job)</span>';
       }
     }
-    const d = seqDetailCache[name];
-    $("seq-detail-name").textContent = name;
-    $("seq-detail-file").textContent = d.file || "";
-    $("seq-detail-params").innerHTML = (d.params || []).map((p) => `
-      <tr>
-        <td class="mono">${escHtml(p.path)}</td>
-        <td class="mono muted">${escHtml(p.step)}</td>
-        <td class="mono muted truncate" title="${escHtml(p.default)}">${escHtml(p.default)}</td>
-      </tr>`).join("") ||
-      '<tr><td colspan="3" class="muted">no params discovered</td></tr>';
-    $("seq-detail-runp").innerHTML = (d.runp || []).map((r) => `
-      <tr>
-        <td class="mono">${escHtml(r.field)}</td>
-        <td class="mono">${escHtml(String(r.default))}</td>
-        <td class="muted">${escHtml(r.comment || "")}</td>
+    const lbl = (r) => escHtml(r.label || r.seqName || "");
+    const qrows = [...running, ...queued].map((r) => `
+      <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
+        <td class="mono">${r.id}</td>
+        <td>${r.kind || "job"}</td>
+        <td class="mono">${fmtTs(r.enqueued_ts)}</td>
+        <td class="mono">${entryDur(r)}</td>
+        <td class="mono">${entrySeqCount(r)}</td>
+        <td class="mono">${entryPerSeq(r)}</td>
+        <td title="${escHtml(entryTimesTitle(r))}">${r.state}</td>
+        <td class="qp-trunc" title="${lbl(r)}">${lbl(r)}</td>
+        <td class="mono qp-trunc" title="${escHtml(String(r.file_id || ""))}">${r.file_id || ""}</td>
+        <td class="qp-actions">
+          ${r.state === "queued" ? `
+            <button class="ghost" data-pq-cancel="${r.id}" style="font-size:10px;padding:2px 8px;">cancel</button>
+            <button class="ghost" data-pq-up="${r.id}" style="font-size:10px;padding:2px 8px;">↑</button>
+            <button class="ghost" data-pq-down="${r.id}" style="font-size:10px;padding:2px 8px;">↓</button>
+          ` : `
+            <button class="ghost q-abort" data-pq-abort="${r.id}"
+              title="Abort the running scan — stops after the current shot (advances to the next queued scan, if any)"
+              style="font-size:10px;padding:2px 8px;color:#ff8585;border-color:rgba(248,81,73,0.4);">abort</button>
+          `}
+          ${r.descriptor ? `<button class="ghost" data-pq-requeue="${r.id}" title="Queue a new copy with exactly the same parameters" style="font-size:10px;padding:2px 8px;">re-queue</button>` : ""}
+        </td>
       </tr>`).join("");
+    const qbody = $("pq-queue-table") && $("pq-queue-table").querySelector("tbody");
+    if (qbody) qbody.innerHTML = qrows || '<tr><td colspan="10" class="muted">queue empty</td></tr>';
+
+    const hrows = history.slice(0, 30).map((r) => `
+      <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
+        <td class="mono">${r.id}</td>
+        <td>${r.kind || "job"}</td>
+        <td class="qp-trunc" title="${lbl(r)}">${lbl(r)}</td>
+        <td class="mono">${fmtTs(r.enqueued_ts)}</td>
+        <td class="mono">${entryDur(r)}</td>
+        <td class="mono">${entrySeqCount(r)}</td>
+        <td class="mono">${entryPerSeq(r)}</td>
+        <td class="${r.status === "ok" ? "ok" : "bad"}" title="${escHtml(entryTimesTitle(r))}">${escHtml(r.status || r.state || "")}</td>
+        <td class="mono qp-trunc" title="${escHtml(String(r.file_id || ""))}">${r.file_id || ""}</td>
+        <td class="muted">${escHtml(r.error_message || "")}</td>
+        <td class="qp-actions">${r.descriptor ? `<button class="ghost" data-pq-requeue="${r.id}" title="Queue a new copy with exactly the same parameters (uses today's code)" style="font-size:10px;padding:2px 8px;">re-queue</button>${r.file_id ? `<button class="ghost" data-pq-requeue-code="${r.id}" title="Re-queue with the EXACT code that ran originally — replays this run's code snapshot (YbSeqs/YbSteps/YbScans)" style="font-size:10px;padding:2px 6px;">+code</button>` : ""}` : ""}</td>
+      </tr>`).join("");
+    const hbody = $("pq-history-table") && $("pq-history-table").querySelector("tbody");
+    if (hbody) hbody.innerHTML = hrows || '<tr><td colspan="11" class="muted">empty</td></tr>';
+
+    // Every data column is truncated by CSS; expose each cell's full value on
+    // hover (e.g. the complete run error). Skip the actions column.
+    $$("#pq-queue-table td:not(.qp-actions), #pq-history-table td:not(.qp-actions)")
+      .forEach((td) => { const txt = td.textContent.trim(); if (txt) td.title = txt; });
+
+    syncQueueSelectionHighlight();
   }
-  function useSeqAsTemplate(name) {
-    selectedSeqName = name;
-    $("submit-seq-select").value = name;
-    fillDescriptorTemplate();
-  }
-  async function fillDescriptorTemplate() {
-    const name = $("submit-seq-select").value || selectedSeqName;
-    if (!name) { toast("pick a sequence first", "warn"); return; }
-    if (!seqDetailCache[name]) {
-      try { seqDetailCache[name] = await api(`/api/seqs/${name}`); }
-      catch (e) { toast("fetch failed", "bad"); return; }
-    }
-    const d = seqDetailCache[name];
-    // Build a starter descriptor: include all params with `null` values so
-    // the operator sees the full namespace. They can delete the ones they
-    // want defaulted via Consts() and edit the rest.
-    const params = {};
-    (d.params || []).forEach((p) => {
-      params[p.path] = null;
-    });
-    const desc = {
-      schema_version: 1,
-      seq: name,
-      params,
-      runp: { NumPerGroup: 4000, NumImages: 2, Scramble: true },
-    };
-    $("submit-scan-json").value = JSON.stringify(desc, null, 2);
-    if (!$("submit-label").value) $("submit-label").value = name;
-    toast(`template filled (${(d.params || []).length} params)`);
-  }
-  $("fill-template-btn").addEventListener("click", fillDescriptorTemplate);
-  $("seq-use-btn").addEventListener("click", () =>
-    selectedSeqName && useSeqAsTemplate(selectedSeqName));
-  $("seq-filter").addEventListener("input", renderSeqCatalog);
-  $("seq-refresh-btn").addEventListener("click", async () => {
+
+  async function pqRequeue(btn, id, withCode) {
+    if (!id) return;
+    btn.disabled = true;
     try {
-      await api("/api/seqs/refresh", { method: "POST" });
-      seqDetailCache = {};
-      await loadSeqCatalog();
-      toast("catalog refreshed");
-    } catch (e) { toast("refresh failed", "bad"); }
-  });
+      const r = await api(`/api/queue/requeue/${id}${withCode ? "?code=1" : ""}`, {method: "POST"});
+      toast(`Re-queued #${id} → #${r.descriptor_id}${withCode ? " (orig code)" : ""}`);
+      refreshQueuePopup();
+    } catch (e) { toast("Re-queue failed: " + (e.message || e), "bad"); btn.disabled = false; }
+  }
+
+  async function refreshQueuePopup() {
+    try { renderQueuePopup(await api("/api/queue")); } catch (e) { /* keep last-known */ }
+  }
+  function openQueuePopup() {
+    queuePopupOpen = true;
+    const p = $("queue-popup");
+    if (p) p.hidden = false;
+    positionQueuePopup();                          // place beside the queue section now...
+    refreshQueuePopup().then(positionQueuePopup);  // ...and again once content height is known
+  }
+  function closeQueuePopup() {
+    queuePopupOpen = false;
+    const p = $("queue-popup");
+    if (p) p.hidden = true;
+  }
+  function toggleQueuePopup() { queuePopupOpen ? closeQueuePopup() : openQueuePopup(); }
+
+  // Place the popup beside the control-panel queue section, vertically centered
+  // on it and clamped to the viewport, with a caret pointing at it -- so it
+  // reads as a popout FROM the queue area, not a detached panel.
+  function positionQueuePopup() {
+    const pop = $("queue-popup"), sec = $("ctrl-queue-section");
+    if (!pop || !sec || pop.hidden) return;
+    const r = sec.getBoundingClientRect();
+    const center = r.top + r.height / 2;
+    const h = pop.offsetHeight || 360;
+    const margin = 12;
+    let top = Math.max(margin, Math.min(center - h / 2, window.innerHeight - h - margin));
+    pop.style.top = top + "px";
+    // Caret tracks the queue section's center, relative to the popup's top edge.
+    pop.style.setProperty("--qp-caret-top",
+      Math.max(16, Math.min(center - top, h - 16)) + "px");
+  }
+
+  function wireQueuePopup() {
+    // Clicking ANYWHERE in the control-panel queue section drives the popup;
+    // the per-row re-queue / +code buttons are skipped (wireSidebarQueue acts
+    // on those). Covers the "full ›" link too (it's inside the section).
+    //   - click a run (mini-view row / active line): 1st click selects it (so
+    //     it highlights in the popout) and opens the popout; clicking the SAME
+    //     run again opens it in Analysis.
+    //   - click anywhere else: toggle the popout open/closed.
+    const section = $("ctrl-queue-section");
+    if (section) section.addEventListener("click", (e) => {
+      if (e.target.closest("[data-sb-requeue], [data-sb-requeue-code]")) return;
+      const runEl = e.target.closest("[data-scan-id]");
+      const sid = runEl && runEl.dataset.scanId;
+      if (sid) {
+        if (sid === selectedScanId) { setTab("analysis"); return; }  // 2nd click -> analyze
+        selectPrimary(sid);    // 1st click -> select + highlight (incl. in the popout)
+        openQueuePopup();
+        return;
+      }
+      toggleQueuePopup();
+    });
+    const closeBtn = $("queue-popup-close");
+    if (closeBtn) closeBtn.addEventListener("click", closeQueuePopup);
+    const refreshBtn = $("pq-refresh");
+    if (refreshBtn) refreshBtn.addEventListener("click", refreshQueuePopup);
+
+    const pop = $("queue-popup");
+    if (pop) pop.addEventListener("click", async (e) => {
+      const t = e.target;
+      const cancel = t.closest("[data-pq-cancel]");
+      if (cancel) {
+        try { await api(`/api/queue/cancel/${cancel.dataset.pqCancel}`, {method: "POST"}); toast("Cancelled"); refreshQueuePopup(); }
+        catch (err) { toast("Cancel failed", "bad"); }
+        return;
+      }
+      const up = t.closest("[data-pq-up]"), down = t.closest("[data-pq-down]");
+      if (up || down) {
+        const mv = up || down;
+        const id = mv.dataset.pqUp || mv.dataset.pqDown;
+        try { await api(`/api/queue/move/${id}/${up ? "up" : "down"}`, {method: "POST"}); refreshQueuePopup(); }
+        catch (err) { toast("Move failed", "bad"); }
+        return;
+      }
+      const abort = t.closest("[data-pq-abort]");
+      if (abort) {
+        if (!confirm("Abort the running scan? It stops after the current shot"
+                     + " (then advances to the next queued scan, if any).")) return;
+        abort.disabled = true;
+        try {
+          const tok = await api("/api/control/confirm_token?action=abort");
+          await api(`/api/control/abort?confirm=${encodeURIComponent(tok.token)}`, {method: "POST"});
+          toast("Abort sent"); refreshQueuePopup();
+        } catch (err) { toast(err.message || "abort failed", "bad"); abort.disabled = false; }
+        return;
+      }
+      const rqc = t.closest("[data-pq-requeue-code]");
+      if (rqc) { pqRequeue(rqc, rqc.dataset.pqRequeueCode, true); return; }
+      const rq = t.closest("[data-pq-requeue]");
+      if (rq) { pqRequeue(rq, rq.dataset.pqRequeue, false); return; }
+      if (t.closest("button")) return;
+      const row = t.closest("tr[data-scan-id]");
+      // Open the run in Analysis; setTab() also closes this popup.
+      if (row && row.dataset.scanId) { selectPrimary(row.dataset.scanId); setTab("analysis"); }
+    });
+
+    // Esc closes; a mousedown outside the popup AND the queue section closes
+    // (it overlays the live view, which stays interactive behind it). The
+    // queue section is excluded so its own toggle handles open/close there.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && queuePopupOpen) closeQueuePopup();
+    });
+    // CAPTURE phase (3rd arg true): Plotly plots stopPropagation on mousedown
+    // for their drag/zoom handlers, so a bubble-phase listener never fires when
+    // you click on a plot -- which is most of the screen, making "click out to
+    // close" feel broken. Capture runs document-first, before any descendant
+    // can swallow the event, so an outside click always closes the popup. We
+    // don't preventDefault, so the plot still gets its click.
+    document.addEventListener("mousedown", (e) => {
+      if (!queuePopupOpen) return;
+      if (e.target.closest("#queue-popup") || e.target.closest("#ctrl-queue-section")) return;
+      closeQueuePopup();
+    }, true);
+    window.addEventListener("resize", () => { if (queuePopupOpen) positionQueuePopup(); });
+  }
 
   // ---- Manual scan_id loader ----
   // Paste-box <-> picker row sync. Typing in the paste-box scrolls the
@@ -5077,7 +6922,11 @@
   $("manual-scan-load").addEventListener("click", () => {
     const id = ($("manual-scan-id").value || "").trim();
     if (!id) { toast("scan_id required", "warn"); return; }
+    // List-independent: loads by id even if the scan isn't a visible row.
     trayReplace(id);
+    selectedScanId = id;
+    persistSelected(id);
+    syncSelectionEverywhere();
     loadAnalysis(id);
   });
   $("manual-scan-id").addEventListener("input", () => {
@@ -5105,6 +6954,9 @@
   // =====================================================================
   let logsSelected = null;     // {category, name} of the open file, or null
   let logsListCache = null;    // last /api/logs/list payload (for re-highlight)
+  let logsHighlight = null;    // substring to highlight + jump to in the open
+                               // file (set when opened from the shot-health chip
+                               // on an error); cleared on a manual file pick.
 
   function fmtBytes(n) {
     if (n == null) return "—";
@@ -5154,6 +7006,7 @@
     el.querySelectorAll(".logs-file").forEach((row) => {
       row.addEventListener("click", () => {
         logsSelected = {category: row.dataset.cat, name: row.dataset.name};
+        logsHighlight = null;   // manual pick clears any error jump-to
         renderLogsList();
         loadLogFile({keepScroll: false});
       });
@@ -5177,8 +7030,26 @@
       setText("logs-view-title", logsSelected.name + "  (" + meta + ")");
       const raw = "/api/logs/file?" + q.toString() + "&raw=1";
       const dl = $("logs-download"); if (dl) dl.href = raw;
-      view.textContent = r.text || "(empty)";
-      if (!opts.keepScroll || wasBottom) view.scrollTop = view.scrollHeight;
+      const text = r.text || "(empty)";
+      // When opened from the shot-health chip on an error, highlight the last
+      // occurrence of the error message and scroll to it (once). Otherwise show
+      // plain text and tail to "now". lastIndexOf falls back gracefully if the
+      // message isn't in the loaded tail.
+      const hl = logsHighlight && logsHighlight.trim();
+      const idx = hl ? text.lastIndexOf(hl) : -1;
+      if (idx >= 0) {
+        view.innerHTML = escHtml(text.slice(0, idx))
+          + '<mark id="log-error-hit" class="log-hit">'
+          + escHtml(text.slice(idx, idx + hl.length)) + '</mark>'
+          + escHtml(text.slice(idx + hl.length));
+        if (!opts.keepScroll) {
+          const hit = document.getElementById("log-error-hit");
+          if (hit) hit.scrollIntoView({block: "center"});
+        }
+      } else {
+        view.textContent = text;
+        if (!opts.keepScroll || wasBottom) view.scrollTop = view.scrollHeight;
+      }
     } catch (e) {
       setText("logs-view-title", logsSelected.name);
       view.textContent = "(failed to load: " + (e.message || e) + ")";
@@ -5192,6 +7063,543 @@
   }
   if ($("logs-refresh-btn")) {
     $("logs-refresh-btn").addEventListener("click", () => pollLogs());
+  }
+
+  // ============================ MOLECUBE TAB ============================
+  // FPGA1 DDS/TTL/clock control via /api/molecube/* (master-gated). When the
+  // gate is closed every call returns 403 and we render a clear "disabled"
+  // banner -- so this tab is harmless until the gate is opened. These helpers
+  // only ever talk to OUR server's proxy routes, never the daemon directly.
+  let _mcLastStateId = null;
+  let _mcLastNameId = null;   // names bump name_id (NOT state_id) -> rebuild on either
+
+  function _mcFmt(v, d) {
+    return (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
+  }
+
+  function mcSetPill(state, text) {
+    const p = $("mc-conn-pill");
+    if (!p) return;
+    p.textContent = text;
+    p.className = "mc-pill mc-pill-" + state;   // ok | warn | err | off
+  }
+
+  async function mcPost(path, body) {
+    try {
+      const r = await api(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {}),
+      });
+      if (r && r.ok === false) toast("molecube: " + (r.error || "failed"), "err");
+      _mcLastStateId = null; _mcLastNameId = null;   // force a re-render on the next poll
+      await pollMolecube();
+      return r;
+    } catch (e) {
+      if (e.status === 403) toast("Molecube writes are disabled (read-only mode).", "warn");
+      else toast("molecube: " + (e.message || e), "err");
+      return null;
+    }
+  }
+
+  function renderMolecubeGated(body) {
+    mcSetPill("off", "disabled");
+    const b = $("mc-gate-banner");
+    if (b) {
+      b.hidden = false;
+      b.innerHTML =
+        "<b>Molecube control is disabled.</b> Every <code>/api/molecube/*</code> endpoint " +
+        "is closed by a master safety gate (HTTP&nbsp;403). Reads and writes are fully " +
+        "implemented and tested, but no user can reach the live FPGA daemon yet.<br>" +
+        "<span class='hint'>To enable later: start <code>run_monitor</code> with " +
+        "<code>YB_MOLECUBE_ENABLED=1</code>, or flip <code>_molecube_gate_open()</code> " +
+        "in <code>dashboard.py</code>.</span>";
+    }
+    setText("mc-status-line", (body && body.error) || "gate closed");
+    const dds = $("mc-dds-body"); if (dds) dds.innerHTML = "<div class='hint'>—</div>";
+    const ttl = $("mc-ttl-grid"); if (ttl) ttl.innerHTML = "<div class='hint'>—</div>";
+    setText("mc-dds-count", ""); setText("mc-ttl-count", "");
+    _mcLastStateId = null; _mcLastNameId = null;
+  }
+
+  async function pollMolecube() {
+    let snap;
+    try {
+      snap = await api("/api/molecube/snapshot");
+    } catch (e) {
+      if (e.status === 403) { renderMolecubeGated(e.body); return; }
+      mcSetPill("err", "error");
+      setText("mc-status-line", "snapshot failed: " + (e.message || e));
+      return;
+    }
+    const b = $("mc-gate-banner"); if (b) b.hidden = true;
+    renderMolecube(snap);
+  }
+
+  function renderMolecube(snap) {
+    if (!snap.connected) {
+      mcSetPill("err", "unreachable");
+      setText("mc-status-line", "daemon unreachable at " + (snap.url || "?") + " — " +
+        ((snap.errors && snap.errors.state_id) || ""));
+      return;
+    }
+    mcSetPill("ok", "connected");
+    // Read-only banner + dimming when the write gate is closed (the default).
+    const readOnly = snap.writes_enabled === false;
+    const pane = $("tab-molecube");
+    if (pane) pane.classList.toggle("mc-readonly", readOnly);
+    const bn = $("mc-gate-banner");
+    if (bn) {
+      if (readOnly) {
+        bn.hidden = false;
+        bn.className = "mc-banner mc-banner-info";
+        bn.innerHTML =
+          "<b>Read-only mode.</b> Live FPGA values are shown and auto-refresh, but all " +
+          "controls (Set / override / reset / TTL toggles / clock) are disabled. " +
+          "<span class='hint'>Enable control later with <code>YB_MOLECUBE_WRITES=1</code>, " +
+          "or <code>_molecube_writes_open()</code> in <code>dashboard.py</code>.</span>";
+      } else {
+        bn.hidden = true; bn.className = "mc-banner";
+      }
+    }
+    const errs = (snap.errors && Object.keys(snap.errors).length)
+      ? "  ⚠ " + Object.keys(snap.errors).join(",") : "";
+    setText("mc-status-line",
+      "server " + (snap.server_id != null ? snap.server_id : "?") +
+      " · state " + (snap.state_id != null ? snap.state_id : "?") +
+      " · clock " + (snap.clock != null ? snap.clock : "?") +
+      " · max_ttl " + (snap.max_ttl != null ? snap.max_ttl : "?") + errs);
+
+    setText("mc-clock-cur", snap.clock != null ? ("current " + snap.clock) : "");
+    const ci = $("mc-clock-input");
+    if (ci && document.activeElement !== ci && snap.clock != null && ci.value === "")
+      ci.value = snap.clock;
+
+    // Rebuild the DDS/TTL panels only when device state OR names changed (names
+    // bump name_id, not state_id) AND no DDS value / channel-name field is being
+    // edited (so we never stomp a value or a name mid-type).
+    const ae = document.activeElement;
+    const editing = ae && ae.classList &&
+      (ae.classList.contains("mc-in") || ae.classList.contains("mc-name-in"));
+    if (!editing &&
+        (snap.state_id !== _mcLastStateId || snap.name_id !== _mcLastNameId)) {
+      _mcLastStateId = snap.state_id;
+      _mcLastNameId = snap.name_id;
+      renderMcDds(snap.dds || []);
+      if (snap.ttl_reads_enabled === false) renderMcTtlDisabled();
+      else renderMcTtl(snap.ttl || []);
+      api("/api/molecube/startup").then((r) => {
+        if (r && r.startup != null) setText("mc-startup-view", r.startup || "(empty)");
+      }).catch(() => {});
+    }
+  }
+
+  function _mcCell(chn, type, val, dec, ovr, ovrVal) {
+    const shown = _mcFmt(val, dec);
+    const ovrTag = ovr
+      ? "<span class='mc-ovr-tag' title='override = " + _mcFmt(ovrVal, dec) + "'>▲</span>"
+      : "";
+    return "<td class='mc-cell" + (ovr ? " mc-ovr" : "") + "'><div class='mc-cell-wrap'>" +
+      "<input class='mc-in' type='number' step='any' value='" +
+        (shown === "—" ? "" : shown) + "' data-mc-chn='" + chn +
+        "' data-mc-type='" + type + "'>" +
+      "<button class='mc-mini mc-set' data-mc-chn='" + chn + "' data-mc-type='" + type +
+        "'>Set</button>" +
+      "<button class='mc-mini mc-ovr-btn" + (ovr ? " on" : "") + "' data-mc-chn='" + chn +
+        "' data-mc-type='" + type + "' title='Toggle override at the field value'>ovr</button>" +
+      ovrTag + "</div></td>";
+  }
+
+  // A read-only channel-name <td>, truncated to 20 chars with an ellipsis; the full
+  // name stays in the cell's title tooltip. Used by the NI DAC table, whose names are
+  // expConfig aliases (config-derived, NOT the molecube daemon's editable names).
+  function mcNameCell(name) {
+    const s = String(name == null ? "" : name);
+    const safe = escAttr(s);
+    if (s.length > 20)
+      return "<td class='mc-name' title='" + safe + "'>" + escHtml(s.slice(0, 20)) + "&hellip;</td>";
+    return "<td class='mc-name'>" + escHtml(s) + "</td>";
+  }
+
+  // A click-to-edit channel-name widget shared by the DDS table + TTL chips. It shows
+  // the name as plain TEXT (exactly as before); only when you click the text does an
+  // inline editor (a box + a ✓ button) appear in its place. Confirm with Enter or ✓,
+  // cancel with Escape or by clicking away. The write goes to the daemon's name store
+  // via /api/molecube/<kind>/name -- clicking the text never toggles a TTL output
+  // (mcControlClick returns early for any click inside a name field).
+  function mcNameField(chn, kind, name) {
+    const full = String(name == null ? "" : name);
+    const safe = escAttr(full);
+    const empty = full === "";
+    return "<span class='mc-name-field' data-mc-name-chn='" + chn +
+        "' data-mc-name-kind='" + kind + "'>" +
+      "<span class='mc-name-text" + (empty ? " mc-name-empty" : "") + "' title='" +
+        (empty ? "Click to name this channel" : safe) + "'>" +
+        (empty ? "name" : escHtml(full)) + "</span>" +
+      "<span class='mc-name-editbox'>" +
+        "<input class='mc-name-in' type='text' maxlength='63' value='" + safe +
+          "' data-mc-name-orig='" + safe + "'>" +
+        "<button class='mc-mini mc-name-save' title='Save name (Enter)'>&#10003;</button>" +
+      "</span></span>";
+  }
+  function mcDdsNameCell(chn, name) {
+    return "<td class='mc-name mc-name-cell'>" + mcNameField(chn, 'dds', name) + "</td>";
+  }
+
+  function renderMcDds(rows) {
+    setText("mc-dds-count", rows.length + " active");
+    const host = $("mc-dds-body");
+    if (!host) return;
+    if (!rows.length) { host.innerHTML = "<div class='hint'>no active DDS channels</div>"; return; }
+    let h = "<table class='mc-dds-table mono'><thead><tr><th>Ch</th><th>Name</th>" +
+      "<th>Freq (MHz)</th><th>Amp (0–1)</th><th>Phase (°)</th><th></th></tr></thead><tbody>";
+    for (const r of rows) {
+      h += "<tr><td class='mc-ch'>" + r.chn + "</td>" + mcDdsNameCell(r.chn, r.name);
+      h += _mcCell(r.chn, "freq",  r.freq_hz != null ? (r.freq_hz / 1e6) : null, 6,
+                   r.ovr_freq != null, r.ovr_freq != null ? (r.ovr_freq / 1e6) : null);
+      h += _mcCell(r.chn, "amp",   r.amp,       4, r.ovr_amp   != null, r.ovr_amp);
+      h += _mcCell(r.chn, "phase", r.phase_deg, 2, r.ovr_phase != null, r.ovr_phase);
+      h += "<td><button class='ghost mc-mini' data-mc-reset='" + r.chn +
+           "' title='Reset/reinitialize this DDS channel'>Reset</button></td></tr>";
+    }
+    host.innerHTML = h + "</tbody></table>";
+  }
+
+  function renderMcTtlDisabled() {
+    setText("mc-ttl-count", "disabled");
+    const host = $("mc-ttl-grid");
+    if (host) host.innerHTML =
+      "<div class='hint'>TTL readback is disabled for now — it would issue zero-mask " +
+      "<code>set_ttl</code>/<code>override_ttl</code> frames. Enable with " +
+      "<code>YB_MOLECUBE_TTL_READS=1</code>.</div>";
+  }
+
+  function renderMcTtl(rows) {
+    setText("mc-ttl-count", rows.length + " channels");
+    const host = $("mc-ttl-grid");
+    if (!host) return;
+    if (!rows.length) { host.innerHTML = "<div class='hint'>no TTL channels</div>"; return; }
+    let h = "";
+    for (const r of rows) {
+      let cls = "mc-ttl-chip" + (r.value ? " on" : "");
+      if (r.ovr_lo) cls += " ovr-lo";
+      if (r.ovr_hi) cls += " ovr-hi";
+      const title = "ch " + r.chn + (r.name ? (" · " + r.name) : "") +
+        (r.ovr_lo ? " · forced LOW" : r.ovr_hi ? " · forced HIGH" : "");
+      // The name shows as text; clicking it opens the inline editor (mcNameField).
+      // Clicks inside the name field are swallowed in mcControlClick, so naming a
+      // channel never toggles its output.
+      h += "<div class='" + cls + "' data-mc-ttl='" + r.chn + "' title='" + escAttr(title) + "'>" +
+        "<span class='mc-ttl-n'>" + r.chn + "</span>" +
+        mcNameField(r.chn, 'ttl', r.name) + "</div>";
+    }
+    host.innerHTML = h;
+  }
+
+  // Molecube DDS/TTL control logic, factored out of the wiring so BOTH the real
+  // cards AND the read-only-clone Overview tiles can drive it. CONTAINER-RELATIVE:
+  // it resolves inputs within e.currentTarget (the element the listener is bound
+  // to), so it works on a mirror clone too -- the clone has its `id`s stripped
+  // (why the old by-id wiring never reached it) but KEEPS the data-* attributes
+  // + classes this logic actually keys off. /api/molecube/* is master-gated.
+  const _mcValOf = (type, raw) => (type === "freq" ? raw * 1e6 : raw);   // MHz->Hz for freq
+
+  // ----- click-to-edit channel names (DDS table + TTL chips) -----
+  // Open by clicking the name text; confirm with Enter or the ✓ button; cancel with
+  // Escape or by clicking/tabbing away. Opening the editor never toggles a TTL output
+  // (mcControlClick returns early for any click inside a name field).
+  function mcOpenNameEditor(field) {
+    if (!field || field.classList.contains("editing")) return;
+    field.classList.add("editing");
+    const chip = field.closest(".mc-ttl-chip");
+    if (chip) chip.classList.add("mc-editing");        // widen the chip to fit the box
+    const inp = field.querySelector(".mc-name-in");
+    if (inp) { inp.value = inp.dataset.mcNameOrig || ""; inp.focus(); inp.select(); }
+  }
+  function mcCloseNameEditor(field) {                  // cancel: revert text + close
+    if (!field) return;
+    field.classList.remove("editing");
+    const chip = field.closest(".mc-ttl-chip");
+    if (chip) chip.classList.remove("mc-editing");
+    const inp = field.querySelector(".mc-name-in");
+    if (inp) inp.value = inp.dataset.mcNameOrig || "";
+  }
+  function mcCommitName(field) {                       // confirm: write only if changed
+    if (!field) return;
+    const inp = field.querySelector(".mc-name-in");
+    field.classList.remove("editing");
+    const chip = field.closest(".mc-ttl-chip");
+    if (chip) chip.classList.remove("mc-editing");
+    if (!inp || inp.value === (inp.dataset.mcNameOrig || "")) return;   // no change -> no write
+    inp.dataset.mcNameOrig = inp.value;
+    mcPost("/api/molecube/" + field.dataset.mcNameKind + "/name",
+           {chn: +field.dataset.mcNameChn, name: inp.value});           // triggers a re-render
+  }
+
+  function mcControlClick(e) {
+    const container = e.currentTarget;
+    // Channel-name editing always wins over the chip toggle / DDS controls, so a click
+    // on a name (its text, its box, or its ✓) NEVER flips a TTL output.
+    if (e.target.closest(".mc-name-save")) {
+      mcCommitName(e.target.closest(".mc-name-field"));
+      return;
+    }
+    const nameText = e.target.closest(".mc-name-text");
+    if (nameText) { mcOpenNameEditor(nameText.closest(".mc-name-field")); return; }
+    if (e.target.closest(".mc-name-field")) return;   // click inside the open editor box
+    const chip = e.target.closest("[data-mc-ttl]");
+    if (chip) {
+      const chn = +chip.dataset.mcTtl;
+      if (e.shiftKey) {     // cycle override: normal -> low -> high -> normal
+        const mode = chip.classList.contains("ovr-lo") ? "high"
+                   : chip.classList.contains("ovr-hi") ? "normal" : "low";
+        mcPost("/api/molecube/ttl/override", {chn, mode});
+      } else {
+        mcPost("/api/molecube/ttl/set", {chn, on: !chip.classList.contains("on")});
+      }
+      return;
+    }
+    const set = e.target.closest(".mc-set");
+    const ovr = e.target.closest(".mc-ovr-btn");
+    const rst = e.target.closest("[data-mc-reset]");
+    if (set) {
+      const chn = +set.dataset.mcChn, type = set.dataset.mcType;
+      const inp = container.querySelector(
+        ".mc-in[data-mc-chn='" + chn + "'][data-mc-type='" + type + "']");
+      if (!inp || inp.value === "") return;
+      mcPost("/api/molecube/dds/set", {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
+    } else if (ovr) {
+      const chn = +ovr.dataset.mcChn, type = ovr.dataset.mcType;
+      if (ovr.classList.contains("on")) {
+        mcPost("/api/molecube/dds/override", {chn, type, value: null});   // clear
+      } else {
+        const inp = container.querySelector(
+          ".mc-in[data-mc-chn='" + chn + "'][data-mc-type='" + type + "']");
+        if (!inp || inp.value === "") { toast("enter a value first", "warn"); return; }
+        mcPost("/api/molecube/dds/override",
+               {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
+      }
+    } else if (rst) {
+      if (confirm("Reset/reinitialize DDS channel " + rst.dataset.mcReset + "?"))
+        mcPost("/api/molecube/dds/reset", {chn: +rst.dataset.mcReset});
+    }
+  }
+  function mcControlKeydown(e) {
+    const nameInp = e.target.closest(".mc-name-in");
+    if (nameInp) {
+      const field = nameInp.closest(".mc-name-field");
+      if (e.key === "Enter") { e.preventDefault(); mcCommitName(field); }
+      else if (e.key === "Escape") { e.preventDefault(); mcCloseNameEditor(field); nameInp.blur(); }
+      return;
+    }
+    if (e.key !== "Enter") return;
+    const inp = e.target.closest(".mc-in");
+    if (!inp || inp.value === "") return;
+    const chn = +inp.dataset.mcChn, type = inp.dataset.mcType;
+    mcPost("/api/molecube/dds/set", {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
+  }
+  // Keep the field focused when the ✓ is pressed (so the focusout-cancel never beats
+  // the ✓ click-commit), and cancel an editor that loses focus to anything else.
+  function mcControlMousedown(e) {
+    if (e.target.closest(".mc-name-save")) e.preventDefault();
+  }
+  function mcNameFocusOut(e) {
+    const inp = e.target.closest(".mc-name-in");
+    if (!inp) return;
+    const field = inp.closest(".mc-name-field");
+    // If focus is moving to this field's own ✓ button, let its click commit first
+    // (belt-and-suspenders with the mousedown preventDefault above).
+    if (e.relatedTarget && field && field.contains(e.relatedTarget)) return;
+    if (field && field.classList.contains("editing")) mcCloseNameEditor(field);
+  }
+
+  // Wire the REAL DDS/TTL cards + static buttons (the Overview mirror tiles are
+  // wired to the same handlers in mirrorMolecubeTiles).
+  (function wireMolecube() {
+    const ddsBody = $("mc-dds-body");
+    if (ddsBody) {
+      ddsBody.addEventListener("click", mcControlClick);
+      ddsBody.addEventListener("keydown", mcControlKeydown);
+      ddsBody.addEventListener("mousedown", mcControlMousedown);
+      ddsBody.addEventListener("focusout", mcNameFocusOut);
+    }
+    const ttlGrid = $("mc-ttl-grid");
+    if (ttlGrid) {
+      ttlGrid.addEventListener("click", mcControlClick);
+      ttlGrid.addEventListener("keydown", mcControlKeydown);
+      ttlGrid.addEventListener("mousedown", mcControlMousedown);
+      ttlGrid.addEventListener("focusout", mcNameFocusOut);
+    }
+    if ($("mc-refresh-btn"))
+      $("mc-refresh-btn").addEventListener("click", () => { _mcLastStateId = null; pollMolecube(); });
+    if ($("mc-clock-set"))
+      $("mc-clock-set").addEventListener("click", () => {
+        const v = $("mc-clock-input").value;
+        if (v !== "") mcPost("/api/molecube/clock/set", {clock: +v});
+      });
+  })();
+
+  // ===================== NI DAC CHANNEL MONITOR (not via molecube) =====================
+  // Read-only readback of the NI PCIe-6738 analog-out voltages via
+  // /api/nidaq/monitor (the card's internal AO monitor, read in the engine venv).
+  // Lives in the Molecube sub-view but is a wholly separate data path.
+  function niSetPill(state, text) {
+    const p = $("ni-mon-pill");
+    if (!p) return;
+    p.textContent = text;
+    p.className = "mc-pill mc-pill-" + state;   // ok | warn | err | off
+  }
+
+  async function pollNidaq() {
+    let res;
+    try {
+      res = await api("/api/nidaq/monitor");
+    } catch (e) {
+      if (e.status === 403) { renderNidaq(e.body || {ok: false, disabled: true}); return; }
+      niSetPill("err", "error");
+      setText("ni-mon-status", "monitor failed: " + (e.message || e));
+      return;
+    }
+    renderNidaq(res);
+  }
+
+  function renderNidaq(res) {
+    const host = $("ni-mon-body");
+    if (res && res.disabled) {
+      niSetPill("off", "disabled");
+      setText("ni-mon-status", res.error || "NI DAC monitor disabled (YB_NIDAQ_MONITOR=0).");
+      if (host) host.innerHTML = "<div class='hint'>—</div>";
+      return;
+    }
+    if (!res || res.ok === false) {
+      niSetPill("err", "error");
+      setText("ni-mon-status", (res && (res.error || res.stderr)) || "read failed");
+      return;
+    }
+    const chans = res.channels || [];
+    if (res.paused) {
+      niSetPill("warn", "paused");
+      setText("ni-mon-status",
+        (res.reason || "scan running -- monitor paused") +
+        (res.age_s != null ? (" · last read " + res.age_s.toFixed(0) + "s ago") : "") +
+        (chans.length ? "" : " · no reading yet"));
+    } else {
+      const nerr = chans.filter((c) => c.error).length;
+      niSetPill(nerr ? "warn" : "ok", nerr ? (nerr + " unread") : "connected");
+      setText("ni-mon-status",
+        (res.device || "Dev1") + " · " + chans.length + " channels" +
+        (res.cached ? (" · cached " + (res.age_s || 0).toFixed(0) + "s") : " · live") +
+        (nerr ? ("  ⚠ " + nerr + " unreadable") : ""));
+    }
+    if (!host) return;
+    // Don't rebuild while a Set field is being edited (would stomp typing).
+    const ae = document.activeElement;
+    if (ae && ae.classList && ae.classList.contains("ni-in")) return;
+    if (!chans.length) { host.innerHTML = "<div class='hint'>no NI channels</div>"; return; }
+    let h = "<table class='mc-dds-table mono'><thead><tr><th>Ch</th><th>Name</th>" +
+      "<th>Monitored&nbsp;(V)</th><th>Default&nbsp;(V)</th><th>&Delta;&nbsp;(V)</th>" +
+      "<th>Set&nbsp;(V)</th></tr></thead><tbody>";
+    for (const c of chans) {
+      const v = c.voltage, d = c.default;
+      const hasV = (v !== null && v !== undefined && !isNaN(v));
+      const hasD = (d !== null && d !== undefined && !isNaN(d));
+      const delta = (hasV && hasD) ? (v - d) : null;
+      const big = (delta !== null && Math.abs(delta) > 0.05);   // visibly off its default
+      const vcell = c.error
+        ? "<span class='ni-err' title='" + String(c.error).replace(/'/g, "") + "'>err</span>"
+        : (hasV ? v.toFixed(4) : "—");
+      const prefill = hasV ? v.toFixed(4) : (hasD ? d.toFixed(4) : "");
+      h += "<tr><td class='mc-ch'>" + c.chn + "</td>" +
+           mcNameCell(c.alias) +
+           "<td class='" + (c.error ? "ni-cell-err" : "") + "'>" + vcell + "</td>" +
+           "<td class='ni-default'>" + (hasD ? d.toFixed(4) : "—") + "</td>" +
+           "<td class='ni-delta" + (big ? " ni-delta-big" : "") + "'>" +
+             (delta !== null ? (delta >= 0 ? "+" : "") + delta.toFixed(4) : "—") + "</td>" +
+           "<td class='ni-set-cell'><input class='ni-in' type='number' step='any' value='" +
+             prefill + "' data-ni-chan=\"" + c.alias + "\">" +
+           "<button class='mc-mini ni-set' data-ni-chan=\"" + c.alias + "\">Set</button></td>" +
+           "</tr>";
+    }
+    host.innerHTML = h + "</tbody></table>";
+  }
+
+  // POST a single NI channel voltage (one-off DC set; server gates + defers while running).
+  async function niPost(channel, voltage) {
+    try {
+      const r = await api("/api/nidaq/set", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({channel: channel, voltage: voltage}),
+      });
+      if (r && r.ok) {
+        toast("NI " + (r.channel || channel) + " = " + voltage + " V" +
+              (r.readback != null ? (" (rb " + Number(r.readback).toFixed(3) + ")") : ""), "ok");
+      } else {
+        toast("NI set: " + ((r && r.error) || "failed"), "err");
+      }
+      setTimeout(pollNidaq, 300);     // cache was invalidated server-side -> refresh readback
+      return r;
+    } catch (e) {
+      if (e.status === 403) toast("NI writes disabled (YB_NIDAQ_WRITES=0).", "warn");
+      else if (e.status === 503) toast("NI write deferred — a scan is running.", "warn");
+      else toast("NI set: " + (e.message || e), "err");
+    }
+  }
+
+  (function wireNidaqWrite() {
+    const niBody = $("ni-mon-body");
+    if (!niBody) return;
+    niBody.addEventListener("click", (e) => {
+      const btn = e.target.closest(".ni-set");
+      if (!btn) return;
+      const inp = niBody.querySelector(
+        '.ni-in[data-ni-chan="' + btn.dataset.niChan + '"]');
+      if (!inp || inp.value === "") return;
+      niPost(btn.dataset.niChan, parseFloat(inp.value));
+    });
+    niBody.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter") return;
+      const inp = e.target.closest(".ni-in");
+      if (!inp || inp.value === "") return;
+      niPost(inp.dataset.niChan, parseFloat(inp.value));
+    });
+  })();
+
+  if ($("ni-mon-refresh"))
+    $("ni-mon-refresh").addEventListener("click", () => { pollNidaq(); });
+
+  // Open the Logs tab from the shot-health chip. "ok" -> the newest backend log
+  // tailed to now ("the log at the current time"); "failing"/"failed" -> the
+  // same log with the last error message highlighted + scrolled into view. The
+  // pyctrl backend is where shot errors land; fall back to monitor/matlab.
+  async function openLogsForShotHealth() {
+    setTab("logs");
+    if (!logsListCache) {
+      try { logsListCache = await api("/api/logs/list"); } catch (e) { /* below */ }
+    }
+    const groups = (logsListCache && logsListCache.groups) || [];
+    const newestIn = (cat) => {
+      const g = groups.find((x) => x.category === cat);
+      return (g && g.files && g.files.length)
+        ? { category: cat, name: g.files[0].name } : null;   // list is newest-first
+    };
+    const anyFile = () => {
+      const g = groups.find((x) => x.files && x.files.length);
+      return g ? { category: g.category, name: g.files[0].name } : null;
+    };
+    const sel = newestIn("pyctrl") || newestIn("monitor")
+                || newestIn("matlab") || anyFile();
+    if (!sel) { toast("no log files found", "warn"); return; }
+    logsSelected = sel;
+    // Highlight + jump only when the chip is in an error state and we know the
+    // message; otherwise just tail to "now".
+    const sh = _lastShotHealth;
+    const failing = sh && (sh.total || 0) > 0;
+    logsHighlight = (failing && sh.last_message) ? String(sh.last_message) : null;
+    renderLogsList();
+    await loadLogFile({ keepScroll: false });
+  }
+  if ($("shot-health-tile")) {
+    $("shot-health-tile").addEventListener("click", openLogsForShotHealth);
   }
 
   // =====================================================================
@@ -5277,12 +7685,25 @@
 
   function setupFloatingAnalysisCards() {
     if (!FLOATING_ANALYSIS_CARDS) return;
-    const host = document.getElementById("floating-analysis-host");
+    // The unified "Scans" picker (the old Analysis Runs card) docks LEFT in the
+    // shared #floating-seqscan-host and is shown on BOTH Analysis + Sequence.
+    // Filter (Data mode) + Channels (Sequence mode) now dock LEFT too, stacked
+    // under it -- the old right-docked #floating-analysis-host is left empty.
+    const host     = document.getElementById("floating-analysis-host");
+    const scanHost = document.getElementById("floating-seqscan-host");
     const runs = document.getElementById("analysis-runs-card");
     const filt = document.getElementById("analysis-filters");
-    if (!host || !runs || !filt) return;
-    host.appendChild(runs);
-    host.appendChild(filt);
+    const chn  = document.getElementById("sequence-chn-card");
+    if (!host || !scanHost || !runs || !filt) return;
+    // All three analysis/sequence pickers dock LEFT now, stacked in ONE flex
+    // column (Runs on top; Filter [Data mode] / Channels [Sequence mode] right
+    // underneath it). This frees the entire RIGHT edge for the global Yb
+    // Control panel. Reparenting into a single column (rather than separate
+    // right-docked hosts) means an EXPANDED upper card pushes the lower card
+    // DOWN, so the lower card's edge tab is never buried under it.
+    scanHost.appendChild(runs);          // top
+    scanHost.appendChild(filt);          // under Runs (Data sub-mode)
+    if (chn) scanHost.appendChild(chn);  // under Runs (Sequence sub-mode)
     runs.classList.remove("runs-collapsed");
     filt.classList.remove("collapsed");
     // Initial counts. renderTray / updateFilterStatus update these
@@ -5298,7 +7719,8 @@
     // clicks are skipped via card.contains() so chip-removes, paste
     // box input, etc. still work normally without collapsing the card.
     document.addEventListener("click", (e) => {
-      const cards = host.querySelectorAll(".card");
+      const cards = [...host.querySelectorAll(".card"),
+                     ...scanHost.querySelectorAll(".card")];
       cards.forEach((card) => {
         if (card.contains(e.target)) return;
         if (card.dataset.floatState === "expanded") {
@@ -5320,9 +7742,11 @@
     document.addEventListener("keydown", (e) => {
       if (activeTab !== "analysis") return;
       if (e.target.matches("input, textarea, select")) return;
-      // Esc: collapse everything back to edge.
+      // Esc: collapse everything back to edge (both the right Filter host and
+      // the left shared Scans host).
       if (e.key === "Escape") {
-        host.querySelectorAll(".card").forEach((card) => {
+        [...host.querySelectorAll(".card"),
+         ...scanHost.querySelectorAll(".card")].forEach((card) => {
           if (card.dataset.floatState !== "edge") _setFloatState(card, "edge");
         });
         return;
@@ -5378,7 +7802,9 @@
       styleTiles();
     }
 
-    host.hidden = (activeTab !== "analysis");
+    // The right-docked host is now empty (Filter moved into the left column).
+    host.hidden = true;
+    updateAnalysisFloatingHosts(activeTab);
   }
 
   // ===================== Sequence tab (flattened .seq viewer) ==========
@@ -5483,6 +7909,7 @@
       '</span><span class="seq-tip-v">' + seqEsc(String(v)) + "</span></div>"); };
     add("scan_id", id);
     add("name", s.name || "—");
+    if (s.description) add("description", s.description);
     add("swept", s.swept || "—");
     add("points", s.n_params);
     add("reps/pt", s.n_shots);
@@ -5625,9 +8052,11 @@
       toast("Reconstructed " +
             (r && r.n_seq != null ? r.n_seq + " sequence(s)" : "") +
             (r && r.approximate ? " (some channels approximate)" : ""), "ok");
-      await loadSeqScans();                      // the row flips to Ready
+      // Force a rescan so the new .seq dump is detected (has_seq is computed
+      // fresh server-side), then plot the regenerated sequence.
+      await loadRunsList({ force: true });       // the row flips to Ready
       await seqLoad({ scan_id: scanId });        // load + plot the regenerated .seq
-      renderSeqScans();
+      renderRunsTable();
     } catch (e) {
       toast("Reconstruct failed: " + (e.message || e), "err");
     } finally {
@@ -7016,9 +9445,11 @@
 
   function loadSequence() {
     if (seqState._refreshToggle) seqState._refreshToggle();
-    // Load the scan list once (it carries Analysis-style meta, so it's a touch
-    // heavy); the Refresh button re-fetches on demand.
-    if (!seqScansCache.length) loadSeqScans();
+    // The Sequence tab now uses the SAME unified Scans picker as Analysis
+    // (left-docked, shared selection). Populate it if empty, else just refresh
+    // the badges / seq-current highlight, then show the PRIMARY's sequence.
+    if (!runsCache.length) { loadRunsList().then(ensureSeqShown); }
+    else { renderRunsTable(); ensureSeqShown(); }
     if (seqState.index) seqRenderPlot();
   }
 
@@ -7094,27 +9525,10 @@
       if (cc) { seqShowChannel(cc.dataset.focusChan); }
     });
 
-    // Floating pickers (Channels on the right, Scans on the left): hover-driven,
-    // like the Analysis selector -- a thin edge tab that expands on hover and
-    // auto-minimizes on leave (see _wireSeqFloatCard).
+    // Right-docked Channels picker (hover-driven edge tab). The Scans picker is
+    // now the SHARED unified picker (#analysis-runs-card) docked LEFT and wired
+    // by setupFloatingAnalysisCards() -- no separate Sequence scan card anymore.
     _wireSeqFloatCard(document.getElementById("sequence-chn-card"));
-    // Scans card: auto-refresh its list each time it opens (req 8), debounced so a
-    // flurry of hovers doesn't spam the backend.
-    let _scanRefreshAt = 0;
-    _wireSeqFloatCard(document.getElementById("seqscan-card"), () => {
-      const now = (window.performance && performance.now) ? performance.now() : 0;
-      if (now - _scanRefreshAt < 1500) return;
-      _scanRefreshAt = now;
-      loadSeqScans();
-    });
-
-    // Scan picker (Analysis-style): search / date filter / refresh.
-    const scanSearch = $("seq-scan-search");
-    if (scanSearch) scanSearch.addEventListener("input", renderSeqScans);
-    const scanDate = $("seq-scan-date");
-    if (scanDate) scanDate.addEventListener("change", renderSeqScans);
-    const scanRefresh = $("seq-scan-refresh");
-    if (scanRefresh) scanRefresh.addEventListener("click", loadSeqScans);
 
     // Browse: native OS folder picker on the lab PC (server-side Tk subprocess).
     const browseBtn = $("seq-browse-btn");
@@ -7238,6 +9652,10 @@
   }
 
   document.addEventListener("DOMContentLoaded", () => {
+    foldSequenceIntoAnalysis();   // single sequence view, inside Analysis
+    initAnalysisModeToggle();     // wire Data/Sequence toggle + default to Data
+    initHwSubtabs();              // merged Hardware tab sub-views (fold + restore)
+    wireQueuePopup();             // full-queue popup (Live sidebar "full ›")
     initTabs();
     initSequenceTab();
     setupFloatingAnalysisCards();
@@ -7255,8 +9673,8 @@
     });
     startPolling();
     loadRunsList();
+    fetchRunDates();   // populate the date dropdown with the whole archive
     loadGroups();
-    loadSeqCatalog();
     renderTray();
     // Header click anywhere (except form controls) toggles the picker.
     const runsHdr = document.getElementById("runs-card-header");
@@ -7270,11 +9688,5 @@
         runsCard.classList.toggle("runs-collapsed");
       });
     }
-    // Hardware iframe reload button
-    const reload = $("hw-iframe-reload");
-    if (reload) reload.addEventListener("click", () => {
-      const ifr = $("hw-iframe");
-      if (ifr) ifr.src = ifr.src;   // re-trigger load
-    });
   });
 })();

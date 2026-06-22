@@ -97,6 +97,27 @@ def test_specs_none(tmp_state):
     assert _bare_dm({}, pSeq=1)._image_pattern_specs() is None
 
 
+def test_specs_json_carries_planes(tmp_state):
+    # A 2-D entry has planes_z_rad None; a 3-D entry threads the depths.
+    cfg = {'imagePatternsJson': json.dumps([
+        {'name': 'flat', 'base_phase_path': 'phase/base/flat.pt'},
+        {'name': 'stack', 'base_phase_path': 'phase/base/stack.pt',
+         'planes_z_rad': [-3.07, 3.07]}])}
+    specs = _bare_dm(cfg, pSeq=2)._image_pattern_specs()
+    assert specs[0]['planes_z_rad'] is None
+    assert specs[1]['planes_z_rad'] == [-3.07, 3.07]
+
+
+def test_specs_warmup_planes_shared_and_per_phase(tmp_state):
+    cfg = {'warmup_kwargs': {
+        'initial_phase': 'phase/a.pt', 'final_phase': 'phase/b.pt',
+        'extras': {'planes_z_rad': [-1.0, 1.0],
+                   'final_phase_planes_z_rad': [-2.0, 2.0]}}}
+    specs = _bare_dm(cfg, pSeq=2)._image_pattern_specs()
+    assert specs[0]['planes_z_rad'] == [-1.0, 1.0]    # shared applies to img1
+    assert specs[1]['planes_z_rad'] == [-2.0, 2.0]    # per-phase wins for img2
+
+
 # ---- _build_pattern_grids ------------------------------------------------
 
 def test_build_grids_applies_affine(tmp_state):
@@ -116,6 +137,36 @@ def test_build_grids_applies_affine(tmp_state):
     assert len(dm.loaded_thresholds) == 25     # resized to match new grid
     assert dm._pattern_names[0] == 'p'
     assert dm._affine_grid0 is not None
+
+
+def test_build_grids_3d_record_grid_stays_2d(tmp_state):
+    """A 3-D registry record (knm still (N,2), 3-D fields alongside) yields the
+    SAME (N,2) projected detection grid as a 2-D record — detection unchanged."""
+    A = np.array([[0.0, 2.0, 300.0], [2.0, 0.0, 300.0]])
+    aff.commit_update(aff._make_candidate(A, 0.1, 100, 100, 's0', bootstrap=True))
+    knm = _knm_5x5()
+    reg.write_pattern({
+        'name': 's', 'base_phase_path': 'phase/base/s.pt',
+        'legacy_zerniked': False, 'baked_zernike': None,
+        'base_sha256': 'a' * 64, 'default_loading_zernike': None,
+        'order': 'col', 'fft_shape': [4096, 4096], 'threshold': 0.30,
+        'min_dist': None, 'n_sites': len(knm), 'knm': knm, 'phases': None,
+        'lattice': {}, 'source_endpoint': 't',
+        # 3-D fields ride alongside; knm itself stays (N,2).
+        'planes_z_rad': [-3.07, 3.07], 'is_3d': True,
+        'z_rad': [(-3.07 if j < 13 else 3.07) for j in range(len(knm))],
+        'positions_knm3d': [[p[0], p[1], 0.0] for p in knm],
+        'n_per_plane': [13, 12], 'plane_of_site': [0] * 13 + [1] * 12,
+        'created_iso': 'i', 'updated_iso': 'i'})
+    roi = [1000, 100, 2100, 2100]
+    cfg = {'roi': roi, 'imagePatternsJson': json.dumps(
+        [{'name': 's', 'base_phase_path': 'phase/base/s.pt', 'order': 'col',
+          'planes_z_rad': [-3.07, 3.07]}])}
+    dm = _bare_dm(cfg, pSeq=1)
+    dm._build_pattern_grids()   # cache hit (planes match) -> no network
+    expected = aff.apply_affine_cropped(np.asarray(knm)[:, [1, 0]], A, roi)
+    np.testing.assert_allclose(dm.grid_locations, expected)
+    assert dm.num_sites == 25
 
 
 def test_build_grids_two_array_final_frame(tmp_state):
