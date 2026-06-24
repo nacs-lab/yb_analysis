@@ -183,6 +183,11 @@ class ControlPanel(tk.Tk):
         # failing" banner. None until first fetched / when the backend lacks
         # the verb (MATLAB).
         self._shot_health = None
+        # Background (calibration) lane mirror (from last_seq_status): the global enable
+        # toggle, whether a background calibration is currently running, and its name -- so the
+        # status label can show "Idle (background calibration: <name>)" and the toggle reflects
+        # the server. Defaults assume enabled (the server default) until first polled.
+        self._bg_state = {'enabled': True, 'running': False, 'name': ''}
         # Reference to the last real-scan DataManager. Dummy frames borrow
         # its plot-data dict so the dashboard can show the live frame without
         # mutating the real DM's internal state or its save buffers.
@@ -287,6 +292,19 @@ class ControlPanel(tk.Tk):
         self._lbl_last_seq = ttk.Label(
             dummy_frame, text='Last: --', font=_FONT_SM, foreground='#555555')
         self._lbl_last_seq.pack(anchor='w', padx=6, pady=(2, 4))
+        # Background (calibration) lane: a global toggle to run/halt low-priority calibration
+        # scans (they run only when no foreground scan is running/queued, and yield instantly
+        # when one is queued). Halting leaves queued calibrations in place -- they resume when
+        # re-enabled. The label shows which calibration is currently running.
+        bg_row = ttk.Frame(dummy_frame)
+        bg_row.pack(fill='x', padx=6, pady=(0, 4))
+        self._bg_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            bg_row, text='Run background calibrations',
+            variable=self._bg_enabled_var,
+            command=self._on_background_toggle).pack(side='left')
+        self._lbl_bg = ttk.Label(bg_row, text='', font=_FONT_SM, foreground='#0a7a5d')
+        self._lbl_bg.pack(side='left', padx=(8, 0))
         # Sync UI from the server on startup so a persistent runner that
         # was last left in a particular mode is reflected in the UI.
         threading.Thread(target=self._load_dummy_state, daemon=True).start()
@@ -680,6 +698,19 @@ class ControlPanel(tk.Tk):
         except Exception as e:
             logger.warning('set_dummy_mode(%r) failed: %s', mode, e)
 
+    def _on_background_toggle(self):
+        enabled = bool(self._bg_enabled_var.get())
+        self._bg_state['enabled'] = enabled
+        # ZMQ REQ/REP off the UI thread so the checkbox click never blocks the UI.
+        threading.Thread(
+            target=self._do_push_background_enabled, args=(enabled,), daemon=True).start()
+
+    def _do_push_background_enabled(self, enabled):
+        try:
+            self._client.set_background_enabled(enabled)
+        except Exception as e:
+            logger.warning('set_background_enabled(%r) failed: %s', enabled, e)
+
     def _load_dummy_state(self):
         """Read mode + last-seq metadata from the server on startup so the
         UI reflects whatever the persistent runner already had. Runs on a
@@ -720,6 +751,23 @@ class ControlPanel(tk.Tk):
             'file_id': str(meta.get('file_id', '') or ''),
             'fallback_active': bool(meta.get('fallback_active')),
         }
+        # Background (calibration) lane mirror -- rides on the same last_seq_status payload
+        # (absent on an older/MATLAB backend -> defaults). Reflect the toggle + running label.
+        self._bg_state = {
+            'enabled': bool(meta.get('background_enabled', True)),
+            'running': bool(meta.get('background_running')),
+            'name': str(meta.get('background_name', '') or ''),
+        }
+        try:
+            if self._bg_enabled_var.get() != self._bg_state['enabled']:
+                self._bg_enabled_var.set(self._bg_state['enabled'])
+            if self._bg_state['running']:
+                self._lbl_bg.config(
+                    text='running: %s' % (self._bg_state['name'] or '(calibration)'))
+            else:
+                self._lbl_bg.config(text='')
+        except (tk.TclError, AttributeError):
+            pass
         available = self._last_seq_meta['available']
         name = self._last_seq_meta['name'] or '(unnamed)'
         fid = self._last_seq_meta['file_id']
@@ -832,9 +880,17 @@ class ControlPanel(tk.Tk):
             if not self._running:
                 return
             s2 = self._apply_abort_hint(s)
-            self._lbl_status.config(
-                text=f'Status: {s2}',
-                foreground=_STATUS_COLORS.get(s2, '#000000'))
+            color = _STATUS_COLORS.get(s2, '#000000')
+            # A running background calibration reads as foreground-idle to the operator: the
+            # coarse get_status flickers Running (active shot) / Stopped (between scans) as the
+            # calibration cycles, so override to a stable "background" label. An explicit Pause
+            # or a pending Abort still wins (the user is acting on whatever is running).
+            if (self._bg_state.get('running') and not self._abort_pending
+                    and s2 not in ('Paused', _ABORT_HINT)):
+                nm = self._bg_state.get('name') or ''
+                s2 = 'Idle (background: %s)' % nm if nm else 'Idle (background calibration)'
+                color = '#0a7a5d'
+            self._lbl_status.config(text=f'Status: {s2}', foreground=color)
             self._publish_ctrl_status(s2)
         try:
             self.after(0, _apply)
@@ -865,6 +921,7 @@ class ControlPanel(tk.Tk):
             _web_control.publish_status({
                 'dummy_mode': self._dummy_mode,
                 'last_seq': dict(self._last_seq_meta),
+                'background': dict(self._bg_state),
                 'scan_id': self._cur_scan_id,
                 'seq_id': self._cur_seq_id,
                 'state': status,
@@ -906,6 +963,10 @@ class ControlPanel(tk.Tk):
                     if mode in _DUMMY_MODES:
                         self._dummy_mode_var.set(mode)
                         self._on_dummy_mode_changed()
+                elif cmd == 'background_enabled':
+                    enabled = bool(rec.get('enabled'))
+                    self._bg_enabled_var.set(enabled)
+                    self._on_background_toggle()
                 elif cmd == 'init_dir':
                     path = rec.get('path')
                     if path:

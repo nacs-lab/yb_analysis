@@ -302,6 +302,9 @@ class QueuePane(ttk.LabelFrame):
         self._tree.tag_configure('error',   foreground='#aa0000')
         self._tree.tag_configure('done',    foreground='#444444')
         self._tree.tag_configure('sep',     foreground='#888888')
+        # Background (calibration) lane: queued background scans (which have no state tag of
+        # their own) are tinted so the low-priority lane is visually distinct from foreground.
+        self._tree.tag_configure('background', foreground='#7a3fa0')
 
         # Hover tooltip
         self._tooltip = _HoverTooltip(self._tree, delay_ms=350)
@@ -451,6 +454,13 @@ class QueuePane(ttk.LabelFrame):
         scan_name = (summary.get('scan_name') or
                      summary.get('scan_filename') or '--')
 
+        # Background (calibration) lane badge: a low-priority scan that runs only when idle and
+        # yields to foreground work. '[bg cyc]' = re-queues to cycle; '[bg]' = one-shot.
+        is_bg = entry.get('priority') == 'background'
+        if is_bg:
+            badge = '[bg cyc]' if entry.get('cycle') else '[bg]'
+            scan_name = ('%s %s' % (badge, scan_name)) if scan_name != '--' else badge
+
         added_cell = _fmt_time(entry.get('enqueued_ts'))
 
         if is_running:
@@ -470,6 +480,12 @@ class QueuePane(ttk.LabelFrame):
         else:
             marker, tag = '.', ''
             status_cell = 'queued'
+
+        # Queued background rows have no state tag -> tint them with the background tag so the
+        # low-priority lane stands out. Running/done/error keep their state colour (the badge
+        # in the Scan column still marks them background).
+        if is_bg and not tag:
+            tag = 'background'
 
         file_id = entry.get('file_id') or ''
 

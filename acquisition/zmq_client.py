@@ -276,6 +276,18 @@ class ZmqClient:
             except Exception:
                 return 'default'
 
+    def set_background_enabled(self, enabled, timeout_ms=2000):
+        """Global toggle for the background (calibration) lane."""
+        with self._lock:
+            return self._client.set_background_enabled(enabled, timeout_ms)
+
+    def get_background_enabled(self, timeout_ms=1000):
+        with self._lock:
+            try:
+                return self._client.get_background_enabled(timeout_ms)
+            except Exception:
+                return True
+
     def last_seq_status(self, timeout_ms=1000):
         """Returns {available, name, file_id, captured_at, fallback_active, mode}.
         Returns None on wire failure so callers can decide whether to retry."""

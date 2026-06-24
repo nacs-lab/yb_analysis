@@ -281,6 +281,15 @@ class ExptClient(object):
     def get_dummy_mode(self, timeout_ms: int = 1000) -> str:
         return self._str_call("get_dummy_mode", timeout_ms)
 
+    def set_background_enabled(self, enabled: bool, timeout_ms: int = 2000) -> str:
+        """Global toggle for the background (calibration) lane: when off the runner skips
+        background scans (queued ones stay, untouched, and resume when re-enabled)."""
+        return self._str_call_with_payload(
+            "set_background_enabled", "1" if enabled else "0", timeout_ms)
+
+    def get_background_enabled(self, timeout_ms: int = 1000) -> bool:
+        return self._str_call("get_background_enabled", timeout_ms) == "1"
+
     def last_seq_status(self, timeout_ms: int = 1000) -> dict:
         """Return {available, name, file_id, captured_at, fallback_active, mode}."""
         try:
