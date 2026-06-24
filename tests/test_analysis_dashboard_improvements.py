@@ -514,6 +514,32 @@ def test_read_threshold_records_filters_by_scan(tmp_path, monkeypatch):
     assert UL.read_threshold_records('testpat', scan_id='00000000000000') == []
 
 
+def test_read_threshold_records_substring_prefilter_is_exact(tmp_path, monkeypatch):
+    """The fast raw-line substring pre-filter must not over-match.
+
+    read_threshold_records skips json.loads on lines that don't contain the
+    wanted scan_id digits (a big speedup on the tens-of-MB per-pattern logs).
+    A line whose THRESHOLD VALUES happen to contain the scan_id digits as a
+    substring would survive the cheap prefilter, but the exact ``_digits``
+    equality on the parsed ``scan_id`` must still reject it. This locks that in.
+    """
+    from yb_analysis import config as cfg
+    from yb_analysis.analysis import update_log as UL
+    monkeypatch.setattr(cfg, 'PATH_PREFIX', str(tmp_path))
+    want = '20260611120000'
+    # A different run, but a threshold value that embeds the wanted digits.
+    UL.append('thresholds/pat.jsonl',
+              {'scan_id': '20260611999999', 'seq_no': 0, 'source': 'fit',
+               'thresholds': [120260611120000.0, 2.0]})
+    # The genuine match.
+    UL.append('thresholds/pat.jsonl',
+              {'scan_id': want, 'seq_no': 5, 'source': 'fit',
+               'thresholds': [1.0, 2.0]})
+    mine = UL.read_threshold_records('pat', scan_id=want)
+    assert len(mine) == 1
+    assert mine[0]['scan_id'] == want and mine[0]['seq_no'] == 5
+
+
 def test_run_threshold_timeline_seed_and_updates(tmp_path, monkeypatch):
     from yb_analysis import config as cfg
     from yb_analysis.analysis import update_log as UL

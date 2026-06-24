@@ -111,6 +111,18 @@ def build_sequence_figure(seq, channel_names, title=None):
     palette = _distinct_colors(max(len(all_names), 1))
     color_of = {nm: palette[i % len(palette)] for i, nm in enumerate(all_names)}
 
+    # Full-sequence time extent across ALL channels (not just the selected ones), so the
+    # x-axis ALWAYS spans the whole sequence -- even with NO channels picked. Without this,
+    # an empty/partial selection leaves Plotly at its tiny default window (~0-6 ms) and the
+    # step ruler (which only draws steps inside the visible range) hides every phase after the
+    # first; double-click can't recover it because an empty plot has no data for autoscale to
+    # span. Pinning the range (autorange off) also makes double-click reset to the full span.
+    t_max = 0.0
+    if seq is not None:
+        for _ch in seq.channels:
+            if _ch.t.size:
+                t_max = max(t_max, float(_ch.t_ms.max()))
+
     for name in (channel_names or []):
         try:
             ch = seq.channel(name)
@@ -165,6 +177,11 @@ def build_sequence_figure(seq, channel_names, title=None):
             # No range-slider: the compressed mini-plot strip at the bottom isn't
             # wanted (it just squeezes the main plot). Use box/zoom + autoscale.
             rangeslider=dict(visible=False),
+            # Pin the default view to the full sequence span (see t_max above). A small pad
+            # keeps the first/last step labels off the axis edges. autorange off so box-zoom
+            # still works AND double-click resets to the full span (not Plotly's empty default).
+            **({"range": [-0.02 * t_max, 1.02 * t_max], "autorange": False}
+               if t_max > 0 else {}),
         ),
         # Channel legend: COLLAPSED by default (the JS reveals it on hover and
         # pins it on click) + a smaller font so it doesn't crowd the plot when

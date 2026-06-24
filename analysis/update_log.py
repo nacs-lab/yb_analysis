@@ -84,6 +84,18 @@ def read_threshold_records(pattern, scan_id=None, max_lines: int = 50000):
             ln = ln.strip()
             if not ln:
                 continue
+            # Fast pre-filter: each record carries a 14-digit ``scan_id`` near
+            # the start of the line. When the caller wants ONE run, skip the
+            # (expensive) json.loads on every line that can't possibly match --
+            # these per-pattern logs grow to tens of MB / thousands of full
+            # per-site threshold vectors, so parsing every line just to discard
+            # it dominated run-analysis (~seconds per view on the big logs).
+            # ``want`` is the digit string; it appears verbatim in a matching
+            # line whether scan_id was serialized as "20260..." or 20260... .
+            # A coincidental substring match still gets the exact _digits check
+            # below, so correctness is unchanged -- this only prunes non-matches.
+            if want is not None and want not in ln:
+                continue
             try:
                 rec = json.loads(ln)
             except (ValueError, TypeError):
