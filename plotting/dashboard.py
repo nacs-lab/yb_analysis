@@ -259,6 +259,66 @@ def _read_slm_data():
         return None
 
 
+# ---- Auto-Calibrations tab data access ----
+# The continuous background-calibration controller (pyctrl autocal package) persists its state to
+# <PATH_PREFIX>/yb_dashboard_state/calibration/{ledger.json, changes.jsonl, commands.jsonl}. The
+# dashboard READS the ledger + change journal, and WRITES only commands (the controller is the
+# single writer of the ledger + of any config). Paths mirror autocal.paths exactly (autocal is a
+# pyctrl module, not importable from this env, so the tiny path logic is duplicated here).
+def _autocal_dir():
+    env = os.environ.get('YB_AUTOCAL_DIR')
+    if env:
+        return env
+    prefix = os.environ.get('YB_PATH_PREFIX',
+                            r'D:\OneDrive - Harvard University\Documents - Yb')
+    return os.path.join(prefix, 'yb_dashboard_state', 'calibration')
+
+
+def _read_autocal_state():
+    """The calibration ledger dict, or None if the controller has never run."""
+    try:
+        with open(os.path.join(_autocal_dir(), 'ledger.json'), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, EOFError, ValueError, OSError):
+        return None
+
+
+def _read_autocal_changes(n=200):
+    """Tail of the append-only change/rollback journal (newest last)."""
+    path = os.path.join(_autocal_dir(), 'changes.jsonl')
+    out = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for ln in f.readlines()[-n:]:
+                ln = ln.strip()
+                if ln:
+                    try:
+                        out.append(json.loads(ln))
+                    except ValueError:
+                        continue
+    except (FileNotFoundError, OSError):
+        return []
+    return out
+
+
+def _autocal_enqueue_command(ctype, args):
+    """Append a command for the controller to consume (rollback / toggle / etc.). Returns ok bool.
+
+    The dashboard NEVER writes the ledger or config -- it only enqueues here; the controller
+    applies it on its next tick (so a toggle reflects once the controller is running)."""
+    import time as _t
+    d = _autocal_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        rec = {'command_id': 'ui-%d' % int(_t.time() * 1000), 'ts': _t.strftime('%Y-%m-%dT%H:%M:%S'),
+               'type': ctype, 'args': args or {}}
+        with open(os.path.join(d, 'commands.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=True) + '\n')
+        return True
+    except OSError:
+        return False
+
+
 def _read_control():
     """Read the dashboard control file (browser -> main reverse channel).
 
@@ -1086,6 +1146,9 @@ def _register_api_routes(server):
         '/api/patterns/<name>':      'full pattern record incl. knm positions + per-site phases',
         '/api/patterns/<name>/refresh': 'POST: re-derive a pattern from the SLM (force)',
         '/api/thresholds/history':   'per-pattern detection-threshold update history (cheap/fit/fit_rejected) + live calibration health (?pattern=<name>)',
+        '/api/autocal/state':        'auto-calibration ledger: per-pattern cals (status/last_fit/accumulator), settings, alerts, controller runtime',
+        '/api/autocal/changes':      'auto-calibration change journal (auto-applied config + rollbacks); ?n=<tail>',
+        '/api/autocal/command':      'POST {type,args}: enqueue a controller command (set_setting/set_baseline/set_cal_field/ack_alert/rerun_cal/rollback/add_cycle_pattern/remove_cycle_pattern)',
     }
 
     def _list_endpoints():
@@ -1231,6 +1294,33 @@ def _register_api_routes(server):
         except Exception as ex:
             logger.exception('pattern refresh failed')
             return jsonify({'error': str(ex)}), 500
+
+    @server.route('/api/autocal/state')
+    def _api_autocal_state():
+        """The auto-calibration ledger (per-pattern cals, settings, alerts, runtime)."""
+        return jsonify(_to_jsonable(_read_autocal_state() or {}))
+
+    @server.route('/api/autocal/changes')
+    def _api_autocal_changes_route():
+        from flask import request
+        try:
+            n = max(1, min(2000, int(request.args.get('n', 200))))
+        except (TypeError, ValueError):
+            n = 200
+        return jsonify(_to_jsonable({'changes': _read_autocal_changes(n)}))
+
+    @server.route('/api/autocal/command', methods=['POST'])
+    def _api_autocal_command():
+        """Enqueue a command for the controller (the controller is the single writer of config)."""
+        from flask import request
+        body = request.get_json(silent=True) or {}
+        ctype = body.get('type')
+        allowed = ('set_setting', 'set_baseline', 'set_cal_field', 'ack_alert', 'rerun_cal',
+                   'rollback', 'add_cycle_pattern', 'remove_cycle_pattern')
+        if ctype not in allowed:
+            return jsonify({'error': 'type must be one of %s' % (allowed,)}), 400
+        ok = _autocal_enqueue_command(ctype, body.get('args') or {})
+        return jsonify({'ok': bool(ok)}), (200 if ok else 500)
 
     @server.route('/api/thresholds/history')
     def _api_thresholds_history():
@@ -4378,6 +4468,41 @@ new MutationObserver(function(mutations) {
         ]),
     ]
 
+    # Auto-Calibrations tab: monitor + control the continuous background-calibration lane.
+    _ac_btn = {'backgroundColor': '#2a7fff', 'color': '#fff', 'border': 'none',
+               'borderRadius': '3px', 'padding': '6px 14px', 'cursor': 'pointer',
+               'fontWeight': '600', 'fontSize': '11px', 'marginRight': '8px'}
+    _autocal_children = [
+        html.Div(style={'backgroundColor': PANEL, 'padding': '10px 14px', 'marginTop': '6px',
+                        'borderRadius': '4px'}, children=[
+            html.Div('Controls', style={'fontWeight': '600', 'color': '#e94560',
+                                        'marginBottom': '8px', 'fontSize': '13px'}),
+            html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
+                            'gap': '6px'}, children=[
+                html.Button('Toggle lane', id='autocal-toggle-lane', n_clicks=0, style=_ac_btn),
+                html.Button('Toggle auto-apply', id='autocal-toggle-apply', n_clicks=0,
+                            style=_ac_btn),
+                html.Button('Toggle auto-cycle', id='autocal-toggle-cycle', n_clicks=0,
+                            style=_ac_btn),
+                html.Span('  |  rollback change ', style={'color': '#888', 'fontSize': '11px'}),
+                dcc.Input(id='autocal-rollback-id', type='text', placeholder='chg-000001',
+                          style={'backgroundColor': '#101020', 'color': TEXT,
+                                 'border': '1px solid #2b2b4a', 'borderRadius': '3px',
+                                 'padding': '5px 8px', 'fontSize': '11px', 'width': '120px'}),
+                html.Button('Roll back', id='autocal-rollback-btn', n_clicks=0,
+                            style={**_ac_btn, 'backgroundColor': '#b5651d'}),
+                html.Div(id='autocal-cmd-result', style={'fontSize': '11px', 'color': '#888',
+                                                         'marginLeft': '8px'}),
+            ]),
+            html.Div('Commands are queued for the controller; a toggle reflects on its next tick.',
+                     style={'fontSize': '10px', 'color': '#666', 'marginTop': '6px'}),
+        ]),
+        html.Div(id='autocal-panel', style={
+            'backgroundColor': PANEL, 'padding': '10px 14px', 'marginTop': '10px',
+            'borderRadius': '4px', 'fontFamily': '"Segoe UI", sans-serif',
+            'fontSize': '12px', 'color': TEXT}),
+    ]
+
     app.layout = html.Div(style={'backgroundColor': BG, 'minHeight': '100vh',
         'fontFamily': '"Segoe UI", sans-serif', 'color': TEXT,
         'padding': '10px'}, children=[
@@ -4396,6 +4521,8 @@ new MutationObserver(function(mutations) {
                     selected_style=_tab_selected, children=_analysis_children),
             dcc.Tab(label='Queue', value='queue', style=_tab_style,
                     selected_style=_tab_selected, children=_queue_children),
+            dcc.Tab(label='Auto-Calibrations', value='autocal', style=_tab_style,
+                    selected_style=_tab_selected, children=_autocal_children),
         ]),
         # Debug
         html.Details([
@@ -4629,6 +4756,37 @@ new MutationObserver(function(mutations) {
     def refresh_slm(_n):
         return _render_slm_panel(_read_slm_data())
 
+    @app.callback(Output('autocal-panel', 'children'),
+                  Input('tick', 'n_intervals'))
+    def refresh_autocal(_n):
+        return _render_autocal_panel(_read_autocal_state(), _read_autocal_changes())
+
+    @app.callback(Output('autocal-cmd-result', 'children'),
+                  [Input('autocal-toggle-lane', 'n_clicks'),
+                   Input('autocal-toggle-apply', 'n_clicks'),
+                   Input('autocal-toggle-cycle', 'n_clicks'),
+                   Input('autocal-rollback-btn', 'n_clicks')],
+                  State('autocal-rollback-id', 'value'),
+                  prevent_initial_call=True)
+    def _autocal_cmd(_nl, _na, _nc, _nr, rb_id):
+        trig = (callback_context.triggered[0]['prop_id'].split('.')[0]
+                if callback_context.triggered else '')
+        s = (_read_autocal_state() or {}).get('settings', {})
+        toggles = {'autocal-toggle-lane': 'lane_enabled',
+                   'autocal-toggle-apply': 'auto_apply',
+                   'autocal-toggle-cycle': 'auto_cycle'}
+        if trig in toggles:
+            key = toggles[trig]
+            newv = not bool(s.get(key, True))
+            ok = _autocal_enqueue_command('set_setting', {'key': key, 'value': newv})
+            return ('queued: %s -> %s' % (key, newv)) if ok else 'enqueue failed (dir unwritable)'
+        if trig == 'autocal-rollback-btn':
+            if not rb_id or not str(rb_id).strip():
+                return 'enter a change id (e.g. chg-000001)'
+            ok = _autocal_enqueue_command('rollback', {'change_id': str(rb_id).strip()})
+            return ('queued rollback of %s' % rb_id) if ok else 'enqueue failed'
+        return no_update
+
     # ===== Phase 4 callbacks =====================================
 
     # Tab <-> URL sync: bookmark /#live, /#slm, /#analysis, /#queue.
@@ -4639,7 +4797,7 @@ new MutationObserver(function(mutations) {
         if not h:
             return no_update
         h = h.lstrip('#').lower()
-        return h if h in ('live', 'slm', 'analysis', 'queue') else no_update
+        return h if h in ('live', 'slm', 'analysis', 'queue', 'autocal') else no_update
 
     @app.callback(Output('tab-url', 'hash'),
                   Input('main-tabs', 'value'),
@@ -5800,6 +5958,201 @@ def _render_queue_panel(q):
             'color': '#888', 'fontSize': '11px', 'fontWeight': 'normal'}),
     ], style=title_style)
     return [title, body]
+
+
+# ---- Auto-Calibrations panel ----
+
+_AC_STATUS_COLOR = {'ok': '#33b864', 'drifting': '#e0c000', 'out_of_band': '#e94560',
+                    'insufficient': '#5a9bd4', 'nofit': '#777', 'stale': '#777'}
+
+
+def _ac_chip(text, color):
+    return html.Span(text, style={'backgroundColor': color, 'color': '#0a0a16',
+                                  'borderRadius': '3px', 'padding': '1px 7px',
+                                  'fontSize': '10px', 'fontWeight': '700',
+                                  'marginRight': '6px'})
+
+
+def _ac_mhz(v):
+    return '--' if v is None else ('%.4f MHz' % (v / 1e6) if abs(v) > 1e4 else '%.4g' % v)
+
+
+def _ac_khz(v):
+    return '--' if v is None else '%.1f kHz' % (v / 1e3)
+
+
+def _ac_trend_figure(cal_key, ce):
+    """A compact center-vs-update trend for one cal (history points; applied ones marked)."""
+    hist = ce.get('history') or []
+    if not hist:
+        return None
+    xs = list(range(len(hist)))
+    ys = [(h.get('center') or 0) / 1e6 for h in hist]
+    applied = [i for i, h in enumerate(hist) if h.get('applied')]
+    data = [{'x': xs, 'y': ys, 'mode': 'lines+markers', 'name': cal_key,
+             'line': {'color': '#5a9bd4'}, 'marker': {'size': 5}}]
+    if applied:
+        data.append({'x': applied, 'y': [ys[i] for i in applied], 'mode': 'markers',
+                     'name': 'applied', 'marker': {'size': 9, 'symbol': 'circle-open',
+                                                   'color': '#33b864'}})
+    base = ce.get('baseline')
+    shapes = []
+    if base is not None and ce.get('band'):
+        b = base / 1e6
+        bw = ce['band'] / 1e6
+        shapes = [{'type': 'rect', 'xref': 'paper', 'x0': 0, 'x1': 1, 'y0': b - bw, 'y1': b + bw,
+                   'fillcolor': 'rgba(51,184,100,0.08)', 'line': {'width': 0}}]
+    layout = {'height': 150, 'margin': {'l': 55, 'r': 8, 't': 18, 'b': 22},
+              'paper_bgcolor': '#0d1220', 'plot_bgcolor': '#0d1220',
+              'font': {'color': '#aaa', 'size': 9}, 'showlegend': False,
+              'title': {'text': '%s center trend (MHz)' % cal_key, 'font': {'size': 10}},
+              'xaxis': {'gridcolor': '#1a1a30', 'title': 'fit #'},
+              'yaxis': {'gridcolor': '#1a1a30'}, 'shapes': shapes}
+    return {'data': data, 'layout': layout}
+
+
+def _render_autocal_panel(state, changes):
+    title_style = {'fontSize': '14px', 'color': '#e94560', 'fontWeight': 'bold',
+                   'marginBottom': '6px'}
+    if not state:
+        return [html.Div('Auto-Calibrations', style=title_style),
+                html.Div('No calibration ledger yet -- the background-calibration controller has '
+                         'not run.', style={'color': '#666', 'fontStyle': 'italic'})]
+
+    s = state.get('settings', {})
+    rt = state.get('runtime', {})
+    home = s.get('home_pattern')
+    active = s.get('active_pattern')
+
+    def _onoff(v):
+        return _ac_chip('ON', '#33b864') if v else _ac_chip('OFF', '#777')
+
+    header = html.Div([
+        html.Span('Auto-Calibrations', style={'fontSize': '14px', 'color': '#e94560',
+                                              'fontWeight': 'bold', 'marginRight': '14px'}),
+        html.Span('lane '), _onoff(s.get('lane_enabled', True)),
+        html.Span('auto-apply '), _onoff(s.get('auto_apply', True)),
+        html.Span('auto-cycle '), _onoff(s.get('auto_cycle', True)),
+        html.Span('  home=%s  active=%s' % (home, active),
+                  style={'color': '#888', 'fontSize': '11px', 'marginLeft': '8px'}),
+    ], style={'marginBottom': '4px'})
+    sub = html.Div('controller %s | last tick %s | lane: %s' % (
+        'alive' if rt.get('controller_alive') else 'NOT running',
+        rt.get('last_tick_ts') or '--', rt.get('lane_state') or '--'),
+        style={'color': '#888', 'fontSize': '10px', 'marginBottom': '10px'})
+
+    children = [header, sub]
+
+    # alerts
+    alerts = state.get('alerts') or []
+    if alerts:
+        arows = []
+        for a in alerts:
+            col = {'warn': '#e94560', 'info': '#5a9bd4'}.get(a.get('severity'), '#e0c000')
+            arows.append(html.Div([
+                _ac_chip(a.get('severity', '?').upper(), col),
+                html.Span('[%s/%s] ' % (a.get('pattern'), a.get('cal')),
+                          style={'color': '#aaa'}),
+                html.Span(a.get('message', ''), style={'color': TEXT}),
+                html.Span(('  -> %s' % a['action_needed']) if a.get('action_needed') else '',
+                          style={'color': '#e0c000', 'fontSize': '10px'}),
+            ], style={'marginBottom': '4px', 'fontSize': '11px'}))
+        children.append(html.Div([html.Div('Alerts (%d)' % len(alerts),
+                                            style={'fontWeight': '600', 'color': '#e94560',
+                                                   'margin': '4px 0'})] + arows,
+                                 style={'backgroundColor': '#16101c', 'padding': '8px 10px',
+                                        'borderRadius': '4px', 'marginBottom': '10px'}))
+
+    # per-pattern cards
+    for pname, pat in (state.get('patterns') or {}).items():
+        badges = []
+        if pname == home:
+            badges.append(_ac_chip('HOME', '#5a9bd4'))
+        if pname == active:
+            badges.append(_ac_chip('ACTIVE', '#33b864'))
+        if not pat.get('eligible', False):
+            badges.append(_ac_chip('NOT ELIGIBLE', '#e94560'))
+        load = pat.get('loading_mean')
+        head = html.Div(badges + [
+            html.Span(pname, style={'fontWeight': '600', 'color': TEXT}),
+            html.Span(('   loading %.2f' % load) if load is not None else '',
+                      style={'color': '#888', 'fontSize': '11px'}),
+        ], style={'marginBottom': '4px'})
+        if not pat.get('eligible', False) and pat.get('eligibility_reasons'):
+            head = html.Div([head, html.Div('  ' + '; '.join(pat['eligibility_reasons']),
+                                             style={'color': '#e94560', 'fontSize': '10px'})])
+
+        cal_rows = []
+        graphs = []
+        for cal_key, ce in (pat.get('cals') or {}).items():
+            status = ce.get('status', 'nofit')
+            fit = ce.get('last_fit') or {}
+            acc = ce.get('accumulator') or {}
+            prog = '%d/%d' % (acc.get('shots', 0), ce.get('target_shots', 0))
+            la = ce.get('last_applied')
+            applied_txt = ('applied %s->%s' % (_ac_mhz(la.get('old')), _ac_mhz(la.get('new')))
+                           if la else '')
+            cal_rows.append(html.Tr([
+                html.Td(cal_key, style={'padding': '3px 8px', 'color': TEXT}),
+                html.Td(_ac_chip(status, _AC_STATUS_COLOR.get(status, '#777')),
+                        style={'padding': '3px 8px'}),
+                html.Td(_ac_mhz(fit.get('center')), style={'padding': '3px 8px', 'color': '#ccc'}),
+                html.Td(_ac_khz(fit.get('fwhm')), style={'padding': '3px 8px', 'color': '#999'}),
+                html.Td(('R2 %.3f' % fit['r2']) if fit.get('r2') is not None else '--',
+                        style={'padding': '3px 8px', 'color': '#999'}),
+                html.Td('pool ' + prog, style={'padding': '3px 8px', 'color': '#888'}),
+                html.Td(applied_txt, style={'padding': '3px 8px', 'color': '#33b864',
+                                            'fontSize': '10px'}),
+            ]))
+            if cal_key in ('556mj0', '556mj1'):
+                fig = _ac_trend_figure(cal_key, ce)
+                if fig:
+                    graphs.append(dcc.Graph(figure=fig, config={'displayModeBar': False},
+                                            style={'flex': '1', 'minWidth': '280px'}))
+        cal_tbl = html.Table(html.Tbody(cal_rows),
+                              style={'width': '100%', 'borderCollapse': 'collapse',
+                                     'fontFamily': 'Consolas, monospace', 'fontSize': '11px'})
+        card_children = [head, cal_tbl]
+        if graphs:
+            card_children.append(html.Div(graphs, style={'display': 'flex', 'flexWrap': 'wrap',
+                                                         'gap': '8px', 'marginTop': '6px'}))
+        children.append(html.Div(card_children, style={
+            'backgroundColor': '#0b0f1a', 'padding': '8px 10px', 'borderRadius': '4px',
+            'marginBottom': '8px', 'border': '1px solid #1a1a30'}))
+
+    # change log (audit + rollback ids)
+    changes = changes or []
+    if changes:
+        reverted = set()
+        for c in changes:
+            if c.get('kind') == 'revert' and c.get('reverts'):
+                reverted.add(c['reverts'])
+        crows = []
+        for c in reversed(changes[-25:]):
+            cid = c.get('change_id', '')
+            is_rev = cid in reverted
+            crows.append(html.Tr([
+                html.Td(cid, style={'padding': '2px 8px', 'color': '#888'}),
+                html.Td(c.get('kind', ''), style={'padding': '2px 8px',
+                        'color': '#b5651d' if c.get('kind') == 'revert' else '#aaa'}),
+                html.Td('%s/%s' % (c.get('pattern'), c.get('cal')),
+                        style={'padding': '2px 8px', 'color': '#999'}),
+                html.Td(c.get('config_key', ''), style={'padding': '2px 8px', 'color': '#999'}),
+                html.Td('%s -> %s' % (_ac_mhz(c.get('old')), _ac_mhz(c.get('new'))),
+                        style={'padding': '2px 8px', 'color': '#ccc'}),
+                html.Td('REVERTED' if is_rev else '', style={'padding': '2px 8px',
+                        'color': '#e94560', 'fontSize': '10px'}),
+                html.Td(c.get('ts', ''), style={'padding': '2px 8px', 'color': '#666',
+                        'fontSize': '10px'}),
+            ]))
+        children.append(html.Div([
+            html.Div('Change log (auto-applied config + rollbacks)',
+                     style={'fontWeight': '600', 'color': '#e94560', 'margin': '8px 0 4px'}),
+            html.Table(html.Tbody(crows), style={'width': '100%', 'borderCollapse': 'collapse',
+                       'fontFamily': 'Consolas, monospace', 'fontSize': '10px'}),
+        ], style={'marginTop': '6px'}))
+
+    return children
 
 
 # ---- SLM panel ----
