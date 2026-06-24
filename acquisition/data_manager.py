@@ -258,6 +258,12 @@ class DataManager:
         self._pattern_knm = {}          # {frame_idx: knm [y,x]} (for the live affine update)
         self._roi = None                # [Xoff, Yoff, W, H] for this scan
         self._affine_grid0 = None       # frame-0 affine-predicted grid (pre-drift)
+        # Loading-phase health (Live status strip "phase" tile). _build_pattern_grids
+        # records each declared pattern's phase-file status as it contacts the SLM
+        # server ('ok'|'missing'|'unreachable'); _compute_pattern_health turns that
+        # + the per-pattern expConfig (ByPattern) check into the chip payload.
+        self._pattern_phase_status = {}  # pattern name -> 'ok'|'missing'|'unreachable'
+        self._pattern_health = None      # get_plot_data payload; None = no loading pattern declared
 
         # Paths
         date_stamp, time_stamp = scan_id_to_stamps(scan_id)
@@ -343,6 +349,14 @@ class DataManager:
         except Exception as e:
             logger.warning('pattern-grid build failed (%s); using day grid', e)
             self._pattern_grids = None
+        # Loading-phase health chip (status strip): does each declared loading
+        # phase actually exist on the SLM server, and does its pattern have an
+        # expConfig (ByPattern) entry. Best-effort -> never break DataManager.
+        try:
+            self._compute_pattern_health()
+        except Exception as e:  # noqa: BLE001
+            logger.warning('pattern-health compute failed: %s', e)
+            self._pattern_health = None
 
         # --- LIVE state (accumulates, resets at 2000) ---
         self._intensity_accum = []          # list of (num_sites,) arrays
@@ -909,6 +923,7 @@ class DataManager:
         selection + live drift correction apply unchanged. No-ops (keeps the
         day grid) if no pattern/ROI/affine is available."""
         self._pattern_knm = {}   # (re)populated below; the live affine update reads it
+        self._pattern_phase_status = {}  # name -> 'ok'|'missing'|'unreachable' (health chip)
         roi = self.config.get('roi')
         roi = _vector(roi) if roi is not None else None
         if roi is None or roi.size < 4:
@@ -921,6 +936,7 @@ class DataManager:
 
         import yb_analysis.analysis.affine_transform as aff
         import yb_analysis.analysis.pattern_registry as reg
+        from yb_analysis.slm_sync.client import SlmPhaseNotFound
         self._pattern_names = {k: s['name'] for k, s in enumerate(specs) if s}
 
         A = aff.load_matrix()
@@ -958,13 +974,26 @@ class DataManager:
                     legacy_zerniked=s.get('legacy_zerniked', False),
                     baked_zernike=s.get('baked_zernike'),
                     planes_z_rad=s.get('planes_z_rad'))
+            except SlmPhaseNotFound:
+                # The phase file the scan asked for does not exist on the SLM
+                # server (almost always a misspelled name). Record it for the
+                # "phase" health chip and skip this frame's grid (-> day grid).
+                self._pattern_phase_status[s['name']] = 'missing'
+                logger.warning('pattern %s: phase file %s NOT FOUND on SLM '
+                               'server', s['name'], s['base_phase_path'])
+                continue
             except Exception as e:
+                self._pattern_phase_status.setdefault(s['name'], 'unreachable')
                 logger.warning('pattern %s fetch failed (%s); trying cache',
                                s['name'], e)
                 rec = reg.get_pattern(s['name'])
             if not rec or not rec.get('knm'):
                 logger.warning('no registry record for pattern %s', s['name'])
                 continue
+            # A usable record (fresh from the server or a cache hit) means the
+            # phase exists -- a transient fetch error that still found a cache
+            # is not a "missing phase".
+            self._pattern_phase_status[s['name']] = 'ok'
             knm = np.asarray(rec['knm'], dtype=np.float64)
             self._pattern_knm[k] = knm
             grids[k] = aff.apply_affine_cropped(aff._knm_to_xy(knm), A, self._roi)
@@ -991,6 +1020,106 @@ class DataManager:
         logger.info('Loading-pattern grids active: %s (sites %s); affine '
                     'mapped + ROI-cropped', self._pattern_names,
                     {k: len(v) for k, v in grids.items()})
+
+    # --- Loading-phase health chip ("phase" status tile) ---
+
+    def _active_by_pattern(self):
+        """The expConfig ``ByPattern`` table from the scan's embedded config
+        snapshot ({} if absent / not a dict). This is the consts that actually
+        ran (scan_summary embeds ``SeqConfig.consts`` as ``config['expConfig']``),
+        so it is authoritative for "does this pattern have a per-array overlay"."""
+        ec = self.config.get('expConfig') if isinstance(self.config, dict) else None
+        if not isinstance(ec, dict):
+            return {}
+        bp = ec.get('ByPattern')
+        return bp if isinstance(bp, dict) else {}
+
+    def _probe_phase_status(self, spec):
+        """Existence check for one loading phase when _build_pattern_grids did
+        not get to it (e.g. no affine committed). Cache-first, so it adds no SLM
+        round-trip in the normal path. Returns 'ok'|'missing'|'unreachable'."""
+        import yb_analysis.analysis.pattern_registry as reg
+        from yb_analysis.slm_sync.client import SlmPhaseNotFound
+        try:
+            rec = reg.fetch_or_refresh_pattern(
+                spec['name'], base_phase_path=spec['base_phase_path'],
+                order=spec.get('order', 'col'),
+                legacy_zerniked=spec.get('legacy_zerniked', False),
+                baked_zernike=spec.get('baked_zernike'),
+                planes_z_rad=spec.get('planes_z_rad'))
+            return 'ok' if rec else 'unreachable'
+        except SlmPhaseNotFound:
+            return 'missing'
+        except Exception:  # noqa: BLE001 — network/HTTP -> treat as unverified
+            return 'unreachable'
+
+    def _compute_pattern_health(self):
+        """Build the Live "phase" status-chip payload: for every loading phase
+        the scan declares, whether the phase file EXISTS on the SLM server and
+        whether its pattern has an expConfig (``ByPattern``) entry.
+
+          red  'fail' -> a declared phase file is MISSING on the SLM server
+                         (HTTP 404). The "misspelled phase name" case this chip
+                         exists to catch.
+          yellow 'warn'-> a pattern has no ByPattern entry while the table is in
+                         use (so per-array config is configured and this one was
+                         likely mistyped), or the SLM couldn't be reached to verify.
+          green 'ok'  -> every declared phase exists (+ has a ByPattern entry
+                         when the table is populated).
+          grey 'none' -> the scan declares no loading pattern.
+        """
+        specs = [s for s in (self._image_pattern_specs() or []) if s]
+        if not specs:
+            self._pattern_health = None
+            return
+
+        by_pattern = self._active_by_pattern()
+        bp_populated = bool(by_pattern)
+
+        patterns, missing, unreachable, no_cfg, seen = {}, [], [], [], set()
+        for s in specs:
+            name = s['name']
+            if name in seen:
+                continue
+            seen.add(name)
+            ph = self._pattern_phase_status.get(name) or self._probe_phase_status(s)
+            self._pattern_phase_status[name] = ph
+            has_cfg = name in by_pattern
+            patterns[name] = {'phase_path': s.get('base_phase_path'),
+                              'phase': ph, 'expconfig': bool(has_cfg)}
+            if ph == 'missing':
+                missing.append(name)
+            elif ph == 'unreachable':
+                unreachable.append(name)
+            # expConfig check fires only when SOME pattern carries a ByPattern
+            # overlay (an empty table = the per-array overlay system is unused,
+            # so no pattern "should" have one and a warning would be pure noise).
+            if bp_populated and not has_cfg:
+                no_cfg.append(name)
+
+        if missing:
+            state, reason = 'fail', 'phase file not on SLM server: ' + ', '.join(missing)
+        elif no_cfg or unreachable:
+            bits = []
+            if no_cfg:
+                bits.append('no expConfig (ByPattern) entry: ' + ', '.join(no_cfg))
+            if unreachable:
+                bits.append('could not reach SLM to verify: ' + ', '.join(unreachable))
+            state, reason = 'warn', ' · '.join(bits)
+        else:
+            state, reason = 'ok', ''
+
+        from datetime import datetime as _dt
+        self._pattern_health = {
+            'state': state,
+            'reason': reason,
+            'phase_missing': missing,
+            'unreachable': unreachable,
+            'no_expconfig': no_cfg,
+            'bypattern_populated': bp_populated,
+            'patterns': patterns,
+            'updated_iso': _dt.now().isoformat(timespec='seconds'),
+        }
 
     def _pattern_thresholds(self, name, n):
         """Per-pattern detection thresholds for a grid of n sites: from the
@@ -2603,6 +2732,11 @@ class DataManager:
             # HDF5 save health (Live status strip): turns the save tile red when
             # an append_block ultimately failed and a block of shots was lost.
             'save_health': self._save_health,
+            # Loading-phase health (Live status strip "phase" tile): red when a
+            # declared loading phase file is missing on the SLM server, yellow
+            # when a pattern lacks an expConfig (ByPattern) entry. None = the
+            # scan declared no loading pattern.
+            'pattern_health': self._pattern_health,
             'seq_reconciliation': {
                 'max_seen': getattr(self, '_seq_ids_max_seen', 0),
                 'gap_count': getattr(self, '_seq_gap_count', 0),

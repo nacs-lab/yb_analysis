@@ -216,6 +216,10 @@ header .status-pill .dot {
   border-radius: 6px;
   border: 1px solid var(--border);
 }
+/* img1 / img2 cards already carry a top-right switch (Downsample / Middle
+   frame); their "Boxes" switch stacks just below it. The middle card has no
+   other switch, so its Boxes switch keeps the default top:6px. */
+#boxes-switch-1, #boxes-switch-2 { top: 32px; }
 /* Slide-in control sidebar: a position:fixed panel on the right edge
    of the viewport, below the sticky header. Default state is OPEN
    (visible). The ‹/› toggle on its LEFT edge collapses it to a thin

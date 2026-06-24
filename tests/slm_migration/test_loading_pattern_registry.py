@@ -75,6 +75,39 @@ def test_unreachable_returns_none():
     assert c.initialize_loading_pattern(phase_path='x.pt') is None
 
 
+def test_initialize_phase_not_found_raises(fake, client):
+    # A 404 from the loading-pattern endpoint = the phase file doesn't exist on
+    # the SLM server (a misspelled name). Distinct from unreachable (-> None) so
+    # the dashboard can warn "phase missing" rather than "SLM down".
+    from yb_analysis.slm_sync.client import SlmPhaseNotFound
+    fake.fail('initialize_loading_pattern', 404)
+    with pytest.raises(SlmPhaseNotFound):
+        client.initialize_loading_pattern(phase_path='phase/base/typo.pt')
+
+
+def test_fetch_phase_not_found_propagates(fake, client, patterns_dir):
+    # The user's case: a misspelled phase name with no cache -> the registry
+    # surfaces SlmPhaseNotFound instead of silently returning None.
+    from yb_analysis.slm_sync.client import SlmPhaseNotFound
+    reg = patterns_dir
+    fake.fail('initialize_loading_pattern', 404)
+    with pytest.raises(SlmPhaseNotFound):
+        reg.fetch_or_refresh_pattern(
+            'typo', base_phase_path='phase/base/typo.pt', client=client)
+
+
+def test_fetch_phase_not_found_not_masked_by_cache(fake, client, patterns_dir):
+    # Even with a last-known-good cache, a now-missing phase is NOT masked --
+    # the cached grid belongs to a phase that no longer exists on the server.
+    from yb_analysis.slm_sync.client import SlmPhaseNotFound
+    reg = patterns_dir
+    reg.write_pattern(_record(name='p1'))
+    fake.fail('initialize_loading_pattern', 404)
+    with pytest.raises(SlmPhaseNotFound):
+        reg.fetch_or_refresh_pattern(
+            'p1', base_phase_path='phase/base/p1.pt', client=client, force=True)
+
+
 # ---- registry persistence -----------------------------------------------
 
 def _record(name='p1', n=4):

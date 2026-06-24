@@ -994,6 +994,17 @@
     catch { return false; }
   })();
 
+  // Per-image green/red site-box overlay switches (img1 / middle / img2).
+  // Persisted; default ON. OFF -> that panel renders the plain camera frame
+  // (the figures endpoint gets ?boxes_<name>=0 and skips the overlay).
+  const _boxesPref = (key) => {
+    try { return localStorage.getItem(key) !== "0"; }
+    catch { return true; }
+  };
+  let showBoxes1   = _boxesPref("yb-dash-boxes-1");
+  let showBoxesMid = _boxesPref("yb-dash-boxes-mid");
+  let showBoxes2   = _boxesPref("yb-dash-boxes-2");
+
   function applyMidVisibility() {
     const cardMid  = $("card-array-mid");
     const card1    = $("card-array1");
@@ -1103,6 +1114,7 @@
       renderSiteInfo(snap, selectedSiteIdx);
       renderControlSidebar(snap);
       renderSaveHealthChip(snap.save_health);
+      renderPatternHealthChip(snap.pattern_health);
       renderSeqGapChip(snap.seq_reconciliation);
       // img2-panel detector badge: when img2 is detected by the spot-shape
       // model (distinct-pattern runs) show the model + mean % certainty;
@@ -1549,6 +1561,38 @@
       : "HDF5 save health: green = all saved · yellow = recovered after an earlier loss · red = saves failing (shots lost to disk)";
   }
 
+  // Loading-phase health chip (status strip). Monitor-side, from /api/snapshot's
+  // pattern_health (DataManager._compute_pattern_health). Catches a misspelled
+  // loading-phase name: the phase the scan asked for doesn't exist on the SLM
+  // server. States:
+  //   green  "ok"       -> every declared phase exists (+ has a ByPattern entry)
+  //   yellow "no cfg…"  -> a pattern has no expConfig (ByPattern) entry, or the
+  //                        SLM couldn't be reached to verify
+  //   red    "missing…" -> a declared phase file is absent on the SLM server
+  //   grey   "none"     -> the scan declares no loading pattern
+  function renderPatternHealthChip(ph) {
+    const tile = $("pattern-health-tile");
+    if (!tile) return;
+    const DEFAULT_TIP = "Loading-phase health: green = every declared phase exists on the SLM server · yellow = a pattern has no expConfig (ByPattern) entry, or the SLM couldn't be reached · red = a phase file is missing on the SLM server (likely a misspelled name)";
+    if (!ph || typeof ph !== "object") {
+      tile.dataset.state = "none";
+      setText("pattern-health-readout", "—");
+      tile.title = DEFAULT_TIP;
+      return;
+    }
+    const state = ph.state || "ok";
+    const nMiss = (ph.phase_missing || []).length;
+    const nCfg = (ph.no_expconfig || []).length;
+    let stateCls, text;
+    if (state === "fail")      { stateCls = "fail"; text = `missing ${nMiss}`; }
+    else if (state === "warn") { stateCls = "warn"; text = nCfg ? `no cfg ${nCfg}` : "SLM?"; }
+    else if (state === "ok")   { stateCls = "ok";   text = "ok"; }
+    else                       { stateCls = "none"; text = "—"; }
+    tile.dataset.state = stateCls;
+    setText("pattern-health-readout", text);
+    tile.title = ph.reason ? `Loading phase — ${ph.reason}` : DEFAULT_TIP;
+  }
+
   // ZMQ delivery gap chip: detects seq_ids that were never received because
   // a grab_imgs() poll timeout raced a large buffer drain from the server.
   //   green  "ok"       -> no missing shots this scan
@@ -1861,9 +1905,16 @@
   async function pollSnapshot() {
     if (!window.Plotly || window.__plotlyLoadFailed) return;   // the stream loop owns the missing-Plotly banner
     let resp = null;
-    const url = scanAutoscale
-      ? "/api/live/figures?group=snapshot&cbar_scale=auto"
-      : "/api/live/figures?group=snapshot";
+    // Per-image box-overlay switches ride this same snapshot fetch (the array
+    // panels live in the snapshot group). Only send the OFF params -- a missing
+    // param defaults to ON server-side.
+    const boxParams = [];
+    if (!showBoxes1)   boxParams.push("boxes_array=0");
+    if (!showBoxesMid) boxParams.push("boxes_array_mid=0");
+    if (!showBoxes2)   boxParams.push("boxes_array2=0");
+    let url = "/api/live/figures?group=snapshot";
+    if (scanAutoscale) url += "&cbar_scale=auto";
+    if (boxParams.length) url += "&" + boxParams.join("&");
     try { resp = await api(url); }
     catch (e) {
       console.warn("snapshot figures fetch failed", e);
@@ -5052,6 +5103,26 @@
         pollSnapshot();   // the scan figure (cbar_scale) lives in the snapshot group now
       });
     }
+
+    // Per-image green/red site-box overlay toggles. Each flips its state var +
+    // persists it, then re-polls the snapshot group so the panel updates at
+    // once (the boxes_<name> query param changes what the server bakes in).
+    [["boxes-live-1",   "yb-dash-boxes-1",   (v) => { showBoxes1   = v; }],
+     ["boxes-live-mid", "yb-dash-boxes-mid", (v) => { showBoxesMid = v; }],
+     ["boxes-live-2",   "yb-dash-boxes-2",   (v) => { showBoxes2   = v; }],
+    ].forEach(([id, key, set]) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.checked = key === "yb-dash-boxes-1"   ? showBoxes1
+                 : key === "yb-dash-boxes-mid" ? showBoxesMid
+                 : showBoxes2;
+      el.addEventListener("change", () => {
+        set(el.checked);
+        try { localStorage.setItem(key, el.checked ? "1" : "0"); }
+        catch {}
+        pollSnapshot();
+      });
+    });
   })();
 
   // Control sidebar buttons (Phase 5.5 Track A). Mirrors control_panel.py.
@@ -6027,18 +6098,108 @@
         </div>`;
     }
 
+    // Trap-depth distribution (|mj|=1 light shift): histogram + CV of per-site
+    // trap depths for ANY 556 push-out survival scan whose line is trap-shifted
+    // (set by the backend's _trap_depth_from_pushout, not the scan name).
+    const isTrap = ss && ss.type === "trap_depth" && Array.isArray(ss.depths_uK);
+    if (isTrap) {
+      const cvPct = (ss.cv_pct != null) ? ss.cv_pct.toFixed(1) : "—";
+      const mean = (ss.mean_depth_uK != null) ? ss.mean_depth_uK.toFixed(1) : "—";
+      const std = (ss.std_depth_uK != null) ? ss.std_depth_uK.toFixed(1) : "—";
+      html += `
+        <div style="padding:8px 0;">
+          <h3 style="margin:0 0 4px;font-size:13px;color:var(--text-dim);
+                     text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">
+            Trap-depth uniformity (|mj|=1 light shift)
+            <span class="muted mono" style="text-transform:none;margin-left:8px;
+                  letter-spacing:0;font-weight:400;">
+              CV = ${cvPct}% · mean ${mean} ± ${std} µK · N=${ss.n_good}/${ss.n_sites} sites
+            </span>
+          </h3>
+          <div class="plot-container" id="plot-trap-depth" style="height:360px;"></div>
+          <div class="hint mono" id="trap-depth-info" style="margin-top:6px;"></div>
+        </div>`;
+    }
+
     // Always include the placeholder text so future per-Seq panels
     // have a home. When avg_image renders above, this is just a tiny
     // muted footer.
+    const hasPanel = hasFocus || isTrap;
     html += `
       <div style="padding:8px 0;font-family:var(--mono);font-size:11px;
                   color:var(--text-dim);">
         scan_name = ${escHtml(r.scan_name || "(none)")}
-        ${hasFocus ? '' : '· (no Seq-specific panel for this scan type yet)'}
+        ${hasPanel ? '' : '· (no Seq-specific panel for this scan type yet)'}
       </div>`;
     body.innerHTML = html;
 
     if (hasFocus) renderFocusMetrics(ss);
+    if (isTrap) renderTrapDepth(ss);
+  }
+
+  // 556 push-out trap-depth distribution (|mj|=1 light shift): a histogram of the
+  // per-site trap depths (µK) with a Gaussian overlay. CV = std/mean is the array
+  // uniformity headline (shown in the section title + info line). Fires for ANY
+  // 556 push-out survival scan whose line is trap-shifted — not just ones named
+  // Spectrum556Scan — because the backend keys it off the swept axis + physics.
+  function renderTrapDepth(ss) {
+    if (!window.Plotly) return;
+    const el = $("plot-trap-depth");
+    if (!el) return;
+    const depths = (ss.depths_uK || []).filter((v) => isFinite(v));
+    if (depths.length < 3) {
+      el.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">'
+                   + 'not enough good per-site fits for a histogram</div>';
+      setText("trap-depth-info", "");
+      return;
+    }
+    const lo = Math.min(...depths), hi = Math.max(...depths);
+    const span = (hi > lo) ? hi - lo : 1;
+    const nb = Math.max(8, Math.min(50, Math.round(Math.sqrt(depths.length))));
+    const binw = span / nb;
+    const traces = [{
+      type: "histogram", x: depths, histnorm: "probability density",
+      autobinx: false, xbins: {start: lo, end: hi + binw, size: binw},
+      marker: {color: "#3388aa", line: {color: "#0d1117", width: 0.4}},
+      opacity: 0.85, name: `sites (n=${depths.length})`,
+    }];
+    // Gaussian overlay from the good-site depths (µ, σ as the campaign figures).
+    const mu = (ss.gauss && ss.gauss.mu != null) ? ss.gauss.mu : avg(depths);
+    const sigma = (ss.gauss && ss.gauss.sigma != null) ? ss.gauss.sigma : 0;
+    if (sigma > 0) {
+      const xs = [], ys = [], n = 200;
+      for (let i = 0; i <= n; i++) {
+        const x = lo - 0.05 * span + 1.1 * span * (i / n);
+        xs.push(x);
+        ys.push(Math.exp(-0.5 * ((x - mu) / sigma) ** 2)
+                / (sigma * Math.sqrt(2 * Math.PI)));
+      }
+      traces.push({
+        x: xs, y: ys, type: "scatter", mode: "lines",
+        line: {color: "#f0f6fc", width: 2}, hoverinfo: "skip",
+        name: `µ=${mu.toFixed(1)}, σ=${sigma.toFixed(1)} µK`,
+      });
+    }
+    Plotly.react(el, traces, plotLayout({
+      margin: {l: 56, r: 12, t: 8, b: 42},
+      xaxis: {title: "trap depth (µK)"},
+      yaxis: {title: "density"},
+      legend: {orientation: "h", y: 1.14, font: {size: 10}},
+      bargap: 0.02,
+    }), plotConfig());
+    const af = ss.array_fit || {};
+    const bits = [
+      `CV ${ss.cv_pct != null ? ss.cv_pct.toFixed(1) : "—"}%`,
+      `mean ${mu.toFixed(1)} µK`, `σ ${sigma.toFixed(1)} µK`,
+      `${depths.length}/${ss.n_sites} good sites`,
+      `R²med ${ss.r2_median != null ? ss.r2_median.toFixed(2) : "—"}`,
+    ];
+    if (af.center_MHz != null) {
+      bits.push(`array line ${af.center_MHz.toFixed(3)} MHz `
+        + `(${af.shift_MHz != null ? af.shift_MHz.toFixed(2) : "—"} MHz red of `
+        + `f0=${ss.f0_MHz != null ? ss.f0_MHz.toFixed(3) : "—"})`);
+    }
+    setText("trap-depth-info", bits.join("  ·  "));
   }
 
   // Averaged camera image — shown for ANY scan with an /imgs dataset (its
@@ -6046,30 +6207,37 @@
   // each shot; the PNG is computed lazily + cached by /api/runs/<id>/avg_image
   // on first request. Rendered as a Plotly image so it ZOOMS/pans like the
   // other image panels (box-zoom drag; double-click resets).
-  function renderAvgImage(r) {
-    const card = $("analysis-avg-image-card");
-    const el = $("plot-avg-image");
-    if (!card || !el) return;
-    const ai = r && r.avg_image;
-    if (!ai || !(ai.available || ai.computable)) {
-      card.hidden = true;
-      if (window.Plotly) Plotly.purge(el);
-      setText("avg-image-info", "");
+  // Token bumped on every renderAvgImage call so an in-flight "computing"
+  // poll for a previous scan stops touching the card once we switch scans.
+  let _avgImagePollGen = 0;
+
+  // Draw a centered message in the avg-image box (no image). Used while the
+  // PNG is being computed on the server, or on error -- never a blank box.
+  function _avgImageMessage(el, W, H, msg, color) {
+    if (!window.Plotly) {
+      el.innerHTML = `<div class="hint" style="padding:24px;text-align:center;">`
+                   + `${msg}</div>`;
       return;
     }
-    card.hidden = false;
-    const sh = ai.image_shape || [];
-    const H = sh.length === 2 ? sh[0] : 0;
-    const W = sh.length === 2 ? sh[1] : 0;
-    const navg = ai.n_avg || ai.n_shots || 0;
-    const sampNote = ai.sampled ? ` (sampled of ${ai.n_shots})` : "";
-    setText("avg-image-info", ai.available
-      ? `cached · mean of ${navg} first-images${sampNote} · ${H}×${W}`
-      : `computes on first load (~${Math.max(1, Math.round(0.025 * navg))} s, one-time) · `
-        + `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
-    if (!window.Plotly || !W || !H) return;
-    const src = `/api/runs/${encodeURIComponent(r.scan_id || "")}`
-              + `/avg_image?v=${encodeURIComponent(r.scan_id || "")}`;
+    Plotly.react(el, [{
+      x: [0, W || 1], y: [0, H || 1], mode: "markers",
+      marker: {opacity: 0}, hoverinfo: "skip", showlegend: false,
+    }], plotLayoutFlush({
+      margin: {l: 0, r: 0, t: 0, b: 0},
+      xaxis: {visible: false},
+      yaxis: {visible: false},
+      annotations: [{
+        text: msg, x: 0.5, y: 0.5, xref: "paper", yref: "paper",
+        showarrow: false, font: {color: color || "#8b949e", size: 14},
+        align: "center",
+      }],
+    }), plotConfig());
+  }
+
+  // Render the cached avg-image PNG into the zoomable Plotly box.
+  function _avgImageDrawPng(el, scanId, W, H) {
+    const src = `/api/runs/${encodeURIComponent(scanId || "")}`
+              + `/avg_image?v=${encodeURIComponent(scanId || "")}`;
     // Transparent corner trace establishes the axes (so box-zoom works);
     // the PNG is a below-layer layout image filling the pixel extent.
     Plotly.react(el, [{
@@ -6085,6 +6253,84 @@
         xanchor: "left", yanchor: "top", sizing: "stretch", layer: "below",
       }],
     }), plotConfig());
+  }
+
+  function renderAvgImage(r) {
+    const card = $("analysis-avg-image-card");
+    const el = $("plot-avg-image");
+    if (!card || !el) return;
+    // A new render supersedes any prior "computing" poll.
+    const myGen = ++_avgImagePollGen;
+    const ai = r && r.avg_image;
+    if (!ai || !(ai.available || ai.computable)) {
+      card.hidden = true;
+      if (window.Plotly) Plotly.purge(el);
+      setText("avg-image-info", "");
+      return;
+    }
+    card.hidden = false;
+    const sh = ai.image_shape || [];
+    const H = sh.length === 2 ? sh[0] : 0;
+    const W = sh.length === 2 ? sh[1] : 0;
+    const navg = ai.n_avg || ai.n_shots || 0;
+    const sampNote = ai.sampled ? ` (sampled of ${ai.n_shots})` : "";
+    const etaS = Math.max(1, Math.round(0.025 * navg));
+    const scanId = r.scan_id || "";
+
+    // Already cached -> draw immediately (the common, fast case).
+    if (ai.available) {
+      setText("avg-image-info", `cached · mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+      if (!window.Plotly || !W || !H) return;
+      _avgImageDrawPng(el, scanId, W, H);
+      return;
+    }
+
+    // Not cached: the PNG computes on the server (~etaS s, one-time, ~25 ms
+    // per gzip frame). Show a clear in-box message NOW so the page isn't held
+    // up and the box is never blank, then poll until it's ready.
+    setText("avg-image-info",
+      `computing on first load (~${etaS} s, one-time) · `
+      + `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+    _avgImageMessage(el, W, H,
+      `Computing averaged image…<br>(~${etaS} s, one-time · cached after)`);
+
+    if (!window.Plotly) return;
+    const statusUrl = `/api/runs/${encodeURIComponent(scanId)}/avg_image?check=1`;
+    let polls = 0;
+    const POLL_MS = 2000;
+    const MAX_POLLS = 120;          // ~4 min ceiling, then stop polling
+    const poll = () => {
+      if (myGen !== _avgImagePollGen) return;   // superseded by a newer render
+      polls += 1;
+      fetch(statusUrl, {cache: "no-store"})
+        .then((resp) => resp.json().catch(() => ({status: "computing"})))
+        .then((j) => {
+          if (myGen !== _avgImagePollGen) return;
+          const st = j && j.status;
+          if (st === "ready") {
+            setText("avg-image-info",
+              `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+            _avgImageDrawPng(el, scanId, W, H);
+          } else if (st === "error") {
+            setText("avg-image-info", "averaged-image compute failed");
+            _avgImageMessage(el, W, H,
+              `Couldn't compute averaged image<br>`
+              + `<span style="font-size:11px;">${(j && j.error) || "see server log"}</span>`,
+              "#f85149");
+          } else if (polls < MAX_POLLS) {
+            setTimeout(poll, POLL_MS);          // still computing
+          } else {
+            _avgImageMessage(el, W, H,
+              "Averaged image still computing…<br>"
+              + "(re-open this run to check again)");
+          }
+        })
+        .catch(() => {
+          if (myGen !== _avgImagePollGen) return;
+          if (polls < MAX_POLLS) setTimeout(poll, POLL_MS);
+        });
+    };
+    setTimeout(poll, 600);          // first poll soon; compute already kicked
   }
 
   // Overlay each focus metric. The metrics have DIFFERENT UNITS (px,
@@ -8992,7 +9238,23 @@
     if (cls === "seq-modified" && hasCfg) {
       rhs = `<span class="seq-config">${seqEsc(seqFmt(leaf.config_value))}</span> ⇒ ${rhs}`;
     }
-    const badge = isScanned ? ' <span class="seq-scanned-badge">scanned</span>' : '';
+    let badge = isScanned ? ' <span class="seq-scanned-badge">scanned</span>' : '';
+    // A scanned param is SWEPT across points, so the static config baseline (leaf.value,
+    // identical for every point -- the "only 0.02" confusion) is misleading. Show the
+    // SELECTED point's swept value (updates as you step the point picker) + the full scan
+    // range, both pulled from the manifest (current point's scanned{} + scanned_axes).
+    if (isScanned) {
+      const cur = seqCurrentPoint();
+      const ptVal = cur && cur.scanned ? cur.scanned[path] : undefined;
+      if (ptVal !== undefined && ptVal !== null) rhs = seqEsc(seqFmt(ptVal));
+      const ax = ((seqState.index && seqState.index.scanned_axes) || [])
+                 .find((a) => a.path === path);
+      const vals = ax && ax.values;
+      badge = (vals && vals.length)
+        ? ` <span class="seq-scanned-badge">scanned ${seqEsc(seqFmt(vals[0]))}…` +
+          `${seqEsc(seqFmt(vals[vals.length - 1]))} (${vals.length} pts)</span>`
+        : ' <span class="seq-scanned-badge">scanned</span>';
+    }
     // Param<->channel matching is GATED behind real build-time provenance (xref.json,
     // produced by the engine build). When absent (available=false) leaves are NOT
     // clickable and no channel reveal is shown -- value-coincidence matching was

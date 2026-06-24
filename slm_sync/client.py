@@ -33,6 +33,29 @@ logger = logging.getLogger(__name__)
 _GATE_BUSY_PREFIX = 'server busy'
 
 
+class SlmPhaseNotFound(requests.HTTPError):
+    """The SLM server has no phase file at the requested path.
+
+    Raised by the loading-pattern endpoints when the server's
+    ``_resolve_base_phase`` reports ``404 phase not found`` (i.e. the
+    ``base_phase_path`` we asked for does not exist on the SLM PC — almost
+    always a misspelled phase-file name). Distinct from an unreachable SLM
+    (connection error / timeout -> ``None``) so callers can tell "the file
+    is genuinely missing" apart from "I couldn't reach the server". Subclasses
+    ``requests.HTTPError`` so existing ``except requests.HTTPError`` handlers
+    still catch it.
+    """
+
+
+def _http_detail(resp):
+    """Best-effort human detail from an error response (FastAPI ``detail``)."""
+    try:
+        d = resp.json().get('detail', '')
+    except Exception:  # noqa: BLE001 — non-JSON body
+        d = ''
+    return d or (resp.text or '').strip()
+
+
 class SlmSyncClient:
     """Thin requests wrapper with retry-on-503 and Tailscale defaults.
 
@@ -218,8 +241,9 @@ class SlmSyncClient:
         Simulate a base loading WGS phase, extract trap positions +
         per-site phases (shared column-major order), optionally write the
         loading phase to the SLM. Returns the parsed JSON dict, or ``None``
-        if the SLM PC is unreachable. Raises ``requests.HTTPError`` on
-        4xx/5xx (e.g. a missing phase file → 404).
+        if the SLM PC is unreachable. Raises :class:`SlmPhaseNotFound` when
+        the server has no phase file at ``phase_path`` (HTTP 404), and
+        ``requests.HTTPError`` on any other 4xx/5xx.
 
         Pass either ``phase_path`` (server-side .pt) or
         ``phase_b64`` + ``phase_shape``. ``loading_zernike`` is the defocus
@@ -265,7 +289,13 @@ class SlmSyncClient:
         except (requests.ConnectionError, requests.Timeout):
             return None
         if r.status_code == 404:
-            return None
+            # The loading-pattern route exists on the deployed server, so a
+            # 404 here is the phase-file-not-found case (``_resolve_base_phase``
+            # raises ``404 phase not found``). Surface it distinctly so the
+            # caller can warn "this phase doesn't exist" rather than treating it
+            # as an unreachable SLM.
+            raise SlmPhaseNotFound(_http_detail(r) or 'phase not found',
+                                   response=r)
         r.raise_for_status()
         return r.json()
 

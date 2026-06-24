@@ -23,7 +23,7 @@ import traceback
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
-from dash import Dash, html, dcc, Input, Output, State, no_update, Patch
+from dash import Dash, html, dcc, Input, Output, State, no_update, Patch, callback_context
 
 from yb_analysis.config import DASH_IMAGE_MAX_DIM, DASH_IMAGE_PNG_COMPRESSION
 
@@ -492,6 +492,57 @@ _XREF_BUILD_ERRORS = {}
 # pending hits 0 -- no churn loop. Reset on process restart.
 _XREF_GLOBALS_REBUILT_COUNT = {}
 
+# In-flight averaged-image computes (scan dir -> True while a background thread is
+# running ensure_avg_image_png). The avg-image PNG takes ~10 s to compute for a big
+# single-image scan (one gzip-decompress per sampled frame), which would otherwise
+# block the /avg_image request -- and the browser's <img> -- for the whole time,
+# leaving the Analysis card blank. Instead the route kicks the compute onto a daemon
+# thread and returns 202 immediately; the client polls + shows a "computing" message.
+# This lock guards spawning at most ONE thread per scan dir. errors land in
+# _AVG_IMAGE_ERRORS so a deterministic failure shows in the card instead of looping.
+_AVG_IMAGE_BUILDS = {}
+_AVG_IMAGE_ERRORS = {}
+_AVG_IMAGE_LOCK = threading.Lock()
+
+
+def _spawn_avg_image_build(scan_dir):
+    """Start (or no-op if already running/done) a background avg_image.png compute.
+
+    Returns a status string: 'ready' (PNG already on disk), 'computing'
+    (a thread is running or was just started), or 'error' (last attempt failed;
+    the message is in _AVG_IMAGE_ERRORS). Idempotent + thread-safe: at most one
+    compute thread per scan dir."""
+    from yb_analysis.analysis.run_analysis import ensure_avg_image_png, AVG_IMAGE_PNG
+    key = str(scan_dir)
+    png_path = scan_dir / AVG_IMAGE_PNG
+    if png_path.is_file():
+        return 'ready'
+    with _AVG_IMAGE_LOCK:
+        if png_path.is_file():          # raced a finishing thread
+            return 'ready'
+        if _AVG_IMAGE_BUILDS.get(key):  # already in flight
+            return 'computing'
+        err = _AVG_IMAGE_ERRORS.get(key)
+        if err:                         # last attempt failed deterministically
+            return 'error'
+        _AVG_IMAGE_BUILDS[key] = True
+
+    def _work():
+        try:
+            res = ensure_avg_image_png(scan_dir)
+            if res is None or not png_path.is_file():
+                _AVG_IMAGE_ERRORS[key] = 'compute failed (no /imgs or write error)'
+        except Exception as ex:         # noqa: BLE001 - report, don't crash the thread
+            _AVG_IMAGE_ERRORS[key] = f'{type(ex).__name__}: {ex}'
+        finally:
+            with _AVG_IMAGE_LOCK:
+                _AVG_IMAGE_BUILDS.pop(key, None)
+
+    t = threading.Thread(target=_work, name=f'avg-image-{key[-12:]}',
+                         daemon=True)
+    t.start()
+    return 'computing'
+
 
 def _read_seq_json(seq_dir, name):
     """Parse a JSON file in ``seq_dir`` (e.g. ``globals.json`` / ``xref.json``); ``{}`` if
@@ -640,7 +691,13 @@ def _maybe_autobuild_xref(base):
             if running is not None and running[0].poll() is not None:
                 _harvest_xref_build(key, running[0], running[1])
                 _XREF_BUILDS.pop(key, None)
-        xr = _xref.load_xref(seq_dir)
+        # Read a CONCRETE file's entry: load_xref(seq_dir) with no fname returns empty for a
+        # multi-.seq scan (it only auto-picks the single-entry case), which made `current`
+        # always False -> a provenance build re-spawned on EVERY view (wasted CPU + a stuck
+        # "building" banner). The whole-scan artifact is one doc; any file's entry reports its
+        # version/pending state, so the first .seq is a fine representative.
+        _files = sf.seq_files()
+        xr = _xref.load_xref(seq_dir, _files[0] if _files else None)
         current = bool(xr.get('available')) and (xr.get('version') or 0) >= _xref_tool_version()
         # A CURRENT-version xref can still be INCOMPLETE: built before the run's globals.json
         # had captured all seqids, its global-dependent step/wait bands resolved to nothing --
@@ -1124,7 +1181,7 @@ def _register_api_routes(server):
         '/api/runs/<scan_id>/code':     'per-scan code-snapshot manifest: synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/grid':     'per-scan grid sidecar (init/target knm coords + grid_rotation): synced sidecar first, then live SLM passthrough',
         '/api/runs/<scan_id>/analysis': 'lab-side per-scan analysis: survival, loading, diag aggregate, sweep description, code/grid pointers',
-        '/api/runs/<scan_id>/avg_image': 'PNG of mean image across all shots (single-image scans only; computed on first call, cached as avg_image.png next to data_*.h5)',
+        '/api/runs/<scan_id>/avg_image': 'PNG of mean image across all shots (single-image scans only; computed in the background on first request -> 202 {status:"computing"} until ready, then cached as avg_image.png next to data_*.h5; ?check=1 returns JSON status only)',
         '/api/runs/dates':              'every available data day (YYYYMMDD), newest-first -- cheap dir listing, no enrichment; pairs with ?date= on /api/runs/list & /api/sequence/scans to jump to one historical day -> {dates:[...]}',
         '/api/sequence/list':   'flattened-sequence index for a scan: ?scan_id= or ?folder= -> {files, points, scanned_axes}',
         '/api/sequence/figure': 'Plotly figure for selected channels: ?scan_id=|folder= &file= &seq= &chns=a,b,c',
@@ -2103,15 +2160,26 @@ def _register_api_routes(server):
     def _api_runs_avg_image(scan_id):
         """Averaged camera image for single-image scans (Phase 5a).
 
-        Returns the cached `<scan_dir>/avg_image.png` (computed on
-        first request from /imgs in data_*.h5; ~10 s for a 300-shot
-        scan, written-through to disk so subsequent requests are
-        instant). Returns 404 when the scan has no /imgs or NumImages
-        is not 1.
+        The PNG (`<scan_dir>/avg_image.png`) is computed from /imgs in
+        data_*.h5 -- ~10 s for a big single-image scan (one gzip-decompress
+        per sampled frame). To keep the Analysis page snappy this is now
+        NON-BLOCKING:
+
+        * PNG cached on disk           -> 200, the image (long cache lifetime,
+          the average is fully determined by the immutable raw imgs).
+        * not cached yet               -> kick the compute onto a background
+          thread and return **202** ``{status:'computing'}`` immediately. The
+          client polls (see ``?check=1``) and shows a clear "computing" message
+          in the card meanwhile, swapping the image in when ready.
+        * `?check=1`                   -> never serves the PNG; returns JSON
+          ``{status: 'ready'|'computing'|'error', error?}`` so the client can
+          poll without tripping the browser's broken-image glyph.
+
+        404 only when the scan has no /imgs.
         """
         from yb_analysis.analysis.run_analysis import (
-            ensure_avg_image_png, _scan_data_h5)
-        from flask import send_file
+            ensure_avg_image_png, _scan_data_h5, AVG_IMAGE_PNG)
+        from flask import send_file, request
         from pathlib import Path as _P
         # _resolve_scan_dir returns a string path (or None); wrap it
         # for the Path API we use below.
@@ -2123,14 +2191,33 @@ def _register_api_routes(server):
             return jsonify({'error': f'scan_dir not found for {scan_id}'}), 404
         if _scan_data_h5(scan_dir) is None:
             return jsonify({'error': 'no data_*.h5 in scan_dir'}), 404
-        png_path = ensure_avg_image_png(scan_dir)
-        if png_path is None or not png_path.is_file():
-            return jsonify({'error': 'no /imgs dataset or compute failed'}), 404
-        # Long cache lifetime — the average is fully determined by the
-        # raw imgs, which never change for a completed scan.
-        resp = send_file(str(png_path), mimetype='image/png')
-        resp.headers['Cache-Control'] = 'public, max-age=86400'
-        return resp
+
+        png_path = scan_dir / AVG_IMAGE_PNG
+        check_only = request.args.get('check') in ('1', 'true', 'yes')
+
+        # Fast path: already cached -> serve it (both for ?check=1 and the
+        # real <img> request).
+        if png_path.is_file():
+            if check_only:
+                return jsonify({'status': 'ready'})
+            resp = send_file(str(png_path), mimetype='image/png')
+            resp.headers['Cache-Control'] = 'public, max-age=86400'
+            return resp
+
+        # Not cached -> ensure a background compute is running, return status.
+        status = _spawn_avg_image_build(scan_dir)
+        if status == 'ready':           # finished between the check and now
+            if check_only:
+                return jsonify({'status': 'ready'})
+            resp = send_file(str(png_path), mimetype='image/png')
+            resp.headers['Cache-Control'] = 'public, max-age=86400'
+            return resp
+        if status == 'error':
+            return jsonify({'status': 'error',
+                            'error': _AVG_IMAGE_ERRORS.get(str(scan_dir),
+                                                           'compute failed')}), 200 if check_only else 500
+        # 'computing' -- not an error; the client polls and shows a message.
+        return jsonify({'status': 'computing'}), 202
 
     @server.route('/api/runs/<scan_id>/shot_image')
     def _api_runs_shot_image(scan_id):
@@ -2473,6 +2560,12 @@ def _register_api_routes(server):
             marker_size = 12
         cbar_scale = request.args.get('cbar_scale', '01')
 
+        # Per-image green/red site-box overlay toggle (default ON). The Live tab
+        # sends ?boxes_<name>=0 for any array panel whose "Boxes" switch is off,
+        # so that panel renders just the plain camera frame.
+        def _boxes_on(name):
+            return request.args.get('boxes_' + name, '1') != '0'
+
         # Site-resolved histogram: ?which=site&site=N (1-indexed).
         try:
             site_idx = int(request.args.get('site', '1')) - 1
@@ -2484,7 +2577,7 @@ def _register_api_routes(server):
         def _fig_for(name):
             try:
                 if name == 'array':
-                    return _fig_array(d)
+                    return _fig_array(d, show_boxes=_boxes_on('array'))
                 if name == 'array_mid':
                     return _fig_array(d, img_key='_img_mid_data_uri',
                                       shape_key='_img_mid_shape',
@@ -2492,7 +2585,8 @@ def _register_api_routes(server):
                                       vhi_key='_img_mid_vhi',
                                       logicals_key='logicals_mid',
                                       grid_key='grid_locations',
-                                      title='Tweezer Array (middle)')
+                                      title='Tweezer Array (middle)',
+                                      show_boxes=_boxes_on('array_mid'))
                 if name == 'array2':
                     return _fig_array(d, img_key='_img2_data_uri',
                                       shape_key='_img2_shape',
@@ -2506,7 +2600,8 @@ def _register_api_routes(server):
                                       logicals_key='logicals2',
                                       grid_key=('grid_locations_img2'
                                           if d.get('is_two_array') else 'grid_locations'),
-                                      title='Tweezer Array (img 2)')
+                                      title='Tweezer Array (img 2)',
+                                      show_boxes=_boxes_on('array2'))
                 if name == 'intens':   return _fig_intens(d)
                 if name == 'loadlive': return _fig_loading_live(d)
                 if name == 'load':     return _fig_loading(d, marker_size=marker_size)
@@ -2937,6 +3032,15 @@ def _aggregate_focus_metrics(results):
                if isinstance(r.get('seq_specific'), dict)
                and r['seq_specific'].get('type') == 'focus_metrics']
     if not members:
+        # No focus members. If this is a group of 556 push-out trap-depth runs,
+        # surface the best (most good-fit sites) member's trap-depth panel --
+        # pooling reps across runs would need a re-fit, so the representative
+        # run is the group view.
+        td = [r.get('seq_specific') for r in results
+              if isinstance(r.get('seq_specific'), dict)
+              and r['seq_specific'].get('type') == 'trap_depth']
+        if td:
+            return max(td, key=lambda s: s.get('n_good', 0) or 0)
         return None
 
     def _key(v):
@@ -5104,7 +5208,7 @@ def _img_to_data_uri(img, max_dim=DASH_IMAGE_MAX_DIM,
 def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
                vlo_key='_img_vlo', vhi_key='_img_vhi',
                logicals_key='logicals', grid_key='grid_locations',
-               title='Tweezer Array (img 1)'):
+               title='Tweezer Array (img 1)', show_boxes=True):
     data_uri = d.get(img_key)
     shape = d.get(shape_key)
     # Only bake a layout image for a well-formed data URI. An empty/malformed
@@ -5133,11 +5237,13 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
     # Site occupancy overlay (green = loaded, red = empty).
     # Suppressed on failing shots: the logicals are unreliable / absent and
     # overlays on a red-state frame mislead more than they help.
+    # Also suppressed when the per-image "Boxes" switch is OFF (show_boxes
+    # False) -- then the panel shows just the plain camera frame.
     grid = d.get(grid_key)
     logicals = d.get(logicals_key)
     box = d.get('box_size', 11)
     n = len(grid) if grid is not None else 0
-    if grid is not None and n > 0 and not d.get('_failing_mode'):
+    if show_boxes and grid is not None and n > 0 and not d.get('_failing_mode'):
         if logicals is not None and len(logicals) >= n:
             occ = np.asarray(logicals[:n], dtype=float)
         else:

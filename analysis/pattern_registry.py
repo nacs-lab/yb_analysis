@@ -279,7 +279,10 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
     ``/slm/initialize_loading_pattern`` (extraction only — ``write_to_slm``
     is the scan's job, not the registry's), build and persist the record,
     and return it. On SLM error, fall back to the last-known-good record if
-    present (logged); otherwise re-raise.
+    present (logged); otherwise re-raise. The one exception that is NEVER
+    masked by the cache is :class:`~yb_analysis.slm_sync.client.SlmPhaseNotFound`
+    (the server has no such phase file) — it always propagates so a misspelled
+    phase path is surfaced rather than silently served a stale grid.
 
     ``planes_z_rad`` (OPTIONAL, list of ANSI ``2*rho^2-1`` radians): when
     given (non-empty) the server does a 3-D, per-plane extraction and the
@@ -300,6 +303,7 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
             planes_z_rad=planes):
         return existing
 
+    from yb_analysis.slm_sync.client import SlmPhaseNotFound
     if client is None:
         from yb_analysis.slm_sync.client import SlmSyncClient
         client = SlmSyncClient()
@@ -311,6 +315,11 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
             order=order, fft_shape=fft_shape, threshold=threshold,
             min_dist=min_dist, write_to_slm=False, name=name,
             planes_z_rad=planes)
+    except SlmPhaseNotFound:
+        # The phase file genuinely does not exist on the SLM server. NEVER mask
+        # this with a stale cache: a cached grid is for a phase that is no longer
+        # there, so silently reusing it is exactly the failure we want surfaced.
+        raise
     except Exception as ex:  # noqa: BLE001 — network/HTTP; fall back if we can
         if existing:
             logger.warning('pattern_registry: refresh %s failed (%s); '

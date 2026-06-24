@@ -116,6 +116,17 @@
       <span class="stat-label">save</span>
       <span class="stat-value" id="save-health-readout">—</span>
     </div>
+    <!-- Loading-phase health (monitor-side, from /api/snapshot pattern_health).
+         Catches a misspelled loading-phase name: red = a declared phase file
+         does NOT exist on the SLM server · yellow = a pattern has no expConfig
+         (ByPattern) entry while the table is in use, or the SLM couldn't be
+         reached to verify · green = all declared phases present · grey = the
+         scan declares no loading pattern. -->
+    <div class="stat-tile shot-health-tile" id="pattern-health-tile" data-state="none"
+         title="Loading-phase health: green = every declared phase exists on the SLM server · yellow = a pattern has no expConfig (ByPattern) entry, or the SLM couldn't be reached · red = a phase file is missing on the SLM server (likely a misspelled name)">
+      <span class="stat-label">phase</span>
+      <span class="stat-value" id="pattern-health-readout">—</span>
+    </div>
     <!-- ZMQ delivery gap chip: green = no missing shots, yellow = N shots lost
          to a get_imgs() timeout while a large batch accumulated in the server
          buffer (root cause: process stall + 2 kms ZMQ poll timeout). -->
@@ -324,11 +335,26 @@
       <span class="track"></span>
       <span>Downsample</span>
     </label>
+    <!-- Per-image green/red site-box overlay toggle (default ON). OFF = plain
+         camera frame, no boxes. Sits below the Downsample switch. -->
+    <label class="switch card-switch box-switch" id="boxes-switch-1"
+           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+      <input type="checkbox" id="boxes-live-1" checked>
+      <span class="track"></span>
+      <span>Boxes</span>
+    </label>
     <div class="plot-container" id="plot-array1" style="height: 320px;"></div>
   </section>
 
   <section class="card col-3 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
     <h2>Tweezer array — middle<span class="grow"></span></h2>
+    <!-- Per-image green/red site-box overlay toggle (default ON). -->
+    <label class="switch card-switch box-switch" id="boxes-switch-mid"
+           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+      <input type="checkbox" id="boxes-live-mid" checked>
+      <span class="track"></span>
+      <span>Boxes</span>
+    </label>
     <div class="plot-container" id="plot-array-mid" style="height: 320px;"></div>
   </section>
 
@@ -341,6 +367,14 @@
       <input type="checkbox" id="show-mid-live" checked>
       <span class="track"></span>
       <span>Middle frame</span>
+    </label>
+    <!-- Per-image green/red site-box overlay toggle (default ON). OFF = plain
+         camera frame, no boxes. Sits below the Middle-frame switch. -->
+    <label class="switch card-switch box-switch" id="boxes-switch-2"
+           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+      <input type="checkbox" id="boxes-live-2" checked>
+      <span class="track"></span>
+      <span>Boxes</span>
     </label>
     <span id="array2-info" class="hint"></span>
     <div class="plot-container" id="plot-array2" style="height: 320px;"></div>
