@@ -84,7 +84,10 @@ ANALYSIS_PAYLOAD_JSON = 'analysis_payload.json'
 # is shot-count, which never changes once the run is done). The cache-write guard
 # below now also refuses to persist a payload whose per_iteration failed, so this
 # can't recur; the bump clears the already-poisoned v2 caches in one shot.
-ANALYSIS_PAYLOAD_VERSION = 3
+# v4: seq_specific now also carries the 556 push-out trap-depth panel
+# (type='trap_depth') for |mj|=1 survival scans; bump so already-cached mj=1 runs
+# recompute and surface it instead of their stale `seq_specific: None`.
+ANALYSIS_PAYLOAD_VERSION = 4
 
 
 def _analysis_cache_path(scan_dir: Path) -> Path:
@@ -182,12 +185,12 @@ def _write_analysis_cache(scan_dir: Path, data: dict) -> None:
 
 def invalidate_analysis_cache(scan_dir) -> list:
     """Delete the lab-side analysis caches for a scan (analysis_cache.json +
-    focus_metrics.json). Returns the list of removed paths. Used by the
-    dashboard's "re-analyze" button."""
+    focus_metrics.json + trap_depth.json). Returns the list of removed paths.
+    Used by the dashboard's "re-analyze" button."""
     scan_dir = Path(scan_dir)
     removed = []
     for name in (ANALYSIS_CACHE_JSON, ANALYSIS_PAYLOAD_JSON,
-                 FOCUS_METRICS_JSON, AVG_IMAGE_PNG):
+                 FOCUS_METRICS_JSON, TRAP_DEPTH_JSON, AVG_IMAGE_PNG):
         p = scan_dir / name
         try:
             if p.is_file():
@@ -498,6 +501,21 @@ def analyze_scan_dir(scan_dir,
     except Exception as ex:
         logger.warning('focus metrics failed: %s', ex)
         out['seq_specific'] = None
+
+    # ---- Seq-specific (2): 556 push-out trap-depth (|mj|=1 light shift) ------
+    # For ANY 556 push-out SURVIVAL scan -- NumImages>=2 sweeping the push-out
+    # green frequency, detected by the swept axis + the trap-shifted line, NOT by
+    # the scan being named Spectrum556Scan -- compute the per-site trap-depth
+    # histogram + CV (the trap-depth-feedback uniformity metric). Single-image
+    # focus metrics and this survival measurement are mutually exclusive, so it
+    # fills the same seq_specific slot when focus metrics didn't apply.
+    if out.get('seq_specific') is None:
+        try:
+            out['seq_specific'] = _trap_depth_from_pushout(
+                scan_dir, scan, scan_params_full, logic1_full, logic2_full,
+                seq_ids, sweep_all=out.get('sweep_all'))
+        except Exception as ex:
+            logger.warning('trap-depth seq-specific failed: %s', ex)
 
     if include_per_site and logic1.size:
         try:
@@ -1538,6 +1556,8 @@ def _code_info(code_json: Path) -> dict:
 
 AVG_IMAGE_PNG = 'avg_image.png'
 FOCUS_METRICS_JSON = 'focus_metrics.json'   # cached calibration-free focus curve
+TRAP_DEPTH_JSON = 'trap_depth.json'         # cached |mj|=1 trap-depth (CV + histogram)
+_TRAP_DEPTH_CACHE_VERSION = 1
 # Cap on frames averaged for avg_image.png. /imgs is gzip-compressed one frame
 # per chunk (~25 ms/frame to read+decompress on CPU — a GPU can't help), so the
 # only way to stay fast is to read fewer frames. A mean image is statistically
@@ -4103,6 +4123,181 @@ def _focus_metrics_from_images(scan_dir, scan, scan_params_full, seq_ids,
     try:
         with open(cache, 'w') as f:
             json.dump(result, f)
+    except OSError:
+        pass
+    return result
+
+
+# A 556 push-out SURVIVAL scan is a TRAP-DEPTH (|mj|=1) measurement only when the
+# measured line sits RED of the mj=0 resonance f0 (the trap-shifted feature). This
+# gate is what lets the panel fire on ANY such scan by its physics -- not its name
+# -- while skipping the mj=0 calibration (line AT f0) and the field-shifted
+# Rydberg / Autler-Townes scans (line BLUE of f0). Margin > the mj=0 linewidth.
+_TRAP_DEPTH_F0_MARGIN_HZ = 0.15e6
+
+
+def _trap_depth_from_lightshift(delta_nu):
+    """556 |mj|=1-vs-mj=0 excited-state light-shift difference (Hz) -> ground-
+    state trap depth (uK). ``delta_nu = 2*(f0 - f_site)``. Ported verbatim from
+    the trap-depth-feedback campaign (``_feedback47x47/fit_trap_depths.py``): a
+    532 nm tweezer, mj1=1, mj0=0, theta=0. Depth is LINEAR in ``delta_nu``, so the
+    overall scale cancels in the CV; the absolute uK only sets the histogram axis.
+    Vectorised over sites."""
+    h = 6.62607015e-34
+    kB = 1.380649e-23
+    mj1, mj0, theta = 1, 0, np.deg2rad(0.0)
+    alpha_s, alpha_t, alpha_g = 22.4, -7.6, 37.9
+    T = (1 - 3 * np.cos(theta) ** 2) / 2
+    alpha_e1 = alpha_s - alpha_t * T * (3 * mj1 ** 2 - 2)
+    alpha_e0 = alpha_s - alpha_t * T * (3 * mj0 ** 2 - 2)
+    intensity = -4 * np.asarray(delta_nu, dtype=float) / (alpha_e1 - alpha_e0)
+    depth_Hz = 0.25 * abs(alpha_g) * intensity
+    return h * depth_Hz / kB * 1e6   # K -> uK
+
+
+def _is_pushout_green_freq(name) -> bool:
+    """True if a swept-axis dotted name is the 556 push-out green frequency
+    (``Pushout.Green.Freq``), tolerant of punctuation/case."""
+    s = re.sub(r'[^a-z0-9]', '', str(name).lower())
+    return ('pushout' in s) and ('green' in s) and ('freq' in s)
+
+
+def _trap_depth_from_pushout(scan_dir, scan, scan_params_full, logic1_full,
+                             logic2_full, seq_ids, *, sweep_all=None):
+    """Seq-specific |mj|=1 trap-depth histogram + CV for ANY 556 push-out
+    survival scan -- detected by the swept axis + the trap-shifted line, NOT by
+    the scan being named ``Spectrum556Scan``.
+
+    Mirrors the trap-depth-feedback campaign
+    (``_feedback47x47/fit_trap_depths.py``): a per-site Lorentzian PEAK on
+    ``1 - survival`` vs the push-out green frequency gives each site's |mj|=1
+    center ``f_i``; the differential light shift converts it to a trap depth
+    ``d_i`` (``delta_nu = 2*(f0 - f_i)``), with ``f0`` = the mj=0 resonance from
+    the run's expConfig snapshot (``Resonance556mj0Freq``). The array-uniformity
+    headline is ``CV = std/mean`` over the good-fit sites.
+
+    Returns the ``seq_specific`` dict (``type='trap_depth'``) or ``None`` when the
+    scan isn't a |mj|=1 556 push-out survival scan: a non-1-D / wrong sweep, no
+    survival image, no f0 in the snapshot, the line not red of f0 (the mj=0
+    calibration / field-shifted Rydberg / Autler-Townes scans), or too few good
+    fits. Cached to ``trap_depth.json`` keyed by shot count -- the per-site fits
+    are the expensive, filter-independent part."""
+    # --- cheap gates: survival scan, same-grid, 1-D push-out-freq sweep, f0 ----
+    try:
+        num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
+    except (TypeError, ValueError, IndexError):
+        num_images = 1
+    if num_images < 2 or logic2_full is None:
+        return None
+    if not (getattr(logic1_full, 'ndim', 0) == 3
+            and getattr(logic2_full, 'ndim', 0) == 3):
+        return None
+    if logic1_full.shape[0] != logic2_full.shape[0]:
+        return None   # cross-grid (rearrangement) -- not a per-site survival map
+    cols = (sweep_all or {}).get('cols') or []
+    if len(cols) != 1 or not _is_pushout_green_freq(cols[0]):
+        return None
+    ec = scan.get('expConfig')
+    f0 = None
+    if isinstance(ec, dict):
+        try:
+            f0 = float(ec.get('Resonance556mj0Freq'))
+        except (TypeError, ValueError):
+            f0 = None
+    if not f0 or not np.isfinite(f0) or f0 <= 0:
+        return None
+
+    sp = np.asarray(scan_params_full, dtype=float).ravel()
+    n_sites, n_params = int(logic1_full.shape[0]), int(logic1_full.shape[1])
+    if sp.size != n_params or n_params < 5 or n_sites < 4:
+        return None
+
+    # --- cache (keyed by recorded shot count; refit only when more shots land) -
+    try:
+        shots = int(len(np.asarray(seq_ids).ravel())) if seq_ids is not None \
+            else int(n_params * logic1_full.shape[2])
+    except (TypeError, ValueError):
+        shots = int(n_params * logic1_full.shape[2])
+    cache = Path(scan_dir) / TRAP_DEPTH_JSON
+    if cache.is_file():
+        try:
+            with open(cache) as f:
+                cached = json.load(f)
+            if (cached.get('_version') == _TRAP_DEPTH_CACHE_VERSION
+                    and cached.get('n_shots') == shots):
+                return cached.get('result')
+        except (OSError, ValueError):
+            pass
+
+    from yb_analysis.analysis.fitting import (
+        fit_lorentzian, fit_lorentzian_site_resolved)
+
+    # --- array-averaged fit: the |mj|=1 gate + context numbers ----------------
+    p11_mean, p11_sem = prob11(logic1_full, logic2_full)
+    afit = fit_lorentzian(sp, 1.0 - p11_mean, yerr=p11_sem, mode='peak')
+    if afit is None:
+        return None
+    a_center = float(afit['center'])
+    a_r2 = float(afit['r_squared'])
+    # Gate: the measured line must sit RED of f0 (the trap-shifted |mj|=1 feature)
+    # and the array fit must be real. Excludes mj=0 (line at f0) + the field-
+    # shifted Rydberg / Autler-Townes scans (line blue of f0).
+    if not (np.isfinite(a_center) and a_center < f0 - _TRAP_DEPTH_F0_MARGIN_HZ
+            and a_r2 >= 0.3):
+        return None
+
+    # --- per-site Lorentzian peak -> per-site trap depth ----------------------
+    p11_sr, p11_sem_sr = prob11_site_resolved(logic1_full, logic2_full)
+    centers, widths, params, fits = fit_lorentzian_site_resolved(
+        sp, 1.0 - p11_sr, p11_sem_sr, mode='peak')
+    r2 = np.array([f['r_squared'] if f else np.nan for f in fits])
+    amp = params[:, 1]   # peak amplitude A
+    depth_uK = _trap_depth_from_lightshift(2.0 * (f0 - centers))
+
+    # Quality mask (matches fit_trap_depths.py): finite, R^2>0.5, center inside
+    # the swept window, peak amp > 0.05, finite positive width, positive depth.
+    fmin, fmax = float(sp.min()), float(sp.max())
+    good = (np.isfinite(centers) & np.isfinite(depth_uK) & (r2 > 0.5)
+            & (centers > fmin) & (centers < fmax) & (amp > 0.05)
+            & np.isfinite(widths) & (widths > 0) & (depth_uK > 0))
+    n_good = int(good.sum())
+    if n_good < 5:
+        return None
+    dg = depth_uK[good]
+    mean_depth = float(np.mean(dg))
+    std_depth = float(np.std(dg))
+    cv = (std_depth / mean_depth) if mean_depth > 0 else float('nan')
+
+    result = {
+        'type': 'trap_depth',
+        'source': 'mj1_lightshift',
+        'x_label': str(cols[0]),
+        'f0_MHz': f0 / 1e6,
+        'cv': cv,
+        'cv_pct': 100.0 * cv,
+        'mean_depth_uK': mean_depth,
+        'std_depth_uK': std_depth,
+        'min_depth_uK': float(dg.min()),
+        'max_depth_uK': float(dg.max()),
+        'n_good': n_good,
+        'n_sites': n_sites,
+        'good_frac': n_good / max(n_sites, 1),
+        'r2_median': float(np.nanmedian(r2)),
+        'n_reps_max': int(logic1_full.shape[2]),
+        'n_shots': shots,
+        'depths_uK': [float(v) for v in dg],
+        'gauss': {'mu': mean_depth, 'sigma': std_depth},
+        'array_fit': {
+            'center_MHz': a_center / 1e6,
+            'fwhm_MHz': abs(float(afit['width'])) / 1e6,
+            'r_squared': a_r2,
+            'shift_MHz': (f0 - a_center) / 1e6,
+        },
+    }
+    try:
+        with open(cache, 'w') as f:
+            json.dump({'_version': _TRAP_DEPTH_CACHE_VERSION,
+                       'n_shots': shots, 'result': result}, f)
     except OSError:
         pass
     return result
