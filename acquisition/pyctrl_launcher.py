@@ -95,6 +95,16 @@ class PyctrlLauncher:
             existing = env.get('PYTHONPATH', '')
             env['PYTHONPATH'] = (
                 self._cwd + (os.pathsep + existing if existing else ''))
+        # Orphan guard: tell the backend which pid to watch. If run_monitor
+        # (this process) dies -- e.g. the hdf5.dll segfault on 2026-07-01 that
+        # killed the .h5-writing parent -- the backend would otherwise keep
+        # firing the scan loop forever with no consumer/saver alive, silently
+        # dropping every shot. The backend's parent-watchdog trips its graceful
+        # stop flag on our death (releasing the DCAM handle -- see
+        # bug-pyctrl-orca-restart-race-dcam-wedge). We ARE the backend's parent,
+        # so overwrite any value inherited from a grandparent; an explicit
+        # extra_env['YB_PARENT_PID'] still wins (the update below runs last).
+        env['YB_PARENT_PID'] = str(os.getpid())
         env.update({k: str(v) for k, v in self._extra_env.items()})
 
         cmd = [self._python, '-u', '-m', self._module, self._url]
