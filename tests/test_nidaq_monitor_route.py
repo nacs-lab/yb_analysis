@@ -126,3 +126,39 @@ def test_driver_no_result_is_error(client):
     r = cl.get("/api/nidaq/monitor")
     assert r.status_code == 500
     assert r.get_json()["ok"] is False
+
+
+# --------------------------------------------------------------------------- #
+# /api/nidaq/set (write route)
+# --------------------------------------------------------------------------- #
+def test_set_reserved_error_gets_actionable_hint(client):
+    # DAQmx -50103 (backend's cached NI Task holds the AO channels) must come back with
+    # an operator-actionable message, not just the raw driver error.
+    cl, tmp_path, monkeypatch = client
+    monkeypatch.setenv("YB_NIDAQ_WRITES", "1")
+    _allow_driver(monkeypatch, tmp_path)
+    _fake_subprocess(monkeypatch,
+                     'NI_WRITE_RESULT:{"ok": false, "channel": "VElectrode1", '
+                     '"backend": "Dev1/12", "voltage": 1.0, "error": '
+                     '"NI write failed: The specified resource is reserved. '
+                     'Status Code: -50103"}\n')
+    r = cl.post("/api/nidaq/set", json={"channel": "VElectrode1", "voltage": 1.0})
+    assert r.status_code == 500
+    body = r.get_json()
+    assert body["ok"] is False
+    assert "-50103" in body["error"]                 # raw error preserved
+    assert "Dummy" in body["error"]                  # actionable hint appended
+
+
+def test_set_ok_passes_through(client):
+    cl, tmp_path, monkeypatch = client
+    monkeypatch.setenv("YB_NIDAQ_WRITES", "1")
+    _allow_driver(monkeypatch, tmp_path)
+    _fake_subprocess(monkeypatch,
+                     'NI_WRITE_RESULT:{"ok": true, "channel": "VElectrode1", '
+                     '"backend": "Dev1/12", "chn": 12, "voltage": 1.0, '
+                     '"readback": 0.999, "error": null}\n')
+    r = cl.post("/api/nidaq/set", json={"channel": "VElectrode1", "voltage": 1.0})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["ok"] is True and body["readback"] == 0.999

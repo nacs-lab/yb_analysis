@@ -57,6 +57,15 @@ _CONTROL_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_control.pkl')
 # emit one concise timing/size line per call, tagged DASHPROF.
 _PROFILE = bool(os.environ.get('YB_DASH_PROFILE'))
 
+# Per-frame cache for the /api/live/figures endpoint: serialized-JSON fragments
+# keyed on the frame's _write_seq + render args. Multiple dashboard tabs poll
+# this ~2x/s each while a new frame arrives ~1/s, so most polls would otherwise
+# rebuild + re-serialize an IDENTICAL (large) figure. Shared across the Werkzeug
+# worker threads, so guarded by a lock. Only ever holds the current frame's
+# figures (cleared when _write_seq advances) -> never serves a stale frame.
+_LIVE_FIG_CACHE = {'key': None, 'frag': {}}
+_LIVE_FIG_LOCK = threading.Lock()
+
 
 class DashboardRenderer:
     """Runs the Dash web server in a **separate process** to avoid GIL
@@ -193,6 +202,37 @@ class DashboardRenderer:
         self.start()
 
 
+# Process-wide memo of the last-unpickled data dict, keyed on the active
+# buffer's (idx, mtime). The live pkl is ~10 MB (two base64 images + per-site
+# lists that scale with the array size -- thousands of sites), so unpickling it
+# takes tens of ms. ~10 dashboard endpoints call _read_data(), and several tabs
+# poll each of those ~2x/s -> without this memo the subprocess re-unpickles the
+# SAME 10 MB dict dozens of times per frame, all serialized by the GIL, and the
+# request queue backs up to many seconds. The memo makes it ONE unpickle per
+# frame shared by every caller. `d` is treated as read-only by all consumers
+# (figure builders only read it), so sharing one instance is safe.
+_DATA_MEMO = {'key': None, 'd': None}
+_DATA_MEMO_LOCK = threading.Lock()
+
+# Finished-JSON cache for /api/queue, keyed on the queue pkl's mtime. The queue
+# response (full 500-row history, ~0.8 MB, + per-row backfill) is otherwise
+# rebuilt on every ~0.5 s poll of every open tab.
+_QUEUE_JSON_CACHE = {'mtime': None, 'body': None}
+
+# Short-TTL response cache for the run-list picker (/api/sequence/scans), keyed
+# on the query params. The picker polls every 3 s from every tab; the list only
+# changes when a scan starts/finishes, so a few-seconds-stale response is fine
+# and keeps the picker from re-walking the archive (and queuing behind figure
+# builds) on every poll. ?force=1 bypasses it.
+_SCANS_JSON_CACHE = {}
+_SCANS_CACHE_LOCK = threading.Lock()
+
+
+def _load_buffer(idx):
+    with open(_DATA_FILE + f'.{idx}', 'rb') as f:
+        return pickle.load(f)
+
+
 def _read_data():
     """Read plot data from the shared pickle file (called in Dash process).
 
@@ -205,6 +245,9 @@ def _read_data():
     the pointer briefly and, failing that, fall back to whichever buffer
     actually loads (freshest by mtime) so the view shows the last good frame
     instead of blanking.
+
+    Result is memoized on (idx, buffer mtime): repeat callers within the same
+    frame reuse the already-unpickled dict instead of re-reading ~10 MB.
     """
     import time as _t
     for _attempt in range(3):
@@ -212,8 +255,25 @@ def _read_data():
             with open(_DATA_FILE, 'r') as f:
                 idx = f.read().strip()
             if idx in ('0', '1'):
-                with open(_DATA_FILE + f'.{idx}', 'rb') as f:
-                    return pickle.load(f)
+                bufp = _DATA_FILE + f'.{idx}'
+                try:
+                    mtime = os.path.getmtime(bufp)
+                except OSError:
+                    mtime = None
+                key = (idx, mtime)
+                # Fast path: same frame as last unpickle -> reuse.
+                memo = _DATA_MEMO
+                if memo.get('key') == key and memo.get('d') is not None:
+                    return memo['d']
+                # Miss: unpickle once under the lock so concurrent callers on the
+                # same frame don't all decode it (double-check inside the lock).
+                with _DATA_MEMO_LOCK:
+                    if memo.get('key') == key and memo.get('d') is not None:
+                        return memo['d']
+                    d = _load_buffer(idx)
+                    memo['key'] = key
+                    memo['d'] = d
+                    return d
         except (FileNotFoundError, EOFError, ValueError,
                 pickle.UnpicklingError, OSError):
             pass
@@ -299,6 +359,30 @@ def _read_autocal_changes(n=200):
     except (FileNotFoundError, OSError):
         return []
     return out
+
+
+def _autocal_mtimes():
+    """Cheap change signature for the autocal ledger + change journal: their
+    mtimes. A stat is far cheaper than reading the JSON (and these live on the
+    OneDrive PATH_PREFIX), so we gate the per-tick read on this."""
+    d = _autocal_dir()
+    out = []
+    for name in ('ledger.json', 'changes.jsonl'):
+        try:
+            out.append(os.stat(os.path.join(d, name)).st_mtime)
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def _obj_sig(obj):
+    """Cheap, order-stable change signature for a small picklable snapshot
+    (queue / SLM dicts). Tries a fast repr; falls back to id-less None so a
+    render still happens if it can't be summarized."""
+    try:
+        return repr(obj)
+    except Exception:
+        return None
 
 
 def _autocal_enqueue_command(ctype, args):
@@ -1258,13 +1342,31 @@ def _register_api_routes(server):
 
     @server.route('/api/queue')
     def _api_queue():
+        from flask import Response
+        # This is polled ~2x/s per tab and carries the full 500-row history
+        # (~0.8 MB) plus per-row _to_jsonable + _fill_recorded_shots (which can
+        # touch each finished run's HDF5). The snapshot only changes when the
+        # runner rewrites the queue pkl (~1 Hz), so cache the finished JSON
+        # string on that file's mtime -- repeat polls + extra tabs reuse it
+        # instead of re-serializing 500 rows every time.
+        try:
+            mtime = os.path.getmtime(_QUEUE_FILE)
+        except OSError:
+            mtime = None
+        c = _QUEUE_JSON_CACHE
+        if mtime is not None and c.get('mtime') == mtime and c.get('body'):
+            return Response(c['body'], mimetype='application/json')
         q = _read_queue_data()
         if q is None:
             return jsonify({'running': None, 'queued': [], 'history': []})
         q = _to_jsonable(q)
         _fill_recorded_shots(q)   # recover actual shot counts for old history rows
         _fill_scan_ids(q)         # stamp scan_id so queue rows link to Analysis
-        return jsonify(q)
+        body = json.dumps(q, default=str)
+        if mtime is not None:
+            c['mtime'] = mtime
+            c['body'] = body
+        return Response(body, mimetype='application/json')
 
     @server.route('/api/snapshot')
     def _api_snapshot():
@@ -2082,7 +2184,8 @@ def _register_api_routes(server):
         Newest first.
         """
         import os
-        from flask import request, jsonify
+        import time as _time
+        from flask import request, jsonify, Response
         from yb_analysis.analysis.runs_list import list_runs
         from yb_analysis.sequence.manifest import find_sequence_dir
         since_days = request.args.get('since_days', type=int)
@@ -2091,6 +2194,22 @@ def _register_api_routes(server):
         # walk) -- the picker's date dropdown. None = recent window.
         date_str = request.args.get('date') or None
         force = request.args.get('force', '0') not in ('0', '', 'false', 'False')
+        # Short-TTL response cache. The picker auto-polls every 3 s from every
+        # open tab; even with the enrichment cache warm, each poll re-walks the
+        # archive dir + stats + os.listdir's each run's sequence/ dir (500 runs),
+        # and worse, waits behind the live-figure builds in the shared worker ->
+        # tens of seconds observed. The run list changes only when a scan starts/
+        # finishes (~minutes), so serving a <=TTL-old finished response to repeat
+        # polls + extra tabs is safe and makes the picker feel instant. ?force=1
+        # (Full rescan / row-just-completed) bypasses the cache.
+        _TTL = 5.0
+        ck = (since_days, max_count, date_str)
+        c = _SCANS_JSON_CACHE
+        if not force:
+            with _SCANS_CACHE_LOCK:
+                ent = c.get(ck)
+                if ent and (_time.time() - ent[0]) < _TTL:
+                    return Response(ent[1], mimetype='application/json')
         scans = []
         # Shares the same enrichment cache as /api/runs/list (one enrich pass
         # serves both the Analysis and Sequence pickers).
@@ -2132,7 +2251,10 @@ def _register_api_routes(server):
                 'has_snapshot': bool(r.get('has_snapshot')),
                 'has_descriptor': bool(r.get('has_descriptor')),
             })
-        return jsonify({'scans': scans})
+        body = json.dumps({'scans': scans}, default=str)
+        with _SCANS_CACHE_LOCK:
+            c[ck] = (_time.time(), body)
+        return Response(body, mimetype='application/json')
 
     @server.route('/api/sequence/pick_folder', methods=['POST'])
     def _api_sequence_pick_folder():
@@ -2637,13 +2759,55 @@ def _register_api_routes(server):
                        'layout': getattr(fig, 'layout', {})}
             return _decode_plotly_bdata(raw)
 
-        if which:
-            fig = _fig_for(which)
+        # Per-figure serialized-JSON cache, keyed on the frame's monotonic
+        # _write_seq plus the render args that affect a figure's output. Multiple
+        # dashboard tabs poll this endpoint every ~0.5 s, but a new frame only
+        # arrives ~1/s and the aggregate maps change even less often -- so most
+        # polls rebuild an IDENTICAL figure. For a large array (thousands of
+        # sites) building + serializing one array panel is ~seconds; caching the
+        # serialized string lets a repeat poll (or a second tab) reuse it instead
+        # of re-doing the overlay build + to_plotly_json + numpy serialize. The
+        # cache holds only the current frame's figures (cleared when _write_seq
+        # advances), so it can never serve a stale frame.
+        seq = d.get('_write_seq')
+        boxes_key = tuple(sorted(
+            (k[len('boxes_'):], v) for k, v in request.args.items()
+            if k.startswith('boxes_')))
+        arg_key = (seq, marker_size, cbar_scale, site_idx, boxes_key)
+
+        def _frag(name, frags):
+            """Serialized JSON string for one figure, memoized in ``frags`` (the
+            current frame's fragment dict). Returns None for an unknown name.
+            MUST be called while holding _LIVE_FIG_LOCK -- builds happen once per
+            frame; concurrent tabs with the same frame reuse the fragment, and a
+            tab with a NEW frame rebuilds the whole set from ITS ``d`` (so a group
+            response is always coherent: all figures from one _read_data snapshot).
+            """
+            if name in frags:
+                return frags[name]
+            fig = _fig_for(name)          # closes over THIS request's `d`
             if fig is None:
+                frags[name] = None
+                return None
+            s = json.dumps(_figdict(fig), cls=_putils.PlotlyJSONEncoder,
+                           allow_nan=False, default=str)
+            frags[name] = s
+            return s
+
+        def _frags_for_key():
+            """Return the current frame's fragment dict, resetting it when the
+            arg_key advanced. Caller holds the lock."""
+            if _LIVE_FIG_CACHE.get('key') != arg_key:
+                _LIVE_FIG_CACHE['key'] = arg_key
+                _LIVE_FIG_CACHE['frag'] = {}
+            return _LIVE_FIG_CACHE['frag']
+
+        if which:
+            with _LIVE_FIG_LOCK:
+                frag = _frag(which, _frags_for_key())
+            if frag is None:
                 return jsonify({'error': f'unknown figure name: {which}'}), 400
-            body = json.dumps(_figdict(fig), cls=_putils.PlotlyJSONEncoder,
-                              allow_nan=False, default=str)
-            return Response(body, mimetype='application/json')
+            return Response(frag, mimetype='application/json')
 
         names = ['array', 'array_mid', 'array2', 'intens', 'loadlive',
                  'load', 'infid', 'shift', 'scan', 'avghist',
@@ -2667,9 +2831,17 @@ def _register_api_routes(server):
             names = [n for n in names if n in _SNAPSHOT_FIGS]
         elif group == 'stream':
             names = [n for n in names if n not in _SNAPSHOT_FIGS]
-        out = {n: _figdict(_fig_for(n)) for n in names}
-        body = json.dumps({'figures': out}, cls=_putils.PlotlyJSONEncoder,
-                          allow_nan=False, default=str)
+        # Assemble the response from per-figure serialized fragments (each built
+        # at most once per frame). Held under the lock so a whole group is built
+        # from one coherent frame and concurrent tabs reuse the fragments.
+        parts = []
+        with _LIVE_FIG_LOCK:
+            frags = _frags_for_key()
+            for n in names:
+                frag = _frag(n, frags)
+                parts.append(json.dumps(n) + ':' +
+                             (frag if frag is not None else 'null'))
+        body = '{"figures":{' + ','.join(parts) + '}}'
         return Response(body, mimetype='application/json')
 
     # ====================================================================
@@ -3855,6 +4027,18 @@ def _register_nidaq_routes(server):
                                 'stderr': (proc.stderr or '')[-1500:]}), 500
             if result.get('ok'):
                 _NIDAQ_CACHE['ts'] = 0.0     # invalidate read cache -> next monitor refreshes
+            else:
+                # DAQmx -50103 "resource is reserved": the pyctrl backend holds the AO
+                # channels via its cached NI Task. Post the 2026-07-02 fix the backend
+                # releases it when truly idle (no scan/background, Dummy OFF), so this
+                # now means a scan/dummy is active -- or an old (pre-fix) backend.
+                err = str(result.get('error') or '')
+                if '-50103' in err or 'reserved' in err.lower():
+                    result['error'] = (
+                        err + '  [NI AO is held by the backend: a scan, background '
+                        'calibration, or the Dummy keep-alive is running. Turn Dummy '
+                        'OFF / wait for idle and retry; if it persists, the backend '
+                        'predates the idle-release fix -- restart the backend.]')
             return jsonify(_to_jsonable(result)), (200 if result.get('ok') else 500)
 
 
@@ -3900,6 +4084,23 @@ def _register_main_html_routes(server):
     static_dir = _os.path.join(here, 'static')
     templates_dir = _os.path.join(here, 'templates')
 
+    # Per-PROCESS cache-bust token (NOT per-request). The asset URLs carry
+    # ?v=<token>; a stable token across reloads lets the browser reuse its
+    # cached dashboard.js/.css/plotly.min.js, while a server restart changes
+    # the token so a fresh build is fetched exactly once. (Previously this was
+    # int(time.time()) evaluated per request -> a new token every reload ->
+    # the 4.8 MB plotly bundle + dashboard.js re-downloaded on EVERY reload,
+    # which is the dominant reload cost, badly over a slow/tailnet transport.)
+    _cache_bust = str(int(_time.time()))
+
+    # How long the browser may cache a versioned static asset. Safe to be long
+    # because the ?v= token changes on restart (see above); 1 day is plenty.
+    _STATIC_MAX_AGE = 86400
+
+    def _cache_static(resp):
+        resp.headers['Cache-Control'] = f'public, max-age={_STATIC_MAX_AGE}'
+        return resp
+
     # Locate the bundled plotly.min.js (ships with plotly-python). Serving
     # locally avoids the silent-bail when a CDN is blocked by lab network
     # policy or unreachable -- in that case pollLiveFigures() returns at
@@ -3917,13 +4118,18 @@ def _register_main_html_routes(server):
 
     @server.route('/static/dashboard/<path:fname>')
     def _serve_main_static(fname):
-        return send_from_directory(static_dir, fname)
+        # send_from_directory sets no-cache by default; override so the browser
+        # caches the versioned (?v=) asset instead of re-fetching every reload.
+        return _cache_static(send_from_directory(static_dir, fname))
 
     @server.route('/vendor/plotly.min.js')
     def _serve_plotly_js():
         if _plotly_js_path is None:
             return ('plotly.js bundle not found', 500)
-        return send_file(_plotly_js_path, mimetype='application/javascript')
+        # 4.8 MB bundle -- cache it so a reload doesn't re-download it (this was
+        # served no-cache before -> the single biggest per-reload cost).
+        return _cache_static(
+            send_file(_plotly_js_path, mimetype='application/javascript'))
 
     @server.route('/')
     def _serve_main_html():
@@ -3937,16 +4143,17 @@ def _register_main_html_routes(server):
             autoescape=select_autoescape(['html']),
         )
         tmpl = env.get_template('main.html')
-        # Cache-bust static URLs with a per-process timestamp so a
-        # browser that's been holding the dashboard tab open while we
-        # iterate doesn't end up running stale dashboard.js / dashboard.css.
+        # Cache-bust static URLs with the PER-PROCESS token (stable across
+        # reloads within a server lifetime, changes on restart) so the browser
+        # reuses its cached dashboard.js / dashboard.css / plotly.min.js instead
+        # of re-downloading them every reload.
         return tmpl.render(
             static_url='/static/dashboard/',
             slm_url=yb_cfg.SLM_URL,
             scope_url=yb_cfg.SCOPE_URL,
             monitor_url=yb_cfg.MONITOR_URL,
             molecube_web_url=yb_cfg.MOLECUBE_WEB_URL,
-            cache_bust=str(int(_time.time())),
+            cache_bust=_cache_bust,
             plotly_local_url='/vendor/plotly.min.js',
         )
 
@@ -3969,7 +4176,14 @@ def _dash_main(host, port, data_file, parent_pid=None):
     if parent_pid is not None:
         _start_parent_watchdog(parent_pid)
     app = _build_app()
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    # threaded=True: Werkzeug's dev server defaults to single-threaded, so every
+    # request (incl. multi-second large-array figure builds) serialized head-to-
+    # tail -- with several dashboard tabs + per-tab status polls, the server never
+    # caught up and the live view appeared frozen. Threaded lets cheap/cached
+    # responses return while one worker builds; the shared figure build is guarded
+    # by _LIVE_FIG_LOCK + the per-frame fragment cache so it happens once per frame.
+    app.run(host=host, port=port, debug=False, use_reloader=False,
+            threaded=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4246,6 +4460,89 @@ def _sig_shift(d):
     return ('shift', bool(d.get('_dummy_mode')),
             _h(d.get('grid_shift_heatmap')),
             tuple(map(tuple, d.get('grid_shift_history') or [])))
+
+
+def _h_fits(fits):
+    """Signature of a list-of-Gaussian-fit dicts (``[{'params': arr}, ...]``).
+    ``_h`` can't descend dicts, so hash each entry's ``params`` array."""
+    if not isinstance(fits, list):
+        return None
+    return tuple(_h(g.get('params')) if isinstance(g, dict) else None
+                 for g in fits)
+
+
+def _h_hist(hist):
+    """Signature of the live-histogram list (``[{'bin_centers','counts'}, ...]``)."""
+    if not isinstance(hist, list):
+        return None
+    return tuple((_h(h.get('bin_centers')), _h(h.get('counts')))
+                 if isinstance(h, dict) else None for h in hist)
+
+
+def _sig_scan(d, cbar_scale):
+    """Everything _fig_scan_curve / _fig_scan_2d / _fig_scan_timeseries read.
+    Broad on purpose -- a missed input freezes the panel, so include the whole
+    scan_curve payload plus the label/scale inputs and the 0d-fallback history."""
+    sc = d.get('scan_curve')
+    if isinstance(sc, dict):
+        sc_sig = tuple(sorted(
+            (k, _h(v)) for k, v in sc.items()
+            if isinstance(v, (np.ndarray, list, tuple, int, float, str, bool,
+                              type(None)))))
+    else:
+        sc_sig = None
+    return ('scan', cbar_scale, bool(d.get('_dummy_mode')),
+            d.get('plot_scale', 1), d.get('scan_name'),
+            d.get('scan_param_path'), d.get('scan_filename'),
+            _h(d.get('loading_history')), _h(d.get('survival_history')),
+            sc_sig)
+
+
+def _sig_avghist(d):
+    """Inputs of _fig_avghist (avg fit curves + avg bars + mean-threshold)."""
+    return ('avghist', bool(d.get('_dummy_mode')),
+            d.get('n_accum_shots', 0),
+            _h_fits(d.get('live_gauss_fits')),
+            _h_fits(d.get('loaded_gauss_fits')),
+            _h_hist(d.get('live_hist_data')),
+            _h(d.get('thresholds')))
+
+
+def _sig_site(d, idx):
+    """Inputs of a single-site histogram (_build_hist + _fig_site info block)
+    for site ``idx``. Per-site slices of the same live/loaded fit + hist data."""
+    def _at(fits):
+        if isinstance(fits, list) and 0 <= idx < len(fits):
+            g = fits[idx]
+            return _h(g.get('params')) if isinstance(g, dict) else None
+        return None
+    def _hist_at():
+        lh = d.get('live_hist_data')
+        if isinstance(lh, list) and 0 <= idx < len(lh):
+            h = lh[idx]
+            if isinstance(h, dict):
+                return (_h(h.get('bin_centers')), _h(h.get('counts')))
+        return None
+    def _scalar(key):
+        v = d.get(key)
+        try:
+            return float(v[idx]) if v is not None and idx < len(v) else None
+        except (TypeError, IndexError):
+            return None
+    return ('site', idx, bool(d.get('_dummy_mode')), d.get('n_accum_shots', 0),
+            _at(d.get('live_gauss_fits')), _at(d.get('loaded_gauss_fits')),
+            _hist_at(), _scalar('thresholds'), _scalar('infidelities'),
+            _scalar('loading_rates'))
+
+
+def _sig_reps(d):
+    """Inputs of the 4 rep-site histograms: the selected rep sites + a per-site
+    signature for each. Rebuilds when the picked sites change or their data does."""
+    sites = d.get('hist_rep_sites')
+    if not sites:
+        return ('reps', None)
+    return ('reps', tuple(sites),
+            tuple(_sig_site(d, s) for s in sites[:4]))
 
 
 def _gated(pid, sig, builder, force_full):
@@ -4783,12 +5080,30 @@ new MutationObserver(function(mutations) {
                 _gated('shift', _sig_shift(d),
                        lambda: _stale('Grid Shift', lambda: _fig_shift(d)),
                        full),
-                _stale('Scan Curve', lambda: _fig_scan_curve(d, cbar_scale=cbar_scale)),
-                _stale('Avg Histogram', lambda: _fig_avghist(d)),
+                # Scan-curve + avg-hist also gated: a fresh live *image* frame
+                # bumps _write_seq every ~0.1-1 s, but these panels only move
+                # when the scan/histogram data actually advances (every 50-200
+                # shots) -- gate so a new image doesn't rebuild them.
+                _gated('scan', _sig_scan(d, cbar_scale),
+                       lambda: _stale('Scan Curve',
+                                      lambda: _fig_scan_curve(d, cbar_scale=cbar_scale)),
+                       full),
+                _gated('avghist', _sig_avghist(d),
+                       lambda: _stale('Avg Histogram', lambda: _fig_avghist(d)),
+                       full),
             ]
 
-            reps = ([_waiting('Site Hist', dummy_msg)] * 4
-                    if is_dummy else _figs_reps(d))
+            # Rep-site histograms: gated as a group so a new image frame doesn't
+            # rebuild all 4 when the fit/hist data is unchanged.
+            if is_dummy:
+                reps = [_waiting('Site Hist', dummy_msg)] * 4
+            else:
+                _reps_sig = _sig_reps(d)
+                if not full and _last_sig.get('reps') == _reps_sig:
+                    reps = [_SKIP] * 4
+                else:
+                    _last_sig['reps'] = _reps_sig
+                    reps = _figs_reps(d)
             opts = [{'label': f'Site {i+1}', 'value': i+1} for i in range(n)]
 
             lh = d.get('live_hist_data')
@@ -4833,13 +5148,26 @@ new MutationObserver(function(mutations) {
         d = _read_data()
         if d is None or val is None:
             _last_figs.pop('site', None)
+            _last_sig.pop('site', None)
             return _waiting('Site Histogram'), ''
         if d.get('_dummy_mode'):
             _last_figs.pop('site', None)
+            _last_sig.pop('site', None)
             return _waiting('Site Histogram', 'Dummy mode'), ''
-        fig, info = _fig_site(d, int(val) - 1)
+        idx = int(val) - 1
+        full = _force_full(_n)
+        # Gate the build: this callback fires every tick, but the selected
+        # site's histogram only changes when its own fit/hist data advances
+        # (or the user picks another site). Skip the rebuild + info assembly
+        # when nothing changed. The dropdown value is part of the signature,
+        # so switching sites always rebuilds.
+        sig = _sig_site(d, idx)
+        if not full and _last_sig.get('site') == sig:
+            return no_update, no_update
+        _last_sig['site'] = sig
+        fig, info = _fig_site(d, idx)
         # Patch the figure in place (the site-info text is tiny — sent whole).
-        return _emit('site', fig, _force_full(_n)), info
+        return _emit('site', fig, full), info
 
     # Click on loading-rate or infidelity 2D plot → select site in dropdown
     # is handled entirely in JavaScript (index_string) via plotly_click +
@@ -4872,17 +5200,38 @@ new MutationObserver(function(mutations) {
     @app.callback(Output('queue-panel', 'children'),
                   Input('tick', 'n_intervals'))
     def refresh_queue(_n):
-        return _render_queue_panel(_read_queue_data())
+        # Fires every tick. The queue snapshot (local tempdir pickle) is small,
+        # so read it, but skip re-rendering + re-sending the panel when the
+        # content is byte-identical to last tick.
+        q = _read_queue_data()
+        sig = _obj_sig(q)
+        if _force_full(_n) or _last_sig.get('queue') != sig:
+            _last_sig['queue'] = sig
+            return _render_queue_panel(q)
+        return no_update
 
     @app.callback(Output('slm-panel', 'children'),
                   Input('tick', 'n_intervals'))
     def refresh_slm(_n):
-        return _render_slm_panel(_read_slm_data())
+        slm = _read_slm_data()
+        sig = _obj_sig(slm)
+        if _force_full(_n) or _last_sig.get('slm') != sig:
+            _last_sig['slm'] = sig
+            return _render_slm_panel(slm)
+        return no_update
 
     @app.callback(Output('autocal-panel', 'children'),
                   Input('tick', 'n_intervals'))
     def refresh_autocal(_n):
-        return _render_autocal_panel(_read_autocal_state(), _read_autocal_changes())
+        # The autocal ledger/journal live under PATH_PREFIX (a OneDrive path on
+        # this machine) -- reading them every 3 s is a cloud round-trip. Gate on
+        # the files' mtimes (cheap stat) so we only read+render when they change.
+        sig = _autocal_mtimes()
+        if _force_full(_n) or _last_sig.get('autocal') != sig:
+            _last_sig['autocal'] = sig
+            return _render_autocal_panel(_read_autocal_state(),
+                                         _read_autocal_changes())
+        return no_update
 
     @app.callback(Output('autocal-cmd-result', 'children'),
                   [Input('autocal-toggle-lane', 'n_clicks'),
@@ -5848,9 +6197,11 @@ def _add_avg_fit_curve(fig, fits, color, name, faint=False):
     P = np.array(valid)  # (N, 6): mu1, sig1, w1, mu2, sig2, w2
     xmin = float((P[:, 0] - 4*P[:, 1]).min())
     xmax = float((P[:, 3] + 4*P[:, 4]).max())
-    xf = np.linspace(xmin, xmax, 200)
-    # Broadcast: xf(200,) vs P(N,6) → (N,200) for each Gaussian
-    dx1 = (xf[None, :] - P[:, 0:1]) / P[:, 1:2]  # (N, 200)
+    # 60 points is plenty for a smooth display curve; the broadcast below is
+    # (N_sites, len(xf)), so this cuts the avg-fit build ~3.3x vs the old 200.
+    xf = np.linspace(xmin, xmax, 60)
+    # Broadcast: xf(60,) vs P(N,6) → (N,60) for each Gaussian
+    dx1 = (xf[None, :] - P[:, 0:1]) / P[:, 1:2]  # (N, len(xf))
     dx2 = (xf[None, :] - P[:, 3:4]) / P[:, 4:5]
     g1 = P[:, 2:3] / (P[:, 1:2] * np.sqrt(2*np.pi)) * np.exp(-0.5 * dx1**2)
     g2 = P[:, 5:6] / (P[:, 4:5] * np.sqrt(2*np.pi)) * np.exp(-0.5 * dx2**2)
