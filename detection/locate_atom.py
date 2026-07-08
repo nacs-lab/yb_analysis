@@ -5,6 +5,7 @@ Port of YbDataAnalysis/AtomDetection/LocateAtom.m (update mode only).
 
 import numpy as np
 from scipy.optimize import least_squares
+from scipy.signal import fftconvolve
 
 
 def _gaussian_2d(coords, A, x0, sigma_x, y0, sigma_y, offset):
@@ -71,26 +72,39 @@ def locate_atom_update(images, grid_locations, search_range, mask_mat):
 
     heatmap = np.zeros((2 * R + 1, 2 * R + 1))
 
-    for dy in range(-R, R + 1):
-        for dx in range(-R, R + 1):
-            total_intensity = 0.0
-            valid_count = 0
-            for s in range(num_sites):
-                ny = grid_locations[s, 0] + dy
-                nx = grid_locations[s, 1] + dx
-                y_min = int(round(ny)) - half_box
-                y_max = int(round(ny)) + half_box
-                x_min = int(round(nx)) - half_box
-                x_max = int(round(nx)) + half_box
-                if y_min < 0 or x_min < 0 or y_max >= H or x_max >= W:
-                    continue
-                patch = avg_image[y_min:y_max + 1, x_min:x_max + 1]
-                if patch.shape != mask_mat.shape:
-                    continue
-                total_intensity += np.sum(patch * mask_mat) / mask_mat.size
-                valid_count += 1
-            if valid_count > 0:
-                heatmap[dy + R, dx + R] = total_intensity / valid_count
+    # Vectorized heatmap. The per-(shift, site) masked patch sum is a 2D
+    # correlation of the mean image with the mask, evaluated at the patch's
+    # top-left corner — so compute that correlation ONCE (FFT, releases the
+    # GIL) and gather it at every (site + shift) position in one fancy-index.
+    # The naive triple loop this replaces cost ~10 s for 1068 sites at R=12
+    # (667k Python iterations) and starved the acquisition loop at every scan
+    # boundary; this path is ~100x faster with the same skip semantics: a
+    # patch that would fall off the image is excluded from both the sum and
+    # the site count, and an all-invalid shift leaves heatmap[dy, dx] = 0.
+    # (A non-square or even-sized mask made the loop skip every patch via its
+    # shape check — patches are always (2*half_box+1)² — so keep the zero
+    # heatmap for that degenerate case.)
+    if (mask_mat.shape == (2 * half_box + 1, 2 * half_box + 1)
+            and num_sites > 0 and H >= box_size and W >= box_size):
+        # corr_map[y, x] = sum(avg_image[y:y+B, x:x+B] * mask_mat) / mask_mat.size
+        # for every valid top-left corner (y, x).
+        corr_map = fftconvolve(avg_image, mask_mat[::-1, ::-1],
+                               mode='valid') / mask_mat.size
+        shifts = np.arange(-R, R + 1)
+        # Rounded per-(site, shift) top-left corners. round() is applied to
+        # (position + shift) like the original — half-to-even can differ
+        # between round(g)+d and round(g+d) at exact-.5 fractions.
+        y0 = np.rint(grid_locations[:, 0:1] + shifts[None, :]).astype(np.int64) - half_box
+        x0 = np.rint(grid_locations[:, 1:2] + shifts[None, :]).astype(np.int64) - half_box
+        vy = (y0 >= 0) & (y0 <= H - box_size)            # (S, 2R+1)
+        vx = (x0 >= 0) & (x0 <= W - box_size)
+        valid = vy[:, :, None] & vx[:, None, :]          # (S, 2R+1, 2R+1)
+        y0c = np.clip(y0, 0, max(H - box_size, 0))
+        x0c = np.clip(x0, 0, max(W - box_size, 0))
+        vals = corr_map[y0c[:, :, None], x0c[:, None, :]]
+        count = valid.sum(axis=0)
+        total = np.where(valid, vals, 0.0).sum(axis=0)
+        np.divide(total, count, out=heatmap, where=count > 0)
 
     # Find initial peak
     max_idx = np.argmax(heatmap)
