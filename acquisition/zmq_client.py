@@ -333,10 +333,21 @@ class ZmqClient:
         }
         if time.monotonic() < self._grab_imgs_cooldown_until:
             return empty
+        t0 = time.monotonic()
+        t_lock = t0
         try:
             with self._lock:
+                t_lock = time.monotonic()
                 raw = self._client.get_imgs(timeout_ms=30000)
-        except Exception:
+        except Exception as e:
+            # A silent swallow here once hid a full 30 s get_imgs timeout that
+            # stalled the whole frame pipeline at a scan boundary — always say
+            # what happened and where the time went (lock wait vs request).
+            now = time.monotonic()
+            logger.warning(
+                'grab_imgs failed after %.1fs (lock wait %.1fs): %r — '
+                'cooling down %.1fs', now - t0, t_lock - t0, e,
+                _GRAB_IMGS_COOLDOWN_S)
             self._grab_imgs_cooldown_until = (
                 time.monotonic() + _GRAB_IMGS_COOLDOWN_S)
             return empty

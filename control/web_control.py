@@ -76,8 +76,13 @@ def enqueue(cmd, **fields):
     rec = dict(fields)
     rec['cmd'] = cmd
     rec['ts'] = time.time()
-    # Unique + lexically sortable by creation order: <ns>_<pid>.json
-    name = '%021d_%d.json' % (time.time_ns(), os.getpid())
+    # Unique + lexically sortable by creation order: <ns>_<pid>_<seq>.json.
+    # The per-process monotonic <seq> breaks ties when two enqueues land in the
+    # same time_ns() tick (Windows clock granularity is coarse -- without it the
+    # second file overwrote the first, silently dropping a command).
+    global _SEQ
+    _SEQ += 1
+    name = '%021d_%d_%06d.json' % (time.time_ns(), os.getpid(), _SEQ)
     path = os.path.join(CMD_DIR, name)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
