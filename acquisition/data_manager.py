@@ -376,6 +376,14 @@ class DataManager:
         self.live_thresholds = None          # from live_gauss_fits
         self.live_infidelities = None
 
+        # Per-site refit cache: maps a fit-channel label ('img1'/'img2') to a
+        # dict {site -> (hist_sig, params, thres, inf)}. A site's per-site
+        # least_squares + minimize_scalar (the dominant refit cost) is skipped
+        # and its cached result reused when the site's input histogram bytes are
+        # unchanged since the last fit -- so a refit that only advanced a few
+        # sites doesn't re-solve every site. Reset on scan/clear.
+        self._fit_cache = {}
+
         # --- Counters ---
         self._img_cnt_grid = 0
         self._img_cnt_refit = 0             # counts toward 200-shot Gaussian refit
@@ -611,6 +619,7 @@ class DataManager:
         self._intensity_accum = []
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
+        self._fit_cache = {}                 # drop per-site refit cache on reset
         self._thr_place_ratio = None
         self._thr_clamp_lo = self._thr_clamp_hi = None
         self._thr_fit_anchor = None
@@ -659,6 +668,10 @@ class DataManager:
         # NOTE: don't reset self._day_dir — it's set in __init__ before this call
         self.img_buffer = self.log_buffer = None
         self._img_cnt_grid = self._img_cnt_refit = self._img_cnt_loading = 0
+        # _img_cnt_affine/_img_cnt_thres_live were added to the normal-path init
+        # only; isInit/isHC scans reach store_new_data through THIS reset, and the
+        # missing attrs made every frame batch raise (imgs silently unsaved).
+        self._img_cnt_affine = self._img_cnt_thres_live = 0
         self._seq_total = 0   # per-run shot stamp (get_plot_data: shots_this_run)
 
     def _load_from_disk(self):
@@ -1653,7 +1666,8 @@ class DataManager:
         all_i = np.array(self._intensity_accum_img2)
         hist = self._compute_hist_data(all_i, self.num_sites_img2)
         self.live_hist_data_img2 = hist
-        fits, thres, inf = self._fit_gaussians(all_i, hist_data=hist)
+        fits, thres, inf = self._fit_gaussians(all_i, hist_data=hist,
+                                               cache_key='img2')
         ok, reason, stats = self._validate_full_fit(
             fits, thres, all_i, num_sites=self.num_sites_img2)
         iso = _now_iso()
@@ -2290,7 +2304,7 @@ class DataManager:
                         self.log_buffer_img2.get_last_n(n2).mean(axis=0))
                 self._img_cnt_loading = 0
 
-    def _fit_gaussians(self, all_intensities, hist_data=None):
+    def _fit_gaussians(self, all_intensities, hist_data=None, cache_key='img1'):
         from scipy.optimize import least_squares, minimize_scalar
         from scipy.special import ndtr   # standard-normal CDF; ~2.5x faster than norm.cdf
         from yb_analysis.detection.dynamical_threshold import _gauss_pdf
@@ -2298,6 +2312,24 @@ class DataManager:
         # Per-site bin centres/counts to fit against. Defaults to the img1 live
         # histograms (self.live_hist_data); the img2 refit passes its own.
         hd = hist_data if hist_data is not None else self.live_hist_data
+
+        # Per-site refit cache for this channel. A site whose input histogram
+        # (bin_centers, counts) is byte-identical to its last fit yields an
+        # identical least_squares/minimize_scalar result, so reuse it instead of
+        # re-solving. This is the selective-refit fast path: a refit that only
+        # advanced a handful of sites skips the solve for all the rest.
+        if getattr(self, '_fit_cache', None) is None:
+            self._fit_cache = {}
+        site_cache = self._fit_cache.setdefault(cache_key, {})
+        new_cache = {}
+
+        def _hist_sig(bc, ct):
+            try:
+                return (hash(np.asarray(bc).tobytes()),
+                        hash(np.asarray(ct).tobytes()))
+            except Exception:
+                return None
+        n_reused = 0
 
         # Fit only the most recent THRES_FIT_MAX_SHOTS shots — the per-site fit is the
         # dominant cost and a few hundred shots already resolve the doublet; this also
@@ -2346,6 +2378,26 @@ class DataManager:
                 thres[s], inf[s] = np.median(vals), np.nan
                 continue
 
+            # Per-site histogram to fit against (drives both the fit and the
+            # cache signature), selected before the solve so we can short-circuit.
+            h = hd[s] if (hd and s < len(hd)) else None
+            if h:
+                bc, ct = h['bin_centers'], h['counts']
+            else:
+                ct, edges = np.histogram(vals, bins=50, density=True)
+                bc = 0.5 * (edges[:-1] + edges[1:])
+
+            # Fast path: input histogram unchanged since the last fit -> reuse.
+            sig = _hist_sig(bc, ct)
+            cached = site_cache.get(s)
+            if sig is not None and cached is not None and cached[0] == sig:
+                _, c_p, c_thr, c_inf = cached
+                fits.append({'params': c_p})
+                thres[s], inf[s] = c_thr, c_inf
+                new_cache[s] = cached
+                n_reused += 1
+                continue
+
             # Use avg fit as initial guess (much better than per-site percentiles)
             if avg_p is not None:
                 x0 = [avg_p[0], avg_p[1], avg_p[2], avg_p[3], avg_p[4], avg_p[5]]
@@ -2359,13 +2411,6 @@ class DataManager:
                 lb = [mn - 0.1*rng, sd/50, 0.01, p50, sd/50, 0.01]
                 ub = [p50, sd*2, 1.0, mx + 0.1*rng, sd*2, 1.0]
 
-            h = hd[s] if (hd and s < len(hd)) else None
-            if h:
-                bc, ct = h['bin_centers'], h['counts']
-            else:
-                ct, edges = np.histogram(vals, bins=50, density=True)
-                bc = 0.5 * (edges[:-1] + edges[1:])
-
             try:
                 res = least_squares(lambda p: two_g(p, bc) - ct, x0, bounds=(lb, ub), method='trf')
                 p = res.x
@@ -2377,9 +2422,17 @@ class DataManager:
                 )
                 fits.append({'params': p})
                 thres[s], inf[s] = opt.x, opt.fun
+                if sig is not None:
+                    new_cache[s] = (sig, p, float(opt.x), float(opt.fun))
             except Exception:
                 fits.append({'params': None})
                 thres[s], inf[s] = np.median(vals), np.nan
+
+        # Swap in the fresh cache (drops sites that vanished / whose hist moved).
+        self._fit_cache[cache_key] = new_cache
+        if n_reused:
+            logger.info('Threshold refit [%s]: reused %d/%d cached site fits',
+                        cache_key, n_reused, M)
 
         return fits, thres, inf
 
