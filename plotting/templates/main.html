@@ -391,6 +391,16 @@
       <span class="track"></span>
       <span>Autoscale</span>
     </label>
+    <!-- Site-mask toggle: restrict the live scan curve to the current pattern's
+         configured "stable sites" subset (record.json site_mask). OFF = full
+         array (default). Applied in the main process's DataManager. -->
+    <label class="switch card-switch" id="site-mask-switch"
+           title="Average the live scan curve over only the current pattern's configured site subset (stable sites). OFF = full array.">
+      <input type="checkbox" id="site-mask-live">
+      <span class="track"></span>
+      <span>Site mask</span>
+    </label>
+    <span class="hint mono" id="site-mask-info"></span>
     <div class="plot-container" id="plot-scan" style="height: 320px;"></div>
   </section>
 

@@ -37,6 +37,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+import warnings
+
 import numpy as np
 
 from yb_analysis import config as _yb_cfg
@@ -216,6 +218,7 @@ def analyze_scan(scan_id: Optional[str] = None,
                  include_diag_aggregate: bool = True,
                  include_per_iteration: bool = True,
                  filters: Optional[dict] = None,
+                 site_mask=None,
                  recompute_infidelity: bool = False,
                  force_recache: bool = False,
                  sync_slm_diag: bool = True) -> dict:
@@ -245,6 +248,7 @@ def analyze_scan(scan_id: Optional[str] = None,
         include_diag_aggregate=include_diag_aggregate,
         include_per_iteration=include_per_iteration,
         filters=filters,
+        site_mask=site_mask,
         recompute_infidelity=recompute_infidelity,
         force_recache=force_recache,
         sync_slm_diag=sync_slm_diag)
@@ -256,6 +260,7 @@ def analyze_scan_dir(scan_dir,
                      include_diag_aggregate: bool = True,
                      include_per_iteration: bool = True,
                      filters: Optional[dict] = None,
+                     site_mask=None,
                      recompute_infidelity: bool = False,
                      force_recache: bool = False,
                      sync_slm_diag: bool = True) -> dict:
@@ -330,19 +335,6 @@ def analyze_scan_dir(scan_dir,
     if not scan_dir.is_dir():
         raise RunAnalysisError(f"scan_dir not a directory: {scan_dir}")
 
-    # Fast path: the DEFAULT view (no filter, no recompute) of a scan whose
-    # data hasn't grown is served straight from the cached payload on disk, so
-    # a page reload / tab-switch returns in ~ms instead of re-reading the HDF5.
-    # Self-invalidates when the scan grows (shot-count key mismatch); busted by
-    # force_recache (which deletes the file just below).
-    _default_view = (filters is None and not recompute_infidelity)
-    if _default_view and not force_recache:
-        _cached = _read_payload_cache(scan_dir)
-        if _cached is not None:
-            _cur_shots = _probe_actual_shots(scan_dir)
-            if _cur_shots is not None and _cached.get('n_shots') == _cur_shots:
-                return _cached['payload']
-
     # "Re-analyze" button: drop the cached (expensive) results so they're
     # recomputed fresh this call.
     if force_recache:
@@ -360,6 +352,34 @@ def analyze_scan_dir(scan_dir,
         raise RunAnalysisError(f"failed to load scan data: {ex}") from ex
 
     scan = bundle.get('Scan') or {}
+
+    # Determine the effective site-mask SPEC now that we know the scan's own
+    # loading pattern. Precedence (see site_mask.effective_spec): explicit
+    # ``site_mask`` arg > the scan pattern's registry-configured mask > None.
+    # ``site_mask=False`` forces the full array. A masked view is NOT the plain
+    # default view, so it bypasses the ms payload cache (below) -- it must never
+    # share the on-disk cache file with the full-array view. The bool array is
+    # resolved after unpack (needs n_sites).
+    try:
+        from yb_analysis.analysis import site_mask as _sm
+        _scan_pattern = (_loading_pattern_names(scan) or [None])[0]
+        _site_mask_spec = _sm.effective_spec(site_mask, pattern=_scan_pattern)
+    except Exception:
+        _site_mask_spec = (site_mask if site_mask not in (None, False) else None)
+
+    # Fast path: the DEFAULT unmasked view (no filter, no recompute, no mask) of
+    # a scan whose data hasn't grown is served straight from the cached payload
+    # on disk (~ms). Self-invalidates when the scan grows (shot-count key
+    # mismatch); busted by force_recache (which already deleted it above).
+    _default_view = (filters is None and _site_mask_spec is None
+                     and not recompute_infidelity)
+    if _default_view and not force_recache:
+        _cached = _read_payload_cache(scan_dir)
+        if _cached is not None:
+            _cur_shots = _probe_actual_shots(scan_dir)
+            if _cur_shots is not None and _cached.get('n_shots') == _cur_shots:
+                return _cached['payload']
+
     out['scan_name']     = _resolve_scan_name(scan)
     out['scan_filename'] = _str_or_none(scan.get('scanfilename'))
     out['scan_description'] = _scan_description(scan)
@@ -406,9 +426,39 @@ def analyze_scan_dir(scan_dir,
 
     n_sites, n_params, max_reps = (
         logic1.shape if logic1.ndim == 3 else (0, 0, 0))
+
+    # ---- Global per-site mask ("analyze only these sites") ------------
+    # Resolve the spec (arg or config.SITE_MASK) against this scan's n_sites.
+    # The bool cubes are LEFT UNTOUCHED (so the tested probability math is
+    # unchanged); the mask is passed to the site-resolved probability functions
+    # + the per_site block below, which NaN the excluded site rows. Every
+    # array-averaged readout (survival/loading/loss/FP + per-shot) is a
+    # nanmean/nansum over sites and drops the excluded rows automatically; the
+    # per-site (x,y) maps keep full width (excluded -> NaN). This applies BEFORE
+    # summary + per_site + the global headline block, so every readout honors it.
+    out['site_mask_active'] = False
+    out['site_mask_spec'] = (str(_site_mask_spec) if _site_mask_spec is not None else None)
+    out['site_mask_error'] = None
+    out['n_sites_used'] = int(n_sites)
+    _site_mask = None
+    if _site_mask_spec is not None and n_sites:
+        try:
+            from yb_analysis.analysis import site_mask as _sm
+            _site_mask = _sm.resolve_site_mask(_site_mask_spec, int(n_sites))
+            if _site_mask is not None:
+                out['site_mask_active'] = True
+                out['n_sites_used'] = int(_site_mask.sum())
+        except Exception as ex:
+            # A bad mask must not blank the whole analysis -- surface it and
+            # fall back to the full array.
+            out['site_mask_error'] = f"{type(ex).__name__}: {ex}"
+            logger.warning("analyze_scan_dir: site_mask %r failed: %s",
+                           _site_mask_spec, out['site_mask_error'])
+
     # Keep UNFILTERED references for the global (filter-independent)
     # headline block computed near the end of this function. The filter
     # block below rebinds logic1/logic2/scan_params/reps_per_param.
+    # (These already carry the site mask -- captured after masking above.)
     logic1_full = logic1
     logic2_full = logic2
     reps_per_param_full = reps_per_param
@@ -484,7 +534,8 @@ def analyze_scan_dir(scan_dir,
     out['filter_active'] = bool(param_mask is not None)
 
     # ---- Summary: survival / loading / loss per param ------------------
-    out['summary'] = _summary_stats(logic1, logic2, reps_per_param)
+    out['summary'] = _summary_stats(logic1, logic2, reps_per_param,
+                                    site_mask=_site_mask)
 
     # ---- Seq-specific: CALIBRATION-FREE focus metrics vs swept param ----
     # For loading-optimisation sweeps (e.g. LoadingDefocusScan) measure spot
@@ -525,8 +576,9 @@ def analyze_scan_dir(scan_dir,
             # site-by-param breakdowns; the map panel wants site-only,
             # so we mean over the param axis after they return.
             lr_per_param, _ = loading_rate_site_resolved(
-                logic1, reps_per_param=reps_per_param)
-            with np.errstate(invalid='ignore'):
+                logic1, reps_per_param=reps_per_param, site_mask=_site_mask)
+            with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN masked rows
                 lr_mean = np.nanmean(np.asarray(lr_per_param, dtype=float),
                                      axis=1)
             per_site = {
@@ -541,8 +593,9 @@ def analyze_scan_dir(scan_dir,
             # survival map instead; here we keep the loading map (img1-only).
             if (logic2 is not None and logic2.size
                     and not _cross_grid_logicals(logic1, logic2)):
-                sr_per_param, _ = prob11_site_resolved(logic1, logic2)
-                with np.errstate(invalid='ignore'):
+                sr_per_param, _ = prob11_site_resolved(logic1, logic2, site_mask=_site_mask)
+                with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                    warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN masked rows
                     sr_mean = np.nanmean(np.asarray(sr_per_param, dtype=float),
                                          axis=1)
                 per_site['survival_mean'] = sr_mean.tolist()
@@ -552,6 +605,8 @@ def analyze_scan_dir(scan_dir,
                     n_empty = empty.sum(axis=(1, 2))
                     n_fp    = detected_in_2.sum(axis=(1, 2))
                     fp = np.where(n_empty > 0, n_fp / n_empty, np.nan)
+                    if _site_mask is not None and fp.shape[0] == _site_mask.size:
+                        fp[~_site_mask] = np.nan
                 per_site['fp_rate'] = fp.tolist()
             per_site['x'], per_site['y'] = _site_grid_xy(scan)
             out['per_site'] = per_site
@@ -1399,7 +1454,8 @@ def _cross_grid_logicals(logic1, logic2) -> bool:
 
 def _summary_stats(logic1: np.ndarray,
                    logic2: Optional[np.ndarray],
-                   reps_per_param: Optional[np.ndarray] = None) -> dict:
+                   reps_per_param: Optional[np.ndarray] = None,
+                   site_mask=None) -> dict:
     """Per-param survival / loss / loading curves.
 
     Each rate carries TWO error families so the dashboard's error-bar
@@ -1420,7 +1476,7 @@ def _summary_stats(logic1: np.ndarray,
     if logic1.size == 0 or logic2 is None or logic2.size == 0:
         # Loading-only or empty scan: still report what we can.
         try:
-            lr_mean, lr_sem = (loading_rate(logic1, reps_per_param)
+            lr_mean, lr_sem = (loading_rate(logic1, reps_per_param, site_mask=site_mask)
                                if logic1.size else (np.array([]),
                                                     np.array([])))
         except Exception:
@@ -1436,14 +1492,14 @@ def _summary_stats(logic1: np.ndarray,
             'loss_sem':          empty,
         }
     else:
-        sr_mean, sr_sem = prob11(logic1, logic2)
-        ls_mean, ls_sem = prob10(logic1, logic2)
-        lr_mean, lr_sem = loading_rate(logic1, reps_per_param)
+        sr_mean, sr_sem = prob11(logic1, logic2, site_mask=site_mask)
+        ls_mean, ls_sem = prob10(logic1, logic2, site_mask=site_mask)
+        lr_mean, lr_sem = loading_rate(logic1, reps_per_param, site_mask=site_mask)
         # Baseline (all-empty) false-positive rate. For rearrangement runs the
         # caller OVERRIDES fp_mean/fp_sem with the target-aware version (which
         # excludes target sites); this is what non-rearrange 2-image scans use.
         try:
-            fp_mean, fp_sem = false_positive_rate(logic1, logic2)
+            fp_mean, fp_sem = false_positive_rate(logic1, logic2, site_mask=site_mask)
         except Exception as ex:
             logger.warning('_summary_stats: false_positive_rate failed: %s', ex)
             fp_mean = fp_sem = None
@@ -1460,7 +1516,7 @@ def _summary_stats(logic1: np.ndarray,
         }
     # Per-shot error families (default for the dashboard).
     try:
-        ps = per_shot_rate_stats(logic1, logic2, reps_per_param)
+        ps = per_shot_rate_stats(logic1, logic2, reps_per_param, site_mask=site_mask)
     except Exception as ex:
         logger.warning('_summary_stats: per_shot_rate_stats failed: %s', ex)
         ps = {}

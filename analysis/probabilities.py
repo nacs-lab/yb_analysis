@@ -8,6 +8,25 @@ import warnings
 import numpy as np
 
 
+def _apply_site_mask_sr(arr_sr, site_mask):
+    """NaN-out excluded site rows of a site-resolved array ``[nSites, nParams]``.
+
+    ``site_mask`` is a bool array over sites (True = keep) or None (no-op). Used
+    by the site-resolved probability functions so a global "analyze only these
+    sites" option threads through every readout without changing the bool-cube
+    math. Length mismatch or None -> returned unchanged. Returns a copy when it
+    masks."""
+    if site_mask is None or arr_sr is None:
+        return arr_sr
+    m = np.asarray(site_mask, dtype=bool)
+    a = np.asarray(arr_sr)
+    if a.ndim < 1 or a.shape[0] != m.size:
+        return arr_sr
+    a = a.astype(float, copy=True)
+    a[~m] = np.nan
+    return a
+
+
 def _inter_site_sem(mean_sr):
     """Standard error of the mean across sites.
 
@@ -31,12 +50,15 @@ def _inter_site_sem(mean_sr):
 
 # ---- Survival: P(1→1 | loaded) ----
 
-def prob11_site_resolved(logic1, logic2):
+def prob11_site_resolved(logic1, logic2, site_mask=None):
     """Site-resolved survival probability P(img1=1 AND img2=1 | img1=1).
 
     Parameters
     ----------
     logic1, logic2 : ndarray (nSites, nParams, nReps) bool
+    site_mask : ndarray (nSites,) bool, optional
+        When given, excluded sites (False) are NaN'd in the returned rows so
+        they drop out of any downstream site-average. Default None = all sites.
 
     Returns
     -------
@@ -54,10 +76,10 @@ def prob11_site_resolved(logic1, logic2):
     mean_sr[mask] = p11
     sem_sr[mask] = np.sqrt(p11 * (1 - p11) / loaded[mask])
 
-    return mean_sr, sem_sr
+    return _apply_site_mask_sr(mean_sr, site_mask), _apply_site_mask_sr(sem_sr, site_mask)
 
 
-def prob11(logic1, logic2):
+def prob11(logic1, logic2, site_mask=None):
     """Site-averaged survival probability.
 
     Grand mean of the per-site survival ratios across sites (each site weighted
@@ -75,8 +97,12 @@ def prob11(logic1, logic2):
     mean : ndarray (nParams,)
     sem  : ndarray (nParams,)
     """
-    mean_sr, sem_sr = prob11_site_resolved(logic1, logic2)
-    n_sites = mean_sr.shape[0]
+    mean_sr, sem_sr = prob11_site_resolved(logic1, logic2, site_mask=site_mask)
+    # Normalize the summed-in-quadrature SEM by the number of sites actually
+    # AVERAGED (kept by the mask), not the full array width, else masking would
+    # deflate the SEM.
+    n_sites = (int(np.asarray(site_mask, dtype=bool).sum())
+               if site_mask is not None else mean_sr.shape[0])
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN columns → NaN
         mean = np.nanmean(mean_sr, axis=0)
@@ -86,12 +112,13 @@ def prob11(logic1, logic2):
 
 # ---- Loss: P(1→0 | loaded) ----
 
-def prob10_site_resolved(logic1, logic2):
+def prob10_site_resolved(logic1, logic2, site_mask=None):
     """Site-resolved loss probability P(img1=1 AND img2=0 | img1=1).
 
     Parameters
     ----------
     logic1, logic2 : ndarray (nSites, nParams, nReps) bool
+    site_mask : ndarray (nSites,) bool, optional — excluded sites NaN'd.
 
     Returns
     -------
@@ -108,17 +135,17 @@ def prob10_site_resolved(logic1, logic2):
     mean_sr[mask] = p10
     sem_sr[mask] = np.sqrt(p10 * (1 - p10) / loaded[mask])
 
-    return mean_sr, sem_sr
+    return _apply_site_mask_sr(mean_sr, site_mask), _apply_site_mask_sr(sem_sr, site_mask)
 
 
-def prob10(logic1, logic2):
+def prob10(logic1, logic2, site_mask=None):
     """Site-averaged loss probability.
 
     Returns
     -------
     mean, sem : ndarray (nParams,)
     """
-    mean_sr, _ = prob10_site_resolved(logic1, logic2)
+    mean_sr, _ = prob10_site_resolved(logic1, logic2, site_mask=site_mask)
     mean = np.nanmean(mean_sr, axis=0)
     sem = _inter_site_sem(mean_sr)
     return mean, sem
@@ -126,13 +153,14 @@ def prob10(logic1, logic2):
 
 # ---- False-positive rate: P(img2=1 | img1=0) ----
 
-def false_positive_site_resolved(logic1, logic2):
+def false_positive_site_resolved(logic1, logic2, site_mask=None):
     """Site-resolved false-positive rate P(img2=1 | img1=0) — spurious
     detection at sites that were EMPTY in img1.
 
     This is the "all-empty" convention; for REARRANGEMENT use the
     target-aware FP that excludes target sites (atoms moved into a target
-    aren't false positives). Parameters/returns mirror ``prob10``."""
+    aren't false positives). Parameters/returns mirror ``prob10``.
+    ``site_mask`` (nSites,) bool optional -> excluded sites NaN'd."""
     empty = np.sum(~logic1, axis=2)
     spur = np.sum(~logic1 & logic2, axis=2)
     mean_sr = np.full(empty.shape, np.nan)
@@ -141,17 +169,17 @@ def false_positive_site_resolved(logic1, logic2):
     p = spur[mask] / empty[mask]
     mean_sr[mask] = p
     sem_sr[mask] = np.sqrt(p * (1 - p) / empty[mask])
-    return mean_sr, sem_sr
+    return _apply_site_mask_sr(mean_sr, site_mask), _apply_site_mask_sr(sem_sr, site_mask)
 
 
-def false_positive_rate(logic1, logic2):
+def false_positive_rate(logic1, logic2, site_mask=None):
     """Site-averaged false-positive rate (all-empty convention).
 
     Returns
     -------
     mean, sem : ndarray (nParams,)
     """
-    mean_sr, _ = false_positive_site_resolved(logic1, logic2)
+    mean_sr, _ = false_positive_site_resolved(logic1, logic2, site_mask=site_mask)
     mean = np.nanmean(mean_sr, axis=0)
     sem = _inter_site_sem(mean_sr)
     return mean, sem
@@ -159,7 +187,7 @@ def false_positive_rate(logic1, logic2):
 
 # ---- Loading rate: P(img1=1) ----
 
-def loading_rate_site_resolved(logic1, reps_per_param=None):
+def loading_rate_site_resolved(logic1, reps_per_param=None, site_mask=None):
     """Site-resolved loading rate.
 
     Parameters
@@ -171,6 +199,7 @@ def loading_rate_site_resolved(logic1, reps_per_param=None):
         when every param has exactly the same number of reps.  Pass it in for
         scans with non-uniform reps (mid-scan aborts, scrambled scans where
         the run ended before all combinations got equal coverage).
+    site_mask : ndarray (nSites,) bool, optional — excluded sites NaN'd.
 
     Returns
     -------
@@ -188,7 +217,7 @@ def loading_rate_site_resolved(logic1, reps_per_param=None):
     sem_sr = np.where(n_per_param > 0,
                       np.sqrt(mean_sr * (1 - mean_sr) / denom),
                       np.nan)
-    return mean_sr, sem_sr
+    return _apply_site_mask_sr(mean_sr, site_mask), _apply_site_mask_sr(sem_sr, site_mask)
 
 
 # ---- Paired-site conditional probabilities: P(img2=AB | img1=11) ----
@@ -294,7 +323,7 @@ def pair_prob(logic1, logic2):
             p1110, p1110_sem, p1101, p1101_sem)
 
 
-def loading_rate(logic1, reps_per_param=None):
+def loading_rate(logic1, reps_per_param=None, site_mask=None):
     """Site-averaged loading rate.
 
     Parameters
@@ -303,18 +332,19 @@ def loading_rate(logic1, reps_per_param=None):
     reps_per_param : ndarray (nParams,) int, optional
         Actual reps per param.  See ``loading_rate_site_resolved`` — required
         for correct results when reps are non-uniform.
+    site_mask : ndarray (nSites,) bool, optional — excluded sites NaN'd.
 
     Returns
     -------
     mean, sem : ndarray (nParams,)
     """
-    mean_sr, _ = loading_rate_site_resolved(logic1, reps_per_param)
+    mean_sr, _ = loading_rate_site_resolved(logic1, reps_per_param, site_mask=site_mask)
     mean = np.nanmean(mean_sr, axis=0)
     sem = _inter_site_sem(mean_sr)
     return mean, sem
 
 
-def per_shot_rate_stats(logic1, logic2=None, reps_per_param=None):
+def per_shot_rate_stats(logic1, logic2=None, reps_per_param=None, site_mask=None):
     """Per-parameter statistics computed ACROSS SHOTS (not across sites).
 
     For each shot the survival rate is ``(#sites loaded AND survived) /
@@ -344,6 +374,15 @@ def per_shot_rate_stats(logic1, logic2=None, reps_per_param=None):
     """
     if logic1 is None or logic1.ndim != 3 or logic1.size == 0:
         return {}
+    # Per-shot rates sum over SITES (axis 0); with a site mask, restrict those
+    # sums to the kept sites by row-slicing here (correct: this function has no
+    # per-site output to preserve).
+    if site_mask is not None:
+        m = np.asarray(site_mask, dtype=bool)
+        if m.size == logic1.shape[0]:
+            logic1 = logic1[m]
+            if logic2 is not None and logic2.size and logic2.shape[0] == m.size:
+                logic2 = logic2[m]
     n_sites, n_params, max_reps = logic1.shape
     if reps_per_param is None:
         reps = np.full(n_params, max_reps, dtype=int)

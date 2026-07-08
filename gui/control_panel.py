@@ -192,6 +192,11 @@ class ControlPanel(tk.Tk):
         # its plot-data dict so the dashboard can show the live frame without
         # mutating the real DM's internal state or its save buffers.
         self._last_real_dm = None
+        # Live "analyze only these sites" toggle (from the web dashboard). Panel-
+        # level so it survives DataManager churn across scans; re-applied to each
+        # new real DM in _process_once. (spec None => use config.SITE_MASK.)
+        self._site_mask_enabled = False
+        self._site_mask_spec = None
 
         style = ttk.Style(self)
         style.configure('Abort.TButton', foreground='red',
@@ -992,6 +997,18 @@ class ControlPanel(tk.Tk):
                         except Exception:
                             pass
                         self._on_switch_backend(target, confirmed=True)
+                elif cmd == 'site_mask':
+                    # Live "analyze only these sites" toggle (view-only; no
+                    # authority over the experiment). Persist on the panel so it
+                    # survives new-scan DM churn, and apply to the current DM now.
+                    self._site_mask_enabled = bool(rec.get('enabled'))
+                    if rec.get('spec') is not None:
+                        self._site_mask_spec = rec.get('spec')
+                    if self._last_real_dm is not None:
+                        self._last_real_dm.set_site_mask_enabled(
+                            self._site_mask_enabled, spec=self._site_mask_spec)
+                    logger.info('Web site_mask -> enabled=%s spec=%r',
+                                self._site_mask_enabled, self._site_mask_spec)
                 elif cmd in ('camera_connect', 'camera_apply',
                              'camera_disconnect'):
                     # Dispatch to CameraPane, which owns the ZMQ client and
@@ -1068,6 +1085,12 @@ class ControlPanel(tk.Tk):
                 # Track this DM so dummy frames (cur_scan < 0) can borrow its
                 # plot context. Updated only on real saves.
                 self._last_real_dm = dm
+                # Carry the live site-mask toggle onto each new-scan DM.
+                if self._site_mask_enabled:
+                    try:
+                        dm.set_site_mask_enabled(True, spec=self._site_mask_spec)
+                    except Exception:
+                        pass
                 self.after(0, self._update_labels, fname, save_err)
             elif cur_scan == FAILING_DISPLAY_SCAN_ID:
                 # Failing-shot frames published for DISPLAY ONLY (backend's

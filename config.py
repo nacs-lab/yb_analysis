@@ -194,6 +194,14 @@ def write_orca_exposure(exposure_time):
         raise RuntimeError(f'Failed to update expConfig.m: {e}')
 
 
+# ---- Per-site analysis mask ("analyze only these sites") ----
+# NOTE: the default mask is now PER PATTERN, stored in the pattern registry
+# (record.json['site_mask'], read by yb_analysis.analysis.pattern_registry.
+# load_pattern_site_mask) -- NOT a global here, because a mask's indices are
+# array-specific. analyze_scan(site_mask=...) overrides per call; site_mask=False
+# forces the full array. See yb_analysis.analysis.site_mask for the resolver and
+# MASK_REGISTRY of named masks (e.g. 'stable').
+
 # DataManager update intervals (in number of sequences)
 UPDATE_GRID_INTERVAL = 50
 UPDATE_GRID_BATCH_SIZE = 50

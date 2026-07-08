@@ -1701,10 +1701,16 @@ def _register_api_routes(server):
         # "Re-analyze" button: drop the cached expensive results and recompute.
         force_recache = request.args.get('force_recache', '0') not in (
             '0', '', 'false', 'False')
+        # Optional site subset: a registered name ('stable') or .npy path.
+        # Omit -> the scan pattern's configured mask (if any); 'full' -> force
+        # the whole array (site_mask=False). Same query-param style as filter.
+        _sm_q = request.args.get('site_mask')
+        site_mask = (False if (_sm_q or '').lower() == 'full' else (_sm_q or None))
         try:
             result = analyze_scan(scan_id, filters=filters,
                                   recompute_infidelity=recompute,
-                                  force_recache=force_recache)
+                                  force_recache=force_recache,
+                                  site_mask=site_mask)
         except RunAnalysisError as ex:
             msg = str(ex).lower()
             if 'must be 14 digits' in msg or 'must pass scan_id' in msg:
@@ -2926,6 +2932,19 @@ def _register_api_routes(server):
                 {'error': 'set_backend requires a valid confirm token'}), 400
         _wc.enqueue('set_backend', target=target)
         return jsonify({'ok': True, 'target': target, 'via': 'run_monitor'})
+
+    @server.route('/api/control/site_mask', methods=['POST'])
+    def _api_control_site_mask():
+        # Live "analyze only these sites" toggle: view-only preference (no
+        # authority over the experiment -> no exposure gate). Spooled to the
+        # main process's ControlPanel, which applies it to the live DataManager.
+        from flask import jsonify, request
+        body = request.get_json(silent=True) or {}
+        enabled = bool(body.get('enabled', True))
+        spec = body.get('spec')  # name / .npy path / None -> config.SITE_MASK
+        _wc.enqueue('site_mask', enabled=enabled, spec=spec)
+        return jsonify({'ok': True, 'enabled': enabled, 'spec': spec,
+                        'via': 'run_monitor'})
 
     @server.route('/api/control/downsample', methods=['POST'])
     def _api_control_downsample():
@@ -5248,13 +5267,19 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
             occ = np.asarray(logicals[:n], dtype=float)
         else:
             occ = np.zeros(n)
+        # Site-mask-excluded sites arrive as NaN (see data_manager._mask_vec):
+        # they must be their OWN category (dim gray), NOT lumped with loaded or
+        # empty. NaN.astype(bool) is True, so build explicit 3-way selectors.
+        excluded = np.isnan(occ)
+        loaded = (occ >= 0.5) & ~excluded
+        empty = ~loaded & ~excluded
         if n > _GL_SITES:
             # WebGL boxes drawn as DATA-coordinate line outlines (not markers):
             # markers are a fixed pixel size that smears into a blob when zoomed
             # out, whereas these rectangles scale with zoom exactly like the old
-            # SVG shapes — but render in two cheap WebGL traces (loaded / empty)
-            # instead of thousands of SVG nodes. Each site contributes a closed
-            # 5-corner loop plus a NaN to break the line between boxes.
+            # SVG shapes — but render in cheap WebGL traces (loaded / empty /
+            # excluded) instead of thousands of SVG nodes. Each site contributes
+            # a closed 5-corner loop plus a NaN to break the line between boxes.
             half = box / 2.0
             ys = grid[:, 0].astype(float)
             xs = grid[:, 1].astype(float)
@@ -5262,8 +5287,10 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
             oy = np.array([-half, -half, half, half, -half, np.nan])
             bx = xs[:, None] + ox[None, :]          # (n, 6)
             by = ys[:, None] + oy[None, :]
-            loaded = occ.astype(bool)
-            for sel, color in ((loaded, '#00ff88'), (~loaded, '#ff4444')):
+            for sel, color in ((loaded, '#00ff88'), (empty, '#ff4444'),
+                               (excluded, '#555555')):
+                if not sel.any():
+                    continue
                 fig.add_trace(go.Scattergl(
                     x=bx[sel].ravel(), y=by[sel].ravel(), mode='lines',
                     line=dict(color=color, width=1.5),
@@ -5274,7 +5301,8 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
             shapes = []
             for i in range(n):
                 y0, x0 = grid[i]
-                c = '#00ff88' if occ[i] else '#ff4444'
+                c = ('#555555' if excluded[i] else
+                     '#00ff88' if loaded[i] else '#ff4444')
                 shapes.append(dict(type='rect', x0=x0-half, y0=y0-half,
                                    x1=x0+half, y1=y0+half,
                                    line=dict(color=c, width=2)))
@@ -5308,27 +5336,52 @@ def _fig_intens(d):
     # WebGL scatter — at thousands of sites SVG markers are a major render cost.
     fig.add_trace(go.Scattergl(x=sites, y=t.tolist(), mode='markers', name='Threshold',
                               marker=dict(size=thr_size, color='#777', symbol='circle', line=dict(width=1, color='#999'))))
-    ymin, ymax = float(t.min()), float(t.max())
+    # nan-aware: thresholds may be NaN at site-mask-excluded sites.
+    _tf = np.asarray(t, dtype=float)
+    if np.isfinite(_tf).any():
+        ymin, ymax = float(np.nanmin(_tf)), float(np.nanmax(_tf))
+    else:
+        ymin, ymax = 0.0, 1.0
     ci = d.get('cur_intensities')
     if ci is not None:
         logicals = d.get('logicals')
-        # Numeric occupancy + 2-stop colorscale (green/red) instead of a list of
-        # thousands of hex strings — smaller payload, faster to build.
+        # Numeric occupancy + 2-stop colorscale (red=empty / green=loaded).
+        # Site-mask-excluded sites are NaN -> map to a distinct GRAY so they
+        # read as "not analyzed", not as loaded (NaN would otherwise poison the
+        # split below). Uses a 3-stop scale with excluded pinned to -1.
         if logicals is not None and len(logicals) >= n:
             occ = np.asarray(logicals[:n], dtype=float)
         else:
             occ = np.zeros(n)
+        excluded = np.isnan(occ)
+        occ_color = np.where(excluded, -1.0, np.where(occ >= 0.5, 1.0, 0.0))
         fig.add_trace(go.Scattergl(x=sites, y=ci.tolist(), mode='markers', name='Current',
                                   marker=dict(size=cur_size, symbol='circle',
-                                              color=occ, colorscale=[[0, '#e44'], [1, '#0c6']],
-                                              cmin=0, cmax=1, line=dict(width=1, color='white'))))
-        ymin = min(ymin, float(ci.min()))
-        ymax = max(ymax, float(ci.max()))
-    # Mean line + 68% (±1σ) band for loaded / empty sites + distance annotation
+                                              color=occ_color,
+                                              colorscale=[[0.0, '#555'], [0.5, '#e44'], [1.0, '#0c6']],
+                                              cmin=-1, cmax=1, line=dict(width=1, color='white'))))
+        # ci may itself be NaN at excluded sites -> use nan-aware min/max.
+        _cf = np.asarray(ci, dtype=float)
+        if np.isfinite(_cf).any():
+            ymin = min(ymin, float(np.nanmin(_cf)))
+            ymax = max(ymax, float(np.nanmax(_cf)))
+    # Mean line + 68% (±1σ) band for loaded / empty sites + distance annotation.
+    # Excluded (NaN-logical) sites are dropped from BOTH bands.
     if ci is not None and logicals is not None:
-        mask = np.array(logicals[:n], dtype=bool) if len(logicals) >= n else np.zeros(n, dtype=bool)
+        if len(logicals) >= n:
+            _lg = np.asarray(logicals[:n], dtype=float)
+            _excl = np.isnan(_lg)
+            mask = (_lg >= 0.5) & ~_excl        # loaded, excluding masked-out
+            empty_mask = ~mask & ~_excl         # empty, excluding masked-out
+        else:
+            mask = np.zeros(n, dtype=bool)
+            empty_mask = np.zeros(n, dtype=bool)
 
         def _band(values, color, fill, label, yanchor):
+            values = np.asarray(values, dtype=float)
+            values = values[np.isfinite(values)]   # drop any NaN (masked) sites
+            if values.size == 0:
+                return None, None
             mu = float(values.mean())
             sd = float(values.std())
             # ±1σ band ≈ central 68% of a normal distribution
@@ -5343,14 +5396,16 @@ def _fig_intens(d):
 
         if mask.any():
             mu_loaded, sd_loaded = _band(ci[mask], '#0c6', 'rgba(0,204,102,0.12)', 'Loaded', 'bottom')
-            ymin = min(ymin, mu_loaded - sd_loaded)
-            ymax = max(ymax, mu_loaded + sd_loaded)
+            if mu_loaded is not None:
+                ymin = min(ymin, mu_loaded - sd_loaded)
+                ymax = max(ymax, mu_loaded + sd_loaded)
         else:
             mu_loaded = None
-        if (~mask).any():
-            mu_empty, sd_empty = _band(ci[~mask], '#e44', 'rgba(238,68,68,0.12)', 'Empty', 'top')
-            ymin = min(ymin, mu_empty - sd_empty)
-            ymax = max(ymax, mu_empty + sd_empty)
+        if empty_mask.any():
+            mu_empty, sd_empty = _band(ci[empty_mask], '#e44', 'rgba(238,68,68,0.12)', 'Empty', 'top')
+            if mu_empty is not None:
+                ymin = min(ymin, mu_empty - sd_empty)
+                ymax = max(ymax, mu_empty + sd_empty)
         else:
             mu_empty = None
         if mu_loaded is not None and mu_empty is not None:
@@ -5373,7 +5428,13 @@ def _fig_loading_live(d):
         return _waiting('Loading Rate')
     hist = np.asarray(hist, dtype=float)
     logicals = d.get('logicals')
-    cur = float(np.asarray(logicals).mean()) if logicals is not None and len(logicals) > 0 else None
+    # nan-aware: site-mask-excluded sites are NaN in `logicals`; the current
+    # loading fraction is over the KEPT sites (else .mean() -> NaN -> "nan%").
+    cur = None
+    if logicals is not None and len(logicals) > 0:
+        _lg = np.asarray(logicals, dtype=float)
+        if np.isfinite(_lg).any():
+            cur = float(np.nanmean(_lg))
     # Average over the displayed history window (always populated, unlike
     # loading_rates which only refreshes every UPDATE_LOADING_INTERVAL shots).
     avg = float(hist.mean())
@@ -5409,9 +5470,14 @@ def _fig_loading(d, marker_size=12):
         return _waiting('Loading Rates')
     n = len(grid)
     sz = marker_size
+    # Site-mask-excluded sites are NaN in `rates`: blank their text label (else
+    # each excluded site prints "nan%"). The numeric colorscale below renders a
+    # NaN as an empty marker, which reads fine as "not analyzed".
+    rates = np.asarray(rates, dtype=float)
+    excluded = np.isnan(rates)
     if n < 100:
         mode = 'markers+text'
-        text = [f'{r:.0%}' for r in rates]
+        text = ['' if e else f'{r:.0%}' for r, e in zip(rates, excluded)]
         tfont = dict(size=7, color='black')
     else:
         mode = 'markers'
@@ -5420,7 +5486,7 @@ def _fig_loading(d, marker_size=12):
     # WebGL + hovertemplate: at thousands of sites, SVG markers and a per-point
     # hovertext string list are both heavy. customdata = [site, rate] feeds both
     # the hover and the click-to-select JS (which reads customdata[0]).
-    customdata = np.column_stack([np.arange(1, n + 1), np.asarray(rates)])
+    customdata = np.column_stack([np.arange(1, n + 1), rates])
     fig = go.Figure(go.Scattergl(
         x=grid[:,1], y=grid[:,0], mode=mode,
         marker=dict(size=sz, color=rates.tolist(), colorscale='RdYlGn', cmin=0, cmax=1,
@@ -5440,11 +5506,13 @@ def _fig_infid(d, marker_size=12):
     if grid is None or inf is None or len(grid) == 0:
         return _waiting('Infidelities')
     n = len(grid)
-    log_inf = np.log10(np.clip(inf, 1e-6, 1.0))
+    inf = np.asarray(inf, dtype=float)
+    excluded = np.isnan(inf)
+    log_inf = np.log10(np.clip(inf, 1e-6, 1.0))   # NaN stays NaN -> empty marker
     sz = marker_size
     if n < 100:
         mode = 'markers+text'
-        text = [f'{v:.0e}' for v in inf]
+        text = ['' if e else f'{v:.0e}' for v, e in zip(inf, excluded)]
         tfont = dict(size=6, color='white')
     else:
         mode = 'markers'
@@ -5797,13 +5865,19 @@ def _add_avg_fit_curve(fig, fits, color, name, faint=False):
 def _add_avg_bars(fig, hist_data, n_shots):
     if not hist_data or not isinstance(hist_data, list) or len(hist_data) == 0:
         return
+    # Site-mask-excluded sites are None entries (data_manager._mask_list): skip
+    # them and average over the KEPT sites so the mean isn't diluted.
+    kept = [h for h in hist_data
+            if h and h.get('bin_centers') is not None and len(h['bin_centers'])]
+    if not kept:
+        return
     # Common x-axis across all sites, then interpolate each site's density
-    all_c = np.concatenate([h['bin_centers'] for h in hist_data])
+    all_c = np.concatenate([h['bin_centers'] for h in kept])
     centers = np.linspace(all_c.min(), all_c.max(), 50)
     avg = np.zeros(50)
-    for h in hist_data:
+    for h in kept:
         avg += np.interp(centers, h['bin_centers'], h['counts'], left=0, right=0)
-    avg /= len(hist_data)
+    avg /= len(kept)
     bw = (centers[-1] - centers[0]) / (len(centers) - 1) * 0.85
     fig.add_trace(go.Bar(x=centers, y=avg, marker_color='#4488cc', opacity=0.8,
                          width=bw, name=f'Live ({n_shots})'))
@@ -5830,8 +5904,20 @@ def _figs_reps(d):
 def _fig_site(d, idx):
     fig = _build_hist(d, idx, f'Site {idx+1} Histogram')
     info = []
+    # A site-mask-excluded site has NaN threshold/infid/loading + a None fit;
+    # surface an explicit "excluded" note and skip the NaN rows.
+    _excluded_site = False
+    lg = d.get('logicals')
+    if lg is not None and idx < len(lg):
+        try:
+            _excluded_site = bool(np.isnan(float(lg[idx])))
+        except (TypeError, ValueError):
+            _excluded_site = False
+    if _excluded_site:
+        info.append(html.Div(html.Span('site-mask excluded',
+                    style={'color': '#888', 'fontStyle': 'italic'})))
     t = d.get('thresholds')
-    if t is not None and idx < len(t):
+    if t is not None and idx < len(t) and np.isfinite(t[idx]):
         info.append(html.Div(f'Threshold: {t[idx]:.2f}'))
     fits = d.get('live_gauss_fits') or d.get('loaded_gauss_fits')
     if fits and isinstance(fits, list) and idx < len(fits):
@@ -5840,15 +5926,28 @@ def _fig_site(d, idx):
             info.extend([html.Div(f'mu_empty: {p[0]:.2f}'), html.Div(f'mu_atom: {p[3]:.2f}'),
                          html.Div(f'sig_empty: {p[1]:.2f}'), html.Div(f'sig_atom: {p[4]:.2f}')])
     inf = d.get('infidelities')
-    if inf is not None and idx < len(inf):
+    if inf is not None and idx < len(inf) and np.isfinite(inf[idx]):
         v = float(inf[idx])
         c = '#4c4' if v < 0.01 else '#cc4' if v < 0.05 else '#c44'
         info.append(html.Div(html.Span(f'Infidelity: {v:.2e}', style={'color': c, 'fontWeight': 'bold'})))
     rates = d.get('loading_rates')
-    if rates is not None and idx < len(rates):
+    if rates is not None and idx < len(rates) and np.isfinite(rates[idx]):
         info.append(html.Div(f'Loading: {rates[idx]:.1%}'))
     info.append(html.Div(f'Shots: {d.get("n_accum_shots", 0)}', style={'color': '#888'}))
     return fig, info
+
+
+def _gauss_pdf(x, mu, sig):
+    """Normal PDF without the scipy.stats.norm dispatch overhead. Used for the
+    site-histogram display curves (called twice per site) -- matches the manual
+    -pdf approach the threshold fitter uses. Falls back safely for sig<=0."""
+    sig = sig if sig > 0 else 1e-9
+    return np.exp(-0.5 * ((x - mu) / sig) ** 2) / (sig * np.sqrt(2 * np.pi))
+
+
+# Display resolution for the per-site fit curves. 80 points is smooth enough at
+# panel size; the old 200 doubled the norm.pdf work per site for no visible gain.
+_HIST_CURVE_PTS = 80
 
 
 def _build_hist(d, idx, title):
@@ -5860,9 +5959,16 @@ def _build_hist(d, idx, title):
     thresholds = d.get('thresholds')
     inf = d.get('infidelities')
 
-    has_live = live_hist is not None and isinstance(live_hist, list) and idx < len(live_hist)
-    has_loaded_f = loaded_fits is not None and isinstance(loaded_fits, list) and idx < len(loaded_fits)
-    has_live_f = live_fits is not None and isinstance(live_fits, list) and idx < len(live_fits)
+    # A site-mask-EXCLUDED site is a None entry (data_manager._mask_list); treat
+    # it as "no data" so we render a clean placeholder instead of crashing on
+    # None['bin_centers'] / None['params'].
+    def _entry(lst):
+        return (lst[idx] if lst is not None and isinstance(lst, list)
+                and idx < len(lst) else None)
+    _lh, _lf, _ldf = _entry(live_hist), _entry(live_fits), _entry(loaded_fits)
+    has_live = isinstance(_lh, dict) and _lh.get('bin_centers') is not None
+    has_loaded_f = isinstance(_ldf, dict)
+    has_live_f = isinstance(_lf, dict)
 
     if not has_live and not has_loaded_f and not has_live_f:
         return _waiting(title)
@@ -5884,9 +5990,9 @@ def _build_hist(d, idx, title):
     if has_loaded_f and not has_live_f:
         p = loaded_fits[idx].get('params') if isinstance(loaded_fits[idx], dict) else None
         if p is not None:
-            xf = np.linspace(xmin, xmax, 200)
-            y1 = p[2]*norm.pdf(xf, p[0], p[1])
-            y2 = p[5]*norm.pdf(xf, p[3], p[4])
+            xf = np.linspace(xmin, xmax, _HIST_CURVE_PTS)
+            y1 = p[2]*_gauss_pdf(xf, p[0], p[1])
+            y2 = p[5]*_gauss_pdf(xf, p[3], p[4])
             fig.add_trace(go.Scatter(x=xf, y=y1, mode='lines', line=dict(color='#44cc44', width=1.5, dash='dot'),
                                      fill='tozeroy', fillcolor='rgba(68,204,68,0.08)', name='Empty (loaded)', opacity=0.5))
             fig.add_trace(go.Scatter(x=xf, y=y2, mode='lines', line=dict(color='#cc44cc', width=1.5, dash='dot'),
@@ -5903,9 +6009,9 @@ def _build_hist(d, idx, title):
     if has_live_f:
         p = live_fits[idx].get('params') if isinstance(live_fits[idx], dict) else None
         if p is not None:
-            xf = np.linspace(xmin, xmax, 200)
-            y1 = p[2]*norm.pdf(xf, p[0], p[1])
-            y2 = p[5]*norm.pdf(xf, p[3], p[4])
+            xf = np.linspace(xmin, xmax, _HIST_CURVE_PTS)
+            y1 = p[2]*_gauss_pdf(xf, p[0], p[1])
+            y2 = p[5]*_gauss_pdf(xf, p[3], p[4])
             fig.add_trace(go.Scatter(x=xf, y=y1, mode='lines', line=dict(color='#44cc44', width=2),
                                      name='Empty (live)'))
             fig.add_trace(go.Scatter(x=xf, y=y2, mode='lines', line=dict(color='#cc44cc', width=2),
@@ -5913,12 +6019,12 @@ def _build_hist(d, idx, title):
             fig.add_trace(go.Scatter(x=xf, y=y1+y2, mode='lines', line=dict(color='white', width=1.5, dash='dot'),
                                      name='Sum'))
 
-    # Threshold line
-    if thresholds is not None and idx < len(thresholds):
+    # Threshold line (skip NaN -- excluded sites have masked-out thresholds)
+    if thresholds is not None and idx < len(thresholds) and np.isfinite(thresholds[idx]):
         fig.add_vline(x=float(thresholds[idx]), line=dict(color='#ff4444', width=2, dash='dash'))
 
     # Infidelity badge (above legend, top-right corner)
-    if inf is not None and idx < len(inf):
+    if inf is not None and idx < len(inf) and np.isfinite(inf[idx]):
         v = float(inf[idx])
         c = '#4c4' if v < 0.01 else '#cc4' if v < 0.05 else '#c44'
         fig.add_annotation(text=f'Infid: {v:.1e}', xref='paper', yref='paper',

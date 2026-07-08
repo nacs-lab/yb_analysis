@@ -265,6 +265,17 @@ class DataManager:
         self._pattern_phase_status = {}  # pattern name -> 'ok'|'missing'|'unreachable'
         self._pattern_health = None      # get_plot_data payload; None = no loading pattern declared
 
+        # "Analyze only these sites" mask (live view). OFF by default: the live
+        # scan curve shows the full array unless the dashboard toggle turns it
+        # on. When on, the spec is the scan PATTERN's registry-configured mask
+        # (record.json['site_mask']) unless an explicit spec was set on the
+        # toggle. The bool array is resolved lazily against num_sites in
+        # _live_site_mask(), keyed on the frame-0 pattern name.
+        self._site_mask_spec = None       # explicit override, else pattern default
+        self._site_mask_enabled = False   # dashboard toggle (set via set_site_mask_enabled)
+        self._site_mask_cache = None      # (spec, pattern, n_sites) -> resolved bool cache
+        self._site_mask_cache_key = None
+
         # Paths
         date_stamp, time_stamp = scan_id_to_stamps(scan_id)
         self.dname, self.date, self.time = make_scan_dir(date_stamp, time_stamp)
@@ -2654,10 +2665,64 @@ class DataManager:
         except Exception as e:
             logger.warning('HistData save failed: %s', e)
 
+    # --- Site mask (global "analyze only these sites" -- live view) ---
+
+    def set_site_mask_enabled(self, enabled, spec=None):
+        """Dashboard toggle. ``enabled`` turns the live site mask on/off; an
+        optional ``spec`` (name / .npy path / array) overrides the pattern
+        default for this session. Cheap -- just flips flags; the next
+        get_plot_data picks it up (bust the resolve cache so it re-resolves)."""
+        self._site_mask_enabled = bool(enabled)
+        if spec is not None:
+            self._site_mask_spec = spec
+        self._site_mask_cache_key = None
+        return self._site_mask_enabled
+
+    def _live_site_mask(self):
+        """Return the resolved bool[n_sites] mask for the live curve, or None
+        (masking off / no spec / unresolvable). When enabled with no explicit
+        spec, uses the frame-0 PATTERN's registry-configured mask. Resolves
+        lazily against the current site count and caches; a bad spec disables
+        masking (logged) rather than breaking the live view."""
+        if not self._site_mask_enabled:
+            return None
+        n = getattr(self, 'num_sites', None)
+        if not n:
+            return None
+        pattern = self._pattern_names.get(0)
+        key = (repr(self._site_mask_spec), pattern, int(n))
+        if self._site_mask_cache_key == key:
+            return self._site_mask_cache
+        mask = None
+        try:
+            from yb_analysis.analysis import site_mask as _sm
+            spec = _sm.effective_spec(self._site_mask_spec, pattern=pattern)
+            mask = _sm.resolve_site_mask(spec, int(n))
+        except Exception as ex:
+            logger.warning('live site_mask (spec=%r pattern=%r) disabled: %s',
+                           self._site_mask_spec, pattern, ex)
+            mask = None
+        self._site_mask_cache_key = key
+        self._site_mask_cache = mask
+        return mask
+
     # --- Plot data ---
 
+    def _img2_site_mask(self, mask1):
+        """The site mask for img2 arrays. When the two grids share a site count
+        (matched-index survival), img1's mask applies directly. For a distinct
+        img2 grid (rearrangement) the img1 mask doesn't map, so return None
+        (img2 readouts stay full). None in -> None out."""
+        if mask1 is None:
+            return None
+        n2 = getattr(self, 'num_sites_img2', None)
+        if n2 and int(n2) == mask1.size:
+            return mask1
+        return None
+
     def get_plot_data(self):
-        return {
+        _live_mask = self._live_site_mask()
+        d = {
             'scan_id': self.scan_id,
             'cur_image': self._display_image.astype(np.float64) if self._display_image is not None else None,
             'cur_intensities': self._display_intensities,
@@ -2755,12 +2820,83 @@ class DataManager:
                 scan_dims=self._scan_dims,
                 is_two_array=self.is_two_array,
                 recent_seq_ids=self._last_batch_seq_ids,
-                seq_targets=self._seq_targets),
+                seq_targets=self._seq_targets,
+                site_mask=_live_mask),
+            'site_mask_active': bool(_live_mask is not None),
+            'site_mask_spec': (str(self._site_mask_spec)
+                               if _live_mask is not None else None),
+            'site_mask_n_used': (int(_live_mask.sum())
+                                 if _live_mask is not None else None),
             'scan_name': self._scan_name,
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,
             'scan_filename': os.path.basename(self.fname) if self.fname else None,
         }
+
+        # ---- Apply the live site mask to EVERY per-site readout ----
+        # When the toggle is ON, NaN out the excluded sites in each per-site
+        # array so the whole dashboard (intensities, loading rates, thresholds,
+        # infidelities, logicals/boxes, histogram, gauss fits, grid-shift) shows
+        # only the masked subset -- consistent with the scan curve. Full site
+        # WIDTH is preserved (NaN, not dropped) so per-site (x,y) alignment holds.
+        # This masks only the RETURNED copies -- the underlying refit
+        # accumulators (_intensity_accum etc.) are untouched, so the threshold
+        # refit still sees every site.
+        if _live_mask is not None:
+            _mask2 = self._img2_site_mask(_live_mask)
+            _apply_live_site_mask(d, _live_mask, _mask2)
+        return d
+
+
+def _mask_vec(v, mask):
+    """NaN-out excluded entries of a per-site 1-D array (True=keep). Returns a
+    float copy; no-op on None / length mismatch / non-1-D."""
+    if v is None or mask is None:
+        return v
+    a = np.asarray(v)
+    if a.ndim != 1 or a.shape[0] != mask.size:
+        return v
+    a = a.astype(float, copy=True)
+    a[~mask] = np.nan
+    return a
+
+
+def _mask_list(lst, mask):
+    """Blank out excluded entries of a per-site LIST (histogram / gauss-fit dicts
+    indexed by site). Excluded -> None so the renderer skips them; length kept.
+    No-op on None / length mismatch."""
+    if lst is None or mask is None:
+        return lst
+    try:
+        if len(lst) != mask.size:
+            return lst
+    except TypeError:
+        return lst
+    return [(item if keep else None) for item, keep in zip(lst, mask)]
+
+
+def _apply_live_site_mask(d, mask1, mask2):
+    """Mask every per-site readout in the get_plot_data dict in place.
+    ``mask1`` applies to num_sites (img1) arrays, ``mask2`` to num_sites_img2
+    (img2) arrays (may be None -> img2 left full for a distinct rearrange grid).
+    Grid coordinates are NOT masked (positions must stay for the (x,y) layout);
+    only the per-site VALUES/bits are NaN'd/blanked."""
+    # img1 per-site vectors (intensities, logicals, thresholds, infidelities,
+    # loading rates). Logicals become float w/ NaN -> the box renderer skips NaN.
+    for k in ('cur_intensities', 'logicals', 'cur_intensities_mid',
+              'logicals_mid', 'thresholds', 'infidelities', 'loading_rates'):
+        d[k] = _mask_vec(d.get(k), mask1)
+    # img1 per-site LISTS (histogram + gauss fits, indexed by site).
+    for k in ('live_hist_data', 'live_gauss_fits', 'loaded_gauss_fits'):
+        d[k] = _mask_list(d.get(k), mask1)
+    # img2 per-site readouts (only when the img2 grid matches -- else mask2 None).
+    for k in ('cur_intensities2', 'logicals2', 'thresholds_img2',
+              'infidelities_img2', 'loading_rates_img2'):
+        d[k] = _mask_vec(d.get(k), mask2)
+    for k in ('loaded_hist_data_img2', 'loaded_gauss_fits_img2'):
+        d[k] = _mask_list(d.get(k), mask2)
+    # NOTE: grid_shift_heatmap is a (2R+1, 2R+1) pixel-shift correlation map, NOT
+    # a per-site array -- deliberately left unmasked.
 
 
 def _extract_scan_title(config):

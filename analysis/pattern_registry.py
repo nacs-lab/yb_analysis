@@ -265,6 +265,49 @@ def save_pattern_thresholds(name, mat_dict):
         logger.warning('save_pattern_thresholds(%s) failed: %s', name, ex)
 
 
+def pattern_site_mask_path(name: str) -> Path:
+    """Per-pattern site-mask .npy store (bool[n_sites] or int indices),
+    alongside record.json. Used when a pattern's record `site_mask` is the
+    literal string 'file' (i.e. the mask lives in this .npy)."""
+    return _pattern_dir(name) / 'site_mask.npy'
+
+
+def load_pattern_site_mask(name):
+    """Return this pattern's configured site-mask SPEC, or None.
+
+    The spec is whatever ``record.json['site_mask']`` holds -- a registered mask
+    NAME, a .npy path, or the literal 'file' (meaning the mask lives in this
+    pattern's own ``site_mask.npy``, whose absolute path is returned). None /
+    missing key -> None (analyze the full array). The spec is resolved to a bool
+    array later by ``site_mask.resolve_site_mask`` against the scan's n_sites."""
+    if not name:
+        return None
+    rec = get_pattern(name)
+    if not rec:
+        return None
+    spec = rec.get('site_mask')
+    if spec is None:
+        return None
+    if isinstance(spec, str) and spec.strip().lower() == 'file':
+        p = pattern_site_mask_path(name)
+        return str(p) if p.is_file() else None
+    return spec
+
+
+def set_pattern_site_mask(name, spec):
+    """Set (or clear, spec=None) this pattern's site-mask spec in record.json.
+    ``spec`` is a registered name, a .npy path, 'file' (mask in the pattern's
+    own site_mask.npy), or None to remove. Leaves other record fields intact."""
+    with _LOCK:
+        rec = _read(name) or {'name': name}
+        if spec is None:
+            rec.pop('site_mask', None)
+        else:
+            rec['site_mask'] = spec
+        rec['updated_iso'] = _now_iso()
+        _write(rec)
+
+
 def fetch_or_refresh_pattern(name, *, base_phase_path,
                              default_loading_zernike=None, order='col',
                              fft_shape=(4096, 4096), threshold=0.30,

@@ -55,7 +55,14 @@ VALID_CMDS = ('dummy_mode', 'init_dir', 'restart_dash', 'restart_all',
               'set_backend', 'shutdown',
               # Sequence control via ZMQ (pyctrl backend has no local memmap).
               'pause', 'start', 'abort',
-              'camera_connect', 'camera_disconnect', 'camera_apply')
+              'camera_connect', 'camera_disconnect', 'camera_apply',
+              # Live "analyze only these sites" view toggle (applied to the DM).
+              'site_mask')
+
+
+#: Per-process monotonic counter so two enqueues in the same time_ns() tick get
+#: distinct, still-order-preserving filenames (see enqueue).
+_SEQ = 0
 
 
 def enqueue(cmd, **fields):

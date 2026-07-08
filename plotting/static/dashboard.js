@@ -2100,10 +2100,13 @@
                                     snap.num_sites == null);
     if (grid && grid.length) {
       const n = grid.length;
+      // occ[i]: 1 = loaded, 0 = empty, -1 = site-mask-excluded (logical NaN).
+      // When the site mask is on, excluded sites arrive as NaN -> draw them in a
+      // dim gray so it's visible WHICH sites are dropped (vs. faking them empty).
       const occ = new Array(n);
       for (let i = 0; i < n; i++) {
-        occ[i] = logicals && logicals.length >= n
-          ? (logicals[i] ? 1 : 0) : 0;
+        const lv = logicals && logicals.length >= n ? logicals[i] : 0;
+        occ[i] = (lv == null || Number.isNaN(lv)) ? -1 : (lv ? 1 : 0);
       }
       // WebGL box outlines via scattergl with mode='lines'. Each site
       // contributes a closed 5-corner loop separated by NaN.
@@ -2113,9 +2116,12 @@
       const oy = [-half, -half,  half,  half, -half, NaN];
       const loadedX = [], loadedY = [];
       const emptyX  = [], emptyY  = [];
+      const exclX   = [], exclY   = [];
       for (let i = 0; i < n; i++) {
         const [y, x] = grid[i];
-        const dst = occ[i] ? [loadedX, loadedY] : [emptyX, emptyY];
+        const dst = occ[i] === 1 ? [loadedX, loadedY]
+                  : occ[i] === 0 ? [emptyX, emptyY]
+                  : [exclX, exclY];
         for (let k = 0; k < 6; k++) {
           dst[0].push(isFinite(x + ox[k]) ? x + ox[k] : null);
           dst[1].push(isFinite(y + oy[k]) ? y + oy[k] : null);
@@ -2132,6 +2138,13 @@
         traces.push({
           x: emptyX, y: emptyY, mode: "lines", type: "scattergl",
           line: { color: "#ff4444", width: 1.5 },
+          hoverinfo: "skip", showlegend: false,
+        });
+      }
+      if (exclX.length) {
+        traces.push({
+          x: exclX, y: exclY, mode: "lines", type: "scattergl",
+          line: { color: "#555", width: 1 },   // site-mask-excluded
           hoverinfo: "skip", showlegend: false,
         });
       }
@@ -2173,6 +2186,19 @@
   //        x_name, y_name, current?:[{x_idx,y_idx}]}
   function renderScanCurve(snap) {
     if (!window.Plotly) return;
+    // Site-mask status readout: reflect what the main process actually applied
+    // (keys emitted by DataManager.get_plot_data), so the label doesn't lie if
+    // the toggle is on but the pattern has no configured mask.
+    const smInfo = document.getElementById("site-mask-info");
+    if (smInfo) {
+      if (snap && snap.site_mask_active) {
+        const spec = snap.site_mask_spec ? ` · ${snap.site_mask_spec}` : "";
+        smInfo.textContent = `${snap.site_mask_n_used ?? "?"} sites${spec}`;
+        smInfo.title = "Scan curve averaged over the pattern's stable-site subset";
+      } else {
+        smInfo.textContent = "";
+      }
+    }
     const el = $("plot-scan");
     if (!el) return;
     const sc = snap.scan_curve;
@@ -2376,10 +2402,18 @@
     const n = hist.length;
     const x = Array.from({length: n}, (_, i) => i + 1);
     const avg_ = hist.reduce((s, x) => s + x, 0) / n;
+    // Current = fraction loaded over the KEPT sites. Site-mask-excluded sites
+    // arrive as null/NaN in `logicals` -> skip them (don't count as empty and
+    // don't divide by the full width, else it reads low or NaN).
     const logicals = snap.logicals || [];
-    const cur = logicals.length
-      ? logicals.reduce((s, x) => s + (x ? 1 : 0), 0) / logicals.length
-      : null;
+    let kept = 0, loaded = 0;
+    for (let i = 0; i < logicals.length; i++) {
+      const lv = logicals[i];
+      if (lv == null || Number.isNaN(lv)) continue;
+      kept++;
+      if (lv) loaded++;
+    }
+    const cur = kept ? loaded / kept : null;
     const annotations = [{
       text: `Avg: ${(100 * avg_).toFixed(1)}%`,
       xref: "paper", x: 0.99, y: avg_, showarrow: false,
@@ -3017,15 +3051,18 @@
     }
     const traces = [];
     // Aggregate bars: avg counts across sites on a common x-axis.
+    // Site-mask-excluded sites arrive as null entries (see _mask_list): skip
+    // them and divide by the KEPT-site count so the average isn't diluted.
+    const keptHist = liveHist.filter(h => h && (h.bin_centers || []).length);
     const allCenters = [];
-    liveHist.forEach(h => (h.bin_centers || []).forEach(c => allCenters.push(c)));
+    keptHist.forEach(h => (h.bin_centers || []).forEach(c => allCenters.push(c)));
     if (allCenters.length) {
       const minC = Math.min(...allCenters), maxC = Math.max(...allCenters);
       const N = 50;
       const centers = Array.from({length: N},
         (_, i) => minC + (maxC - minC) * i / (N - 1));
       const avg_ = new Array(N).fill(0);
-      liveHist.forEach(h => {
+      keptHist.forEach(h => {
         const bc = h.bin_centers || [];
         const cnt = h.counts || [];
         if (!bc.length) return;
@@ -3039,7 +3076,7 @@
           avg_[i] += cnt[lo] * (1 - t) + (cnt[lo + 1] || 0) * t;
         }
       });
-      for (let i = 0; i < N; i++) avg_[i] /= liveHist.length;
+      for (let i = 0; i < N; i++) avg_[i] /= Math.max(keptHist.length, 1);
       const bw = (maxC - minC) / (N - 1) * 0.85;
       traces.push({
         x: centers, y: avg_, type: "bar",
@@ -5078,6 +5115,40 @@
       });
     }
 
+    // Site-mask toggle -> POST to the server, which spools 'site_mask' to the
+    // main process (ControlPanel), which applies it to the live DataManager.
+    // OFF by default (full array); ON restricts the live scan curve to the
+    // current pattern's configured stable-site subset. Persisted across reloads.
+    const sm = document.getElementById("site-mask-live");
+    if (sm) {
+      try { sm.checked = localStorage.getItem("yb-dash-site-mask") === "1"; }
+      catch {}
+      // If restored ON, re-assert it to the backend once (a fresh main process /
+      // new DataManager starts OFF). Best-effort; the toggle is view-only.
+      if (sm.checked) {
+        api("/api/control/site_mask", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: true}),
+        }).catch(() => {});
+      }
+      sm.addEventListener("change", async () => {
+        try {
+          await api("/api/control/site_mask", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({enabled: sm.checked}),
+          });
+          try { localStorage.setItem("yb-dash-site-mask", sm.checked ? "1" : "0"); }
+          catch {}
+        } catch (e) {
+          console.warn("site_mask toggle failed", e);
+          toast("Site-mask toggle failed: " + (e.message || e), "bad");
+          sm.checked = !sm.checked;   // revert on failure
+        }
+      });
+    }
+
     // Middle-frame toggle -> pure client-side show/hide (persisted).
     const mid = document.getElementById("show-mid-live");
     if (mid) {
@@ -6412,7 +6483,9 @@
 
   function avg(arr) {
     if (!arr || !arr.length) return null;
-    const vs = arr.filter((v) => v != null);
+    // Drop null AND NaN (site-mask-excluded sites arrive as NaN -> would
+    // otherwise poison the mean to NaN, e.g. the loading-rate stat tile).
+    const vs = arr.filter((v) => v != null && !Number.isNaN(v));
     if (!vs.length) return null;
     return vs.reduce((a, b) => a + b, 0) / vs.length;
   }

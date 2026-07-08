@@ -269,9 +269,25 @@ def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets):
     return mean, sem, cnt
 
 
+def _mask_sr(y_sr, site_mask):
+    """NaN-out excluded site rows of a site-resolved ``[nSites, nParams]`` array
+    (True = keep). No-op on None / shape mismatch. Returns a float copy when it
+    masks. Used to thread the global site mask through the live scan curve."""
+    if site_mask is None or y_sr is None:
+        return y_sr
+    import numpy as _np
+    m = _np.asarray(site_mask, dtype=bool)
+    a = _np.asarray(y_sr)
+    if a.ndim != 2 or a.shape[0] != m.size:
+        return y_sr
+    a = a.astype(float, copy=True)
+    a[~m] = _np.nan
+    return a
+
+
 def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
                        scan_dims=None, is_two_array=False, recent_seq_ids=None,
-                       seq_targets=None):
+                       seq_targets=None, site_mask=None):
     """Compute survival, loading, or rearrangement curve from accumulated
     logicals.
 
@@ -307,7 +323,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     if is_2d:
         return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                            is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
-                           seq_targets=seq_targets)
+                           seq_targets=seq_targets, site_mask=site_mask)
 
     # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
@@ -366,10 +382,20 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
         mode = 'loading'
         y_mean_sr, y_sem_sr, n_reps = _loading_buckets(buckets, n_sites, n_params)
 
+    # Global "analyze only these sites" mask: NaN excluded rows of the
+    # site-resolved arrays, then average only the kept sites (SEM normalized by
+    # the kept count). Per-site path only -- the target-aware branch above is
+    # already site-collapsed. No-op when site_mask is None.
+    y_mean_sr = _mask_sr(y_mean_sr, site_mask)
+    y_sem_sr = _mask_sr(y_sem_sr, site_mask)
+    n_avg = (int(np.asarray(site_mask, dtype=bool).sum())
+             if site_mask is not None
+             and np.asarray(site_mask).size == n_sites else n_sites)
+
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)  # nanmean on empty slices
         y_mean = np.nanmean(y_mean_sr, axis=0)
-    y_sem = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / n_sites
+    y_sem = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
 
     order = np.argsort(scan_params)
     return {
@@ -383,7 +409,8 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
 
 def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
-                is_two_array=False, recent_seq_ids=None, seq_targets=None):
+                is_two_array=False, recent_seq_ids=None, seq_targets=None,
+                site_mask=None):
     """Compute 2-D heatmap for multi-dimensional scans.
 
     The flat param_index decomposes column-major (dim-0 varies fastest):
@@ -454,6 +481,14 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         mode = 'loading'
         y_mean_sr, y_sem_sr, n_reps = _loading_buckets(buckets, n_sites, n_total)
 
+    # Global "analyze only these sites" mask (NaN excluded rows, average the
+    # kept sites). No-op when site_mask is None.
+    y_mean_sr = _mask_sr(y_mean_sr, site_mask)
+    y_sem_sr = _mask_sr(y_sem_sr, site_mask)
+    n_avg = (int(np.asarray(site_mask, dtype=bool).sum())
+             if site_mask is not None
+             and np.asarray(site_mask).size == n_sites else n_sites)
+
     # Site-average
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)  # nanmean on empty slices
@@ -464,7 +499,7 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
     #   value_cell = mean_s p_s,   SE_cell = sqrt(Σ_s SE_s²) / n_sites
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
-        sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_sites, 1)
+        sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
 
     # Reshape into (s1, s0) grid → heatmap[dim1_idx, dim0_idx]
     # Column-major: dim0 varies fastest in the flat array
