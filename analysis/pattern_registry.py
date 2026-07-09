@@ -308,6 +308,22 @@ def set_pattern_site_mask(name, spec):
         _write(rec)
 
 
+def save_pattern_site_mask_file(name, mask):
+    """Write ``mask`` (bool[n_sites], pattern detection-column order) to this
+    pattern's own ``site_mask.npy`` and point ``record.json['site_mask']`` at
+    it (the literal 'file'). Returns the .npy path. The dashboard's lasso
+    mask editor saves through here."""
+    import numpy as np
+    m = np.asarray(mask, dtype=bool).ravel()
+    if m.size == 0 or not m.any():
+        raise ValueError('site mask must keep at least one site')
+    p = pattern_site_mask_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(p), m)
+    set_pattern_site_mask(name, 'file')
+    return p
+
+
 def fetch_or_refresh_pattern(name, *, base_phase_path,
                              default_loading_zernike=None, order='col',
                              fft_shape=(4096, 4096), threshold=0.30,

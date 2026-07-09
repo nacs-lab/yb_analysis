@@ -342,3 +342,41 @@ def test_compute_scan_curve_mask_matches_slice():
     # None is a no-op
     none = compute_scan_curve(logs, pidx, params, 2, site_mask=None)
     assert np.allclose(full["y_mean"], none["y_mean"], equal_nan=True)
+
+
+# ---- pattern's own site_mask.npy (dashboard lasso editor save path) ----
+
+def test_pattern_mask_file_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("YB_PATTERNS_DIR", str(tmp_path))
+    import yb_analysis.analysis.pattern_registry as pr
+    pr.write_pattern({"name": "P", "n_sites": 20})
+    m = _mask()
+    p = pr.save_pattern_site_mask_file("P", m)
+    assert p.is_file()
+    # record now points at the file; spec resolves back to the same mask
+    assert pr.get_pattern("P").get("site_mask") == "file"
+    spec = pr.load_pattern_site_mask("P")
+    assert spec == str(pr.pattern_site_mask_path("P"))
+    assert np.array_equal(resolve_site_mask(spec, 20), m)
+    # other record fields survive the save
+    assert pr.get_pattern("P").get("n_sites") == 20
+
+
+def test_pattern_mask_file_clear(tmp_path, monkeypatch):
+    monkeypatch.setenv("YB_PATTERNS_DIR", str(tmp_path))
+    import yb_analysis.analysis.pattern_registry as pr
+    pr.write_pattern({"name": "P", "n_sites": 20})
+    pr.save_pattern_site_mask_file("P", _mask())
+    pr.set_pattern_site_mask("P", None)
+    assert pr.load_pattern_site_mask("P") is None   # cleared -> full array
+    # the .npy stays on disk as a backup; only the record spec is gone
+    assert pr.pattern_site_mask_path("P").is_file()
+
+
+def test_pattern_mask_file_rejects_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("YB_PATTERNS_DIR", str(tmp_path))
+    import yb_analysis.analysis.pattern_registry as pr
+    with pytest.raises(ValueError):
+        pr.save_pattern_site_mask_file("P", np.zeros(20, bool))
+    with pytest.raises(ValueError):
+        pr.save_pattern_site_mask_file("P", np.zeros(0, bool))

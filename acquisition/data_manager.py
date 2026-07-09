@@ -2743,7 +2743,23 @@ class DataManager:
         if not n:
             return None
         pattern = self._pattern_names.get(0)
-        key = (repr(self._site_mask_spec), pattern, int(n))
+        # Stamp the registry files into the cache key so an out-of-band mask
+        # edit (the dashboard's lasso editor writes record.json +
+        # site_mask.npy from the Dash process) invalidates a same-spec cache.
+        stamp = 0
+        if pattern:
+            try:
+                import os as _os
+                from yb_analysis.analysis import pattern_registry as _pr
+                for p in (_pr._record_path(pattern),
+                          _pr.pattern_site_mask_path(pattern)):
+                    try:
+                        stamp ^= _os.stat(p).st_mtime_ns
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+        key = (repr(self._site_mask_spec), pattern, int(n), stamp)
         if self._site_mask_cache_key == key:
             return self._site_mask_cache
         mask = None

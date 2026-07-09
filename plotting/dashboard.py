@@ -3130,6 +3130,83 @@ def _register_api_routes(server):
         _write_control({'downsample': on})
         return jsonify({'ok': True, 'downsample': on})
 
+    # ---- Per-pattern site mask (Analysis-tab lasso editor) -------------
+    # GET returns the pattern's configured mask resolved to site indices;
+    # POST saves a lasso-selected subset as the pattern's own site_mask.npy
+    # (spec 'file') or clears the configured mask. Indices are in the
+    # pattern's detection-column order (the loading map's canonical order).
+    # Gated like the other config-writing controls.
+
+    @server.route('/api/patterns/<name>/site_mask', methods=['GET'])
+    def _api_pattern_site_mask_get(name):
+        from flask import jsonify, request
+        from yb_analysis.analysis import pattern_registry as _pr
+        from yb_analysis.analysis import site_mask as _sm
+        rec = _pr.get_pattern(name)
+        if not rec:
+            return jsonify({'error': f'unknown pattern {name!r}'}), 404
+        spec = _pr.load_pattern_site_mask(name)
+        out = {'name': name, 'record_spec': rec.get('site_mask'),
+               'spec': spec, 'indices': None, 'n_kept': None,
+               'n_sites': rec.get('n_sites')}
+        if spec is not None:
+            n = request.args.get('n_sites', type=int) or rec.get('n_sites')
+            if n:
+                try:
+                    m = _sm.resolve_site_mask(spec, int(n))
+                    if m is not None:
+                        import numpy as _np
+                        out['indices'] = _np.where(m)[0].tolist()
+                        out['n_kept'] = int(m.sum())
+                        out['n_sites'] = int(n)
+                except ValueError as ex:
+                    out['error'] = str(ex)
+        return jsonify(out)
+
+    @server.route('/api/patterns/<name>/site_mask', methods=['POST'])
+    def _api_pattern_site_mask_set(name):
+        from flask import jsonify, request
+        g = _gate()
+        if g is not None:
+            return g
+        from yb_analysis.analysis import pattern_registry as _pr
+        rec = _pr.get_pattern(name)
+        if not rec:
+            return jsonify({'error': f'unknown pattern {name!r}'}), 404
+        body = request.get_json(silent=True) or {}
+        if body.get('clear'):
+            _pr.set_pattern_site_mask(name, None)
+            return jsonify({'ok': True, 'cleared': True, 'name': name})
+        indices = body.get('indices')
+        n_sites = body.get('n_sites')
+        if not isinstance(indices, list) or not indices:
+            return jsonify({'error': 'indices must be a non-empty list '
+                                     '(or pass {"clear": true})'}), 400
+        if not isinstance(n_sites, int) or n_sites <= 0:
+            return jsonify({'error': 'n_sites (int > 0) required'}), 400
+        rec_n = rec.get('n_sites')
+        if rec_n and int(rec_n) != n_sites:
+            return jsonify({'error': f'n_sites {n_sites} != pattern '
+                                     f'{name!r} n_sites {rec_n} — mask must '
+                                     'be in the pattern\'s site order'}), 400
+        import numpy as _np
+        try:
+            idx = _np.asarray(indices, dtype=_np.int64).ravel()
+        except (TypeError, ValueError):
+            return jsonify({'error': 'indices must be integers'}), 400
+        if idx.min() < 0 or idx.max() >= n_sites:
+            return jsonify({'error': 'index out of range for n_sites '
+                                     f'{n_sites}'}), 400
+        mask = _np.zeros(n_sites, dtype=bool)
+        mask[idx] = True
+        try:
+            path = _pr.save_pattern_site_mask_file(name, mask)
+        except ValueError as ex:
+            return jsonify({'error': str(ex)}), 400
+        return jsonify({'ok': True, 'name': name, 'spec': 'file',
+                        'path': str(path), 'n_kept': int(mask.sum()),
+                        'n_sites': n_sites})
+
     # ---- Camera control mirror (Phase 5.5) ----------------------------
     # Mirror of the Tkinter CameraPane. Status is published by the main
     # process (CameraPane._publish_web_status); connect/disconnect/apply

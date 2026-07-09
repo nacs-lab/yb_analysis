@@ -4924,6 +4924,7 @@
       const ihc = $("analysis-site-inthist-card");
       if (ihc) ihc.hidden = true;
       setupPathsOverlay(null);
+      maskEditAfterRender(r);
       return;
     }
     // 1-image (loading-only) scans have no img2 → survival / FP are empty.
@@ -4956,6 +4957,7 @@
         ps.loading_x || ps.x, ps.loading_y || ps.y,
         ps.loading_init || ps.loading_rate, "Cividis", "loading", {});
       setupPathsOverlay(null);
+      maskEditAfterRender(r);
       return;
     }
     // Phase 5a paths-overlay: surface the picker on runs that have
@@ -4997,6 +4999,7 @@
         ps.x, ps.y, ps.fp_rate, "Plasma", "FP",
         {mask: ntgtMask, maskLabel: "non-target site", infoSuffix});
     }
+    maskEditAfterRender(r);
   }
 
   // Returns the trace index that holds the colored per-site markers
@@ -5016,6 +5019,205 @@
     }
     return el.data.length >= 2 ? 1 : 0;
   }
+
+  // ---- Site-mask lasso editor (2026-07-09) --------------------------------
+  // Lasso/box-select sites on the per-site LOADING map (always the img1 /
+  // frame-0 pattern grid, whose canonical order IS the site-mask index space)
+  // and save the subset as the pattern's own site_mask.npy via
+  // POST /api/patterns/<name>/site_mask. The web twin of
+  // scripts/select_subset_survival.py's Qt selector.
+  const maskEdit = {active: false, sel: new Set(), n: 0, pattern: null};
+
+  function maskEditPatternOf(r) {
+    const pats = r && r.thresholds_info && r.thresholds_info.patterns;
+    return (Array.isArray(pats) && pats.length) ? pats[0] : null;
+  }
+
+  function _maskApi(path, obj) {
+    return api(path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(obj),
+    });
+  }
+
+  async function maskEditEnter() {
+    const r = activeAnalysis;
+    const ps = r && r.per_site;
+    const el = $("plot-site-loading");
+    if (!ps || !el || !el.data) return;
+    const pattern = maskEditPatternOf(r);
+    if (!pattern) {
+      toast("no loading pattern on this run — the site-mask store is per-pattern", "warn");
+      return;
+    }
+    const lx = ps.loading_x || ps.x;
+    maskEdit.active = true;
+    maskEdit.pattern = pattern;
+    maskEdit.n = lx.length;
+    // Preload the pattern's configured mask as the starting selection
+    // (fall back to all-selected when none is configured / unresolvable).
+    maskEdit.sel = new Set(Array.from({length: maskEdit.n}, (_, i) => i));
+    try {
+      const cur = await api(`/api/patterns/${encodeURIComponent(pattern)}`
+                            + `/site_mask?n_sites=${maskEdit.n}`);
+      if (cur && Array.isArray(cur.indices) && cur.indices.length) {
+        maskEdit.sel = new Set(cur.indices);
+      }
+    } catch { /* 404 / no mask -> keep all-selected */ }
+    const bar = $("mask-edit-bar"); if (bar) bar.hidden = false;
+    const btn = $("mask-edit-btn"); if (btn) btn.classList.add("active");
+    maskEditApplyPlot();
+  }
+
+  function maskEditApplyPlot() {
+    const el = $("plot-site-loading");
+    if (!el || !el.data || !maskEdit.active) return;
+    Plotly.relayout(el, {dragmode: "lasso"});
+    if (!el._maskEditWired) {
+      el._maskEditWired = true;
+      el.on("plotly_selected", (ev) => {
+        // (fires with no points on an empty double-click clear -> ignore)
+        if (!maskEdit.active || !ev || !ev.points || !ev.points.length) return;
+        const picked = [];
+        ev.points.forEach((pt) => {
+          // customdata = canonical site index on the loading map (plain
+          // number; [idx, value] pairs only on the infid map). Bg/overlay
+          // traces carry no customdata and drop out here.
+          const cd = pt.customdata;
+          const idx = Array.isArray(cd) ? cd[0] : cd;
+          if (typeof idx === "number" && isFinite(idx)) picked.push(idx);
+        });
+        if (!picked.length) return;
+        const modeSel = $("mask-edit-mode");
+        const mode = (modeSel && modeSel.value) || "replace";
+        if (mode === "replace") maskEdit.sel = new Set(picked);
+        else if (mode === "add") picked.forEach((i) => maskEdit.sel.add(i));
+        else picked.forEach((i) => maskEdit.sel.delete(i));
+        maskEditRefresh();
+      });
+    }
+    maskEditRefresh();
+  }
+
+  function maskEditRefresh() {
+    const el = $("plot-site-loading");
+    const r = activeAnalysis;
+    const ps = r && r.per_site;
+    if (!el || !el.data || !ps) return;
+    const oi = el.data.findIndex((t) => t.name === "mask-sel");
+    if (oi >= 0) Plotly.deleteTraces(el, oi);
+    if (!maskEdit.active) { setText("mask-edit-count", ""); return; }
+    const lx = ps.loading_x || ps.x, ly = ps.loading_y || ps.y;
+    const xs = [], ys = [];
+    maskEdit.sel.forEach((i) => {
+      if (i < lx.length) { xs.push(lx[i]); ys.push(ly[i]); }
+    });
+    Plotly.addTraces(el, [{
+      x: xs, y: ys, type: "scattergl", mode: "markers",
+      marker: {symbol: "circle-open", size: Math.max(6, siteDotSize + 4),
+               color: "#ff5555", line: {width: 1.4}},
+      hoverinfo: "skip", showlegend: false, name: "mask-sel",
+    }]);
+    setText("mask-edit-count",
+      `${maskEdit.sel.size}/${maskEdit.n} kept · ${maskEdit.pattern}`);
+  }
+
+  function maskEditExit() {
+    maskEdit.active = false;
+    const el = $("plot-site-loading");
+    if (el && el.data) {
+      const oi = el.data.findIndex((t) => t.name === "mask-sel");
+      if (oi >= 0) Plotly.deleteTraces(el, oi);
+      Plotly.relayout(el, {dragmode: "zoom"});
+    }
+    const bar = $("mask-edit-bar"); if (bar) bar.hidden = true;
+    const btn = $("mask-edit-btn"); if (btn) btn.classList.remove("active");
+    setText("mask-edit-count", "");
+  }
+
+  async function maskEditSave() {
+    if (!maskEdit.active || !maskEdit.pattern) return;
+    if (!maskEdit.sel.size) {
+      toast("empty selection — lasso at least one site", "warn");
+      return;
+    }
+    // Full array selected == no mask: store nothing, clear the record.
+    if (maskEdit.sel.size >= maskEdit.n) return maskEditClear();
+    try {
+      const res = await _maskApi(
+        `/api/patterns/${encodeURIComponent(maskEdit.pattern)}/site_mask`, {
+          indices: Array.from(maskEdit.sel).sort((a, b) => a - b),
+          n_sites: maskEdit.n,
+        });
+      toast(`site mask saved: ${res.n_kept}/${res.n_sites} sites -> ${maskEdit.pattern}`, "ok");
+      maskEditExit();
+      // Re-analyze so the new default mask shows up in every panel.
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+    } catch (e) {
+      toast(`mask save failed: ${(e.body && e.body.error) || e.message}`, "bad");
+    }
+  }
+
+  async function maskEditClear() {
+    if (!maskEdit.pattern) return;
+    try {
+      await _maskApi(
+        `/api/patterns/${encodeURIComponent(maskEdit.pattern)}/site_mask`,
+        {clear: true});
+      toast(`site mask cleared for ${maskEdit.pattern} (full array)`, "ok");
+      maskEditExit();
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+    } catch (e) {
+      toast(`mask clear failed: ${(e.body && e.body.error) || e.message}`, "bad");
+    }
+  }
+
+  // Called at every renderPerSiteMaps exit: toggles the "✎ mask" button and,
+  // when editing, re-applies overlay + lasso dragmode (Plotly.react wiped
+  // them) or bails out if the run/pattern under the editor changed.
+  function maskEditAfterRender(r) {
+    const btn = $("mask-edit-btn");
+    const pattern = maskEditPatternOf(r);
+    const ps = r && r.per_site;
+    if (btn) btn.hidden = !(ps && pattern);
+    if (!maskEdit.active) return;
+    const lx = ps && (ps.loading_x || ps.x);
+    if (!ps || !pattern || pattern !== maskEdit.pattern
+        || !lx || lx.length !== maskEdit.n) {
+      maskEditExit();
+      return;
+    }
+    maskEditApplyPlot();
+  }
+
+  (function wireMaskEditor() {
+    const btn = $("mask-edit-btn");
+    if (!btn) return;
+    btn.addEventListener("click", () =>
+      (maskEdit.active ? maskEditExit() : maskEditEnter()));
+    const on = (id, fn) => {
+      const b = $(id);
+      if (b) b.addEventListener("click", fn);
+    };
+    on("mask-edit-save", maskEditSave);
+    on("mask-edit-clear", maskEditClear);
+    on("mask-edit-cancel", maskEditExit);
+    on("mask-edit-all", () => {
+      if (!maskEdit.active) return;
+      maskEdit.sel = new Set(Array.from({length: maskEdit.n}, (_, i) => i));
+      maskEditRefresh();
+    });
+    on("mask-edit-invert", () => {
+      if (!maskEdit.active) return;
+      const inv = new Set();
+      for (let i = 0; i < maskEdit.n; i++) {
+        if (!maskEdit.sel.has(i)) inv.add(i);
+      }
+      maskEdit.sel = inv;
+      maskEditRefresh();
+    });
+  })();
 
   function currentPathsOverlaySegments() {
     const s = pathsOverlayState;

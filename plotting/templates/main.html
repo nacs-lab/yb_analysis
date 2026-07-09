@@ -787,11 +787,32 @@
   <section class="card col-4" data-card-id="analysis-site-loading">
     <h2>Per-site loading<span class="grow"></span>
         <span class="hint mono" id="site-loading-info"></span>
+        <button id="mask-edit-btn" class="mask-edit-btn" hidden
+                title="Lasso-select sites on this map to create/change this pattern's site mask (analysis-only subset)">&#9998; mask</button>
         <label class="site-size-ctl" title="Dot size">
           <span>size</span>
           <input type="range" id="site-dot-size" min="1" max="22" step="1" value="4">
         </label>
     </h2>
+    <!-- Site-mask lasso editor (2026-07-09): hidden until "✎ mask" is
+         clicked. Lasso/box-select sites on the loading map (canonical
+         detection-column order = the site-mask index space), then save the
+         subset as the pattern's own site_mask.npy via
+         POST /api/patterns/<name>/site_mask. -->
+    <div id="mask-edit-bar" class="mask-edit-bar" hidden>
+      <select id="mask-edit-mode" title="What each lasso does to the selection">
+        <option value="replace">replace</option>
+        <option value="add">add</option>
+        <option value="remove">remove</option>
+      </select>
+      <span class="hint mono" id="mask-edit-count"></span>
+      <span class="grow"></span>
+      <button id="mask-edit-all" title="Select all sites">all</button>
+      <button id="mask-edit-invert" title="Invert selection">invert</button>
+      <button id="mask-edit-save" title="Save selection as this pattern's site mask">save</button>
+      <button id="mask-edit-clear" title="Remove this pattern's configured site mask (analyze full array)">clear mask</button>
+      <button id="mask-edit-cancel" title="Exit editor without saving">done</button>
+    </div>
     <div class="plot-container" id="plot-site-loading" style="height:360px;"></div>
   </section>
   <section class="card col-4" data-card-id="analysis-site-survival">

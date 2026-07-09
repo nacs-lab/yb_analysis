@@ -2209,6 +2209,44 @@ table.runs-table tr.grouped td:first-child::before {
   border: 0;
 }
 
+/* ---- Site-mask lasso editor (loading-map card) ---- */
+.mask-edit-btn {
+  font: 10.5px var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 1px 7px;
+}
+.mask-edit-btn.active {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.mask-edit-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  margin-bottom: 4px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  background: rgba(210, 153, 34, 0.07);
+  font: 10.5px var(--mono);
+}
+.mask-edit-bar button,
+.mask-edit-bar select {
+  font: 10.5px var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 1px 7px;
+}
+.mask-edit-bar #mask-edit-save {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.mask-edit-bar #mask-edit-clear {
+  border-color: var(--err);
+  color: var(--err);
+}
+
 /* ---- Reserve heights for analysis cards while data loads ---- */
 /* Plot containers already have explicit heights; the loading state of
    the run-summary card otherwise reflows the grid as the stat-tiles
