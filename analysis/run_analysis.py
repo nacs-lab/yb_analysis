@@ -219,6 +219,7 @@ def analyze_scan(scan_id: Optional[str] = None,
                  include_per_iteration: bool = True,
                  filters: Optional[dict] = None,
                  site_mask=None,
+                 survival_ref: str = 'img1',
                  recompute_infidelity: bool = False,
                  force_recache: bool = False,
                  sync_slm_diag: bool = True) -> dict:
@@ -249,6 +250,7 @@ def analyze_scan(scan_id: Optional[str] = None,
         include_per_iteration=include_per_iteration,
         filters=filters,
         site_mask=site_mask,
+        survival_ref=survival_ref,
         recompute_infidelity=recompute_infidelity,
         force_recache=force_recache,
         sync_slm_diag=sync_slm_diag)
@@ -261,6 +263,7 @@ def analyze_scan_dir(scan_dir,
                      include_per_iteration: bool = True,
                      filters: Optional[dict] = None,
                      site_mask=None,
+                     survival_ref: str = 'img1',
                      recompute_infidelity: bool = False,
                      force_recache: bool = False,
                      sync_slm_diag: bool = True) -> dict:
@@ -353,6 +356,15 @@ def analyze_scan_dir(scan_dir,
 
     scan = bundle.get('Scan') or {}
 
+    # Survival conditioning frame: 'img1' (default -- survival conditioned on
+    # the LOADING frame; rearrange runs keep the target-aware TP override) or
+    # 'mid' (condition on the MIDDLE / verify frame, only for NumImages>=3 runs
+    # that persisted logicals_mid; the TP override is skipped so the requested
+    # curve is not clobbered). Unknown value / no middle frame -> 'img1'.
+    _mid_logicals = bundle.get('logicals_mid')
+    _mid_available = _mid_logicals is not None and getattr(_mid_logicals, 'size', 0) > 0
+    _survival_ref = 'mid' if (str(survival_ref).lower() == 'mid' and _mid_available) else 'img1'
+
     # Determine the effective site-mask SPEC now that we know the scan's own
     # loading pattern. Precedence (see site_mask.effective_spec): explicit
     # ``site_mask`` arg > the scan pattern's registry-configured mask > None.
@@ -372,6 +384,7 @@ def analyze_scan_dir(scan_dir,
     # on disk (~ms). Self-invalidates when the scan grows (shot-count key
     # mismatch); busted by force_recache (which already deleted it above).
     _default_view = (filters is None and _site_mask_spec is None
+                     and _survival_ref == 'img1'
                      and not recompute_infidelity)
     if _default_view and not force_recache:
         _cached = _read_payload_cache(scan_dir)
@@ -427,6 +440,32 @@ def analyze_scan_dir(scan_dir,
     n_sites, n_params, max_reps = (
         logic1.shape if logic1.ndim == 3 else (0, 0, 0))
 
+    # ---- Middle (verify) frame cube, for survival_ref='mid' -----------
+    # Unpack logicals_mid onto the SAME (nSites, nParams, maxReps) grid as
+    # logic1 (same seq_ids -> same shot placement) so survival can condition on
+    # the post-rearrangement occupancy. Only when the run persisted it AND the
+    # caller asked for it; else None (survival uses logic1).
+    logic_mid = None
+    if _survival_ref == 'mid' and logic1.size:
+        try:
+            _, logic_mid, _, _ = unpack_scan_logicals(
+                scan, seq_ids=seq_ids, mat_path=bundle.get('mat_path'),
+                logicals_img1=_mid_logicals, logicals_img2=bundle.get('logicals_img2'))
+        except Exception as ex:
+            logger.warning('analyze_scan_dir: logicals_mid unpack failed (%s); '
+                           'falling back to survival_ref=img1', ex)
+            logic_mid = None
+            _survival_ref = 'img1'
+    out['survival_ref'] = _survival_ref
+    out['survival_ref_available'] = bool(_mid_available)
+    # NumImages (frames per shot) so the dashboard can show a DISABLED
+    # survival-ref control (with an explanation) for 3-image runs that predate
+    # the logicals_mid save path.
+    try:
+        out['num_images'] = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
+    except (TypeError, ValueError, IndexError):
+        out['num_images'] = None
+
     # ---- Global per-site mask ("analyze only these sites") ------------
     # Resolve the spec (arg or config.SITE_MASK) against this scan's n_sites.
     # The bool cubes are LEFT UNTOUCHED (so the tested probability math is
@@ -461,6 +500,7 @@ def analyze_scan_dir(scan_dir,
     # (These already carry the site mask -- captured after masking above.)
     logic1_full = logic1
     logic2_full = logic2
+    logic_mid_full = logic_mid
     reps_per_param_full = reps_per_param
     n_params_full = int(n_params)
     # Actual recorded shots = number of saved sequences (seq_ids), NOT the
@@ -518,6 +558,8 @@ def analyze_scan_dir(scan_dir,
             logic1 = logic1[:, param_mask, :]
             if logic2 is not None:
                 logic2 = logic2[:, param_mask, :]
+            if logic_mid is not None:
+                logic_mid = logic_mid[:, param_mask, :]
             scan_params = scan_params[param_mask] if scan_params.ndim == 1 \
                           else scan_params[param_mask, :]
             reps_per_param = reps_per_param[param_mask]
@@ -534,8 +576,11 @@ def analyze_scan_dir(scan_dir,
     out['filter_active'] = bool(param_mask is not None)
 
     # ---- Summary: survival / loading / loss per param ------------------
+    # Survival conditions on `cond` (the middle/verify cube when survival_ref
+    # ='mid', else logic1); loading always uses logic1 (see _summary_stats).
+    cond = logic_mid if (_survival_ref == 'mid' and logic_mid is not None) else logic1
     out['summary'] = _summary_stats(logic1, logic2, reps_per_param,
-                                    site_mask=_site_mask)
+                                    site_mask=_site_mask, cond=cond)
 
     # ---- Seq-specific: CALIBRATION-FREE focus metrics vs swept param ----
     # For loading-optimisation sweeps (e.g. LoadingDefocusScan) measure spot
@@ -586,22 +631,24 @@ def analyze_scan_dir(scan_dir,
                 'survival_mean':  None,
                 'fp_rate':        None,
             }
-            # Per-site survival/FP pair logic1[s] & logic2[s] site-for-site, so
-            # they're only defined when img1 and img2 share a grid. For a
-            # cross-grid rearrangement run (init pattern != target pattern) the
-            # target-aware per-site map (_per_site_from_lab_paths) supplies the
-            # survival map instead; here we keep the loading map (img1-only).
+            # Per-site survival/FP pair cond[s] & logic2[s] site-for-site, so
+            # they're only defined when the conditioning + final frames share a
+            # grid. For a cross-grid rearrangement run (init pattern != target
+            # pattern) the target-aware per-site map (_per_site_from_lab_paths)
+            # supplies the survival map instead; here we keep the loading map
+            # (img1-only). `cond` = middle/verify cube for survival_ref='mid',
+            # else logic1.
             if (logic2 is not None and logic2.size
-                    and not _cross_grid_logicals(logic1, logic2)):
-                sr_per_param, _ = prob11_site_resolved(logic1, logic2, site_mask=_site_mask)
+                    and not _cross_grid_logicals(cond, logic2)):
+                sr_per_param, _ = prob11_site_resolved(cond, logic2, site_mask=_site_mask)
                 with np.errstate(invalid='ignore'), warnings.catch_warnings():
                     warnings.simplefilter('ignore', RuntimeWarning)  # all-NaN masked rows
                     sr_mean = np.nanmean(np.asarray(sr_per_param, dtype=float),
                                          axis=1)
                 per_site['survival_mean'] = sr_mean.tolist()
                 with np.errstate(invalid='ignore', divide='ignore'):
-                    empty = (~logic1).astype(np.float64)
-                    detected_in_2 = (logic2 & ~logic1).astype(np.float64)
+                    empty = (~cond).astype(np.float64)
+                    detected_in_2 = (logic2 & ~cond).astype(np.float64)
                     n_empty = empty.sum(axis=(1, 2))
                     n_fp    = detected_in_2.sum(axis=(1, 2))
                     fp = np.where(n_empty > 0, n_fp / n_empty, np.nan)
@@ -756,6 +803,13 @@ def analyze_scan_dir(scan_dir,
         reps_per_param=reps_per_param,
         param_mask=param_mask)
     out['target_aware'] = target_aware
+    # survival_ref='mid' is an EXPLICIT user choice of conditioning frame --
+    # P(final | verify) at matched sites. The target-aware TP override answers
+    # a different question (fraction of TARGETS filled) and would clobber the
+    # requested curve, so it only applies for the default img1 view (where it
+    # remains the rearrangement-meaningful headline).
+    if _survival_ref == 'mid':
+        target_aware = None
     if target_aware and target_aware.get('per_param_mean') is not None:
         # Override the canonical curve so the dashboard's default
         # survival panel shows the rearrangement-meaningful number.
@@ -1050,8 +1104,10 @@ def analyze_scan_dir(scan_dir,
     # The dashboard's top stat bar must NOT move when a filter is applied.
     # Recompute survival / loss / loading over the UNFILTERED logicals and,
     # for rearrangement runs, the whole-scan target-aware (TP) curve.
+    _cond_full = (logic_mid_full if (_survival_ref == 'mid'
+                                     and logic_mid_full is not None) else logic1_full)
     out['summary_global'] = _summary_stats(
-        logic1_full, logic2_full, reps_per_param_full)
+        logic1_full, logic2_full, reps_per_param_full, cond=_cond_full)
     try:
         ta_global = _target_aware_survival(
             slm_an, out, scan, scan_params_full,
@@ -1085,6 +1141,10 @@ def analyze_scan_dir(scan_dir,
     except Exception as ex:
         logger.warning('filtered target_aware failed: %s', ex)
         out['target_aware_filtered'] = None
+    # Same gating as the filtered summary: an explicit survival_ref='mid'
+    # keeps the verify-conditioned curve, no TP clobber.
+    if _survival_ref == 'mid':
+        ta_global = None
     if ta_global and ta_global.get('per_param_mean') is not None:
         out['summary_global']['survival_mean_per_site'] = \
             out['summary_global']['survival_mean']
@@ -1455,7 +1515,8 @@ def _cross_grid_logicals(logic1, logic2) -> bool:
 def _summary_stats(logic1: np.ndarray,
                    logic2: Optional[np.ndarray],
                    reps_per_param: Optional[np.ndarray] = None,
-                   site_mask=None) -> dict:
+                   site_mask=None,
+                   cond: Optional[np.ndarray] = None) -> dict:
     """Per-param survival / loss / loading curves.
 
     Each rate carries TWO error families so the dashboard's error-bar
@@ -1465,15 +1526,24 @@ def _summary_stats(logic1: np.ndarray,
       * ``*_sem_pershot`` / ``*_std_pershot`` — computed across SHOTS
         (each shot is one sample of the array-averaged rate; this is the
         dashboard default). ``*_n_shots`` is the eligible-shot count.
+
+    ``cond`` is the CONDITIONING frame for survival / loss / FP -- P(final=1 |
+    cond=1). Default None -> ``logic1`` (survival conditioned on the LOADING
+    frame). Pass the MIDDLE (verify) cube to condition survival on the
+    post-rearrangement occupancy instead (NumImages>=3). ``loading_rate``
+    ALWAYS uses ``logic1`` (it is the loading-frame occupancy, independent of
+    the survival conditioning choice).
     """
+    if cond is None:
+        cond = logic1
     # Cross-grid rearrangement (init pattern != target pattern): img1 and img2
     # live on DIFFERENT detection grids, so per-site survival/loss/FP are
     # undefined (and would crash on the shape mismatch). Drop to loading-only
     # here; the target-aware TP override (in analyze_scan_dir) supplies the
     # meaningful survival curve.
-    if _cross_grid_logicals(logic1, logic2):
+    if _cross_grid_logicals(cond, logic2):
         logic2 = None
-    if logic1.size == 0 or logic2 is None or logic2.size == 0:
+    if cond.size == 0 or logic2 is None or logic2.size == 0:
         # Loading-only or empty scan: still report what we can.
         try:
             lr_mean, lr_sem = (loading_rate(logic1, reps_per_param, site_mask=site_mask)
@@ -1492,14 +1562,14 @@ def _summary_stats(logic1: np.ndarray,
             'loss_sem':          empty,
         }
     else:
-        sr_mean, sr_sem = prob11(logic1, logic2, site_mask=site_mask)
-        ls_mean, ls_sem = prob10(logic1, logic2, site_mask=site_mask)
+        sr_mean, sr_sem = prob11(cond, logic2, site_mask=site_mask)
+        ls_mean, ls_sem = prob10(cond, logic2, site_mask=site_mask)
         lr_mean, lr_sem = loading_rate(logic1, reps_per_param, site_mask=site_mask)
         # Baseline (all-empty) false-positive rate. For rearrangement runs the
         # caller OVERRIDES fp_mean/fp_sem with the target-aware version (which
         # excludes target sites); this is what non-rearrange 2-image scans use.
         try:
-            fp_mean, fp_sem = false_positive_rate(logic1, logic2, site_mask=site_mask)
+            fp_mean, fp_sem = false_positive_rate(cond, logic2, site_mask=site_mask)
         except Exception as ex:
             logger.warning('_summary_stats: false_positive_rate failed: %s', ex)
             fp_mean = fp_sem = None
@@ -1514,18 +1584,24 @@ def _summary_stats(logic1: np.ndarray,
             'fp_sem':            fp_sem.tolist() if fp_sem is not None else None,
             'fp_source':         'all_empty',
         }
-    # Per-shot error families (default for the dashboard).
+    # Per-shot error families (default for the dashboard). Survival conditions
+    # on `cond`; loading on logic1. per_shot_rate_stats derives loading from its
+    # first arg, so run it twice when cond != logic1 (cheap) and take survival
+    # from the cond pass, loading from the logic1 pass.
     try:
-        ps = per_shot_rate_stats(logic1, logic2, reps_per_param, site_mask=site_mask)
+        ps = per_shot_rate_stats(cond, logic2, reps_per_param, site_mask=site_mask)
+        ps_load = (ps if cond is logic1
+                   else per_shot_rate_stats(logic1, logic2, reps_per_param,
+                                            site_mask=site_mask))
     except Exception as ex:
         logger.warning('_summary_stats: per_shot_rate_stats failed: %s', ex)
-        ps = {}
+        ps = ps_load = {}
     out['survival_std_pershot']   = ps.get('survival_std_pershot')
     out['survival_sem_pershot']   = ps.get('survival_sem_pershot')
     out['survival_n_shots']       = ps.get('survival_n_shots')
-    out['loading_std_pershot']    = ps.get('loading_std_pershot')
-    out['loading_sem_pershot']    = ps.get('loading_sem_pershot')
-    out['loading_n_shots']        = ps.get('loading_n_shots')
+    out['loading_std_pershot']    = ps_load.get('loading_std_pershot')
+    out['loading_sem_pershot']    = ps_load.get('loading_sem_pershot')
+    out['loading_n_shots']        = ps_load.get('loading_n_shots')
     return out
 
 

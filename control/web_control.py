@@ -57,7 +57,9 @@ VALID_CMDS = ('dummy_mode', 'init_dir', 'restart_dash', 'restart_all',
               'pause', 'start', 'abort',
               'camera_connect', 'camera_disconnect', 'camera_apply',
               # Live "analyze only these sites" view toggle (applied to the DM).
-              'site_mask')
+              'site_mask',
+              # Live survival conditioning frame toggle: img1 | mid (verify).
+              'survival_ref')
 
 
 #: Per-process monotonic counter so two enqueues in the same time_ns() tick get

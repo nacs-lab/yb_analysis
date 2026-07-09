@@ -129,6 +129,7 @@
   }
   let recomputeInfid = false;       // refit discrimination from this run's data
   let svdMode = "total";            // survival-vs-distance x-axis: total|per_step
+  let survivalRef = "img1";         // survival conditioning frame: img1 | mid (verify)
 
   // Shrink the font of each top-row status value until it fits its tile
   // (no ellipsis). Resets to the stylesheet base first so values that got
@@ -3872,7 +3873,7 @@
     // Persist so refresh keeps you on the same scan.
     try { localStorage.setItem("yb_dashboard_selected_scan", scanId || ""); }
     catch { /* private mode */ }
-    if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; }
+    if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; survivalRef = "img1"; }
     const body = $("analysis-detail-body");
     if (!silent) {
       body.innerHTML = '<div class="hint">loading…</div>';
@@ -3889,6 +3890,7 @@
       }
       if (recomputeInfid) qs.push('recompute_infidelity=1');
       if (opts.forceRecache) qs.push('force_recache=1');
+      if (survivalRef === 'mid') qs.push('survival_ref=mid');
       if (qs.length) url += '?' + qs.join('&');
       const r = await api(url);
       if (!r || typeof r !== "object") {
@@ -4219,6 +4221,17 @@
             }</button>` : ""}
           · <button class="ghost" id="reanalyze-btn"
               title="Clear this run's cached analysis (double-Gaussian fits, focus metrics) and recompute from scratch.">↻ re-analyze</button>
+          ${r.survival_ref_available ? `· <label class="mono" style="white-space:nowrap"
+              title="Frame the survival is conditioned on. img1 = the default view — on rearrangement runs this is the target-aware TP (fraction of target sites filled in the final image; raw P(final | loading) kept under survival_mean_per_site). middle = P(final | middle/verify frame) — survival of the verified post-rearrangement atoms. Loading rate is unaffected.">survival vs:
+              <select id="survival-ref-sel" class="ghost" style="margin-left:4px">
+                <option value="img1"${survivalRef === "img1" ? " selected" : ""}>img1 (target-aware)</option>
+                <option value="mid"${survivalRef === "mid" ? " selected" : ""}>middle (verify)</option>
+              </select></label>`
+            : ((r.num_images || 0) >= 3 ? `· <label class="mono muted" style="white-space:nowrap"
+              title="This 3-image run has no saved middle-frame logicals (logicals_mid) — runs started before the middle-frame save path went live only stored raw middle frames. Survival here is conditioned on img1 (loading). New scans record logicals_mid and unlock this control.">survival vs:
+              <select disabled class="ghost" style="margin-left:4px">
+                <option>img1 (no mid saved)</option>
+              </select></label>` : "")}
         </div>
         ${imf ? `<div title="${
           imf.source === "logged_throughout_run"
@@ -4287,6 +4300,13 @@
       if (selectedScanId)
         loadAnalysis(selectedScanId, {keepFilters: true, forceRecache: true});
     });
+    // Survival conditioning frame (NumImages>=3 runs with a saved middle frame):
+    // img1 (loading) vs middle (verify). Re-fetches with survival_ref.
+    const srSel = document.getElementById("survival-ref-sel");
+    if (srSel) srSel.addEventListener("change", () => {
+      survivalRef = srSel.value === "mid" ? "mid" : "img1";
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+    });
     // The dedicated Survival / Loading cards were replaced by the
     // per-site maps + per-iteration chart further down the tab. Only
     // the sweep visualization needs to render here.
@@ -4338,8 +4358,9 @@
     const fpHasData = isSurv && fpm.some((v) => v != null && isFinite(v));
     const fpName = (summary.fp_source === "rearrange") ? "FP (target)" : "FP";
     const _num = (v) => (v == null || !isFinite(v)) ? null : v;
+    const _refTag = (r.survival_ref === "mid") ? " | verify" : "";
     const yLabel = isSurv
-        ? (targetAware ? "TP (target survival)" : "survival")
+        ? (targetAware ? "TP (target survival)" : ("survival" + _refTag))
         : "loading rate";
     const baseMargin = {l: 70, r: 50, t: 14, b: 56};
     const nDimsReal = dims.filter((d) => d > 1).length;
@@ -5347,6 +5368,40 @@
           console.warn("site_mask toggle failed", e);
           toast("Site-mask toggle failed: " + (e.message || e), "bad");
           sm.checked = !sm.checked;   // revert on failure
+        }
+      });
+    }
+
+    // Survival conditioning-frame toggle -> POST to the server, which spools
+    // 'survival_ref' to the main process (ControlPanel) -> live DataManager.
+    // OFF = img1 (loading, default); ON = middle/verify frame (3-image scans).
+    // View-only; persisted across reloads and re-asserted on load like the
+    // site mask (a fresh main process starts at img1).
+    const svr = document.getElementById("survival-ref-live");
+    if (svr) {
+      try { svr.checked = localStorage.getItem("yb-dash-survival-ref") === "mid"; }
+      catch {}
+      if (svr.checked) {
+        api("/api/control/survival_ref", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({ref: "mid"}),
+        }).catch(() => {});
+      }
+      svr.addEventListener("change", async () => {
+        const ref = svr.checked ? "mid" : "img1";
+        try {
+          await api("/api/control/survival_ref", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ref}),
+          });
+          try { localStorage.setItem("yb-dash-survival-ref", ref); }
+          catch {}
+        } catch (e) {
+          console.warn("survival_ref toggle failed", e);
+          toast("Survival-ref toggle failed: " + (e.message || e), "bad");
+          svr.checked = !svr.checked;   // revert on failure
         }
       });
     }

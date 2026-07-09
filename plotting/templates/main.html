@@ -400,6 +400,15 @@
       <span class="track"></span>
       <span>Site mask</span>
     </label>
+    <!-- Survival conditioning-frame toggle (3-image scans): condition the live
+         survival on the MIDDLE (verify) frame instead of img1 (loading). No
+         effect on loading readouts or on scans without a middle frame. -->
+    <label class="switch card-switch" id="survival-ref-switch"
+           title="Condition the live survival on the MIDDLE (verify) frame — P(final | verify) — instead of img1 (loading), for 3-image (rearrange-verify) scans. Loading readouts unaffected; no effect when the scan has no middle frame.">
+      <input type="checkbox" id="survival-ref-live">
+      <span class="track"></span>
+      <span>Cond. verify</span>
+    </label>
     <span class="hint mono" id="site-mask-info"></span>
     <div class="plot-container" id="plot-scan" style="height: 320px;"></div>
   </section>

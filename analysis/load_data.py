@@ -103,6 +103,8 @@ def _load_from_h5(h5_path, scan_dir, base):
     # when img2 was detected by the spot-shape model, distinct-pattern runs).
     logicals_img2_source = None
     certainties_img2 = None
+    # Middle (verify) frame, NumImages >= 3: post-rearrangement occupancy.
+    logicals_mid = intensities_mid = None
 
     with h5py.File(h5_path, 'r') as f:
         two_array = bool(f.attrs.get('two_array', False))
@@ -118,6 +120,10 @@ def _load_from_h5(h5_path, scan_dir, base):
                 str(src) if src is not None else None)
             if 'certainties_img2' in f:
                 certainties_img2 = f['certainties_img2'][:]
+            if 'logicals_mid' in f:
+                logicals_mid = f['logicals_mid'][:]
+            if 'intensities_mid' in f:
+                intensities_mid = f['intensities_mid'][:]
         else:
             logicals = f['logicals'][:] if 'logicals' in f else None
             intensities = f['intensities'][:] if 'intensities' in f else None
@@ -142,6 +148,8 @@ def _load_from_h5(h5_path, scan_dir, base):
         'intensities_img2': intensities_img2,
         'logicals_img2_source': logicals_img2_source,
         'certainties_img2': certainties_img2,
+        'logicals_mid': logicals_mid,
+        'intensities_mid': intensities_mid,
         'seq_ids': seq_ids.ravel() if seq_ids is not None else None,
         'imgs_shape': imgs_shape,
         'path': h5_path,
@@ -169,6 +177,8 @@ def _load_from_mat(mat_path):
         'logicals_img2': None,
         'intensities_img1': None,
         'intensities_img2': None,
+        'logicals_mid': None,
+        'intensities_mid': None,
         'seq_ids': seq_ids,
         'imgs_shape': imgs_shape,
         'path': mat_path,

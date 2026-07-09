@@ -42,6 +42,9 @@ def _drop_safety_dm(pSeq=2):
     dm._img_cnt_affine = dm._img_cnt_thres_live = 0
     dm._img_cnt_refit_img2 = 0            # img2 distinct-pattern refit cadence
     dm._diag_pull_cnt = 0                 # incremented in store_new_data (live-target pull cadence)
+    dm._seq_ids_max_seen = 0              # seq-gap tracking (store_new_data since 2026-06-21)
+    dm._seq_gap_count = 0
+    dm._seq_gap_ids = []
     return dm
 
 
@@ -102,6 +105,8 @@ def _save_dm(tmp_path, pSeq=2, num_sites=3, num_sites_img2=3):
     dm.num_sites_img2 = num_sites_img2
     dm.is_two_array = True
     dm._save_two_array = True
+    # Persist the middle (verify) frame for the two-round (pSeq >= 3) layout.
+    dm._save_mid = pSeq >= 3
     dm.frame_size = (4, 4)
     dm.config = {}
     dm.fname = str(tmp_path / 'data_test.h5')
@@ -109,7 +114,8 @@ def _save_dm(tmp_path, pSeq=2, num_sites=3, num_sites_img2=3):
     dm._save_lock = threading.Lock()
     dm._proba_img2_to_save = []          # img2 model certainties buffer (empty -> none)
     create_scan_file(dm.fname, {}, dm.frame_size, num_sites,
-                     two_array=True, num_sites_img2=num_sites_img2)
+                     two_array=True, num_sites_img2=num_sites_img2,
+                     save_mid=dm._save_mid)
     return dm
 
 
@@ -167,3 +173,34 @@ def test_save_data_demux_even_buffer_no_warning(tmp_path, caplog):
         assert f['logicals_img2'].shape[0] == 2
         assert f['imgs'].shape[0] == 4
     assert not any('orphan frame' in r.message for r in caplog.records)
+
+
+def test_save_data_pseq3_persists_middle_verify_frame(tmp_path):
+    """NumImages=3: the MIDDLE (verify) frame's logicals/intensities are saved to
+    logicals_mid/intensities_mid, demuxed from the [1::pSeq] slot, and img1/img2
+    stay the FIRST / FINAL frames (not the middle)."""
+    dm = _save_dm(tmp_path, pSeq=3)
+    assert dm._save_mid is True
+    # 2 complete sequences * 3 frames. Tag each frame's logicals by its slot so
+    # we can prove the demux picks the right frame for each dataset.
+    #   frame0 -> [1,0,0]  frame1(mid) -> [0,1,0]  frame2(final) -> [0,0,1]
+    slot_bits = {0: [1, 0, 0], 1: [0, 1, 0], 2: [0, 0, 1]}
+    n = 6
+    dm._imgs_to_save = [np.full((4, 4), i, dtype=np.int16) for i in range(n)]
+    dm._logicals_to_save = [np.array(slot_bits[i % 3], dtype=bool) for i in range(n)]
+    dm._intensities_to_save = [np.full(3, float(i % 3)) for i in range(n)]
+    dm._seq_ids_to_save = [10, 20]
+
+    dm.save_data()
+    _wait_for_rows(dm.fname, 'logicals_mid', 2)
+
+    with h5py.File(dm.fname, 'r') as f:
+        assert f['logicals_img1'].shape[0] == 2
+        assert f['logicals_img2'].shape[0] == 2
+        assert f['logicals_mid'].shape[0] == 2
+        assert f['intensities_mid'].shape[0] == 2
+        # Each dataset must carry ITS frame's bits, not another slot's.
+        assert (f['logicals_img1'][:] == [1, 0, 0]).all()   # frame0
+        assert (f['logicals_mid'][:] == [0, 1, 0]).all()    # frame1 (verify)
+        assert (f['logicals_img2'][:] == [0, 0, 1]).all()   # frame2 (final)
+        assert (f['intensities_mid'][:] == 1.0).all()       # frame1 intensity tag

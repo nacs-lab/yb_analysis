@@ -197,6 +197,9 @@ class ControlPanel(tk.Tk):
         # new real DM in _process_once. (spec None => use config.SITE_MASK.)
         self._site_mask_enabled = False
         self._site_mask_spec = None
+        # Live survival conditioning frame ('img1' | 'mid'), panel-level like
+        # the site mask so it survives DM churn; re-applied to each new DM.
+        self._survival_ref = 'img1'
 
         style = ttk.Style(self)
         style.configure('Abort.TButton', foreground='red',
@@ -1009,6 +1012,15 @@ class ControlPanel(tk.Tk):
                             self._site_mask_enabled, spec=self._site_mask_spec)
                     logger.info('Web site_mask -> enabled=%s spec=%r',
                                 self._site_mask_enabled, self._site_mask_spec)
+                elif cmd == 'survival_ref':
+                    # Live survival conditioning-frame toggle (view-only).
+                    # Persist on the panel (survives new-scan DM churn) and
+                    # apply to the current DM now.
+                    ref = str(rec.get('ref', 'img1')).lower()
+                    self._survival_ref = 'mid' if ref == 'mid' else 'img1'
+                    if self._last_real_dm is not None:
+                        self._last_real_dm.set_survival_ref(self._survival_ref)
+                    logger.info('Web survival_ref -> %s', self._survival_ref)
                 elif cmd in ('camera_connect', 'camera_apply',
                              'camera_disconnect'):
                     # Dispatch to CameraPane, which owns the ZMQ client and
@@ -1089,6 +1101,12 @@ class ControlPanel(tk.Tk):
                 if self._site_mask_enabled:
                     try:
                         dm.set_site_mask_enabled(True, spec=self._site_mask_spec)
+                    except Exception:
+                        pass
+                # Carry the survival conditioning-frame toggle likewise.
+                if self._survival_ref != 'img1':
+                    try:
+                        dm.set_survival_ref(self._survival_ref)
                     except Exception:
                         pass
                 self.after(0, self._update_labels, fname, save_err)

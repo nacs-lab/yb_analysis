@@ -276,6 +276,15 @@ class DataManager:
         self._site_mask_cache = None      # (spec, pattern, n_sites) -> resolved bool cache
         self._site_mask_cache_key = None
 
+        # Live survival conditioning frame: 'img1' (default -- condition on the
+        # loading frame) or 'mid' (condition on the MIDDLE / verify frame,
+        # NumImages >= 3 only). Set via set_survival_ref (dashboard toggle).
+        # Mid-frame bits per shot live in _scan_mid_logicals {seq_id: bool[M]}
+        # and are substituted for logic1 at READ time (scan curve + per-shot
+        # survival series) -- loading readouts always stay on the loading frame.
+        self.survival_ref = 'img1'
+        self._scan_mid_logicals = {}
+
         # Paths
         date_stamp, time_stamp = scan_id_to_stamps(scan_id)
         self.dname, self.date, self.time = make_scan_dir(date_stamp, time_stamp)
@@ -563,6 +572,10 @@ class DataManager:
         # img2 logicals from the shape model -> persist a per-site certainty
         # dataset + a provenance tag, but only when we're actually saving img2.
         img2_src = self._img2_logicals_source if self._save_two_array else None
+        # NumImages >= 3 (two-round rearrangement): also persist the MIDDLE
+        # (verify) frame's logicals/intensities. Their bits are already detected
+        # + displayed live; save_data demuxes them from the same [1::pSeq] slot.
+        self._save_mid = self._save_two_array and self.num_images_per_seq >= 3
         if self.num_sites > 0:
             try:
                 create_scan_file(
@@ -570,6 +583,7 @@ class DataManager:
                     two_array=self._save_two_array,
                     num_sites_img2=self.num_sites_img2,
                     img2_logicals_source=img2_src,
+                    save_mid=self._save_mid,
                 )
                 self._file_created = True
             except Exception as e:
@@ -607,6 +621,7 @@ class DataManager:
         self._display_proba2 = None
         self._proba_img2_to_save = []
         self._save_two_array = False
+        self._save_mid = False
         self._display_image = None
         self._display_intensities = None
         self._display_logicals = None
@@ -645,6 +660,8 @@ class DataManager:
         self.grid_shift_history = []
         self.grid_shift_heatmap = None
         self._scan_logicals = []
+        self.survival_ref = 'img1'
+        self._scan_mid_logicals = {}
         self._last_batch_seq_ids = []
         self._seq_targets = {}
         self._diag_since = 0
@@ -1219,7 +1236,7 @@ class DataManager:
         # present); 1-image scans keep the loading timeseries.
         if self.num_images_per_seq < 2:
             return None
-        sl = self._scan_logicals
+        sl = self._effective_scan_logicals()   # mid-conditioned when survival_ref='mid'
         if not sl or sl[0][2] is None:
             return None
         st = self._seq_targets
@@ -2098,6 +2115,11 @@ class DataManager:
                 logic1 = seq_logic_buf[0]
                 logic2 = seq_logic_buf[-1] if len(seq_logic_buf) >= 2 else None
                 self._scan_logicals.append((sid, logic1.copy(), logic2.copy() if logic2 is not None else None))
+                # Middle (verify) frame bits (pSeq >= 3): kept per shot so the
+                # live survival can be re-conditioned on the verify frame
+                # (survival_ref='mid') at read time.
+                if len(seq_logic_buf) >= 3:
+                    self._scan_mid_logicals[sid] = seq_logic_buf[1].copy()
                 batch_sids.append(sid)
                 seq_logic_buf.clear()
                 n_new_seqs += 1
@@ -2566,6 +2588,16 @@ class DataManager:
                 if pr:
                     proba2 = np.array(pr, dtype=np.float64)
 
+            # Middle (verify) frame (NumImages >= 3): the round-1 post-
+            # rearrangement occupancy, detected on the img1 grid. Demux the
+            # frame-1 slot ([1::pSeq]) -- its bits are already in the same
+            # buffers as img1/img2, just never extracted before. (For pSeq > 3
+            # only the FIRST middle frame is persisted.)
+            logs_mid = ints_mid = None
+            if self._save_mid and pSeq >= 3 and logs_all:
+                logs_mid = np.array(logs_all[1::pSeq], dtype=bool)
+                ints_mid = np.array(ints_all[1::pSeq], dtype=np.float64)
+
             def _do():
                 self._save_block(
                     lambda: append_block(
@@ -2573,6 +2605,8 @@ class DataManager:
                         logicals_img2_block=logs2,
                         intensities_img2_block=ints2,
                         proba_img2_block=proba2,
+                        logicals_mid_block=logs_mid,
+                        intensities_mid_block=ints_mid,
                     ),
                     sids, len(imgs), two_array=True)
         else:
@@ -2717,6 +2751,28 @@ class DataManager:
             savemat(os.path.join(self._day_dir, 'histData.mat'), {'histData': hs})
         except Exception as e:
             logger.warning('HistData save failed: %s', e)
+
+    # --- Survival conditioning frame (live view) ---
+
+    def set_survival_ref(self, ref):
+        """Dashboard toggle: 'img1' (default) or 'mid'. With 'mid', the live
+        survival readouts (scan curve + per-shot series) condition on the
+        MIDDLE (verify) frame instead of the loading frame; loading readouts
+        are unaffected. A no-op for scans with no middle frame (NumImages<3 --
+        no mid bits accumulate, substitution falls back to logic1)."""
+        self.survival_ref = 'mid' if str(ref).lower() == 'mid' else 'img1'
+        return self.survival_ref
+
+    def _effective_scan_logicals(self):
+        """The (seq_id, cond, logic2) triples the live survival consumers use.
+        survival_ref='mid': substitute each shot's middle (verify) bits for
+        logic1 (per-shot fallback to logic1 when the mid bits are missing);
+        else the raw accumulator. Cheap -- referencing, no bit copies.
+        getattr defaults keep partially-built DMs (tests, dummy display) safe."""
+        mid = getattr(self, '_scan_mid_logicals', None)
+        if getattr(self, 'survival_ref', 'img1') != 'mid' or not mid:
+            return self._scan_logicals
+        return [(sid, mid.get(sid, l1), l2) for sid, l1, l2 in self._scan_logicals]
 
     # --- Site mask (global "analyze only these sites" -- live view) ---
 
@@ -2884,13 +2940,15 @@ class DataManager:
             'grid_shift_heatmap': self.grid_shift_heatmap.copy() if self.grid_shift_heatmap is not None else None,
             'grid_shift_history': list(self.grid_shift_history),
             'scan_curve': compute_scan_curve(
-                self._scan_logicals, self._param_indices,
+                self._effective_scan_logicals(), self._param_indices,
                 self._scan_params, self.num_images_per_seq,
                 scan_dims=self._scan_dims,
                 is_two_array=self.is_two_array,
                 recent_seq_ids=self._last_batch_seq_ids,
                 seq_targets=self._seq_targets,
                 site_mask=_live_mask),
+            'survival_ref': self.survival_ref,
+            'survival_mid_available': bool(self._scan_mid_logicals),
             'site_mask_active': bool(_live_mask is not None),
             'site_mask_spec': (str(self._site_mask_spec)
                                if _live_mask is not None else None),

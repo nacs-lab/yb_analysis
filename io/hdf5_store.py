@@ -57,7 +57,7 @@ def _open_h5_append(path, retries=12, base_delay=0.1, max_delay=1.0):
 
 def create_scan_file(path, scan_config, frame_size, num_sites,
                      two_array=False, num_sites_img2=0,
-                     img2_logicals_source=None):
+                     img2_logicals_source=None, save_mid=False):
     """Create a new HDF5 scan file with resizable datasets.
 
     Parameters
@@ -87,6 +87,13 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
         ``logicals_img2``) is created alongside, and the tag is stored as the
         ``logicals_img2_source`` file + dataset attribute. None -> threshold
         detection (no certainties dataset), the default.
+    save_mid : bool
+        If True (NumImages >= 3, two-round rearrangement), also create
+        ``logicals_mid`` / ``intensities_mid`` datasets (shape ``(NSeqs,
+        num_sites)``) for the MIDDLE (verify) frame -- the post-rearrangement
+        occupancy that is detected + displayed live but was previously never
+        persisted (only frame-0 -> img1 and the FINAL frame -> img2 were saved).
+        Uses ``num_sites`` (the middle frame detects on the same grid as img1).
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -132,6 +139,20 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
                     chunks=(64, max(num_sites_img2, 1)))
                 cert.attrs['source'] = src
                 cert.attrs['meaning'] = 'per-site P(loaded) posterior for logicals_img2'
+            # Middle (verify) frame: post-rearrangement occupancy, detected on
+            # the img1 grid (num_sites). Only for NumImages >= 3.
+            if save_mid:
+                f.attrs['save_mid'] = True
+                lm = f.create_dataset(
+                    'logicals_mid', shape=(0, num_sites),
+                    maxshape=(None, num_sites), dtype='bool',
+                    chunks=(64, max(num_sites, 1)))
+                lm.attrs['meaning'] = ('middle (verify) frame occupancy: '
+                                       'post-rearrangement, pre-science')
+                f.create_dataset(
+                    'intensities_mid', shape=(0, num_sites),
+                    maxshape=(None, num_sites), dtype='float64',
+                    chunks=(64, max(num_sites, 1)))
         else:
             # Legacy single-array layout: (nFrames, num_sites) interleaved.
             f.create_dataset(
@@ -165,7 +186,8 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
 
 def append_block(path, imgs_block, logicals_block, intensities_block,
                  seq_ids_block, logicals_img2_block=None,
-                 intensities_img2_block=None, proba_img2_block=None):
+                 intensities_img2_block=None, proba_img2_block=None,
+                 logicals_mid_block=None, intensities_mid_block=None):
     """Append a block of data to an existing HDF5 file.
 
     Parameters
@@ -188,6 +210,12 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
         If non-None, two-array mode: shape (NSeqs, M2), the spot-shape model's
         per-site posterior P(loaded) for ``logicals_img2`` (the "% certainty"),
         appended to the ``certainties_img2`` dataset.
+    logicals_mid_block : ndarray or None
+        If non-None, two-array mode (NumImages >= 3): shape (NSeqs, M1), the
+        MIDDLE (verify) frame logicals, appended to ``logicals_mid``.
+    intensities_mid_block : ndarray or None
+        If non-None, two-array mode (NumImages >= 3): shape (NSeqs, M1), the
+        middle-frame intensities, appended to ``intensities_mid``.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -218,6 +246,12 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
             if proba_img2_block is not None:
                 pairs.append(('certainties_img2',
                               np.asarray(proba_img2_block, dtype='float32')))
+            if logicals_mid_block is not None:
+                pairs.append(('logicals_mid',
+                              np.asarray(logicals_mid_block, dtype='bool')))
+            if intensities_mid_block is not None:
+                pairs.append(('intensities_mid',
+                              np.asarray(intensities_mid_block, dtype='float64')))
         else:
             pairs = [
                 ('logicals', logicals_block),

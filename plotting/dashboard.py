@@ -1808,11 +1808,18 @@ def _register_api_routes(server):
         # the whole array (site_mask=False). Same query-param style as filter.
         _sm_q = request.args.get('site_mask')
         site_mask = (False if (_sm_q or '').lower() == 'full' else (_sm_q or None))
+        # Survival conditioning frame: 'img1' (default; condition on the loading
+        # frame) or 'mid' (condition on the middle/verify frame, NumImages>=3).
+        # Falls back to img1 for runs with no saved middle frame.
+        survival_ref = (request.args.get('survival_ref') or 'img1').lower()
+        if survival_ref not in ('img1', 'mid'):
+            survival_ref = 'img1'
         try:
             result = analyze_scan(scan_id, filters=filters,
                                   recompute_infidelity=recompute,
                                   force_recache=force_recache,
-                                  site_mask=site_mask)
+                                  site_mask=site_mask,
+                                  survival_ref=survival_ref)
         except RunAnalysisError as ex:
             msg = str(ex).lower()
             if 'must be 14 digits' in msg or 'must pass scan_id' in msg:
@@ -3117,6 +3124,20 @@ def _register_api_routes(server):
         _wc.enqueue('site_mask', enabled=enabled, spec=spec)
         return jsonify({'ok': True, 'enabled': enabled, 'spec': spec,
                         'via': 'run_monitor'})
+
+    @server.route('/api/control/survival_ref', methods=['POST'])
+    def _api_control_survival_ref():
+        # Live survival conditioning-frame toggle (img1 | mid): view-only
+        # preference (no authority over the experiment -> no exposure gate).
+        # Spooled to the main process's ControlPanel, which applies it to the
+        # live DataManager (and carries it onto each new scan's DM).
+        from flask import jsonify, request
+        body = request.get_json(silent=True) or {}
+        ref = str(body.get('ref', 'img1')).lower()
+        if ref not in ('img1', 'mid'):
+            return jsonify({'error': "ref must be 'img1' or 'mid'"}), 400
+        _wc.enqueue('survival_ref', ref=ref)
+        return jsonify({'ok': True, 'ref': ref, 'via': 'run_monitor'})
 
     @server.route('/api/control/downsample', methods=['POST'])
     def _api_control_downsample():
