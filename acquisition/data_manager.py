@@ -17,7 +17,7 @@ import numpy as np
 from yb_analysis.config import (
     UPDATE_GRID_INTERVAL, UPDATE_GRID_BATCH_SIZE,
     UPDATE_THRES_INTERVAL, UPDATE_THRES_BATCH_SIZE,
-    UPDATE_LOADING_INTERVAL, UPDATE_HIST_BATCH_SIZE,
+    UPDATE_LOADING_INTERVAL, UPDATE_HIST_BATCH_SIZE, REBIN_HIST_INTERVAL,
     AFFINE_LIVE_INTERVAL, AFFINE_LIVE_BATCH, AFFINE_LIVE_SEARCH_RANGE,
     AFFINE_LIVE_EMA, THRES_LIVE_INTERVAL, THRES_LIVE_WINDOW,
     THRES_LIVE_EMA, THRES_LIVE_MIN_PER_SIDE,
@@ -380,7 +380,8 @@ class DataManager:
 
         # --- LIVE state (accumulates, resets at 2000) ---
         self._intensity_accum = []          # list of (num_sites,) arrays
-        self.live_hist_data = None           # rebinned every shot after accumulation starts
+        self.live_hist_data = None           # rebinned every REBIN_HIST_INTERVAL shots
+        self._hist_last_rebin_n = 0          # accum length at the last live_hist_data rebin
         self.live_gauss_fits = None          # fitted every 200 shots
         self.live_thresholds = None          # from live_gauss_fits
         self.live_infidelities = None
@@ -497,7 +498,7 @@ class DataManager:
 
         # --- Buffers ---
         buf_size = max(UPDATE_THRES_BATCH_SIZE, UPDATE_GRID_BATCH_SIZE)
-        self.img_buffer = RingBuffer(buf_size, self.frame_size, dtype='int16')
+        self.img_buffer = RingBuffer(buf_size, self.frame_size, dtype='uint16')
         self.log_buffer = RingBuffer(buf_size, (self.num_sites,), dtype='float64')
         if self.is_two_array and self.num_sites_img2 > 0:
             self.log_buffer_img2 = RingBuffer(buf_size, (self.num_sites_img2,),
@@ -632,6 +633,7 @@ class DataManager:
         self._display_intensities_mid = None
         self._display_logicals_mid = None
         self._intensity_accum = []
+        self._hist_last_rebin_n = 0
         self.live_hist_data = self.live_gauss_fits = None
         self.live_thresholds = self.live_infidelities = None
         self._fit_cache = {}                 # drop per-site refit cache on reset
@@ -1882,7 +1884,7 @@ class DataManager:
                 logger.info('Fixing frame_size: config=%s, actual=%s', self.frame_size, actual_shape)
                 self.frame_size = actual_shape
                 buf_size = max(UPDATE_THRES_BATCH_SIZE, UPDATE_GRID_BATCH_SIZE)
-                self.img_buffer = RingBuffer(buf_size, self.frame_size, dtype='int16')
+                self.img_buffer = RingBuffer(buf_size, self.frame_size, dtype='uint16')
                 self._frame_size_fixed = True
                 # Retry HDF5 creation — initial attempt fails when config has frameSize=(0,0)
                 if not self._file_created and self.num_sites > 0:
@@ -1920,7 +1922,7 @@ class DataManager:
             for p in range(pSeq):
                 self._imgs_to_process.append(img3d[:, :, p])
             if self.img_buffer is not None:
-                self.img_buffer.push(img3d[:, :, 0].astype(np.int16))
+                self.img_buffer.push(img3d[:, :, 0].astype(np.uint16))
             sid = int(sids_in[i])
             if self._seq_ids_max_seen > 0 and sid > self._seq_ids_max_seen + 1:
                 gap_start = self._seq_ids_max_seen + 1
@@ -1957,12 +1959,12 @@ class DataManager:
             return
         if self.is_init:
             for img in self._imgs_to_process:
-                self._imgs_to_save.append(img.astype(np.int16))
+                self._imgs_to_save.append(img.astype(np.uint16))
             # Show the first image of the latest sequence on the dashboard
             pSeq = self.num_images_per_seq
             n_imgs = len(self._imgs_to_process)
             last_seq_start = (n_imgs - 1) // pSeq * pSeq
-            self._display_image = self._imgs_to_process[last_seq_start].astype(np.int16)
+            self._display_image = self._imgs_to_process[last_seq_start].astype(np.uint16)
             self._seq_ids_to_save.extend(self._seq_ids_to_process)
             self._imgs_to_process.clear()
             self._seq_ids_to_process.clear()
@@ -2021,7 +2023,7 @@ class DataManager:
                     img.astype(np.float64), grid_i, thr_i, self.mask_mat)
             self._logicals_to_save.append(logicals)
             self._intensities_to_save.append(intensities)
-            self._imgs_to_save.append(img.astype(np.int16))
+            self._imgs_to_save.append(img.astype(np.uint16))
             seq_logic_buf.append(logicals)
 
             # On first image of each sequence: accumulate for histograms + display
@@ -2053,20 +2055,20 @@ class DataManager:
                 self.log_buffer.push(logicals.astype(np.float64))
                 record_loading(logicals)
                 # Always display image-1 (loading image, not pushout)
-                self._display_image = img.astype(np.int16)
+                self._display_image = img.astype(np.uint16)
                 self._display_intensities = intensities.copy()
                 self._display_logicals = logicals.copy()
             # Middle frame(s): only meaningful when pSeq >= 3 (e.g. the
             # two-round SLM rearrangement after round 1 but before round
             # 2). Only the most recent middle frame is kept for display.
             if is_mid:
-                self._display_image_mid = img.astype(np.int16)
+                self._display_image_mid = img.astype(np.uint16)
                 self._display_intensities_mid = intensities.copy()
                 self._display_logicals_mid = logicals.copy()
             # Final image of each sequence: feeds the "image 2" display
             # slot and (for is_two_array) the second log buffer.
             if is_last:
-                self._display_image2 = img.astype(np.int16)
+                self._display_image2 = img.astype(np.uint16)
                 self._display_intensities2 = intensities.copy()
                 self._display_logicals2 = logicals.copy()
                 self._display_proba2 = (proba_vec.copy()
@@ -2126,9 +2128,20 @@ class DataManager:
         self._last_batch_seq_ids = batch_sids
         self._seq_total += n_new_seqs
 
-        # Rebin histograms from accumulated intensities (cheap: ~0.5ms)
-        if len(self._intensity_accum) >= 1:
-            self._rebin_histograms()
+        # Rebin histograms from accumulated intensities. The rebuild re-histograms
+        # every site over the whole accumulator, so it is throttled to every
+        # REBIN_HIST_INTERVAL new accumulated shots rather than every shot; the
+        # full Gaussian refit (its only strict consumer) forces a fresh rebin
+        # itself, and get_plot_data tolerates up to interval-shot staleness.
+        # Always rebin on the first accumulated shot and after any accumulator
+        # reset (live_hist_data is None, or the length dropped) so panels are
+        # never empty and the cadence restarts cleanly at 2000-shot rotation.
+        n_accum = len(self._intensity_accum)
+        if n_accum >= 1:
+            if (self.live_hist_data is None
+                    or n_accum < self._hist_last_rebin_n
+                    or n_accum - self._hist_last_rebin_n >= REBIN_HIST_INTERVAL):
+                self._rebin_histograms()
 
         # Check 2000-shot rotation
         if len(self._intensity_accum) >= UPDATE_HIST_BATCH_SIZE:
@@ -2190,6 +2203,7 @@ class DataManager:
     def _rebin_histograms(self):
         all_i = np.array(self._intensity_accum)  # (N, num_sites)
         self.live_hist_data = self._compute_hist_data(all_i, self.num_sites)
+        self._hist_last_rebin_n = all_i.shape[0] if all_i.ndim else 0
 
     def update_data(self):
         if self.is_init:
@@ -2262,6 +2276,11 @@ class DataManager:
                 pa = _get_pattern_accum(self._accum_pattern_name, self.num_sites)
                 with _pattern_accum_lock:
                     pa['n_since_attempt'] = 0
+            # _fit_gaussians reads self.live_hist_data (the per-site bins); the
+            # rebin is throttled in process_data, so refresh it here first to fit
+            # against bins that reflect the current accumulator (as it did when
+            # the rebin ran every shot).
+            self._rebin_histograms()
             all_i = np.array(self._intensity_accum)
             fits, thres, inf = self._fit_gaussians(all_i)
             ok, reason, stats = self._validate_full_fit(fits, thres, all_i)
@@ -2528,7 +2547,7 @@ class DataManager:
     def save_data(self):
         if not self._imgs_to_save or not self._file_created:
             return self.fname
-        imgs = np.array(self._imgs_to_save, dtype=np.int16)
+        imgs = np.array(self._imgs_to_save, dtype=np.uint16)
         sids = np.array(self._seq_ids_to_save, dtype=np.int64)
 
         if self._save_two_array:

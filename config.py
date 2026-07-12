@@ -210,6 +210,12 @@ UPDATE_THRES_BATCH_SIZE = 200
 UPDATE_LOADING_INTERVAL = 50  # update loading rates every 50 shots (like grid)
 UPDATE_HIST_BATCH_SIZE = 2000  # accumulate this many shots for histogram
 UPDATE_HIST_INTERVAL = 200     # recompute histograms every N shots
+# Live per-site histogram (live_hist_data) rebin cadence. Each rebin re-histograms
+# every site over the whole accumulator, so it is throttled to every N new shots
+# instead of every shot; consumers that need current bins (the full Gaussian
+# refit) force a rebin themselves, and get_plot_data tolerates up to this many
+# shots of histogram staleness in the display panels.
+REBIN_HIST_INTERVAL = 10
 
 # ---- Live per-N-shots EWMA self-calibration (loading-pattern scans only) ----
 # Every N loading shots we nudge BOTH the global SLM->camera affine (TRANSLATION

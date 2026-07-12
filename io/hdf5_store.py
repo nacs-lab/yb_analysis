@@ -102,10 +102,13 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
     tmp = path + '.tmp'
 
     with h5py.File(tmp, 'w') as f:
-        # Resizable image dataset: (N, H, W), int16, chunked
+        # Resizable image dataset: (N, H, W), uint16, chunked. uint16 (not
+        # int16) so full 16-bit camera counts >= 32768 store without wrapping to
+        # negatives; readers cast to float and are dtype-agnostic (old int16
+        # files still load unchanged).
         f.create_dataset(
             'imgs', shape=(0, H, W), maxshape=(None, H, W),
-            dtype='int16', chunks=(1, H, W), compression='gzip',
+            dtype='uint16', chunks=(1, H, W), compression='gzip',
             compression_opts=1,
         )
         if two_array:
@@ -193,7 +196,7 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
     Parameters
     ----------
     path : str
-    imgs_block : ndarray, shape (N, H, W), int16
+    imgs_block : ndarray, shape (N, H, W), uint16
     logicals_block : ndarray, bool
         Single-array mode: shape (N, M) interleaved.
         Two-array mode: shape (NSeqs, M1), image-1 logicals.

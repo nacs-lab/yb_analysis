@@ -58,7 +58,7 @@ def load_scan_from_path(scan_dir):
         Scan : dict — scan config
         logicals : ndarray (nFrames, nSites) bool
         intensities : ndarray (nFrames, nSites) float64 (if available)
-        imgs : ndarray (nFrames, H, W) int16 (if available, can be None for large files)
+        imgs : ndarray (nFrames, H, W) uint16 (int16 in legacy files) (if available, can be None for large files)
         seq_ids : ndarray (nSeqs,) int64
         path : str
     """

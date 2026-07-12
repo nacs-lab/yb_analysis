@@ -127,7 +127,7 @@ class DashboardRenderer:
         max_dim = DASH_IMAGE_MAX_DIM if ctrl.get('downsample', True) else None
         img = d.get('cur_image')
         if img is not None:
-            uri, vlo, vhi = _img_to_data_uri(np.asarray(img, dtype=np.int16),
+            uri, vlo, vhi = _img_to_data_uri(np.asarray(img, dtype=np.uint16),
                                              max_dim=max_dim)
             d['_img_data_uri'] = uri
             d['_img_shape'] = img.shape
@@ -136,7 +136,7 @@ class DashboardRenderer:
             d.pop('cur_image', None)  # don't pickle the raw image (18MB)
         img2 = d.get('cur_image2')
         if img2 is not None:
-            uri2, vlo2, vhi2 = _img_to_data_uri(np.asarray(img2, dtype=np.int16),
+            uri2, vlo2, vhi2 = _img_to_data_uri(np.asarray(img2, dtype=np.uint16),
                                                 max_dim=max_dim)
             d['_img2_data_uri'] = uri2
             d['_img2_shape'] = img2.shape
@@ -146,7 +146,7 @@ class DashboardRenderer:
         img_mid = d.get('cur_image_mid')
         if img_mid is not None:
             uri_mid, vlo_mid, vhi_mid = _img_to_data_uri(
-                np.asarray(img_mid, dtype=np.int16), max_dim=max_dim)
+                np.asarray(img_mid, dtype=np.uint16), max_dim=max_dim)
             d['_img_mid_data_uri'] = uri_mid
             d['_img_mid_shape'] = img_mid.shape
             d['_img_mid_vlo'] = vlo_mid
@@ -5893,7 +5893,7 @@ def _build_analysis_curve(result, mean_key, sem_key, title):
 
 def _img_to_data_uri(img, max_dim=DASH_IMAGE_MAX_DIM,
                      compression=DASH_IMAGE_PNG_COMPRESSION):
-    """Convert an int16 image to a PNG data URI for the Plotly background.
+    """Convert a uint16 image to a PNG data URI for the Plotly background.
 
     Downsamples to ``max_dim`` px on the long edge before encoding: the array
     panel is only ~670 px wide, so shipping a full-sensor frame is wasteful and
