@@ -47,6 +47,26 @@
     ctrlpanel: 1500,
   };
 
+  // WS-active SAFETY-NET intervals. When the /ws/events push is up, shot/queue
+  // events drive the real refreshes, so these loops only need a slow backstop
+  // (covers a missed event / half-open socket the ping hasn't caught yet). The
+  // instant WS drops, pollIvl() falls back to POLL.* -> full-rate polling
+  // resumes with zero other changes. Only the event-driven loops are stretched;
+  // every other loop (analysis/logs/molecube/...) keeps its POLL.* cadence.
+  const POLL_WS = {
+    live:      5000,
+    snapshot:  5000,
+    ctrlpanel: 10000,
+  };
+  // True while the /ws/events socket is OPEN. Flipped by the WS manager; read
+  // by pollIvl() so the loops stretch/revert automatically.
+  let wsActive = false;
+  // Current interval for a loop: stretched when WS is up, else the poll default.
+  function pollIvl(tab) {
+    if (wsActive && POLL_WS[tab] != null) return POLL_WS[tab];
+    return POLL[tab];
+  }
+
   // ---- DOM helpers ----
   const $  = (id) => document.getElementById(id);
   const $$ = (sel, ctx) => Array.from((ctx || document).querySelectorAll(sel));
@@ -763,23 +783,62 @@
   // Hook the iframe reload button now that the DOM is ready (wired
   // at bootstrap, not here).
 
+  // ---- Per-tab "kick" registry (WS-driven event coalescing) ----
+  // A loop() registers a kicker here so a WS event can make its poll fn fire
+  // NOW instead of waiting out the interval. kick() re-arms the timer to fire
+  // immediately when the fn isn't running; if it IS running, it sets a trailing
+  // flag so exactly ONE more run happens after the in-flight one finishes
+  // (coalesced -- a burst of kicks collapses to a single trailing run). This
+  // preserves loop()'s two guarantees: never two concurrent runs of a poll fn,
+  // and the tab gate still decides whether a run actually fetches.
+  const kickers = {};
+  function kick(tab) {
+    const k = kickers[tab];
+    if (k) k();
+  }
+
   function startPolling() {
     // gate() (optional) overrides the default "this tab is active" check -- used
     // by the Molecube sub-view, which is active only on Hardware + its sub-tab.
+    // `interval` may be a number OR a function returning the current interval
+    // (ms) -- the WS layer stretches it (safety-net cadence) while push events
+    // drive the real refreshes, and reverts to POLL.* the moment WS drops.
     function loop(tab, fn, interval, gate) {
+      const ivl = (typeof interval === "function") ? interval : () => interval;
+      let running = false;        // fn currently in flight
+      let pendingKick = false;    // a kick arrived mid-run -> one trailing run
+      const armed = () => autoRefresh && (gate ? gate() : activeTab === tab);
+      function schedule(ms) {
+        clearTimeout(timers[tab]);
+        timers[tab] = setTimeout(tick, ms);
+      }
+      // tick() is the SINGLE scheduling point. It runs fn (if armed), then
+      // re-arms: immediately (0 ms) if a kick coalesced during the run,
+      // otherwise at the current interval. So a kick that lands mid-run yields
+      // exactly ONE trailing run and never a double-run or a lost kick.
       const tick = async () => {
-        if (autoRefresh && (gate ? gate() : activeTab === tab)) {
+        let next = ivl();
+        if (armed()) {
+          running = true;
           try { await fn(); } catch (e) { console.warn(tab, e); }
+          running = false;
+          if (pendingKick) { pendingKick = false; if (armed()) next = 0; }
         }
-        timers[tab] = setTimeout(tick, interval);
+        schedule(next);
+      };
+      // Kick: fire NOW if idle + armed; else coalesce into a single trailing run.
+      kickers[tab] = () => {
+        if (!armed()) return;   // gate/off -> let the safety-net interval handle it
+        if (running) { pendingKick = true; return; }
+        schedule(0);
       };
       tick();
     }
-    loop("live",     pollLive,     POLL.live);
+    loop("live",     pollLive,     () => pollIvl("live"));
     // The coherent single-shot group (frames + intensities + scan red-outline) on its
     // own loop, gated to the Live tab. Fetched together so they always show ONE shot;
     // the fast `live` loop above streams the aggregate maps/histograms independently.
-    loop("snapshot", pollSnapshot,  POLL.snapshot,   () => activeTab === "live");
+    loop("snapshot", pollSnapshot,  () => pollIvl("snapshot"),  () => activeTab === "live");
     // Hardware tab is a self-contained iframe to the SLM dashboard --
     // it owns its own polling. We DON'T poll /api/slm/* here, or we
     // get null-querySelector crashes against UI elements that only
@@ -814,10 +873,94 @@
     // The "Yb Control" sidebar is shown on EVERY tab now. pollLive refreshes it
     // on the Live tab; this loop keeps its queue / runner-state / camera live on
     // the OTHER tabs. Gated to non-Live so the two never double-poll.
-    loop("ctrlpanel", pollControlPanel, POLL.ctrlpanel, () => activeTab !== "live");
+    loop("ctrlpanel", pollControlPanel, () => pollIvl("ctrlpanel"), () => activeTab !== "live");
     // Connection-status pill polls every 5s regardless of active tab.
     setInterval(updateConnStatus, 5000);
     updateConnStatus();
+    // Start the WebSocket event push (falls back to full-rate polling if it
+    // can't connect / the server has no /ws/events). Must run AFTER the loops
+    // register their kickers.
+    startEventSocket();
+  }
+
+  // ---- WebSocket event push (/ws/events) ----
+  // Tiny shot/queue EVENTS only; all bulk data stays on the /api polls. On a
+  // `shot` we kick "live"+"snapshot"; on a `queue` we kick "live" (Live-tab
+  // sidebar queue) + "ctrlpanel" (non-Live sidebar queue) -- each kick's tab
+  // gate still decides whether a fetch actually happens. While the socket is up,
+  // the event-driven loops stretch to a slow safety-net cadence (POLL_WS); every
+  // disconnect flips wsActive=false so full-rate polling resumes instantly.
+  // Reconnects forever with exponential backoff + jitter. If the server has no
+  // /ws/events (old server / no flask-sock / a proxy stripping Upgrade), the
+  // socket just never opens and behaviour is byte-identical to pure polling.
+  let _ws = null;
+  let _wsBackoff = 2000;             // 2 s -> 15 s cap
+  const _WS_BACKOFF_MAX = 15000;
+  let _wsReconnectTimer = null;
+
+  function _wsOnEvent(ev) {
+    switch (ev && ev.topic) {
+      case "shot":
+        kick("live");
+        kick("snapshot");
+        break;
+      case "queue":
+        kick("live");        // Live-tab sidebar queue (pollLive)
+        kick("ctrlpanel");   // non-Live sidebar queue (pollControlPanel)
+        break;
+      case "hello":
+      case "ping":
+      default:
+        break;               // bookkeeping only
+    }
+  }
+
+  function startEventSocket() {
+    if (typeof WebSocket === "undefined") return;   // ancient browser -> polling
+    clearTimeout(_wsReconnectTimer);
+    let ws;
+    try {
+      const proto = (location.protocol === "https:") ? "wss" : "ws";
+      ws = new WebSocket(proto + "://" + location.host + "/ws/events");
+    } catch (e) {
+      scheduleWsReconnect();
+      return;
+    }
+    _ws = ws;
+    ws.onopen = () => {
+      wsActive = true;
+      _wsBackoff = 2000;             // reset backoff on a clean connect
+      // Kick everything once so a poll that stretched under a PRIOR ws session
+      // (or that we're about to stretch now) refreshes immediately.
+      kick("live"); kick("snapshot"); kick("ctrlpanel");
+    };
+    ws.onmessage = (m) => {
+      let ev = null;
+      try { ev = JSON.parse(m.data); } catch { return; }
+      _wsOnEvent(ev);
+    };
+    const drop = () => {
+      if (_ws !== ws) return;        // superseded by a newer socket
+      _ws = null;
+      // Any disconnect immediately restores full-rate polling.
+      if (wsActive) {
+        wsActive = false;
+        // Wake the stretched loops NOW so they don't wait out a long safety-net
+        // interval before reverting to POLL.* cadence.
+        kick("live"); kick("snapshot"); kick("ctrlpanel");
+      }
+      scheduleWsReconnect();
+    };
+    ws.onclose = drop;
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+
+  function scheduleWsReconnect() {
+    clearTimeout(_wsReconnectTimer);
+    // Backoff + jitter (+-25%) so many tabs don't reconnect in lockstep.
+    const jitter = _wsBackoff * (0.75 + Math.random() * 0.5);
+    _wsReconnectTimer = setTimeout(startEventSocket, jitter);
+    _wsBackoff = Math.min(_wsBackoff * 2, _WS_BACKOFF_MAX);
   }
 
   // On viewport resize, re-fit the top-row status fonts and re-size the

@@ -14,6 +14,7 @@ import json
 import math
 import os
 import pickle
+import queue
 import time
 import threading
 import multiprocessing
@@ -24,6 +25,15 @@ import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import norm
 from dash import Dash, html, dcc, Input, Output, State, no_update, Patch, callback_context
+
+# WebSocket push signaling (tiny shot/queue EVENTS only; bulk data stays on the
+# HTTP /api routes, polling stays as the fallback). flask-sock rides the same
+# threaded Werkzeug dev server. Import-guarded: if it's missing the dashboard
+# runs exactly as before -- no /ws/events route, clients fall back to polling.
+try:
+    from flask_sock import Sock
+except ImportError:
+    Sock = None
 
 from yb_analysis.config import DASH_IMAGE_MAX_DIM, DASH_IMAGE_PNG_COMPRESSION
 
@@ -303,6 +313,189 @@ def _read_queue_data():
             return pickle.load(f)
     except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
         return None
+
+
+def _cheap_frame_id():
+    """A cheap, unique-per-frame identity for the plot-data double buffer.
+
+    The WS shot-watcher needs to know "did a new frame land?" WITHOUT paying to
+    unpickle the ~10 MB buffer. We reuse exactly the identity _read_data() memos
+    on: (pointer content, current buffer mtime). The main process rewrites the
+    pointer + the active buffer on every frame (update()), so this tuple changes
+    once per frame. Returns None on the transient race where the pointer is
+    mid-truncate/empty -- the caller treats "no change" as "no event".
+    """
+    try:
+        with open(_DATA_FILE, 'r') as f:
+            idx = f.read().strip()
+        if idx not in ('0', '1'):
+            return None
+        try:
+            mtime = os.path.getmtime(_DATA_FILE + f'.{idx}')
+        except OSError:
+            mtime = None
+        return (idx, mtime)
+    except (FileNotFoundError, EOFError, OSError):
+        return None
+
+
+def _cheap_queue_mtime():
+    """Queue pkl mtime, or None if not written yet -- cheap change indicator."""
+    try:
+        return os.path.getmtime(_QUEUE_FILE)
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# WebSocket event fan-out (shot + queue push signaling)
+# ---------------------------------------------------------------------------
+# ONE daemon watcher thread polls the two cheap change indicators (frame id +
+# queue mtime) every ~poll_interval and fans a TINY event dict out to every
+# registered client's bounded queue. The event carries no bulk data -- the
+# browser reacts by kicking its existing HTTP polls. Design goals:
+#   * cheap when idle: the loop is a no-op burden with zero clients (it still
+#     stats two files, but publish() short-circuits with no subscribers).
+#   * one client's full/slow queue never blocks another (per-client Queue, drop
+#     oldest on overflow, fan-out under a short lock).
+#   * transient pickle/stat races never kill the loop (same exception families
+#     the existing readers tolerate).
+# Read/mtime sources are injectable so the logic is unit-testable without files
+# or a live server (see tests/test_ws_events.py).
+
+class EventHub:
+    """Shared publisher: a watcher loop + a set of per-client bounded queues.
+
+    read_frame_id() / read_queue_mtime() are the cheap change indicators
+    (default to the module helpers above). Injecting them lets tests drive the
+    watcher deterministically.
+    """
+
+    def __init__(self, read_frame_id=None, read_queue_mtime=None,
+                 poll_interval=0.12, client_maxsize=64):
+        self._read_frame_id = read_frame_id or _cheap_frame_id
+        self._read_queue_mtime = read_queue_mtime or _cheap_queue_mtime
+        self._poll_interval = poll_interval
+        self._client_maxsize = client_maxsize
+        self._clients = set()          # set of queue.Queue
+        self._lock = threading.Lock()
+        self._thread = None
+        self._started = False
+        # Seeded lazily on the first watcher tick so the FIRST real change after
+        # startup still publishes (None -> first-seen id is a change we swallow).
+        self._last_frame = None
+        self._last_qmtime = None
+        self._seeded = False
+
+    # -- client registry -------------------------------------------------
+    def register(self):
+        """Add a client; return its bounded queue.Queue. Also starts the
+        watcher on the first client (lazy -- no thread until someone connects)."""
+        q = queue.Queue(maxsize=self._client_maxsize)
+        with self._lock:
+            self._clients.add(q)
+        self.ensure_started()
+        return q
+
+    def unregister(self, q):
+        with self._lock:
+            self._clients.discard(q)
+
+    def snapshot_hello(self):
+        """The connect-time greeting: current frame id + queue mtime (or null).
+
+        `frame` is the pointer content ('0'/'1') -- an opaque token the client
+        only compares for change; it does NOT need the monotonic _write_seq.
+        """
+        fid = self._read_frame_id()
+        return {
+            'topic': 'hello',
+            'frame': (fid[0] if fid else None),
+            'queue_mtime': self._read_queue_mtime(),
+        }
+
+    # -- publish ---------------------------------------------------------
+    def publish(self, event):
+        """Fan `event` out to every client queue. On a full queue, drop the
+        OLDEST item to make room (a slow browser must not wedge the watcher or
+        starve its peers). Never blocks under the lock for longer than the
+        set of clients -- each put is non-blocking."""
+        with self._lock:
+            if not self._clients:
+                return
+            clients = list(self._clients)
+        for q in clients:
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                try:
+                    q.get_nowait()       # drop oldest
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    pass                 # peer drained meanwhile / still full -> skip
+
+    # -- watcher ---------------------------------------------------------
+    def poll_once(self):
+        """One watcher iteration: detect frame + queue change, publish events.
+
+        Survives transient read errors silently. Returns the list of events it
+        published (handy for tests). Publishes at most ONE shot event and ONE
+        queue event per call (per change)."""
+        events = []
+        try:
+            fid = self._read_frame_id()
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
+            fid = None
+        try:
+            qmt = self._read_queue_mtime()
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
+            qmt = None
+
+        if not self._seeded:
+            # First tick just latches the current state -- don't fire a spurious
+            # event for "startup -> first observation".
+            self._last_frame = fid
+            self._last_qmtime = qmt
+            self._seeded = True
+            return events
+
+        if fid is not None and fid != self._last_frame:
+            self._last_frame = fid
+            ev = {'topic': 'shot', 'frame': fid[0]}
+            events.append(ev)
+            self.publish(ev)
+        if qmt is not None and qmt != self._last_qmtime:
+            self._last_qmtime = qmt
+            ev = {'topic': 'queue'}
+            events.append(ev)
+            self.publish(ev)
+        return events
+
+    def _run(self):
+        while True:
+            try:
+                self.poll_once()
+            except Exception:      # defensive: a watcher tick must never die
+                logger.debug('EventHub watcher tick failed', exc_info=True)
+            time.sleep(self._poll_interval)
+
+    def ensure_started(self):
+        if self._started:
+            return
+        with self._lock:
+            if self._started:
+                return
+            self._thread = threading.Thread(
+                target=self._run, name='ws-event-watcher', daemon=True)
+            self._started = True
+        self._thread.start()
+
+
+# One hub per dashboard process. Created in _register_ws_events; None until then.
+_EVENT_HUB = None
 
 
 def _read_slm_data():
@@ -3308,6 +3501,55 @@ def _register_api_routes(server):
         return jsonify({'ok': True, 'via': 'run_monitor'})
 
 
+def _register_ws_events(server):
+    """Attach the /ws/events WebSocket that PUSHES tiny shot/queue events.
+
+    No-op (registers nothing) when flask-sock is unavailable -> the dashboard
+    behaves exactly as before and clients fall back to polling. The events carry
+    NO bulk data (just {topic, frame} / {topic}); the browser reacts by kicking
+    its normal HTTP polls. Read-only info (equivalent to GET /api/queue, which is
+    ungated), so no remote-controls gate here.
+    """
+    global _EVENT_HUB
+    if Sock is None:
+        logger.info('flask-sock not installed -- /ws/events disabled (polling only)')
+        return
+    sock = Sock(server)
+    _EVENT_HUB = EventHub()
+
+    @sock.route('/ws/events')
+    def _ws_events(ws):
+        hub = _EVENT_HUB
+        q = hub.register()
+        try:
+            # Greeting: current frame id + queue mtime so the client can sync
+            # its "last seen" without waiting for the first change.
+            try:
+                ws.send(json.dumps(hub.snapshot_hello()))
+            except Exception:
+                return
+            while True:
+                # Drain anything the client sent (it sends nothing meaningful);
+                # non-blocking so a chatty client can't stall the send path.
+                try:
+                    while ws.receive(timeout=0) is not None:
+                        pass
+                except Exception:
+                    return
+                # Block for an event; on timeout send a keepalive ping so a
+                # wedged proxy / half-open socket is detected within ~25 s.
+                try:
+                    ev = q.get(timeout=25)
+                except queue.Empty:
+                    ev = {'topic': 'ping'}
+                try:
+                    ws.send(json.dumps(ev))
+                except Exception:
+                    return
+        finally:
+            hub.unregister(q)
+
+
 def _aggregate_focus_metrics(results):
     """Combine seq-specific focus metrics across group members.
 
@@ -4662,6 +4904,12 @@ def _build_app():
     # Lets external clients (e.g. the SLM server) poll experiment state over
     # the LAN. All GET, no writes. Bound to the same port as the dashboard.
     _register_api_routes(app.server)
+
+    # ---- WebSocket push signaling (/ws/events) ------------------------
+    # Tiny shot/queue EVENTS only -- the browser reacts by kicking its normal
+    # HTTP polls; all bulk data still flows over /api. No-op if flask-sock is
+    # missing (clients fall back to pure polling, byte-identical to before).
+    _register_ws_events(app.server)
 
     # ---- Molecube (FPGA1 DDS/TTL/clock) control API -- MASTER-GATED ----
     # All /api/molecube/* routes are closed by default (HTTP 403); see the
