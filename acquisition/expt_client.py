@@ -228,6 +228,34 @@ class ExptClient(object):
             self._reset_on_failure()
             raise
 
+    def get_imgs_uint16(self, timeout_ms: int = 10000) -> bytes:
+        """Pull the buffered image deque using the uint16 wire format.
+
+        Sends the "get_imgs_uint16" verb and returns the RAW reply bytes with
+        NO array('d') decode -- the reply mixes float64 header fields with
+        2-byte uint16 pixel blocks, so it must be parsed with explicit byte
+        offsets (see zmq_client._process_imgs_uint16), not a single f8 view.
+
+        A backend that does not implement the verb (the retired MATLAB
+        ExptServer, or a pyctrl backend predating the WP1 producer change)
+        falls through ExptServer.handle_msg's else branch and replies with an
+        empty string, so this returns b'' (0 bytes). Callers treat a reply
+        shorter than the 8-byte header as "verb unsupported" and fall back to
+        get_imgs. Mirrors get_imgs's send / poll-timeout / socket-recovery
+        handling exactly.
+        """
+        try:
+            self.__sock.send_string("get_imgs_uint16")
+            if self.__sock.poll(timeout_ms) == 0:
+                self._reset_on_failure()
+                raise TimeoutError("get_imgs_uint16: no reply")
+            return self.__sock.recv()
+        except TimeoutError:
+            raise
+        except Exception:
+            self._reset_on_failure()
+            raise
+
     # -------- Camera --------
 
     def camera_init(self, roi, exposure_time=None, timeout_ms: int = 10000) -> str:

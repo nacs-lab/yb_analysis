@@ -31,6 +31,14 @@ _GRAB_IMGS_COOLDOWN_S = 1.0
 # Suppress duplicate get_status warnings within this window (seconds).
 _STATUS_WARN_THROTTLE_S = 30.0
 
+# One-time image-format probe: the first grab_imgs tries the new
+# "get_imgs_uint16" verb with this SHORT timeout. A backend that supports it
+# replies (near-instantly) with a parseable header; a backend that does not
+# (the retired MATLAB ExptServer, or a pre-WP1 pyctrl) replies with an empty
+# string, so the short timeout only bites when the backend is entirely down --
+# in which case we leave the format undecided and re-probe on the next call.
+_IMG_PROBE_TIMEOUT_MS = 2000
+
 
 def _process_imgs(raw_data):
     """Parse the flat double array returned by ExptClient.get_imgs().
@@ -119,6 +127,117 @@ def _process_imgs(raw_data):
     }
 
 
+def _looks_like_uint16_reply(raw):
+    """Cheap header sanity check for a get_imgs_uint16 reply.
+
+    True iff `raw` is at least the 8-byte nseqs header and that leading f8 is a
+    finite, non-negative, integral, not-absurd sequence count. An empty-string
+    reply (unsupported verb) is 0 bytes -> False. nseqs == 0 (a supported
+    backend with nothing buffered) is a VALID reply -> True, so we can still
+    lock onto the new format when the first batch happens to be empty.
+    """
+    if raw is None or len(raw) < 8:
+        return False
+    try:
+        nseqs = float(np.frombuffer(raw, dtype='<f8', count=1, offset=0)[0])
+    except Exception:
+        return False
+    return (np.isfinite(nseqs) and nseqs >= 0.0
+            and nseqs == int(nseqs) and nseqs < 1e7)
+
+
+def _process_imgs_uint16(raw_bytes):
+    """Parse the uint16 image wire format returned by ExptClient.get_imgs_uint16().
+
+    Wire format (little-endian, single ZMQ frame):
+        [nseqs: f8]
+        per sequence:
+            [scan_id: f8] [seq_id: f8]
+            per image:
+                [s1: f8] [s2: f8] [s3: f8]
+                <s1*s2*s3 pixels: u2, C-ORDER flat of the (s1, s2, s3) array>
+            [0.0: f8]   (sequence separator)
+
+    Disambiguation: at each image slot read one f8; 0.0 ends the sequence,
+    anything else is s1 of the next image (s1 is never 0). The pixel blocks are
+    2-byte elements, so the f8 fields that follow them are generally NOT
+    8-byte-aligned; every field is therefore read with an explicit
+    np.frombuffer(..., count=, offset=) rather than one big f8 view.
+
+    Returns the SAME dict shape as _process_imgs -- imgs is a list of (H, W, n)
+    arrays and the images are reconstructed as the identical logical arrays the
+    old F-order path yields -- EXCEPT the pixel dtype stays uint16 (no upcast;
+    downstream .astype handles it).
+    """
+    if raw_bytes is None or len(raw_bytes) < 8:
+        return {'imgs': [], 'scan_ids': [], 'seq_ids': []}
+
+    # A writable copy so the frombuffer views (and single-image stacks) are
+    # writable, matching _process_imgs's arrays (views into a writable buffer).
+    buf = bytearray(raw_bytes) if not isinstance(raw_bytes, bytearray) else raw_bytes
+    n = len(buf)
+
+    def _f8(off):
+        return float(np.frombuffer(buf, dtype='<f8', count=1, offset=off)[0])
+
+    num_seqs = int(_f8(0))
+    if num_seqs == 0:
+        return {'imgs': [], 'scan_ids': [], 'seq_ids': []}
+
+    imgs = []
+    scan_ids = []
+    seq_ids = []
+
+    off = 8
+    seq_count = 0
+    while seq_count < num_seqs and off + 16 <= n:
+        scan_id = int(_f8(off))
+        seq_id = int(_f8(off + 8))
+        off += 16
+        scan_ids.append(scan_id)
+        seq_ids.append(seq_id)
+
+        cur_img_stack = None
+        # Read images until the 0.0 separator (or the buffer is exhausted).
+        while off + 8 <= n:
+            first = _f8(off)
+            if first == 0.0:
+                off += 8            # consume the sequence separator
+                break
+            # `first` is s1; need s2, s3 too.
+            if off + 24 > n:
+                off = n             # truncated header -> bail cleanly
+                break
+            s1 = int(first)
+            s2 = int(_f8(off + 8))
+            s3 = int(_f8(off + 16))
+            off += 24
+            n_pixels = s1 * s2 * s3
+            if off + n_pixels * 2 > n:
+                off = n             # truncated pixel block -> bail cleanly
+                break
+            # C-order flat of the (s1, s2, s3) array (the old format was F-order;
+            # for identical logical images both paths recover the same array).
+            img_data = np.frombuffer(
+                buf, dtype='<u2', count=n_pixels, offset=off
+            ).reshape(s1, s2, s3)
+            off += n_pixels * 2
+            if cur_img_stack is None:
+                cur_img_stack = img_data
+            else:
+                cur_img_stack = np.concatenate([cur_img_stack, img_data], axis=2)
+
+        if cur_img_stack is not None:
+            imgs.append(cur_img_stack)
+        seq_count += 1
+
+    return {
+        'imgs': imgs,
+        'scan_ids': np.array(scan_ids, dtype=np.int64),
+        'seq_ids': np.array(seq_ids, dtype=np.int64),
+    }
+
+
 class ZmqClient:
     """High-level ZMQ client for experiment control.
 
@@ -149,6 +268,14 @@ class ZmqClient:
         # _STATUS_WARN_THROTTLE_S, otherwise a dead runner spams the log
         # at the GUI's 1 Hz status-poll cadence.
         self._last_get_status_warn = 0.0
+        # Image wire format, decided once (lazily) on the first grab_imgs that
+        # reaches a live backend: None = not yet probed, 'uint16' = backend
+        # supports the get_imgs_uint16 verb, 'legacy' = it does not (MATLAB
+        # backend / pre-WP1 pyctrl -> stay on the float64 get_imgs stream).
+        # A pure timeout during the probe leaves this None so a later call
+        # re-probes (the backend may just not be up yet); a definitive reply
+        # (parseable => uint16, empty/garbage => legacy) commits it for good.
+        self._img_format = None
 
     # -------- Liveness / queue --------
 
@@ -338,7 +465,9 @@ class ZmqClient:
         try:
             with self._lock:
                 t_lock = time.monotonic()
-                raw = self._client.get_imgs(timeout_ms=30000)
+                # Only the wire call(s) run under the shared REQ lock; parsing
+                # (CPU-bound) happens after release, as before.
+                raw, fmt = self._grab_raw_locked()
         except Exception as e:
             # A silent swallow here once hid a full 30 s get_imgs timeout that
             # stalled the whole frame pipeline at a scan boundary — always say
@@ -353,12 +482,55 @@ class ZmqClient:
             return empty
         if raw is None or len(raw) == 0:
             return empty
-        info = _process_imgs(raw)
+        if fmt == 'uint16':
+            try:
+                info = _process_imgs_uint16(raw)
+            except Exception as e:
+                # A malformed uint16 batch shouldn't wedge or flip us back to
+                # legacy (the backend still speaks uint16) -- drop this batch.
+                logger.warning(
+                    'grab_imgs: could not parse uint16 reply (%d bytes): %r',
+                    len(raw), e)
+                return empty
+        else:
+            info = _process_imgs(raw)
         return {
             'imgs': info['imgs'],
             'scan_ids': np.array(info['scan_ids'], dtype=np.int64) if len(info['scan_ids']) > 0 else np.array([], dtype=np.int64),
             'seq_ids': np.array(info['seq_ids'], dtype=np.int64) if len(info['seq_ids']) > 0 else np.array([], dtype=np.int64),
         }
+
+    def _grab_raw_locked(self):
+        """Fetch the raw image reply. Caller MUST hold self._lock.
+
+        Returns (raw, fmt) where fmt is 'uint16' or 'legacy'. Once probed,
+        exactly ONE wire request is issued per call (no per-call double
+        requests). The one-time probe (first call against a live backend) may
+        issue a second request only to fetch this call's data via the legacy
+        verb after discovering the new verb is unsupported -- the unsupported
+        path consumes no server-side images, so that fallback loses nothing.
+        """
+        if self._img_format == 'uint16':
+            return self._client.get_imgs_uint16(timeout_ms=30000), 'uint16'
+        if self._img_format == 'legacy':
+            return self._client.get_imgs(timeout_ms=30000), 'legacy'
+
+        # First contact with a live backend: probe the new verb (short timeout).
+        raw = self._client.get_imgs_uint16(timeout_ms=_IMG_PROBE_TIMEOUT_MS)
+        if _looks_like_uint16_reply(raw):
+            self._img_format = 'uint16'
+            logger.info('grab_imgs: backend supports get_imgs_uint16; '
+                        'using the uint16 image wire format')
+            return raw, 'uint16'
+        # Empty/garbage reply => verb unsupported (MATLAB backend or a pyctrl
+        # predating the producer change). handle_msg's else branch replied
+        # without touching the image deque, so fetch this call's batch via the
+        # legacy verb now and lock onto legacy for the rest of the process.
+        self._img_format = 'legacy'
+        logger.info('grab_imgs: backend lacks get_imgs_uint16 (%d-byte reply); '
+                    'using the legacy float64 image wire format',
+                    0 if raw is None else len(raw))
+        return self._client.get_imgs(timeout_ms=30000), 'legacy'
 
     def get_status(self):
         """Get experiment status: 0=Stopped, 1=Running, 2=Paused, 3=Unknown."""

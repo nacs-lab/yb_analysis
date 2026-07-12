@@ -343,6 +343,13 @@ def run_fake_server(url, params, n_seq=None, rate=2.0, overrides=None):
                     _send_bytes(addr, data)
                     seq_num += batch_size
                     logger.info('Sent %d sequences (total: %d)', batch_size, seq_num)
+                elif msg == 'get_imgs_uint16':
+                    batch_size = max(1, int(rate))
+                    data = _encode_batch_uint16(grid, params, scan_id,
+                                                seq_num, batch_size, rng)
+                    _send_bytes(addr, data)
+                    seq_num += batch_size
+                    logger.info('Sent %d sequences uint16 (total: %d)', batch_size, seq_num)
                 elif msg == 'get_seq_num':
                     _send_bytes(addr, seq_num.to_bytes(8, 'little'))
                 elif msg == 'get_num_imgs':
@@ -393,6 +400,31 @@ def _encode_batch(grid, params, scan_id, start_seq, batch_size, rng):
         chunks.extend([header, pixels, trailer])
 
     return np.concatenate(chunks).tobytes()
+
+
+def _encode_batch_uint16(grid, params, scan_id, start_seq, batch_size, rng):
+    """Encode a batch in the get_imgs_uint16 wire format.
+
+    Same framing as _encode_batch (f8 nseqs, then per sequence: f8 scan_id,
+    f8 seq_id, per image f8 s1,s2,s3 + pixels, f8 0.0 separator) EXCEPT the
+    pixels are uint16 in C-ORDER (the float64 stream is F-order). Built by
+    manual byte concatenation because the fields mix f8 and u2 dtypes.
+    """
+    H, W = params['frame_size']
+    n_imgs = params['num_images_per_seq']
+    parts = [np.array([batch_size], dtype='<f8').tobytes()]
+
+    for i in range(batch_size):
+        seq_id = start_seq + i + 1
+        stack, _, _ = generate_sequence(grid, params, rng)  # (H, W, n_imgs) int16
+
+        header = np.array([scan_id, seq_id, H, W, n_imgs], dtype='<f8').tobytes()
+        # C-order flat of the (H, W, n_imgs) array as little-endian uint16.
+        pixels = np.ascontiguousarray(stack).astype('<u2').ravel(order='C').tobytes()
+        trailer = np.array([0.0], dtype='<f8').tobytes()
+        parts.extend([header, pixels, trailer])
+
+    return b''.join(parts)
 
 
 def _find_latest_real_scan():
@@ -642,12 +674,16 @@ def run_replay_server(url, mat_path, rate=2.0):
                 sock.send(b'', zmq.SNDMORE)
                 sock.send_string(date_stamp, zmq.SNDMORE)
                 sock.send_string(time_stamp)
-            elif msg == 'get_imgs':
+            elif msg in ('get_imgs', 'get_imgs_uint16'):
+                as_uint16 = (msg == 'get_imgs_uint16')
                 batch = max(1, int(rate))
                 end = min(seq_cursor + batch, n_seqs)
                 # Read images from .mat file on demand
                 with h5py.File(mat_path, 'r') as f:
-                    chunks = [np.array([float(end - seq_cursor)], dtype=np.float64)]
+                    if as_uint16:
+                        parts = [np.array([end - seq_cursor], dtype='<f8').tobytes()]
+                    else:
+                        chunks = [np.array([float(end - seq_cursor)], dtype=np.float64)]
                     for s in range(seq_cursor, end):
                         frame_start = s * nimgs_per_seq
                         frame_end = frame_start + nimgs_per_seq
@@ -656,18 +692,33 @@ def run_replay_server(url, mat_path, rate=2.0):
                         # to match what the real ExptServer sends.
                         raw = f['imgs'][:, :, frame_start:frame_end]  # (dim0, dim1, pSeq)
                         H_img, W_img = raw.shape[1], raw.shape[0]  # HDF5 is (W, H, f)
-                        header = np.array([scan_id, seq_ids[s], H_img, W_img, nimgs_per_seq],
-                                          dtype=np.float64)
-                        pixels = raw.astype(np.float64).ravel(order='F')
-                        chunks.extend([header, pixels, np.array([0.0], dtype=np.float64)])
-                    data = np.concatenate(chunks).tobytes()
+                        if as_uint16:
+                            # Reconstruct the SAME logical (H, W, pSeq) image the
+                            # legacy F-order path decodes to, then re-emit it as
+                            # C-order uint16 so both wire formats yield identical
+                            # images through _process_imgs / _process_imgs_uint16.
+                            stack = (raw.astype(np.float64).ravel(order='F')
+                                     .reshape(H_img, W_img, nimgs_per_seq, order='F'))
+                            header = np.array(
+                                [scan_id, seq_ids[s], H_img, W_img, nimgs_per_seq],
+                                dtype='<f8').tobytes()
+                            pixels = stack.astype('<u2').ravel(order='C').tobytes()
+                            parts.extend([header, pixels,
+                                          np.array([0.0], dtype='<f8').tobytes()])
+                        else:
+                            header = np.array([scan_id, seq_ids[s], H_img, W_img, nimgs_per_seq],
+                                              dtype=np.float64)
+                            pixels = raw.astype(np.float64).ravel(order='F')
+                            chunks.extend([header, pixels, np.array([0.0], dtype=np.float64)])
+                    data = b''.join(parts) if as_uint16 else np.concatenate(chunks).tobytes()
 
                 sock.send(addr, zmq.SNDMORE)
                 sock.send(b'', zmq.SNDMORE)
                 sock.send(data)
                 seq_cursor = end
-                logger.info('Replayed %d sequences (total: %d/%d)',
-                            end - seq_cursor + batch, seq_cursor, n_seqs)
+                logger.info('Replayed %d sequences%s (total: %d/%d)',
+                            end - seq_cursor + batch, ' uint16' if as_uint16 else '',
+                            seq_cursor, n_seqs)
             elif msg == 'get_seq_num':
                 sock.send(addr, zmq.SNDMORE)
                 sock.send(b'', zmq.SNDMORE)
