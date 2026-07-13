@@ -785,12 +785,20 @@
 
   // ---- Per-tab "kick" registry (WS-driven event coalescing) ----
   // A loop() registers a kicker here so a WS event can make its poll fn fire
-  // NOW instead of waiting out the interval. kick() re-arms the timer to fire
-  // immediately when the fn isn't running; if it IS running, it sets a trailing
-  // flag so exactly ONE more run happens after the in-flight one finishes
-  // (coalesced -- a burst of kicks collapses to a single trailing run). This
-  // preserves loop()'s two guarantees: never two concurrent runs of a poll fn,
-  // and the tab gate still decides whether a run actually fetches.
+  // SOONER than the (stretched) safety-net interval -- but never faster than the
+  // loop's MIN-GAP floor (see below). If the fn is running, one trailing run is
+  // coalesced. This preserves loop()'s guarantees (never two concurrent runs;
+  // the tab gate still decides whether a run actually fetches) AND the old
+  // self-throttle: pollLive was setTimeout-after-completion, so a slow 2 s fetch
+  // simply meant the loop ran slower, never piling up. WITHOUT a floor a stream
+  // of ~1/s events made pollLive re-fire the instant it finished -> back-to-back
+  // 5.5 MB figure fetches+renders that starved the browser main thread (the
+  // 10 s "shot # tab froze" bug). The floor restores the gap between runs.
+  //
+  // MIN_GAP per loop: a kick can shorten the wait to at most this, measured from
+  // the END of the last run. So kicks accelerate a loop up to (but not past) its
+  // POLL.* full-rate cadence -- exactly the busiest it ever ran pre-WS.
+  const KICK_MIN_GAP = { live: 500, snapshot: 500, ctrlpanel: 1500 };
   const kickers = {};
   function kick(tab) {
     const k = kickers[tab];
@@ -805,32 +813,41 @@
     // drive the real refreshes, and reverts to POLL.* the moment WS drops.
     function loop(tab, fn, interval, gate) {
       const ivl = (typeof interval === "function") ? interval : () => interval;
+      const minGap = KICK_MIN_GAP[tab] || 0;   // kick floor; 0 = no floored loops
       let running = false;        // fn currently in flight
       let pendingKick = false;    // a kick arrived mid-run -> one trailing run
+      let lastEnd = 0;            // performance.now() when fn last finished
       const armed = () => autoRefresh && (gate ? gate() : activeTab === tab);
       function schedule(ms) {
         clearTimeout(timers[tab]);
         timers[tab] = setTimeout(tick, ms);
       }
+      // How soon a kick may re-run the fn: never sooner than minGap after the
+      // last run ENDED. Returns the ms to wait from now (0 once the floor has
+      // already elapsed). This is what stops a ~1/s event stream from pinning a
+      // heavy loop to back-to-back runs.
+      const gapWait = () => Math.max(0, minGap - (performance.now() - lastEnd));
       // tick() is the SINGLE scheduling point. It runs fn (if armed), then
-      // re-arms: immediately (0 ms) if a kick coalesced during the run,
-      // otherwise at the current interval. So a kick that lands mid-run yields
-      // exactly ONE trailing run and never a double-run or a lost kick.
+      // re-arms: at the floored kick-wait if a kick coalesced during the run,
+      // otherwise at the current (safety-net) interval. A kick that lands mid-run
+      // yields exactly ONE trailing run and never a double-run or a lost kick.
       const tick = async () => {
         let next = ivl();
         if (armed()) {
           running = true;
           try { await fn(); } catch (e) { console.warn(tab, e); }
           running = false;
-          if (pendingKick) { pendingKick = false; if (armed()) next = 0; }
+          lastEnd = performance.now();
+          if (pendingKick) { pendingKick = false; if (armed()) next = gapWait(); }
         }
         schedule(next);
       };
-      // Kick: fire NOW if idle + armed; else coalesce into a single trailing run.
+      // Kick: bring the next run forward to the floor (never sooner); if the fn
+      // is running, coalesce into a single trailing run (which tick() also floors).
       kickers[tab] = () => {
         if (!armed()) return;   // gate/off -> let the safety-net interval handle it
         if (running) { pendingKick = true; return; }
-        schedule(0);
+        schedule(gapWait());
       };
       tick();
     }
@@ -901,11 +918,20 @@
   function _wsOnEvent(ev) {
     switch (ev && ev.topic) {
       case "shot":
+        // Fast, lightweight "shot #" tile update EVERY shot (~0.4 KB fetch),
+        // so it tracks each seq bump instead of lagging pollLive's heavy cycle.
+        updateShotTileFast();
         kick("live");
         kick("snapshot");
         break;
       case "queue":
-        kick("live");        // Live-tab sidebar queue (pollLive)
+        // Deliberately do NOT kick "live": during a running scan the queue pkl
+        // mtime bumps ~1/s, and pollLive's cost is dominated by the ~5.5 MB
+        // figure fetch -- coupling queue churn to that heavy path is what pinned
+        // the Live tab to back-to-back fetches (the froze-for-10s bug). New plot
+        // data is already covered by the "shot" event; on the Live tab the
+        // sidebar queue rides along with pollLive's shot-driven refresh (at most
+        // ~1 shot stale, invisible). Off the Live tab, ctrlpanel owns it.
         kick("ctrlpanel");   // non-Live sidebar queue (pollControlPanel)
         break;
       case "hello":
@@ -1179,6 +1205,34 @@
     if (midSwitch) midSwitch.style.opacity = lastNumImages >= 3 ? "" : "0.45";
   }
 
+  // ---- Fast per-shot "shot #" tile (WS-driven, decoupled from pollLive) ----
+  // The "shot #" status tile used to update only once per pollLive cycle, and
+  // pollLive is a heavy ~5-8 s serial chain (2.7 MB snapshot + 8 MB figures +
+  // diag/affine/thresholds). So the tile lagged badly -- ~10 s between bumps.
+  // The operator wants it to track EVERY seq bump (~1/s). Fix: on each `shot`
+  // WS event, refresh just this tile from /api/control/status -- a ~0.4 KB
+  // endpoint whose `seq_id` IS the per-run shot count (verified == snapshot's
+  // shots_this_run). The `total` denominator is cached from the last pollLive
+  // (below); if the scan changed and pollLive hasn't refreshed it yet, show the
+  // bare count until it does. pollLive still owns the tile on its own cadence
+  // too -- this just makes it fast between those runs.
+  let _shotTileTotal = null;    // last-known total_per_group (cached in pollLive)
+  let _shotTileScanId = null;   // scan_id that _shotTileTotal belongs to
+  let _shotFastBusy = false;    // never overlap fast updates; drop if one's in flight
+  async function updateShotTileFast() {
+    if (_shotFastBusy) return;
+    _shotFastBusy = true;
+    try {
+      const st = await api("/api/control/status");
+      const cur = st && st.seq_id;
+      if (cur == null) return;
+      const sid = st.scan_id != null ? String(st.scan_id) : null;
+      const total = (sid && sid === _shotTileScanId) ? _shotTileTotal : null;
+      setText("kv-shot", total ? `${cur} / ${total}` : String(cur));
+    } catch (e) { /* transient -> the next pollLive refreshes it */ }
+    finally { _shotFastBusy = false; }
+  }
+
   async function pollLive() {
     // Queue first: the status strip's "shot # / total" + "shot length" tiles
     // read the running entry's scheduled total + start_ts. renderSidebarQueue
@@ -1218,6 +1272,11 @@
         ? running.summary.total_per_group : null;
       setText("kv-shot",
         cur == null ? "—" : (total ? `${cur} / ${total}` : String(cur)));
+      // Cache the denominator + its scan for the fast per-shot updater
+      // (updateShotTileFast) so it can render "seq / total" on every shot
+      // event without re-fetching the heavy queue/snapshot.
+      _shotTileTotal = total;
+      _shotTileScanId = snap.scan_id != null ? String(snap.scan_id) : null;
       // avg shot length (s) = elapsed since the run started / shots so far.
       // Replaces the old num_sites tile (deprecated: a scan can span multiple
       // loading patterns across images, so one site count is meaningless).
@@ -3600,6 +3659,15 @@
   // so reloads are instant (the backend payload cache makes the one first-paint
   // fetch ~ms too). Cleared per-scan when (re)analyzed.
   let lastAnalyzedShots = {};
+  // scan_id -> wall-clock ms of the last live re-analysis. Throttles the growth
+  // gate: a live rearrangement re-analysis costs ~1.5 s, and the runs list polls
+  // every POLL.scans (3 s), so re-fetching on EVERY growth kept the backend
+  // recomputing back-to-back for the whole scan ("perpetually analyzing"). We
+  // now re-analyze a growing run at most once per LIVE_REANALYZE_MS, or sooner
+  // once it has grown by >= LIVE_REANALYZE_SHOTS shots -- whichever comes first.
+  let _lastLiveReanalyzeAt = {};
+  const LIVE_REANALYZE_MS = 12000;      // >= 4 poll cycles between refreshes
+  const LIVE_REANALYZE_SHOTS = 50;      // ...unless it jumped this many shots
 
   // Recorded-shot count for a run as the runs list currently knows it (the
   // SAME quantity analyze_scan reports as n_shots, so the live-growth gate
@@ -3685,8 +3753,17 @@
         const cur  = _rowShots(selectedScanId);
         const prev = lastAnalyzedShots[selectedScanId];
         if (cur != null && prev != null && cur > prev) {
-          // Silent: refresh in place (no blank/purge/"analyzing…" flash).
-          loadAnalysis(selectedScanId, {keepFilters: true, silent: true});
+          // Throttle: don't re-analyze on every 3 s poll (a live rearrange
+          // recompute is ~1.5 s). Refresh at most once per LIVE_REANALYZE_MS,
+          // or immediately once >= LIVE_REANALYZE_SHOTS new shots landed.
+          const now = Date.now();
+          const last = _lastLiveReanalyzeAt[selectedScanId] || 0;
+          const grew = cur - prev;
+          if (grew >= LIVE_REANALYZE_SHOTS || (now - last) >= LIVE_REANALYZE_MS) {
+            _lastLiveReanalyzeAt[selectedScanId] = now;
+            // Silent: refresh in place (no blank/purge/"analyzing…" flash).
+            loadAnalysis(selectedScanId, {keepFilters: true, silent: true});
+          }
         }
       }
     } catch (e) {
@@ -3860,10 +3937,11 @@
         <div class="${cls.join(" ")}" data-scan-id="${id}" data-seq-state="${seq.state}">
           <button class="run-add" data-tray-toggle="${id}"
                   title="${inTray ? "Remove from group" : "Add to group"}">${inTray ? "✓" : "+"}</button>
-          <div class="run-info" title="${id}">
+          <div class="run-info" title="${r.dehydrated ? id + " — cloud-only (OneDrive placeholder); details load once the file is hydrated" : id}">
             ${idShort}
             <span class="run-dim"> · ${escHtml(r.name || "—")}</span>
             <span class="run-dim"> · ${escHtml(r.swept || "—")}</span>
+            ${r.dehydrated ? '<span class="run-dim" title="cloud-only (OneDrive placeholder) — not read to avoid a hydrate/hang">· ☁</span>' : ""}
             <span class="seq-row-tag"> · ${escHtml(seq.tag)}</span>
           </div>
         </div>`;
@@ -6726,12 +6804,75 @@
     }), plotConfig());
   }
 
+  // Kick the server-side PNG compute (via /avg_image, which spawns the
+  // background build) and poll until ready, drawing it in. Only called on an
+  // explicit "Generate" click -- the averaged image is NEVER auto-computed on
+  // tab open, because reading the sampled gzip frames from a multi-GB .h5 is a
+  // one-time ~1-10 s cost that used to fire on every run view.
+  function _avgImageGenerate(scanId, el, W, H, navg, sampNote) {
+    const myGen = ++_avgImagePollGen;   // supersede any prior poll
+    const btn = $("avg-image-gen-btn");
+    if (btn) btn.hidden = true;
+    const etaS = Math.max(1, Math.round(0.025 * navg));
+    setText("avg-image-info",
+      `computing (~${etaS} s, one-time) · `
+      + `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+    _avgImageMessage(el, W, H,
+      `Computing averaged image…<br>(~${etaS} s, one-time · cached after)`);
+    if (!window.Plotly) return;
+    // The plain (non-check) request kicks the background build; ?check=1 polls.
+    fetch(`/api/runs/${encodeURIComponent(scanId)}/avg_image`, {cache: "no-store"})
+      .catch(() => {});
+    const statusUrl = `/api/runs/${encodeURIComponent(scanId)}/avg_image?check=1`;
+    let polls = 0;
+    const POLL_MS = 2000;
+    const MAX_POLLS = 120;          // ~4 min ceiling, then stop polling
+    const showGenBtn = () => { if (btn && myGen === _avgImagePollGen) btn.hidden = false; };
+    const poll = () => {
+      if (myGen !== _avgImagePollGen) return;   // superseded by a newer render
+      polls += 1;
+      fetch(statusUrl, {cache: "no-store"})
+        .then((resp) => resp.json().catch(() => ({status: "computing"})))
+        .then((j) => {
+          if (myGen !== _avgImagePollGen) return;
+          const st = j && j.status;
+          if (st === "ready") {
+            setText("avg-image-info",
+              `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+            _avgImageDrawPng(el, scanId, W, H);
+          } else if (st === "error") {
+            setText("avg-image-info", "averaged-image compute failed");
+            _avgImageMessage(el, W, H,
+              `Couldn't compute averaged image<br>`
+              + `<span style="font-size:11px;">${(j && j.error) || "see server log"}</span>`,
+              "#f85149");
+            showGenBtn();           // allow a retry
+          } else if (polls < MAX_POLLS) {
+            setTimeout(poll, POLL_MS);          // still computing
+          } else {
+            _avgImageMessage(el, W, H,
+              "Averaged image still computing…<br>"
+              + "(click Generate to check again)");
+            showGenBtn();
+          }
+        })
+        .catch(() => {
+          if (myGen !== _avgImagePollGen) return;
+          if (polls < MAX_POLLS) setTimeout(poll, POLL_MS);
+          else showGenBtn();
+        });
+    };
+    setTimeout(poll, 600);          // first poll soon; compute already kicked
+  }
+
   function renderAvgImage(r) {
     const card = $("analysis-avg-image-card");
     const el = $("plot-avg-image");
+    const btn = $("avg-image-gen-btn");
     if (!card || !el) return;
     // A new render supersedes any prior "computing" poll.
     const myGen = ++_avgImagePollGen;
+    if (btn) btn.hidden = true;
     const ai = r && r.avg_image;
     if (!ai || !(ai.available || ai.computable)) {
       card.hidden = true;
@@ -6756,52 +6897,17 @@
       return;
     }
 
-    // Not cached: the PNG computes on the server (~etaS s, one-time, ~25 ms
-    // per gzip frame). Show a clear in-box message NOW so the page isn't held
-    // up and the box is never blank, then poll until it's ready.
+    // Not cached: DO NOT auto-compute. Show an idle prompt + a Generate button
+    // so the operator opts in to the one-time ~etaS s read (see _avgImageGenerate).
     setText("avg-image-info",
-      `computing on first load (~${etaS} s, one-time) · `
-      + `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
+      `not generated · mean of ${navg} first-images${sampNote} · ${H}×${W} · ~${etaS} s one-time`);
     _avgImageMessage(el, W, H,
-      `Computing averaged image…<br>(~${etaS} s, one-time · cached after)`);
-
-    if (!window.Plotly) return;
-    const statusUrl = `/api/runs/${encodeURIComponent(scanId)}/avg_image?check=1`;
-    let polls = 0;
-    const POLL_MS = 2000;
-    const MAX_POLLS = 120;          // ~4 min ceiling, then stop polling
-    const poll = () => {
-      if (myGen !== _avgImagePollGen) return;   // superseded by a newer render
-      polls += 1;
-      fetch(statusUrl, {cache: "no-store"})
-        .then((resp) => resp.json().catch(() => ({status: "computing"})))
-        .then((j) => {
-          if (myGen !== _avgImagePollGen) return;
-          const st = j && j.status;
-          if (st === "ready") {
-            setText("avg-image-info",
-              `mean of ${navg} first-images${sampNote} · ${H}×${W}`);
-            _avgImageDrawPng(el, scanId, W, H);
-          } else if (st === "error") {
-            setText("avg-image-info", "averaged-image compute failed");
-            _avgImageMessage(el, W, H,
-              `Couldn't compute averaged image<br>`
-              + `<span style="font-size:11px;">${(j && j.error) || "see server log"}</span>`,
-              "#f85149");
-          } else if (polls < MAX_POLLS) {
-            setTimeout(poll, POLL_MS);          // still computing
-          } else {
-            _avgImageMessage(el, W, H,
-              "Averaged image still computing…<br>"
-              + "(re-open this run to check again)");
-          }
-        })
-        .catch(() => {
-          if (myGen !== _avgImagePollGen) return;
-          if (polls < MAX_POLLS) setTimeout(poll, POLL_MS);
-        });
-    };
-    setTimeout(poll, 600);          // first poll soon; compute already kicked
+      `Averaged image not generated.<br>`
+      + `<span style="font-size:11px;">Click "Generate" (~${etaS} s, one-time · cached after)</span>`);
+    if (btn) {
+      btn.hidden = false;
+      btn.onclick = () => _avgImageGenerate(scanId, el, W, H, navg, sampNote);
+    }
   }
 
   // Overlay each focus metric. The metrics have DIFFERENT UNITS (px,

@@ -4036,6 +4036,31 @@ def _paths_per_shot(diag_path: Path, grid_path: Path) -> dict:
     }
 
 
+def _ndarray_to_jsonable(obj):
+    """Fast NaN/Inf-safe conversion of a numpy array to nested lists.
+
+    Float/complex arrays: non-finite entries (NaN/+-Inf, which the stdlib json
+    module would emit as bare `NaN`/`Infinity` that browsers reject) become
+    None. The previous implementation looped over every element in Python
+    (`to_jsonable(float(x))` per cell) which cost ~1 s on the 1068-site payload.
+    Here numpy does the finite check + list build in C, and we only pay a Python
+    pass over the (usually few) non-finite cells.
+    """
+    if obj.dtype.kind in ('f', 'c'):
+        arr = np.asarray(obj, dtype=float) if obj.dtype.kind == 'f' else obj
+        finite = np.isfinite(arr)
+        if finite.all():
+            # No NaN/Inf -> .tolist() is a pure C conversion, no None patching.
+            return arr.tolist()
+        # Convert wholesale in C, then patch only the non-finite positions to
+        # None. Building an object array lets tolist() emit real Python None.
+        out = arr.astype(object)
+        out[~finite] = None
+        return out.tolist()
+    # Integer / bool / other numeric kinds: JSON-safe as-is.
+    return obj.tolist()
+
+
 def to_jsonable(obj):
     """Coerce numpy / NaN / nested structures to JSON-safe Python.
 
@@ -4064,13 +4089,12 @@ def to_jsonable(obj):
         except UnicodeDecodeError:
             return f'<{len(obj)} bytes>'
     if isinstance(obj, np.ndarray):
-        # Replace NaN/Inf with None in the list form.
-        if obj.dtype.kind in ('f', 'c'):
-            return [to_jsonable(float(x)) for x in obj.flat] \
-                if obj.ndim == 1 \
-                else [[to_jsonable(float(x)) for x in row]
-                      for row in obj]
-        return obj.tolist()
+        # Homogeneous numeric arrays convert in C (see _ndarray_to_jsonable).
+        # Object/other-dtype arrays fall back to the per-element recursion so
+        # nested numpy scalars / strings are still coerced correctly.
+        if obj.dtype.kind in ('f', 'c', 'i', 'u', 'b'):
+            return _ndarray_to_jsonable(obj)
+        return [to_jsonable(x) for x in obj.tolist()]
     if isinstance(obj, np.generic):
         return to_jsonable(obj.item())
     try:

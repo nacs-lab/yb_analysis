@@ -26,6 +26,11 @@ def _make_scan(root, day, hms):
 @pytest.fixture
 def data_root(tmp_path, monkeypatch):
     monkeypatch.setattr(rl._yb_cfg, 'PATH_PREFIX', str(tmp_path))
+    # Isolate the persisted enrich cache to the tmp dir so the test never
+    # reads/writes/deletes the operator's real LOCALAPPDATA cache file.
+    monkeypatch.setenv('YB_RUNS_CACHE_PATH',
+                       str(tmp_path / 'runs_enrich_cache.json'))
+    rl._ENRICH_CACHE_LOADED = False   # force a fresh (empty) lazy load in-test
     rl.clear_enrich_cache()
     return tmp_path
 
@@ -126,3 +131,57 @@ def test_date_str_only_enriches_that_day(data_root, monkeypatch):
 
     rl.list_runs(date_str='20260103')
     assert calls == ['20260103090000']           # only the chosen day enriched
+
+
+def test_persisted_cache_survives_restart(data_root, monkeypatch):
+    """After a listing, a simulated restart (wipe in-memory cache, keep the
+    on-disk file) must serve every scan from the persisted file WITHOUT any
+    file-opening enrich."""
+    _make_scan(data_root, '20260101', '120000')
+    _make_scan(data_root, '20260101', '130000')
+
+    rl.list_runs(use_cache=True)                  # cold: enrich + persist to disk
+    cache_file = os.environ['YB_RUNS_CACHE_PATH']
+    assert os.path.exists(cache_file)             # the small file was written
+
+    # Simulate a run_monitor restart: fresh process = empty in-memory cache,
+    # file untouched. The next listing must load the file and enrich nothing.
+    rl._ENRICH_CACHE.clear()
+    rl._ENRICH_CACHE_LOADED = False
+    calls = []
+    orig = rl._enrich_meta
+    monkeypatch.setattr(
+        rl, '_enrich_meta',
+        lambda sd, row: (calls.append(row['scan_id']), orig(sd, row))[1])
+
+    rows = rl.list_runs(use_cache=True)
+    assert len(rows) == 2
+    assert calls == []                            # zero file-opening enriches
+
+
+def test_dehydrated_scan_is_skipped_not_opened(data_root, monkeypatch):
+    """A OneDrive cloud-only placeholder scan (not already cached) must be
+    listed from stat only -- never enriched (opening it would block/fail while
+    OneDrive is off) -- and flagged dehydrated."""
+    _make_scan(data_root, '20260101', '120000')
+
+    monkeypatch.setattr(rl, '_dehydrated_scan', lambda sd: True)
+    calls = []
+    orig = rl._enrich_meta
+    monkeypatch.setattr(
+        rl, '_enrich_meta',
+        lambda sd, row: (calls.append(row['scan_id']), orig(sd, row))[1])
+
+    rows = rl.list_runs(use_cache=True)
+    assert len(rows) == 1
+    assert calls == []                            # never opened the file
+    assert rows[0].get('dehydrated') is True
+    # A dehydrated scan that WAS enriched before (cache hit) must still serve
+    # its cached metadata -- add an entry with the matching .h5 mtime and
+    # confirm it wins over the dehydrated skip.
+    sid = rows[0]['scan_id']
+    h5 = os.path.join(rows[0]['scan_dir'], f"data_{rows[0]['date']}_{rows[0]['time']}.h5")
+    rl._ENRICH_CACHE[sid] = {
+        'mtime': os.stat(h5).st_mtime, 'enriched': {'name': 'CachedScan'}}
+    rows2 = rl.list_runs(use_cache=True)
+    assert rows2[0].get('name') == 'CachedScan'   # cache hit beats the skip

@@ -10,9 +10,11 @@ Used by the dashboard ``/api/runs/list`` endpoint.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import stat as _stat
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -31,9 +33,19 @@ _SCAN_DIR_RE = re.compile(r'^data_(\d{8})_(\d{6})$')
 # the enriched fields keyed by scan_id and only re-enrich a scan that is NEW or
 # whose .h5 mtime changed (the live-growing current scan). Steady-state cost
 # then drops to the cheap directory/stat pass + dict lookups (~tens of ms).
+#
+# The cache is ALSO persisted to a small JSON on the LOCAL disk (not OneDrive)
+# so a ``run_monitor`` restart doesn't pay the full cold re-enrich again -- and,
+# crucially, so a scan whose data files have since been DEHYDRATED by OneDrive
+# (cloud-only placeholders; opening them would block/fail while OneDrive is off
+# or offline) is served from the cache instead of touching the file. See
+# ``_PERSIST_PATH`` + ``_load_persisted_cache`` / ``_save_persisted_cache``.
 _ENRICH_CACHE: dict = {}          # scan_id -> {'mtime': float|None, 'enriched': {field: val}}
 _ENRICH_CACHE_LOCK = threading.Lock()
-_ENRICH_CACHE_MAX = 4000          # hard cap; clear wholesale past this (cheap to rebuild)
+_ENRICH_CACHE_MAX = 20000         # hard cap; clear wholesale past this (cheap to rebuild)
+_ENRICH_CACHE_LOADED = False      # lazy one-time load of the persisted cache
+_ENRICH_CACHE_DIRTY = False       # true when a new/changed scan was enriched
+_PERSIST_VERSION = 1
 # Fields produced by ``_enrich_meta`` that are cached/restored. Cheap stat-based
 # flags (has_diag/has_code/has_grid/complete) are recomputed fresh each pass.
 _ENRICH_FIELDS = (
@@ -42,11 +54,118 @@ _ENRICH_FIELDS = (
     'n_total_shots', 'n_dims',
 )
 
+# Windows OneDrive/Files-On-Demand placeholder attribute bits. A file carrying
+# either bit is a CLOUD-ONLY placeholder: a stat is cheap, but OPENING its
+# content triggers an on-demand hydrate that blocks (and fails when OneDrive is
+# off/offline). We must never open such a file during a listing.
+_FILE_ATTRIBUTE_OFFLINE = 0x1000
+_FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+
+
+def _persist_path() -> str:
+    """Local (non-OneDrive, non-temp) path for the persisted enrich cache.
+
+    Mirrors ``config.RUNNER_QUEUE_PATH``'s ``nacsctl`` dir so it survives
+    restarts but never lands on OneDrive (which is where the scans live and the
+    exact thing we're trying to avoid re-reading)."""
+    override = os.environ.get('YB_RUNS_CACHE_PATH')
+    if override:
+        return override
+    base = (os.environ.get('YB_NACSCTL_DIR')
+            or os.path.join(os.environ.get('LOCALAPPDATA')
+                            or os.path.expanduser('~'), 'nacsctl'))
+    return os.path.join(base, 'runs_enrich_cache.json')
+
+
+def _is_dehydrated(p: Path) -> bool:
+    """True if ``p`` is a OneDrive cloud-only placeholder (opening it would
+    block/fail while OneDrive is off). Cheap: reads stat attributes only, which
+    never triggers a hydrate. Non-Windows / no attributes -> False."""
+    try:
+        st = p.stat()
+    except OSError:
+        return False
+    attrs = getattr(st, 'st_file_attributes', 0)
+    return bool(attrs & (_FILE_ATTRIBUTE_OFFLINE
+                         | _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+
+
+def _dehydrated_scan(scan_dir: Path) -> bool:
+    """True if the config sidecar this scan would enrich from is a OneDrive
+    cloud-only placeholder. Checks the .mat / .json (whichever the enrich would
+    open) -- the .h5 is only stat'd for shape, but ``load_scan_config`` /
+    ``extract_scan_dims_h5`` fully read the sidecar, so the sidecar is the file
+    that would block on hydrate. Stat-only, never opens content."""
+    base = scan_dir.name
+    for suffix in ('.mat', '.json'):
+        p = scan_dir / f'{base}{suffix}'
+        if p.is_file():
+            return _is_dehydrated(p)
+    return False
+
+
+def _load_persisted_cache() -> None:
+    """One-time load of the on-disk enrich cache into ``_ENRICH_CACHE``.
+
+    Called under ``_ENRICH_CACHE_LOCK``. Best-effort: a missing / corrupt /
+    stale-version file just leaves the in-memory cache empty."""
+    global _ENRICH_CACHE_LOADED
+    _ENRICH_CACHE_LOADED = True
+    path = _persist_path()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict) or data.get('_version') != _PERSIST_VERSION:
+        return
+    entries = data.get('entries')
+    if isinstance(entries, dict):
+        # Keys are scan_ids; values {'mtime', 'enriched'}. Trust the shape but
+        # tolerate junk entries (drop anything malformed).
+        for sid, ent in entries.items():
+            if isinstance(ent, dict) and isinstance(ent.get('enriched'), dict):
+                _ENRICH_CACHE[str(sid)] = {
+                    'mtime': ent.get('mtime'),
+                    'enriched': ent['enriched'],
+                }
+        logger.info('runs_list: loaded %d enrich-cache entries from %s',
+                    len(_ENRICH_CACHE), path)
+
+
+def _save_persisted_cache() -> None:
+    """Persist ``_ENRICH_CACHE`` to disk (atomic). Called at the end of a
+    listing only when something was (re)enriched. Best-effort."""
+    global _ENRICH_CACHE_DIRTY
+    with _ENRICH_CACHE_LOCK:
+        if not _ENRICH_CACHE_DIRTY:
+            return
+        snapshot = {'_version': _PERSIST_VERSION,
+                    'entries': dict(_ENRICH_CACHE)}
+        _ENRICH_CACHE_DIRTY = False
+    path = _persist_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError) as ex:
+        logger.warning('runs_list: enrich-cache persist failed (%s): %s',
+                       path, ex)
+
 
 def clear_enrich_cache() -> None:
-    """Drop the whole enrichment cache (a Full-rescan re-enriches every scan)."""
+    """Drop the whole enrichment cache (a Full-rescan re-enriches every scan).
+    Also deletes the persisted file so the rescan is genuinely full."""
+    global _ENRICH_CACHE_DIRTY
     with _ENRICH_CACHE_LOCK:
         _ENRICH_CACHE.clear()
+        _ENRICH_CACHE_DIRTY = False
+    try:
+        os.remove(_persist_path())
+    except OSError:
+        pass
 
 
 def list_dates() -> List[str]:
@@ -180,7 +299,13 @@ def list_runs(*, since_days: Optional[int] = None,
                     _enrich_meta(scan_dir, row)
             out.append(row)
             if len(out) >= max_count:
+                if use_cache:
+                    _save_persisted_cache()
                 return out
+    if use_cache:
+        # Persist any newly-enriched entries so the next restart is instant and
+        # never re-touches (possibly since-dehydrated) files.
+        _save_persisted_cache()
     return out
 
 
@@ -193,6 +318,7 @@ def _enrich_meta_cached(scan_dir: Path, row: dict) -> None:
     are cached. The live-growing current scan re-enriches because its .h5 mtime
     advances as shots are appended.
     """
+    global _ENRICH_CACHE_DIRTY
     base = scan_dir.name
     h5_path = scan_dir / f'{base}.h5'
     try:
@@ -201,19 +327,34 @@ def _enrich_meta_cached(scan_dir: Path, row: dict) -> None:
         mtime = None
     sid = row['scan_id']
     with _ENRICH_CACHE_LOCK:
+        if not _ENRICH_CACHE_LOADED:
+            _load_persisted_cache()   # lazy one-time restore from disk
         ent = _ENRICH_CACHE.get(sid)
-        hit = ent is not None and ent.get('mtime') == mtime
+        # Cache HIT when the entry exists and the .h5 mtime is unchanged. A
+        # DEHYDRATED scan's mtime often survives even when content is cloud-only,
+        # so a prior (hydrated) enrich still matches -> we serve it without ever
+        # opening the file. Also accept a hit when we CAN'T stat the mtime but an
+        # entry exists (better a slightly-stale name than blocking on hydrate).
+        hit = ent is not None and (ent.get('mtime') == mtime or mtime is None)
         if hit:
             row.update(ent['enriched'])
     if hit:
         return
-    # Miss or .h5 changed -> enrich fresh (outside the lock; this is the slow part).
+    # Miss (or the live-growing scan's .h5 mtime advanced). Before paying the
+    # slow content-open, refuse to touch a OneDrive cloud-only placeholder --
+    # opening it would block/fail (OneDrive off/offline). Emit a stat-only row
+    # flagged 'dehydrated' so the operator sees WHY it's sparse.
+    if _dehydrated_scan(scan_dir):
+        row['dehydrated'] = True
+        return
+    # Enrich fresh (outside the lock; this is the slow part).
     _enrich_meta(scan_dir, row)
     enriched = {k: row[k] for k in _ENRICH_FIELDS if k in row}
     with _ENRICH_CACHE_LOCK:
         if len(_ENRICH_CACHE) >= _ENRICH_CACHE_MAX:
             _ENRICH_CACHE.clear()   # wholesale reset; cheap to rebuild incrementally
         _ENRICH_CACHE[sid] = {'mtime': mtime, 'enriched': enriched}
+        _ENRICH_CACHE_DIRTY = True
 
 
 def _actual_shots(h5_path: Path) -> Optional[int]:
@@ -224,6 +365,10 @@ def _actual_shots(h5_path: Path) -> Optional[int]:
     is absent. Returns None on any failure (file missing, not yet written).
     """
     if not h5_path.is_file():
+        return None
+    # A cloud-only placeholder .h5 would block/fail on open (OneDrive off) --
+    # skip it (stat-only check, no hydrate).
+    if _is_dehydrated(h5_path):
         return None
     try:
         import h5py
