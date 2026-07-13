@@ -215,8 +215,32 @@ class DashboardRenderer:
         self._port = port
         self._host = host
         self._proc = None
+        self._api_proc = None
+        # The sibling analysis-API process runs on the next port, LOOPBACK ONLY
+        # (never remote -- the Dash app proxies to it). Overridable via
+        # YB_ANALYSIS_API_PORT; set to 0/empty to disable the sibling entirely
+        # (Dash then serves /api/runs/* in-process, the old behavior).
+        try:
+            self._api_port = int(os.environ.get('YB_ANALYSIS_API_PORT',
+                                                 str(port + 1)))
+        except (TypeError, ValueError):
+            self._api_port = port + 1
 
     def start(self):
+        # Start the sibling analysis-API FIRST so its port is live and the env
+        # var is set before the Dash child spawns (the child inherits the env
+        # and installs its proxy hook against this port).
+        if self._api_port and (self._api_proc is None
+                               or not self._api_proc.is_alive()):
+            os.environ['YB_ANALYSIS_API_PORT'] = str(self._api_port)
+            self._api_proc = multiprocessing.Process(
+                target=_analysis_api_main,
+                args=('127.0.0.1', self._api_port, _DATA_FILE, os.getpid()),
+                daemon=True)
+            self._api_proc.start()
+            logger.info('Analysis-API process started (pid=%d) at '
+                        'http://127.0.0.1:%d', self._api_proc.pid,
+                        self._api_port)
         if self._proc is None or not self._proc.is_alive():
             # Pass the parent (this process) PID so the child can watchdog
             # us. If we die unexpectedly (terminal close, taskkill, crash)
@@ -314,6 +338,15 @@ class DashboardRenderer:
                 self._proc.join(timeout=1)
             logger.info('Dashboard process stopped%s', f' ({tag})' if tag else '')
         self._proc = None
+        if self._api_proc and self._api_proc.is_alive():
+            self._api_proc.terminate()
+            self._api_proc.join(timeout=3)
+            if self._api_proc.is_alive():
+                self._api_proc.kill()
+                self._api_proc.join(timeout=1)
+            logger.info('Analysis-API process stopped%s',
+                        f' ({tag})' if tag else '')
+        self._api_proc = None
 
     def close(self):
         self._terminate_proc()
@@ -1682,6 +1715,87 @@ def _log_dirs():
         ('monitor', 'run_monitor (log/monitor_log)',    os.path.join(base, 'monitor_log')),
         ('matlab',  'MATLAB backend (log/matlab_log)',  os.path.join(base, 'matlab_log')),
     ]
+
+
+# Path prefixes whose handlers are heavy DISK readers with NO dependence on the
+# Dash live state -- safe to serve from the sibling analysis-API process. Kept
+# as (prefix, needs_suffix) rules; matched in _should_proxy_runs. `/diag_live`
+# is deliberately EXCLUDED (it reads the live pickle/queue) and stays on Dash.
+_RUNS_PROXY_EXACT = frozenset({'/api/runs/list', '/api/runs/dates'})
+_RUNS_PROXY_SUFFIXES = ('/analysis', '/avg_image', '/grid', '/code', '/shot_image')
+
+
+def _should_proxy_runs(path: str) -> bool:
+    """True iff `path` is one of the offloaded run/analysis endpoints."""
+    if path in _RUNS_PROXY_EXACT:
+        return True
+    if path.startswith('/api/runs/groups'):
+        return True
+    if path.startswith('/api/runs/'):
+        # /api/runs/<id>/<suffix> -- offload the heavy suffixes only
+        # (NOT /diag_live, which needs the live in-process state).
+        return any(path.endswith(sfx) for sfx in _RUNS_PROXY_SUFFIXES)
+    return False
+
+
+def _install_runs_proxy(server):
+    """Forward offloaded `/api/runs/*` requests to the sibling analysis-API
+    process (own GIL) via a Flask before_request hook. No-op unless
+    YB_ANALYSIS_API_PORT is set (i.e. run_monitor spawned the sibling)."""
+    port = os.environ.get('YB_ANALYSIS_API_PORT')
+    if not port:
+        return
+    try:
+        api_port = int(port)
+    except (TypeError, ValueError):
+        return
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        logger.warning('runs-proxy disabled: `requests` not importable')
+        return
+    from flask import request, Response
+
+    base = f'http://127.0.0.1:{api_port}'
+    # Session with a small connection pool -> keep-alive to the sibling, so the
+    # forward doesn't pay a fresh TCP handshake every call.
+    import requests as _rq
+    _sess = _rq.Session()
+
+    @server.before_request
+    def _maybe_proxy_runs():
+        if not _should_proxy_runs(request.path):
+            return None    # not offloaded -> normal Dash dispatch
+        url = base + request.full_path.rstrip('?') \
+            if request.query_string else base + request.path
+        try:
+            # stream=True + reading raw with decode_content=False preserves the
+            # sibling's gzip bytes verbatim (requests would otherwise transparently
+            # decompress resp.content, breaking the Content-Encoding header we pass
+            # through). Forward Accept-Encoding so the sibling gzips.
+            resp = _sess.request(
+                method=request.method, url=url,
+                data=request.get_data(),
+                headers={k: v for k, v in request.headers
+                         if k.lower() not in ('host', 'content-length')},
+                timeout=120, stream=True)
+            body = resp.raw.read(decode_content=False)
+        except Exception as ex:
+            # Sibling down/unreachable -> return None so Flask falls through to
+            # the LOCAL (in-process) handler, which is still registered. Slower
+            # under load, but never a hard failure.
+            logger.warning('runs-proxy to %s failed (%s); serving locally',
+                           url, ex)
+            return None
+        # Keep Content-Encoding (gzip) + Content-Type so the browser decodes it;
+        # drop hop-by-hop + length headers (Response recomputes length).
+        excluded = {'content-length', 'transfer-encoding', 'connection'}
+        headers = [(k, v) for k, v in resp.raw.headers.items()
+                   if k.lower() not in excluded]
+        return Response(body, resp.status_code, headers)
+
+    logger.info('runs-proxy installed -> %s (offloads /api/runs/* heavy paths)',
+                base)
 
 
 def _register_api_routes(server):
@@ -4695,6 +4809,77 @@ def _register_main_html_routes(server):
         )
 
 
+def _analysis_api_main(host, port, data_file, parent_pid=None):
+    """Entry point for the ANALYSIS-API subprocess.
+
+    A second, tiny Flask process that owns the heavy DISK-reading run/analysis
+    endpoints (`/api/runs/*`). It exists purely to escape the Dash process's GIL:
+    during a live scan, the Dash process is pegged ~100% CPU by the per-frame
+    live-figure pre-builder (EventHub), which starved the in-process
+    `/api/runs/list` + `/analysis` handlers for 10-25 s even though the work
+    itself is ~50 ms. Running them in their OWN interpreter (own GIL) makes them
+    fast regardless of what the live view is doing. The Dash app proxies
+    `/api/runs/*` here (see `_register_runs_proxy`), so the browser origin/port
+    is unchanged.
+
+    Reuses `_register_api_routes` verbatim -- the live/control routes it also
+    attaches are never proxied here, so they're inert; the run/analysis routes
+    only touch disk + the shared pickle (`_read_data`, file-based, process-safe),
+    so they behave identically to the Dash-hosted originals.
+    """
+    global _DATA_FILE
+    if data_file:
+        _DATA_FILE = data_file
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [analysis-api] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+    if parent_pid is not None:
+        _start_parent_watchdog(parent_pid)
+    from flask import Flask
+    app = Flask(__name__)
+    _register_api_routes(app)
+    _install_gzip(app)   # analysis payloads are multi-MB; gzip ~10x smaller
+    logger.info('Analysis-API process listening on http://%s:%d', host, port)
+    app.run(host=host, port=port, debug=False, use_reloader=False,
+            threaded=True)
+
+
+def _install_gzip(app, min_bytes=2048):
+    """gzip large JSON responses (stdlib; no flask_compress dependency).
+
+    The per-scan analysis payload is multi-MB; a completed scan's cached
+    payload compresses ~10x. Crucial because the response is copied back
+    through the (often CPU-pegged) Dash proxy process -- 10x fewer bytes
+    there is a big win. Only compresses when the client sent Accept-Encoding:
+    gzip, the body is worth it, and it's not already encoded."""
+    import gzip as _gz
+    from flask import request
+
+    @app.after_request
+    def _gzip(resp):
+        try:
+            ae = request.headers.get('Accept-Encoding', '')
+            if 'gzip' not in ae.lower():
+                return resp
+            if resp.direct_passthrough or resp.status_code < 200 \
+                    or resp.status_code >= 300 \
+                    or 'Content-Encoding' in resp.headers:
+                return resp
+            data = resp.get_data()
+            if len(data) < min_bytes:
+                return resp
+            comp = _gz.compress(data, compresslevel=5)
+            resp.set_data(comp)
+            resp.headers['Content-Encoding'] = 'gzip'
+            resp.headers['Content-Length'] = str(len(comp))
+            resp.headers['Vary'] = 'Accept-Encoding'
+        except Exception:
+            return resp
+        return resp
+
+
 def _dash_main(host, port, data_file, parent_pid=None):
     """Entry point for the Dash subprocess.
 
@@ -5101,6 +5286,13 @@ def _build_app():
     # Lets external clients (e.g. the SLM server) poll experiment state over
     # the LAN. All GET, no writes. Bound to the same port as the dashboard.
     _register_api_routes(app.server)
+
+    # ---- Offload heavy run/analysis endpoints to a sibling process --------
+    # When YB_ANALYSIS_API_PORT is set (run_monitor spawns the sibling), a
+    # before_request hook forwards the heavy DISK-reading `/api/runs/*` calls to
+    # that process (own GIL) so a live scan's figure pre-builder pegging THIS
+    # Dash process can't starve them. Transparent to the browser (same origin).
+    _install_runs_proxy(app.server)
 
     # ---- WebSocket push signaling (/ws/events) ------------------------
     # Tiny shot/queue EVENTS only -- the browser reacts by kicking its normal

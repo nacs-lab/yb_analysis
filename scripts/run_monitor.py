@@ -118,8 +118,10 @@ def main():
         except Exception as _ex:
             logging.warning('YB_WAIT_FOR_PID wait failed: %s', _ex)
 
-    # Clear any stale listener on the dashboard port
+    # Clear any stale listener on the dashboard port + the sibling analysis-API
+    # port (dashboard port + 1; see DashboardRenderer._api_port).
     kill_port(args.port)
+    kill_port(args.port + 1)
 
     # Start the background backend (owns the ZMQ ExptServer at args.url).
     # The backend is selected by --backend; the GUI toggle relaunches us with
@@ -261,6 +263,10 @@ def main():
             pass
         try:
             kill_port(args.port)
+        except Exception:
+            pass
+        try:
+            kill_port(args.port + 1)   # sibling analysis-API port
         except Exception:
             pass
 

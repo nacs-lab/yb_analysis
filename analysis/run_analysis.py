@@ -159,6 +159,50 @@ def _write_payload_cache(scan_dir: Path, payload: dict, n_shots) -> None:
         logger.warning('analysis payload cache write failed (%s): %s', p, ex)
 
 
+# Single-flight background payload refresh for RUNNING scans. A page refresh of
+# a live scan serves the stale cache instantly (fast path) and schedules ONE
+# recompute here to overwrite the cache; concurrent/rapid refreshes coalesce
+# (a scan_dir already refreshing is skipped) and a short cooldown prevents
+# hammering the disk on a fast poll loop.
+import threading as _threading
+import time as _time_mod
+_PAYLOAD_REFRESH_LOCK = _threading.Lock()
+_PAYLOAD_REFRESHING: set = set()        # scan_dirs with a refresh in flight
+_PAYLOAD_REFRESH_LAST: dict = {}        # scan_dir -> monotonic ts of last refresh
+_PAYLOAD_REFRESH_COOLDOWN_S = 8.0       # min gap between background refreshes/scan
+
+
+def _schedule_payload_refresh(scan_dir: Path) -> None:
+    """Kick a one-shot background recompute of a running scan's default-view
+    payload cache. Coalesces concurrent refreshes + rate-limits per scan."""
+    key = str(scan_dir)
+    now = _time_mod.monotonic()
+    with _PAYLOAD_REFRESH_LOCK:
+        if key in _PAYLOAD_REFRESHING:
+            return
+        if (now - _PAYLOAD_REFRESH_LAST.get(key, 0.0)) < _PAYLOAD_REFRESH_COOLDOWN_S:
+            return
+        _PAYLOAD_REFRESHING.add(key)
+        _PAYLOAD_REFRESH_LAST[key] = now
+
+    def _run():
+        try:
+            # Recompute the DEFAULT view; analyze_scan_dir writes the payload
+            # cache at the current shot count as a side effect. _skip_fastpath
+            # forces a real compute (else it would re-hit the stale cache and
+            # never refresh). force_recache stays False so it reuses the
+            # expensive filter-independent sub-caches.
+            analyze_scan_dir(scan_dir, sync_slm_diag=False, _skip_fastpath=True)
+        except Exception as ex:   # never let a background refresh raise
+            logger.debug('payload refresh %s failed: %s', key, ex)
+        finally:
+            with _PAYLOAD_REFRESH_LOCK:
+                _PAYLOAD_REFRESHING.discard(key)
+
+    t = _threading.Thread(target=_run, name='payload-refresh', daemon=True)
+    t.start()
+
+
 def _read_analysis_cache(scan_dir: Path) -> Optional[dict]:
     p = _analysis_cache_path(scan_dir)
     if not p.is_file():
@@ -266,7 +310,8 @@ def analyze_scan_dir(scan_dir,
                      survival_ref: str = 'img1',
                      recompute_infidelity: bool = False,
                      force_recache: bool = False,
-                     sync_slm_diag: bool = True) -> dict:
+                     sync_slm_diag: bool = True,
+                     _skip_fastpath: bool = False) -> dict:
     """Analyze a scan from its directory path. Same return shape as
     :func:`analyze_scan` — kept separate so callers that already
     have a path don't have to round-trip through scan_id resolution.
@@ -379,18 +424,29 @@ def analyze_scan_dir(scan_dir,
     except Exception:
         _site_mask_spec = (site_mask if site_mask not in (None, False) else None)
 
-    # Fast path: the DEFAULT unmasked view (no filter, no recompute, no mask) of
-    # a scan whose data hasn't grown is served straight from the cached payload
-    # on disk (~ms). Self-invalidates when the scan grows (shot-count key
-    # mismatch); busted by force_recache (which already deleted it above).
+    # Fast path: the DEFAULT unmasked view (no filter, no recompute, no mask).
+    #  - FINISHED scan (shot count unchanged): exact cache hit -> instant, forever.
+    #  - RUNNING scan (shot count grew): the exact key misses, so a naive fetch
+    #    would fully recompute on EVERY page refresh (~1-1.5 s each). Instead serve
+    #    the STALE cached payload immediately AND kick a one-shot background
+    #    recompute that overwrites the cache -> the next refresh shows fresher
+    #    numbers. Net: refreshes of a live scan are instant (one-refresh lag on the
+    #    numbers); the frontend's growth-poll also keeps updating in place.
+    # Busted by force_recache (which already deleted the cache above).
     _default_view = (filters is None and _site_mask_spec is None
                      and _survival_ref == 'img1'
                      and not recompute_infidelity)
-    if _default_view and not force_recache:
+    if _default_view and not force_recache and not _skip_fastpath:
         _cached = _read_payload_cache(scan_dir)
         if _cached is not None:
             _cur_shots = _probe_actual_shots(scan_dir)
-            if _cur_shots is not None and _cached.get('n_shots') == _cur_shots:
+            _cache_shots = _cached.get('n_shots')
+            if _cur_shots is not None and _cache_shots == _cur_shots:
+                return _cached['payload']            # finished / unchanged: exact hit
+            if _cur_shots is not None and isinstance(_cache_shots, int) \
+                    and _cur_shots > _cache_shots:
+                # Running scan: serve stale now, refresh the cache in the background.
+                _schedule_payload_refresh(scan_dir)
                 return _cached['payload']
 
     out['scan_name']     = _resolve_scan_name(scan)
