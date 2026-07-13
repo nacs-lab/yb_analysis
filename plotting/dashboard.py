@@ -988,8 +988,28 @@ def _to_jsonable(x):
 
     Used by the /api/* Flask routes — Flask's jsonify chokes on numpy
     arrays, np.int64, NaN/Inf, and bytes.
+
+    numpy arrays are the hot path (the /api/snapshot per-site arrays over 1068
+    sites, every poll). We handle them VECTORIZED rather than tolist()-then-
+    recurse-element-by-element: the old path made ~one Python call per element
+    (tens of thousands per snapshot) solely to null out NaN/Inf, which py-spy
+    showed as ~33% of the dashboard's GIL time. `.tolist()` already yields
+    JSON-safe Python scalars for int/uint/bool arrays and for float arrays with
+    no non-finite values; only a float array that actually contains NaN/Inf needs
+    the null-out, done with one vectorized mask instead of per-element recursion.
     """
     if isinstance(x, np.ndarray):
+        k = x.dtype.kind
+        if k in 'iub':                 # int / uint / bool -> tolist() is json-safe
+            return x.tolist()
+        if k == 'f':                   # float: null NaN/Inf, vectorized
+            finite = np.isfinite(x)
+            if finite.all():
+                return x.tolist()      # all finite -> plain floats, no NaN/Inf
+            o = x.astype(object)
+            o[~finite] = None          # one masked assign (C), not N Python calls
+            return o.tolist()          # nested lists with None where non-finite
+        # complex / object / str / datetime etc. -- rare, small: recurse per elem
         return _to_jsonable(x.tolist())
     if isinstance(x, np.integer):
         return int(x)
