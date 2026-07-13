@@ -76,6 +76,124 @@ _PROFILE = bool(os.environ.get('YB_DASH_PROFILE'))
 _LIVE_FIG_CACHE = {'key': None, 'frag': {}}
 _LIVE_FIG_LOCK = threading.Lock()
 
+# The full ordered live-figure name set the /api/live/figures groups draw from
+# (the 'site' hist is a separate ?which=site fetch, not part of a group). Shared
+# by the request handler AND the eager pre-builder so both stay in sync.
+_LIVE_FIG_NAMES = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
+                   'load', 'infid', 'shift', 'scan', 'avghist',
+                   'rep0', 'rep1', 'rep2')
+# The render-arg tuple the Live tab sends when NOTHING is customized (marker_size
+# 12, colorbar 0-1, site 1, all box overlays ON). The eager pre-builder targets
+# exactly this key so the common-case poll finds a ready fragment; any customized
+# request has a different arg_key and falls back to an inline build (unchanged).
+_LIVE_FIG_DEFAULT_ARGS = (12, '01', 0, ())
+
+
+def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on):
+    """Build ONE live Plotly figure by name (the name->builder dispatch shared by
+    the request handler and the eager pre-builder). ``boxes_on(name)`` -> bool
+    selects the green/red per-site overlay for the array panels. Returns a Figure
+    or None for an unknown name; raises are handled by the caller."""
+    if name == 'array':
+        return _fig_array(d, show_boxes=boxes_on('array'))
+    if name == 'array_mid':
+        return _fig_array(d, img_key='_img_mid_data_uri',
+                          shape_key='_img_mid_shape',
+                          vlo_key='_img_mid_vlo', vhi_key='_img_mid_vhi',
+                          logicals_key='logicals_mid',
+                          grid_key='grid_locations',
+                          title='Tweezer Array (middle)',
+                          show_boxes=boxes_on('array_mid'))
+    if name == 'array2':
+        return _fig_array(d, img_key='_img2_data_uri',
+                          shape_key='_img2_shape',
+                          vlo_key='_img2_vlo', vhi_key='_img2_vhi',
+                          logicals_key='logicals2',
+                          grid_key=('grid_locations_img2'
+                                    if d.get('is_two_array') else 'grid_locations'),
+                          title='Tweezer Array (img 2)',
+                          show_boxes=boxes_on('array2'))
+    if name == 'intens':   return _fig_intens(d)
+    if name == 'loadlive': return _fig_loading_live(d)
+    if name == 'load':     return _fig_loading(d, marker_size=marker_size)
+    if name == 'infid':    return _fig_infid(d, marker_size=marker_size)
+    if name == 'shift':    return _fig_shift(d)
+    if name == 'scan':     return _fig_scan_curve(d, cbar_scale=cbar_scale)
+    if name == 'avghist':  return _fig_avghist(d)
+    if name in ('rep0', 'rep1', 'rep2', 'rep3'):
+        figs = _figs_reps(d)
+        idx = int(name[3])
+        return figs[idx] if idx < len(figs) else _waiting('Site Hist')
+    if name == 'site':
+        fig, _info = _fig_site(d, site_idx)
+        return fig
+    return None
+
+
+def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
+                    boxes_off=()):
+    """Serialized JSON string for one live figure -- a pure function of
+    ``(d, render-args)`` so it can run on a request thread OR the eager
+    pre-build worker. ``boxes_off`` is the set of array-panel names whose overlay
+    is toggled off. Returns None for an unknown name; a build error becomes a
+    'render error' waiting panel (same as the old inline path)."""
+    import plotly.utils as _putils
+    boxes_off = set(boxes_off)
+
+    def _boxes_on(nm):
+        return nm not in boxes_off
+    try:
+        fig = _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, _boxes_on)
+    except Exception as ex:
+        logger.exception('_build_fig_json %s failed', name)
+        fig = _waiting(name, message='render error: %s' % ex)
+    if fig is None:
+        return None
+    try:
+        raw = fig.to_plotly_json()
+    except Exception:
+        raw = {'data': list(getattr(fig, 'data', [])),
+               'layout': getattr(fig, 'layout', {})}
+    return json.dumps(_decode_plotly_bdata(raw), cls=_putils.PlotlyJSONEncoder,
+                      allow_nan=False, default=str)
+
+
+def _prebuild_default_fragments():
+    """Eagerly build the DEFAULT-arg live-figure fragments for the CURRENT frame
+    into _LIVE_FIG_CACHE, so request threads read a ready string instead of
+    building ~100 ms of figures inline while holding _LIVE_FIG_LOCK -- the
+    GIL-contention hotspot that made concurrent polls serialize (0.2 s -> 1.7 s).
+
+    Called by the EventHub watcher when the frame advances (~1/s). The heavy build
+    runs OUTSIDE the lock; the swap-in is brief and under the lock. If a request
+    thread already installed this frame's key we fill in any names it hasn't built
+    yet rather than clobbering its work. A newer frame arriving mid-build just
+    means we skip the install (that frame triggers its own prebuild)."""
+    d = _read_data() or {}
+    seq = d.get('_write_seq')
+    if seq is None:
+        return
+    arg_key = (seq,) + _LIVE_FIG_DEFAULT_ARGS
+    built = {}
+    for name in _LIVE_FIG_NAMES:
+        try:
+            built[name] = _build_fig_json(d, name)
+        except Exception:
+            built[name] = None
+    with _LIVE_FIG_LOCK:
+        cur_key = _LIVE_FIG_CACHE.get('key')
+        if cur_key != arg_key:
+            # No one built this frame's default set yet (or the cache holds an
+            # older/other-arg frame) -> install ours wholesale.
+            _LIVE_FIG_CACHE['key'] = arg_key
+            _LIVE_FIG_CACHE['frag'] = built
+        else:
+            # A request already opened this exact key; fill only the gaps so we
+            # don't discard fragments it already built (identical data anyway).
+            frag = _LIVE_FIG_CACHE.setdefault('frag', {})
+            for name, val in built.items():
+                frag.setdefault(name, val)
+
 
 class DashboardRenderer:
     """Runs the Dash web server in a **separate process** to avoid GIL
@@ -372,11 +490,15 @@ class EventHub:
     """
 
     def __init__(self, read_frame_id=None, read_queue_mtime=None,
-                 poll_interval=0.12, client_maxsize=64):
+                 poll_interval=0.12, client_maxsize=64, on_shot=None):
         self._read_frame_id = read_frame_id or _cheap_frame_id
         self._read_queue_mtime = read_queue_mtime or _cheap_queue_mtime
         self._poll_interval = poll_interval
         self._client_maxsize = client_maxsize
+        # Optional callback fired (best-effort) on each detected frame advance,
+        # ONLY while there is >=1 client -- used to eagerly pre-build the live
+        # figures off the request thread. Injectable so tests stay file-free.
+        self._on_shot = on_shot
         self._clients = set()          # set of queue.Queue
         self._lock = threading.Lock()
         self._thread = None
@@ -467,6 +589,18 @@ class EventHub:
             ev = {'topic': 'shot', 'frame': fid[0]}
             events.append(ev)
             self.publish(ev)
+            # Eagerly pre-build the live figures for this new frame, but only when
+            # someone is watching (no clients -> no wasted ~100 ms GIL-held build).
+            # Best-effort: a failed prebuild just means requests build inline.
+            if self._on_shot is not None:
+                with self._lock:
+                    has_clients = bool(self._clients)
+                if has_clients:
+                    try:
+                        self._on_shot()
+                    except Exception:
+                        logger.debug('EventHub on_shot prebuild failed',
+                                     exc_info=True)
         if qmt is not None and qmt != self._last_qmtime:
             self._last_qmtime = qmt
             ev = {'topic': 'queue'}
@@ -666,6 +800,87 @@ def _log_refresh_profile(n, t0, t_read, t_build, emitted):
                  n, (t_read - t0) * 1e3, (t_build - t_read) * 1e3,
                  (t_emit - t_build) * 1e3, full, patch, noupd,
                  payload / 1e6, (t_emit - t0) * 1e3)
+
+
+# Cache for _read_threshold_scalars: path -> {'size': int, 'records': [scalar-dict,...]}.
+# The threshold audit log is APPEND-ONLY and historical records are IMMUTABLE, so we
+# keep the parsed scalar records and only process bytes that appeared since last read
+# (seek to the previous size, parse the tail, extend). This turns the per-poll cost
+# from "read the whole 45 MB file + json.loads + numpy over 400 x 1068-float records
+# EVERY time" (measured 3-16 s under load) into "read only the new tail" (~ms).
+_THRESHOLD_SCALARS_CACHE = {}
+_THRESHOLD_SCALARS_LOCK = threading.Lock()
+
+
+def _read_threshold_scalars(path, n):
+    """Return the last ``n`` scalar records from an append-only threshold JSONL log.
+
+    Incremental + cached: parses only bytes appended since the previous call, so a
+    growing multi-MB log costs ~constant time per poll instead of a full re-read +
+    re-parse. Each raw record's heavy per-site arrays are reduced to scalars by
+    ``_threshold_record_scalars`` and cached; the arrays are never kept.
+
+    Robust to truncation/rotation (a shrunk file resets the cache and re-reads).
+    Partial trailing line (a concurrent append mid-write) is left unconsumed until
+    it completes -- we only advance the cached offset to the last full newline.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    with _THRESHOLD_SCALARS_LOCK:
+        ent = _THRESHOLD_SCALARS_CACHE.get(path)
+        if ent is None or size < ent['size']:
+            # First read, or the file shrank (rotation/truncation) -> start fresh.
+            # Cold-seed from a BOUNDED tail rather than byte 0: we only ever return
+            # the last n records, and each record is ~22 KB, so seeking back a
+            # generous multiple of (n x record-size) avoids parsing the whole
+            # multi-MB history on the first poll. Start reading at the first full
+            # line after that offset (drop a partial leading line).
+            _REC_BYTES = 24000            # ~22 KB/record observed; round up
+            _tail_bytes = min(size, max(1, n) * _REC_BYTES * 2 + 1_000_000)
+            start = size - _tail_bytes
+            if start > 0:
+                try:
+                    with open(path, 'rb') as fh:
+                        fh.seek(start)
+                        # Advance past the (likely partial) first line.
+                        first = fh.readline()
+                        start += len(first)
+                except OSError:
+                    start = 0
+            ent = {'size': max(0, start), 'records': []}
+        if size > ent['size']:
+            try:
+                with open(path, 'rb') as fh:
+                    fh.seek(ent['size'])
+                    chunk = fh.read(size - ent['size'])
+            except OSError:
+                return [r for r in ent['records']][-n:]
+            # Only consume through the last complete line; keep the byte offset at
+            # that newline so a half-written trailing record is re-read next time.
+            last_nl = chunk.rfind(b'\n')
+            if last_nl < 0:
+                # No complete line yet in the new bytes; don't advance.
+                return [r for r in ent['records']][-n:]
+            consumed = ent['size'] + last_nl + 1
+            text = chunk[:last_nl].decode('utf-8', errors='replace')
+            for ln in text.splitlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ent['records'].append(_threshold_record_scalars(json.loads(ln)))
+                except Exception:
+                    continue
+            # Bound the cache so a very long run can't grow it without limit. Keep a
+            # generous tail (>= any n a caller asks for; n is capped at 2000).
+            _CAP = 4000
+            if len(ent['records']) > _CAP:
+                ent['records'] = ent['records'][-_CAP:]
+            ent['size'] = consumed
+            _THRESHOLD_SCALARS_CACHE[path] = ent
+        return list(ent['records'][-n:])
 
 
 def _threshold_record_scalars(r):
@@ -1712,16 +1927,9 @@ def _register_api_routes(server):
                 path = os.path.join(_ul._logs_dir(), 'thresholds',
                                     '%s.jsonl' % _reg._sanitize_name(pattern))
                 if os.path.isfile(path):
-                    with open(path, 'r', encoding='utf-8') as fh:
-                        lines = fh.readlines()[-n:]
-                    for ln in lines:
-                        ln = ln.strip()
-                        if not ln:
-                            continue
-                        try:
-                            records.append(_threshold_record_scalars(json.loads(ln)))
-                        except Exception:
-                            continue
+                    # Incremental + cached seek-tail read (append-only log) -- see
+                    # _read_threshold_scalars. Was a full 45 MB read + reparse per poll.
+                    records = _read_threshold_scalars(path, n)
             except Exception:
                 logger.debug('threshold history read failed', exc_info=True)
         # Live calibration health for the SELECTED pattern. The snapshot only
@@ -2879,7 +3087,6 @@ def _register_api_routes(server):
         / data URIs get the same treatment Dash gives them internally.
         """
         from flask import Response, jsonify
-        import plotly.utils as _putils
         d = _read_data() or {}
         which = request.args.get('which', '').lower()
         try:
@@ -2902,62 +3109,9 @@ def _register_api_routes(server):
         except ValueError:
             site_idx = 0
 
-        def _fig_for(name):
-            try:
-                if name == 'array':
-                    return _fig_array(d, show_boxes=_boxes_on('array'))
-                if name == 'array_mid':
-                    return _fig_array(d, img_key='_img_mid_data_uri',
-                                      shape_key='_img_mid_shape',
-                                      vlo_key='_img_mid_vlo',
-                                      vhi_key='_img_mid_vhi',
-                                      logicals_key='logicals_mid',
-                                      grid_key='grid_locations',
-                                      title='Tweezer Array (middle)',
-                                      show_boxes=_boxes_on('array_mid'))
-                if name == 'array2':
-                    return _fig_array(d, img_key='_img2_data_uri',
-                                      shape_key='_img2_shape',
-                                      vlo_key='_img2_vlo', vhi_key='_img2_vhi',
-                                      # img2 panel ALWAYS shows the final frame's
-                                      # own logicals (_display_logicals2 is set for
-                                      # every is_last frame, two-array or not). The
-                                      # old `else 'logicals'` fell back to frame-0's
-                                      # logicals in single-array NumImages=2 mode,
-                                      # making img2 render identically to img1.
-                                      logicals_key='logicals2',
-                                      grid_key=('grid_locations_img2'
-                                          if d.get('is_two_array') else 'grid_locations'),
-                                      title='Tweezer Array (img 2)',
-                                      show_boxes=_boxes_on('array2'))
-                if name == 'intens':   return _fig_intens(d)
-                if name == 'loadlive': return _fig_loading_live(d)
-                if name == 'load':     return _fig_loading(d, marker_size=marker_size)
-                if name == 'infid':    return _fig_infid(d, marker_size=marker_size)
-                if name == 'shift':    return _fig_shift(d)
-                if name == 'scan':     return _fig_scan_curve(d, cbar_scale=cbar_scale)
-                if name == 'avghist':  return _fig_avghist(d)
-                if name in ('rep0', 'rep1', 'rep2', 'rep3'):
-                    figs = _figs_reps(d)
-                    idx = int(name[3])
-                    return figs[idx] if idx < len(figs) else _waiting('Site Hist')
-                if name == 'site':
-                    fig, _info = _fig_site(d, site_idx)
-                    return fig
-            except Exception as ex:
-                logger.exception('_fig_for %s failed', name)
-                return _waiting(name, message=f'render error: {ex}')
-            return None
-
-        def _figdict(fig):
-            if fig is None:
-                return None
-            try:
-                raw = fig.to_plotly_json()
-            except Exception:
-                raw = {'data': list(getattr(fig, 'data', [])),
-                       'layout': getattr(fig, 'layout', {})}
-            return _decode_plotly_bdata(raw)
+        # Which array-panel overlays are toggled OFF (for _build_fig_json).
+        _boxes_off = tuple(nm for nm in ('array', 'array_mid', 'array2')
+                           if not _boxes_on(nm))
 
         # Per-figure serialized-JSON cache, keyed on the frame's monotonic
         # _write_seq plus the render args that affect a figure's output. Multiple
@@ -2982,15 +3136,16 @@ def _register_api_routes(server):
             frame; concurrent tabs with the same frame reuse the fragment, and a
             tab with a NEW frame rebuilds the whole set from ITS ``d`` (so a group
             response is always coherent: all figures from one _read_data snapshot).
+            For DEFAULT args the eager pre-builder usually filled this already, so
+            this is a dict hit; a custom-arg request builds inline here (fallback).
             """
             if name in frags:
                 return frags[name]
-            fig = _fig_for(name)          # closes over THIS request's `d`
-            if fig is None:
-                frags[name] = None
-                return None
-            s = json.dumps(_figdict(fig), cls=_putils.PlotlyJSONEncoder,
-                           allow_nan=False, default=str)
+            # Shared builder (same as the eager pre-builder) -- closes over THIS
+            # request's `d` + render args, so a custom-arg fragment is correct.
+            s = _build_fig_json(d, name, marker_size=marker_size,
+                                cbar_scale=cbar_scale, site_idx=site_idx,
+                                boxes_off=_boxes_off)
             frags[name] = s
             return s
 
@@ -3515,7 +3670,11 @@ def _register_ws_events(server):
         logger.info('flask-sock not installed -- /ws/events disabled (polling only)')
         return
     sock = Sock(server)
-    _EVENT_HUB = EventHub()
+    # on_shot pre-builds the default-arg live figures off the request thread when
+    # a frame lands (only while a client is connected) -- turns the concurrent
+    # poll from "serialize behind a ~100 ms inline build under the lock" into a
+    # ready-string read (see _prebuild_default_fragments).
+    _EVENT_HUB = EventHub(on_shot=_prebuild_default_fragments)
 
     @sock.route('/ws/events')
     def _ws_events(ws):

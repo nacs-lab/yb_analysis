@@ -197,3 +197,92 @@ def test_register_starts_watcher_lazily():
     hub.register()
     assert hub._started and hub._thread is not None
     assert hub._thread.daemon
+
+
+# ---- Eager live-figure pre-build (on_shot) -----------------------------------
+# On a frame advance the watcher pre-builds the default-arg live figures off the
+# request thread (only while a client is connected), so concurrent polls read a
+# ready string instead of serializing behind a ~100 ms inline build under the
+# lock. The hook is injectable (on_shot) so it's testable with no files/figures.
+
+def test_on_shot_fires_only_on_frame_change_with_clients():
+    """on_shot pre-build hook fires exactly once per frame advance, and ONLY
+    while >=1 client is registered (no client -> no wasted GIL-held build)."""
+    calls = {"n": 0}
+    frames = [("0", 1.0)]
+    hub = dsh.EventHub(read_frame_id=lambda: frames[0],
+                       read_queue_mtime=lambda: None,
+                       on_shot=lambda: calls.__setitem__("n", calls["n"] + 1))
+    hub.poll_once()                     # seed (no client)
+    frames[0] = ("1", 2.0)
+    hub.poll_once()                     # frame change but NO client -> no fire
+    assert calls["n"] == 0
+
+    q = hub.register()                  # now a client is watching
+    hub.poll_once()                     # same frame -> no change -> no fire
+    assert calls["n"] == 0
+    frames[0] = ("0", 3.0)
+    hub.poll_once()                     # frame change WITH client -> fire once
+    assert calls["n"] == 1
+    _ = q  # keep the client registered
+
+
+def test_on_shot_error_does_not_kill_poll():
+    """A failing pre-build is best-effort: swallowed, the shot event still
+    publishes, and the watcher keeps running."""
+    frames = [("0", 1.0)]
+
+    def boom():
+        raise RuntimeError("prebuild blew up")
+
+    hub = dsh.EventHub(read_frame_id=lambda: frames[0],
+                       read_queue_mtime=lambda: None, on_shot=boom)
+    q = hub.register()
+    hub.poll_once()                     # seed
+    frames[0] = ("1", 2.0)
+    evs = hub.poll_once()              # must not raise
+    assert evs == [{"topic": "shot", "frame": "1"}]
+    assert q.get_nowait() == {"topic": "shot", "frame": "1"}
+
+
+def test_prebuild_populates_default_key_cache(monkeypatch):
+    """_prebuild_default_fragments builds every group figure for the current
+    frame into _LIVE_FIG_CACHE under the DEFAULT arg key, so a default-arg
+    request is a pure cache read. Stub the data + builder so it's file-free."""
+    monkeypatch.setattr(dsh, "_read_data", lambda: {"_write_seq": 7})
+    built = []
+    monkeypatch.setattr(dsh, "_build_fig_json",
+                        lambda d, name, **kw: built.append(name) or ('{"n":"%s"}' % name))
+    dsh._LIVE_FIG_CACHE["key"] = None
+    dsh._LIVE_FIG_CACHE["frag"] = {}
+    dsh._prebuild_default_fragments()
+    assert dsh._LIVE_FIG_CACHE["key"] == (7,) + dsh._LIVE_FIG_DEFAULT_ARGS
+    assert set(dsh._LIVE_FIG_CACHE["frag"].keys()) == set(dsh._LIVE_FIG_NAMES)
+    assert set(built) == set(dsh._LIVE_FIG_NAMES)
+
+
+def test_prebuild_fills_gaps_without_clobbering(monkeypatch):
+    """If a request already opened this frame's default key and built some
+    fragments, the prebuild fills only the MISSING names (identical data) rather
+    than discarding the request's work."""
+    monkeypatch.setattr(dsh, "_read_data", lambda: {"_write_seq": 3})
+    monkeypatch.setattr(dsh, "_build_fig_json",
+                        lambda d, name, **kw: "PREBUILT:%s" % name)
+    key = (3,) + dsh._LIVE_FIG_DEFAULT_ARGS
+    # A request already installed the key + one hand-built fragment.
+    dsh._LIVE_FIG_CACHE["key"] = key
+    dsh._LIVE_FIG_CACHE["frag"] = {"array": "REQUEST_BUILT"}
+    dsh._prebuild_default_fragments()
+    frag = dsh._LIVE_FIG_CACHE["frag"]
+    assert frag["array"] == "REQUEST_BUILT"                 # not clobbered
+    assert frag["load"] == "PREBUILT:load"                  # gap filled
+    assert set(frag.keys()) == set(dsh._LIVE_FIG_NAMES)
+
+
+def test_prebuild_noop_without_write_seq(monkeypatch):
+    """No frame written yet (_write_seq is None) -> prebuild is a safe no-op."""
+    monkeypatch.setattr(dsh, "_read_data", lambda: {})
+    dsh._LIVE_FIG_CACHE["key"] = "sentinel"
+    dsh._LIVE_FIG_CACHE["frag"] = {}
+    dsh._prebuild_default_fragments()
+    assert dsh._LIVE_FIG_CACHE["key"] == "sentinel"         # unchanged
