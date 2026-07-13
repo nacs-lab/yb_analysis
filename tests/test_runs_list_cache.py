@@ -75,7 +75,13 @@ def test_mtime_change_reenriches(data_root, monkeypatch):
     st = os.stat(h5)
     os.utime(h5, (st.st_atime + 100, st.st_mtime + 100))
 
-    rl.list_runs(use_cache=True)            # mtime changed -> re-enrich
+    # An mtime change re-enriches -- BUT the live-growing throttle suppresses the
+    # re-open within _LIVE_REENRICH_MIN_S of the last enrich (see
+    # test_growing_scan_reenrich_is_throttled). Age the entry past the window so
+    # this asserts the mtime-change -> re-enrich contract without the throttle.
+    rl._ENRICH_CACHE['20260101120000']['enriched_at'] -= (rl._LIVE_REENRICH_MIN_S + 5)
+
+    rl.list_runs(use_cache=True)            # mtime changed + window elapsed -> re-enrich
     assert len(calls) == 2
 
 
@@ -157,6 +163,38 @@ def test_persisted_cache_survives_restart(data_root, monkeypatch):
     rows = rl.list_runs(use_cache=True)
     assert len(rows) == 2
     assert calls == []                            # zero file-opening enriches
+
+
+def test_growing_scan_reenrich_is_throttled(data_root, monkeypatch):
+    """A live-growing scan's .h5 mtime advances every shot. Without throttling,
+    every poll re-opens its (multi-GB, actively-written) .h5 -> seconds of stall.
+    The throttle must serve cached fields and skip the re-open within the window,
+    then re-enrich once the window elapses."""
+    import time
+    d = _make_scan(data_root, '20260101', '120000')
+    h5 = os.path.join(d, 'data_20260101_120000.h5')
+
+    calls = []
+    orig = rl._enrich_meta
+    monkeypatch.setattr(
+        rl, '_enrich_meta',
+        lambda sd, row: (calls.append(row['scan_id']), orig(sd, row))[1])
+
+    rl.list_runs(use_cache=True)                  # cold enrich
+    assert len(calls) == 1
+    calls.clear()
+
+    # Simulate 4 growth polls (bump the .h5 mtime each time) inside the window.
+    for i in range(4):
+        os.utime(h5, (time.time(), time.time() + i + 1))
+        rl.list_runs(use_cache=True)
+    assert calls == []                            # throttled: no re-open
+
+    # Age the entry past the throttle window -> one re-enrich.
+    rl._ENRICH_CACHE['20260101120000']['enriched_at'] -= (rl._LIVE_REENRICH_MIN_S + 5)
+    os.utime(h5, (time.time(), time.time() + 99))
+    rl.list_runs(use_cache=True)
+    assert calls == ['20260101120000']
 
 
 def test_dehydrated_scan_is_skipped_not_opened(data_root, monkeypatch):

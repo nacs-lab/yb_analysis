@@ -46,6 +46,12 @@ _ENRICH_CACHE_MAX = 20000         # hard cap; clear wholesale past this (cheap t
 _ENRICH_CACHE_LOADED = False      # lazy one-time load of the persisted cache
 _ENRICH_CACHE_DIRTY = False       # true when a new/changed scan was enriched
 _PERSIST_VERSION = 1
+# Min seconds between re-opening a LIVE-GROWING scan's .h5 during a listing. The
+# runs list polls every ~3 s; the running scan's .h5 mtime advances every shot,
+# so without this we'd re-open its actively-written multi-GB file on every poll
+# (seconds of stall under the writer's disk contention). Only n_actual_shots
+# goes briefly stale in between; the rest of the metadata is fixed for the run.
+_LIVE_REENRICH_MIN_S = 15.0
 # Fields produced by ``_enrich_meta`` that are cached/restored. Cheap stat-based
 # flags (has_diag/has_code/has_grid/complete) are recomputed fresh each pass.
 _ENRICH_FIELDS = (
@@ -140,8 +146,12 @@ def _save_persisted_cache() -> None:
     with _ENRICH_CACHE_LOCK:
         if not _ENRICH_CACHE_DIRTY:
             return
+        # Persist only {mtime, enriched} -- drop the per-process monotonic
+        # enriched_at (meaningless across restarts).
         snapshot = {'_version': _PERSIST_VERSION,
-                    'entries': dict(_ENRICH_CACHE)}
+                    'entries': {sid: {'mtime': e.get('mtime'),
+                                      'enriched': e.get('enriched')}
+                                for sid, e in _ENRICH_CACHE.items()}}
         _ENRICH_CACHE_DIRTY = False
     path = _persist_path()
     try:
@@ -319,6 +329,7 @@ def _enrich_meta_cached(scan_dir: Path, row: dict) -> None:
     advances as shots are appended.
     """
     global _ENRICH_CACHE_DIRTY
+    import time as _time
     base = scan_dir.name
     h5_path = scan_dir / f'{base}.h5'
     try:
@@ -336,6 +347,19 @@ def _enrich_meta_cached(scan_dir: Path, row: dict) -> None:
         # opening the file. Also accept a hit when we CAN'T stat the mtime but an
         # entry exists (better a slightly-stale name than blocking on hydrate).
         hit = ent is not None and (ent.get('mtime') == mtime or mtime is None)
+        # THROTTLE the live-growing current scan. Its .h5 mtime advances every
+        # shot, so a strict mtime check misses on EVERY 3 s poll -> we'd re-open
+        # its actively-written multi-GB .h5 each time, which stalls for seconds
+        # under the writer's disk contention (the residual "loading still slow").
+        # When an entry exists but the mtime advanced, serve the cached fields
+        # and skip the re-open unless _LIVE_REENRICH_MIN_S elapsed since the last
+        # enrich of THIS scan. Only n_actual_shots goes briefly stale (cosmetic);
+        # everything else (name/swept/params) is fixed for the run's lifetime.
+        if not hit and ent is not None and mtime is not None:
+            last = ent.get('enriched_at', 0.0)
+            if (_time.monotonic() - last) < _LIVE_REENRICH_MIN_S:
+                row.update(ent['enriched'])
+                hit = True
         if hit:
             row.update(ent['enriched'])
     if hit:
@@ -353,7 +377,11 @@ def _enrich_meta_cached(scan_dir: Path, row: dict) -> None:
     with _ENRICH_CACHE_LOCK:
         if len(_ENRICH_CACHE) >= _ENRICH_CACHE_MAX:
             _ENRICH_CACHE.clear()   # wholesale reset; cheap to rebuild incrementally
-        _ENRICH_CACHE[sid] = {'mtime': mtime, 'enriched': enriched}
+        # enriched_at (monotonic, per-process) throttles re-enriching a growing
+        # scan; NOT persisted (meaningless across restarts -> loaded entries get
+        # 0.0 and re-enrich once, harmlessly).
+        _ENRICH_CACHE[sid] = {'mtime': mtime, 'enriched': enriched,
+                              'enriched_at': _time.monotonic()}
         _ENRICH_CACHE_DIRTY = True
 
 
