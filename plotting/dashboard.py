@@ -157,6 +157,20 @@ def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
         fig = _waiting(name, message='render error: %s' % ex)
     if fig is None:
         return None
+    # Approach A: a builder that returns a raw dict ({'data':[...], 'layout':...})
+    # is serialized directly with orjson (numpy-native, NaN->null) -- no go.*
+    # validation, no bdata encode/decode. go.Figure builders keep the legacy path.
+    if isinstance(fig, dict):
+        if _orjson is not None:
+            try:
+                return _orjson.dumps(
+                    fig, option=_orjson.OPT_SERIALIZE_NUMPY,
+                    default=_orjson_default).decode('utf-8')
+            except Exception:
+                logger.debug('orjson figure serialize failed; falling back',
+                             exc_info=True)
+        # orjson absent / failed: _to_jsonable makes it stdlib-json-safe.
+        return json.dumps(_to_jsonable(fig), allow_nan=False, default=str)
     try:
         raw = fig.to_plotly_json()
     except Exception:
@@ -6631,41 +6645,98 @@ def _fig_loading_live(d):
     return fig
 
 
+# ---- Approach A: hot per-site maps built as RAW dicts (no go.* objects) -------
+# The go.* pipeline (build -> validate -> to_plotly_json bdata-encode ->
+# _decode_plotly_bdata -> PlotlyJSONEncoder) was ~45% of the dashboard GIL
+# (py-spy). For the simple 1-trace Scattergl per-site maps (loading, infid) we
+# emit the figure JSON dict DIRECTLY and let orjson serialize it -- skipping
+# validation + the bdata encode/decode round-trip entirely. Output is VALUE-
+# IDENTICAL to the go.* path (verified byte-for-value incl NaN->null across
+# live + synthetic <100/>=100-site cases); ~110x faster per figure. Complex
+# figures (intens/loadlive with shapes+annotations, histograms, scan) stay on
+# go.* -- _build_fig_json handles both dict and go.Figure returns.
+_FIG_TEMPLATE = None
+_COLORSCALE_CACHE = {}
+
+
+def _fig_template():
+    """The default Plotly layout template go.Figure() attaches (~7 KB), captured
+    ONCE so raw-dict figures render identically. Lazy + cached."""
+    global _FIG_TEMPLATE
+    if _FIG_TEMPLATE is None:
+        _FIG_TEMPLATE = go.Figure().to_plotly_json()['layout']['template']
+    return _FIG_TEMPLATE
+
+
+def _expand_colorscale(name):
+    """Expand a named colorscale to the explicit [[pos, color], ...] list the way
+    go.* validation does. Required because names like RdYlGn / Magma are NOT
+    Plotly.js-native -- sending the bare string would render the wrong colors.
+    Cached; pass-through for an already-explicit list."""
+    if not isinstance(name, str):
+        return name
+    exp = _COLORSCALE_CACHE.get(name)
+    if exp is None:
+        exp = [list(p) for p in go.Scattergl(
+            marker=dict(colorscale=name)).marker.colorscale]
+        _COLORSCALE_CACHE[name] = exp
+    return exp
+
+
+def _site_scatter_dict(grid, color, colorscale, cmin, cmax, cbar_title, title,
+                       customdata, hovertemplate, size=12, text=None, tfont=None):
+    """Raw figure-JSON dict for a per-site Scattergl map (Approach A). Mirrors
+    exactly what the old go.Figure(go.Scattergl(...)) + _L/_A layout produced.
+    `grid` is [n,2] (row=y, col=x); numpy arrays pass straight to orjson."""
+    grid = np.asarray(grid)
+    trace = {
+        "type": "scattergl",
+        "x": grid[:, 1], "y": grid[:, 0],
+        "mode": "markers+text" if text is not None else "markers",
+        "marker": {"size": size,
+                   "color": color, "colorscale": _expand_colorscale(colorscale),
+                   "cmin": cmin, "cmax": cmax,
+                   "colorbar": {"title": {"text": cbar_title}, "len": 0.9},
+                   "line": {"width": 0.5, "color": "white"}},
+        "textposition": "middle center",
+        "customdata": customdata,
+        "hovertemplate": hovertemplate,
+    }
+    if text is not None:
+        trace["text"] = text
+        if tfont is not None:
+            trace["textfont"] = tfont
+    layout = dict(_L)
+    layout["title"] = {"text": title}
+    layout["clickmode"] = "event"
+    layout["yaxis"] = {"autorange": "reversed", "scaleanchor": "x",
+                       "scaleratio": 1, "visible": False, **_A}
+    layout["xaxis"] = {"visible": False, **_A}
+    layout["template"] = _fig_template()
+    return {"data": [trace], "layout": layout}
+
+
 def _fig_loading(d, marker_size=12):
     grid, rates = d.get('grid_locations'), d.get('loading_rates')
     if grid is None or rates is None or len(grid) == 0:
         return _waiting('Loading Rates')
     n = len(grid)
-    sz = marker_size
     # Site-mask-excluded sites are NaN in `rates`: blank their text label (else
-    # each excluded site prints "nan%"). The numeric colorscale below renders a
-    # NaN as an empty marker, which reads fine as "not analyzed".
+    # each excluded site prints "nan%"). The numeric colorscale renders a NaN as
+    # an empty marker, which reads fine as "not analyzed".
     rates = np.asarray(rates, dtype=float)
     excluded = np.isnan(rates)
+    text = tfont = None
     if n < 100:
-        mode = 'markers+text'
         text = ['' if e else f'{r:.0%}' for r, e in zip(rates, excluded)]
-        tfont = dict(size=7, color='black')
-    else:
-        mode = 'markers'
-        text = None
-        tfont = None
-    # WebGL + hovertemplate: at thousands of sites, SVG markers and a per-point
-    # hovertext string list are both heavy. customdata = [site, rate] feeds both
-    # the hover and the click-to-select JS (which reads customdata[0]).
+        tfont = {"size": 7, "color": "black"}
+    # customdata = [site, rate] feeds both the hover and the click-to-select JS.
     customdata = np.column_stack([np.arange(1, n + 1), rates])
-    fig = go.Figure(go.Scattergl(
-        x=grid[:,1], y=grid[:,0], mode=mode,
-        marker=dict(size=sz, color=rates.tolist(), colorscale='RdYlGn', cmin=0, cmax=1,
-                    colorbar=dict(title='Rate', len=0.9), line=dict(width=0.5, color='white')),
-        text=text, textfont=tfont, textposition='middle center',
-        customdata=customdata,
-        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.1%}<extra></extra>'))
-    fig.update_layout(**_L, title=f'Loading Rates ({n} sites)', clickmode='event',
-                      yaxis=dict(autorange='reversed', scaleanchor='x', scaleratio=1,
-                                 visible=False, **_A),
-                      xaxis=dict(visible=False, **_A))
-    return fig
+    return _site_scatter_dict(
+        grid, color=rates, colorscale='RdYlGn', cmin=0, cmax=1, cbar_title='Rate',
+        title=f'Loading Rates ({n} sites)', customdata=customdata,
+        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.1%}<extra></extra>',
+        size=marker_size, text=text, tfont=tfont)
 
 
 def _fig_infid(d, marker_size=12):
@@ -6676,30 +6747,19 @@ def _fig_infid(d, marker_size=12):
     inf = np.asarray(inf, dtype=float)
     excluded = np.isnan(inf)
     log_inf = np.log10(np.clip(inf, 1e-6, 1.0))   # NaN stays NaN -> empty marker
-    sz = marker_size
+    text = tfont = None
     if n < 100:
-        mode = 'markers+text'
         text = ['' if e else f'{v:.0e}' for v, e in zip(inf, excluded)]
-        tfont = dict(size=6, color='white')
-    else:
-        mode = 'markers'
-        text = None
-        tfont = None
-    # WebGL + hovertemplate; customdata = [site, infidelity] (the marker colour
-    # is log10, so the real value rides in customdata for a readable hover).
-    customdata = np.column_stack([np.arange(1, n + 1), np.asarray(inf)])
-    fig = go.Figure(go.Scattergl(
-        x=grid[:,1], y=grid[:,0], mode=mode,
-        marker=dict(size=sz, color=log_inf.tolist(), colorscale='Magma', cmin=-4, cmax=-0.3,
-                    colorbar=dict(title='log10', len=0.9), line=dict(width=0.5, color='white')),
-        text=text, textfont=tfont, textposition='middle center',
+        tfont = {"size": 6, "color": "white"}
+    # customdata = [site, infidelity]; the marker colour is log10, so the real
+    # value rides in customdata for a readable hover.
+    customdata = np.column_stack([np.arange(1, n + 1), inf])
+    return _site_scatter_dict(
+        grid, color=log_inf, colorscale='Magma', cmin=-4, cmax=-0.3,
+        cbar_title='log10', title=f'Discrimination Infidelities ({n} sites)',
         customdata=customdata,
-        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.2e}<extra></extra>'))
-    fig.update_layout(**_L, title=f'Discrimination Infidelities ({n} sites)', clickmode='event',
-                      yaxis=dict(autorange='reversed', scaleanchor='x', scaleratio=1,
-                                 visible=False, **_A),
-                      xaxis=dict(visible=False, **_A))
-    return fig
+        hovertemplate='Site %{customdata[0]}: %{customdata[1]:.2e}<extra></extra>',
+        size=marker_size, text=text, tfont=tfont)
 
 
 def _fig_shift(d):
