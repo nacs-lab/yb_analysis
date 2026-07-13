@@ -1029,6 +1029,42 @@ def _to_jsonable(x):
     return x
 
 
+# orjson (C JSON serializer) serializes numpy natively (OPT_SERIALIZE_NUMPY) and
+# emits null for NaN/Inf -- VALUE-IDENTICAL to the _to_jsonable + stdlib-json path
+# (verified across numpy int/uint/bool/float, NaN/Inf, 2-D, nested, bytes), but in
+# C. It's the hot serialize on /api/snapshot (~2.5 MB of per-site arrays every
+# poll; py-spy showed json iterencode ~33% of the dashboard's GIL). Import-guarded:
+# absent -> fall back to jsonify(_to_jsonable(...)), byte-for-value the same.
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
+
+
+def _orjson_default(o):
+    """Fallback for the few types orjson's numpy mode doesn't cover: bytes ->
+    str, and anything exotic (datetime/set/custom) via _to_jsonable (which
+    returns an orjson-serializable value)."""
+    if isinstance(o, bytes):
+        return o.decode('utf-8', errors='replace')
+    return _to_jsonable(o)
+
+
+def _fast_json_response(obj):
+    """A JSON Flask Response for ``obj`` via orjson when available (C, numpy-
+    native, NaN->null), else jsonify(_to_jsonable(obj)). Both produce the same
+    JSON values. Use for /api/* payloads carrying big numpy per-site arrays."""
+    from flask import Response, jsonify
+    if _orjson is not None:
+        try:
+            body = _orjson.dumps(
+                obj, option=_orjson.OPT_SERIALIZE_NUMPY, default=_orjson_default)
+            return Response(body, mimetype='application/json')
+        except Exception:
+            logger.debug('orjson serialize failed; falling back', exc_info=True)
+    return jsonify(_to_jsonable(obj))
+
+
 # Keys served by each /api/* endpoint. Each maps to a subset of the
 # dashboard's plot-data dict; everything that's downsampled-image-only
 # is excluded (those live in _HEAVY_KEYS and are stripped from /snapshot).
@@ -1957,9 +1993,10 @@ def _register_api_routes(server):
         # Strip the megabyte-scale image data URIs (Live tab fetches PNG
         # bytes via /api/live/imageN), but keep _img_shape / vlo / vhi so
         # the dashboard's Plotly.js heatmap-with-overlay knows the
-        # geometry + colour range.
-        return jsonify(_to_jsonable(
-            {k: v for k, v in d.items() if k not in _SNAPSHOT_HEAVY_KEYS}))
+        # geometry + colour range. orjson serialize (C) -- this ~2.5 MB of
+        # per-site arrays every poll was the top GIL consumer (json iterencode).
+        return _fast_json_response(
+            {k: v for k, v in d.items() if k not in _SNAPSHOT_HEAVY_KEYS})
 
     # ---- Loading-pattern affine + registry (calibration) ----
     # The global SLM->camera affine and the per-pattern grid registry live as
