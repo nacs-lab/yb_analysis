@@ -45,6 +45,11 @@
     // Global control-panel refresh on NON-Live tabs (queue / runner / camera).
     // Live is covered by pollLive's 500ms; elsewhere this keeps it fresh.
     ctrlpanel: 1500,
+    // Detection-thresholds card: its OWN slow loop (was chained into pollLive at
+    // per-shot rate). The data changes only on a refit (~200 shots) and feeds a
+    // display-only health card, so 10 s is ample; keeping it off the per-shot
+    // chain removes a ~1.9 s serial await that gated the whole live cadence.
+    thresholds: 10000,
   };
 
   // WS-active SAFETY-NET intervals. When the /ws/events push is up, shot/queue
@@ -856,6 +861,12 @@
     // own loop, gated to the Live tab. Fetched together so they always show ONE shot;
     // the fast `live` loop above streams the aggregate maps/histograms independently.
     loop("snapshot", pollSnapshot,  () => pollIvl("snapshot"),  () => activeTab === "live");
+    // Detection-thresholds card: its OWN slow loop, Live-tab gated -- OFF the
+    // per-shot pollLive chain (its data only changes on a refit ~every 200 shots
+    // and it's a display-only card, so a per-shot serial fetch was pure waste
+    // that gated the whole live cadence). Not kicked by shot events -- the 10 s
+    // timer is plenty; the live countdown renders from the last fetch.
+    loop("thresholds", pollThresholds, POLL.thresholds, () => activeTab === "live");
     // Hardware tab is a self-contained iframe to the SLM dashboard --
     // it owns its own polling. We DON'T poll /api/slm/* here, or we
     // get null-querySelector crashes against UI elements that only
@@ -1357,8 +1368,12 @@
     await pollSiteHist();
     // Affine-alignment card (small JSON; re-renders only when it changes).
     await pollAffine();
-    // Detection-thresholds & calibration card (per-pattern audit log + health).
-    await pollThresholds();
+    // NOTE: the Detection-thresholds card is NOT polled here. Its data only
+    // changes on a threshold refit (~every 200 shots), it feeds a display-only
+    // health card (nothing downstream consumes it), and its fetch is a serial
+    // ~1.9 s await under load -- polling it per shot made it the bottleneck that
+    // gated the whole pollLive cadence. It now has its own slow loop (10 s), so
+    // it's off the per-shot path. See loop("thresholds", ...) in startPolling.
   }
 
   // Compact queue preview in the Yb Control sidebar — mirrors the Tkinter

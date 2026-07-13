@@ -89,13 +89,16 @@ _LIVE_FIG_NAMES = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
 _LIVE_FIG_DEFAULT_ARGS = (12, '01', 0, ())
 
 
-def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on):
+def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
+                  use_img_url=False):
     """Build ONE live Plotly figure by name (the name->builder dispatch shared by
     the request handler and the eager pre-builder). ``boxes_on(name)`` -> bool
-    selects the green/red per-site overlay for the array panels. Returns a Figure
-    or None for an unknown name; raises are handled by the caller."""
+    selects the green/red per-site overlay for the array panels. ``use_img_url``
+    makes the array panels reference the out-of-band binary image endpoint
+    instead of baking base64 (see _fig_array). Returns a Figure or None for an
+    unknown name; raises are handled by the caller."""
     if name == 'array':
-        return _fig_array(d, show_boxes=boxes_on('array'))
+        return _fig_array(d, show_boxes=boxes_on('array'), use_img_url=use_img_url)
     if name == 'array_mid':
         return _fig_array(d, img_key='_img_mid_data_uri',
                           shape_key='_img_mid_shape',
@@ -103,7 +106,8 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on):
                           logicals_key='logicals_mid',
                           grid_key='grid_locations',
                           title='Tweezer Array (middle)',
-                          show_boxes=boxes_on('array_mid'))
+                          show_boxes=boxes_on('array_mid'),
+                          use_img_url=use_img_url)
     if name == 'array2':
         return _fig_array(d, img_key='_img2_data_uri',
                           shape_key='_img2_shape',
@@ -112,7 +116,8 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on):
                           grid_key=('grid_locations_img2'
                                     if d.get('is_two_array') else 'grid_locations'),
                           title='Tweezer Array (img 2)',
-                          show_boxes=boxes_on('array2'))
+                          show_boxes=boxes_on('array2'),
+                          use_img_url=use_img_url)
     if name == 'intens':   return _fig_intens(d)
     if name == 'loadlive': return _fig_loading_live(d)
     if name == 'load':     return _fig_loading(d, marker_size=marker_size)
@@ -131,19 +136,22 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on):
 
 
 def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
-                    boxes_off=()):
+                    boxes_off=(), use_img_url=True):
     """Serialized JSON string for one live figure -- a pure function of
     ``(d, render-args)`` so it can run on a request thread OR the eager
     pre-build worker. ``boxes_off`` is the set of array-panel names whose overlay
-    is toggled off. Returns None for an unknown name; a build error becomes a
-    'render error' waiting panel (same as the old inline path)."""
+    is toggled off. ``use_img_url`` (default True for this HTTP path) references
+    the out-of-band binary image endpoint from the array panels instead of baking
+    base64. Returns None for an unknown name; a build error becomes a 'render
+    error' waiting panel (same as the old inline path)."""
     import plotly.utils as _putils
     boxes_off = set(boxes_off)
 
     def _boxes_on(nm):
         return nm not in boxes_off
     try:
-        fig = _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, _boxes_on)
+        fig = _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, _boxes_on,
+                            use_img_url=use_img_url)
     except Exception as ex:
         logger.exception('_build_fig_json %s failed', name)
         fig = _waiting(name, message='render error: %s' % ex)
@@ -810,6 +818,39 @@ def _log_refresh_profile(n, t0, t_read, t_build, emitted):
 # EVERY time" (measured 3-16 s under load) into "read only the new tail" (~ms).
 _THRESHOLD_SCALARS_CACHE = {}
 _THRESHOLD_SCALARS_LOCK = threading.Lock()
+
+# Cache of the registered loading-pattern NAMES (for the thresholds card's pattern
+# dropdown), keyed on the patterns dir's mtime. list_patterns() reads ~31 record.json
+# files off OneDrive (~37 ms) every call; the pattern SET changes only when one is
+# added/edited (which bumps the dir mtime), so a stat-gated cache serves the common
+# poll for ~free. Value: (dir_mtime, [names]).
+_PATTERN_NAMES_CACHE = {'mtime': None, 'names': []}
+_PATTERN_NAMES_LOCK = threading.Lock()
+
+
+def _cached_pattern_names():
+    """Sorted registered loading-pattern names, cached on the patterns-dir mtime.
+
+    A new/edited pattern bumps the dir mtime -> cache refreshes; otherwise the
+    poll skips the ~31-file OneDrive read. Returns [] on any error."""
+    try:
+        import yb_analysis.analysis.pattern_registry as _regp
+        base = _regp._patterns_dir()
+        mtime = os.stat(base).st_mtime if base.is_dir() else None
+    except Exception:
+        return list(_PATTERN_NAMES_CACHE.get('names') or [])
+    with _PATTERN_NAMES_LOCK:
+        if _PATTERN_NAMES_CACHE.get('mtime') == mtime:
+            return list(_PATTERN_NAMES_CACHE['names'])
+    # Miss (first call or a pattern changed) -> re-read outside the lock.
+    try:
+        names = sorted(_regp.list_patterns().keys())
+    except Exception:
+        names = []
+    with _PATTERN_NAMES_LOCK:
+        _PATTERN_NAMES_CACHE['mtime'] = mtime
+        _PATTERN_NAMES_CACHE['names'] = names
+    return list(names)
 
 
 def _read_threshold_scalars(path, n):
@@ -1966,11 +2007,8 @@ def _register_api_routes(server):
         }
         # All registered loading patterns (names only) so the card's pattern
         # dropdown can list every loaded pattern, not just the running ones.
-        try:
-            import yb_analysis.analysis.pattern_registry as _regp
-            all_patterns = sorted(_regp.list_patterns().keys())
-        except Exception:
-            all_patterns = []
+        # mtime-cached: skips the ~37 ms OneDrive re-read when the set is unchanged.
+        all_patterns = _cached_pattern_names()
         return jsonify(_to_jsonable({
             'pattern': pattern, 'active_pattern': active_pattern,
             'active_pattern_img2': active_pattern_img2,
@@ -6078,22 +6116,48 @@ def _img_to_data_uri(img, max_dim=DASH_IMAGE_MAX_DIM,
     return f'data:image/png;base64,{b64}', vlo, vhi
 
 
+# Maps a camera-image data-URI key to the binary endpoint that serves the SAME
+# PNG bytes out-of-band (raw image/png, no base64, GIL-released socket send). The
+# HTTP live-figures path references these URLs from the layout image instead of
+# baking the ~2.3 MB base64 into the figure JSON (which the single-GIL process
+# must serialize through PlotlyJSONEncoder, serializing every other request
+# behind it). The legacy Dash callback keeps baking (use_img_url=False default).
+_IMG_URL_FOR_KEY = {
+    '_img_data_uri':     '/api/live/image1',
+    '_img_mid_data_uri': '/api/live/image_mid',
+    '_img2_data_uri':    '/api/live/image2',
+}
+
+
 def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
                vlo_key='_img_vlo', vhi_key='_img_vhi',
                logicals_key='logicals', grid_key='grid_locations',
-               title='Tweezer Array (img 1)', show_boxes=True):
+               title='Tweezer Array (img 1)', show_boxes=True,
+               use_img_url=False):
     data_uri = d.get(img_key)
     shape = d.get(shape_key)
-    # Only bake a layout image for a well-formed data URI. An empty/malformed
+    # Only render a layout image for a well-formed data URI. An empty/malformed
     # value would render as the browser's broken-image glyph in the panel;
-    # fall back to the clean "Waiting for data..." placeholder instead.
+    # fall back to the clean "Waiting for data..." placeholder instead. We gate
+    # on the data URI even in URL mode: it's the reliable "an image exists this
+    # frame" signal (the binary endpoint reads the same pickle key), and it
+    # carries the shape we size the axes with.
     if (not data_uri or not isinstance(data_uri, str)
             or not data_uri.startswith('data:') or shape is None):
         return _waiting(title)
     H, W = shape
+    # Out-of-band source: reference the binary endpoint (raw PNG) with a
+    # frame-keyed cache-buster so Plotly.js refetches when the frame advances
+    # (the URL is otherwise static). Falls back to the baked data URI when no
+    # endpoint is mapped for this key or URL mode is off.
+    img_source = data_uri
+    url_path = _IMG_URL_FOR_KEY.get(img_key) if use_img_url else None
+    if url_path is not None:
+        seq = d.get('_write_seq')
+        img_source = url_path + ('?t=%s' % seq if seq is not None else '')
     fig = go.Figure()
     fig.add_layout_image(
-        source=data_uri, xref='x', yref='y',
+        source=img_source, xref='x', yref='y',
         x=0, y=0, sizex=W, sizey=H,
         sizing='stretch', layer='below',
     )
