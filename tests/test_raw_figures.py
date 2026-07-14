@@ -123,3 +123,110 @@ def test_go_star_figures_untouched():
     # for a go.* builder returns valid JSON or None (no crash).
     for name in ("load", "infid"):
         assert json.loads(dsh._build_fig_json(d, name))  # dict path
+
+
+# ---- array panels (Approach A) ----------------------------------------------
+def _array_frame(n):
+    r = np.random.RandomState(3)
+    return {
+        "_write_seq": 9, "box_size": 11,
+        "_img_data_uri": "data:image/png;base64,AAAA",
+        "_img_shape": (2100, 2100), "_img_vlo": 192.0, "_img_vhi": 211.0,
+        "grid_locations": r.randint(50, 2050, (n, 2)),
+        "logicals": (r.rand(n) > 0.5).astype(float),
+    }
+
+
+def test_array_returns_raw_dict_with_image():
+    fig = dsh._fig_array(_array_frame(1068), use_img_url=True)
+    assert isinstance(fig, dict) and fig["data"][0]["type"] == "scatter"
+    assert fig["layout"]["images"][0]["source"] == "/api/live/image1?t=9"
+
+
+def test_array_gray_colorscale_is_expanded():
+    """The colorbar anchor's 'gray' scale must be expanded to an explicit list --
+    a bare 'gray' string is not a Plotly.js-native name."""
+    cs = dsh._fig_array(_array_frame(1068))["data"][0]["marker"]["colorscale"]
+    assert isinstance(cs, list) and isinstance(cs[0], list)
+    assert cs == dsh._expand_colorscale("gray")
+
+
+def test_array_overlay_traces_above_gl_threshold():
+    """n > _GL_SITES -> box outlines as Scattergl line traces (with NaN->null
+    line-breaks); n <= _GL_SITES -> rect shapes in the layout."""
+    big = dsh._fig_array(_array_frame(dsh._GL_SITES + 50), use_img_url=True)
+    gl = [t for t in big["data"] if t.get("type") == "scattergl" and t.get("mode") == "lines"]
+    assert gl, "expected Scattergl overlay traces above the GL threshold"
+    assert "shapes" not in big["layout"]
+
+    small = dsh._fig_array(_array_frame(80), use_img_url=True)
+    assert not [t for t in small["data"] if t.get("type") == "scattergl"]
+    assert small["layout"]["shapes"], "expected rect shapes below the GL threshold"
+    # <=200 sites also get a text-label trace
+    assert [t for t in small["data"] if t.get("mode") == "text"]
+
+
+def test_array_value_identical_to_go_star():
+    """_build_fig_json('array') must equal the old go.* output in JSON values,
+    across the large-n (overlay) and small-n (shapes+text) branches."""
+    import plotly.graph_objects as go
+
+    def norm(o):
+        if isinstance(o, dict): return {k: norm(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)): return [norm(v) for v in o]
+        if isinstance(o, np.ndarray): return norm(o.tolist())
+        if isinstance(o, np.integer): return int(o)
+        if isinstance(o, (float, np.floating)):
+            f = float(o); return f if np.isfinite(f) else None
+        if isinstance(o, np.bool_): return bool(o)
+        return o
+
+    _L, _A, _GL = dsh._L, dsh._A, dsh._GL_SITES
+
+    def golden(d, use_img_url=True):
+        H, W = d["_img_shape"]
+        src = "/api/live/image1?t=%s" % d.get("_write_seq") if use_img_url else d["_img_data_uri"]
+        f = go.Figure()
+        f.add_layout_image(source=src, xref="x", yref="y", x=0, y=0,
+                           sizex=W, sizey=H, sizing="stretch", layer="below")
+        vlo, vhi = d["_img_vlo"], d["_img_vhi"]
+        f.add_trace(go.Scatter(x=[0, W, 0, W], y=[0, 0, H, H], mode="markers",
+            marker=dict(size=0.1, opacity=0, color=[vlo, vhi, vlo, vhi],
+                        colorscale="gray", cmin=vlo, cmax=vhi, showscale=True,
+                        colorbar=dict(title="Counts", len=0.9)),
+            hoverinfo="skip", showlegend=False))
+        grid = np.asarray(d["grid_locations"]); n = len(grid); box = d.get("box_size", 11)
+        occ = np.asarray(d["logicals"][:n], dtype=float)
+        exc = np.isnan(occ); loaded = (occ >= 0.5) & ~exc; empty = ~loaded & ~exc
+        if n > _GL:
+            half = box/2.0; ys = grid[:, 0].astype(float); xs = grid[:, 1].astype(float)
+            ox = np.array([-half, half, half, -half, -half, np.nan])
+            oy = np.array([-half, -half, half, half, -half, np.nan])
+            bx = xs[:, None]+ox[None, :]; by = ys[:, None]+oy[None, :]
+            for sel, c in ((loaded, "#00ff88"), (empty, "#ff4444"), (exc, "#555555")):
+                if not sel.any(): continue
+                f.add_trace(go.Scattergl(x=bx[sel].ravel(), y=by[sel].ravel(), mode="lines",
+                            line=dict(color=c, width=1.5), hoverinfo="skip", showlegend=False))
+        else:
+            half = box/2; sh = []
+            for i in range(n):
+                y0, x0 = grid[i]
+                c = "#555555" if exc[i] else "#00ff88" if loaded[i] else "#ff4444"
+                sh.append(dict(type="rect", x0=x0-half, y0=y0-half, x1=x0+half, y1=y0+half,
+                               line=dict(color=c, width=2)))
+            f.update_layout(shapes=sh)
+        if n <= 200:
+            f.add_trace(go.Scatter(x=grid[:, 1], y=grid[:, 0]-box/2-3, mode="text",
+                text=[str(i+1) for i in range(n)], textfont=dict(color="#ffdd44", size=7),
+                hoverinfo="skip", showlegend=False))
+        f.update_layout(**_L, title="Tweezer Array (img 1)",
+            xaxis=dict(range=[0, W], showgrid=False, zeroline=False, **_A),
+            yaxis=dict(range=[H, 0], scaleanchor="x", scaleratio=1,
+                       showgrid=False, zeroline=False, **_A))
+        return f
+
+    for n in (1068, dsh._GL_SITES + 1, dsh._GL_SITES, 80):
+        d = _array_frame(n)
+        g = norm(dsh._decode_plotly_bdata(golden(d).to_plotly_json()))
+        new = json.loads(dsh._build_fig_json(d, "array"))
+        assert g == new, f"array n={n} diverged"

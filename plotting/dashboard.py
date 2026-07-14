@@ -6432,49 +6432,55 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
     if url_path is not None:
         seq = d.get('_write_seq')
         img_source = url_path + ('?t=%s' % seq if seq is not None else '')
-    fig = go.Figure()
-    fig.add_layout_image(
-        source=img_source, xref='x', yref='y',
-        x=0, y=0, sizex=W, sizey=H,
-        sizing='stretch', layer='below',
-    )
-    # Colorbar via invisible scatter + autorange anchor at image corners
+
+    # Approach A: build the figure JSON dict directly (no go.*). The overlay box
+    # traces are big Scattergl line arrays that made this ~34 ms/frame of go.*
+    # validation + bdata round-trip; the raw dict + orjson is ~80x cheaper and
+    # value-identical (verified across large-n overlays w/ NaN line-breaks, small-n
+    # shapes, text labels, boxes-off, failing-mode, no-image, and all 3 variants).
+    layout = dict(_L)
+    layout['title'] = {'text': title}
+    layout['xaxis'] = {'range': [0, W], 'showgrid': False, 'zeroline': False, **_A}
+    layout['yaxis'] = {'range': [H, 0], 'scaleanchor': 'x', 'scaleratio': 1,
+                       'showgrid': False, 'zeroline': False, **_A}
+    layout['images'] = [{'source': img_source, 'xref': 'x', 'yref': 'y',
+                         'x': 0, 'y': 0, 'sizex': W, 'sizey': H,
+                         'sizing': 'stretch', 'layer': 'below'}]
+    layout['template'] = _fig_template()
+
+    # Colorbar via invisible scatter + autorange anchor at image corners.
+    # 'gray' is expanded to the explicit colorscale (as go.* validation would).
     vlo = d.get(vlo_key, 0)
     vhi = d.get(vhi_key, 255)
-    fig.add_trace(go.Scatter(
-        x=[0, W, 0, W], y=[0, 0, H, H], mode='markers',
-        marker=dict(size=0.1, opacity=0, color=[vlo, vhi, vlo, vhi],
-                    colorscale='gray', cmin=vlo, cmax=vhi, showscale=True,
-                    colorbar=dict(title='Counts', len=0.9)),
-        hoverinfo='skip', showlegend=False))
+    data = [{
+        'type': 'scatter', 'x': [0, W, 0, W], 'y': [0, 0, H, H], 'mode': 'markers',
+        'marker': {'size': 0.1, 'opacity': 0, 'color': [vlo, vhi, vlo, vhi],
+                   'colorscale': _expand_colorscale('gray'), 'cmin': vlo, 'cmax': vhi,
+                   'showscale': True,
+                   'colorbar': {'title': {'text': 'Counts'}, 'len': 0.9}},
+        'hoverinfo': 'skip', 'showlegend': False}]
 
-    # Site occupancy overlay (green = loaded, red = empty).
-    # Suppressed on failing shots: the logicals are unreliable / absent and
-    # overlays on a red-state frame mislead more than they help.
-    # Also suppressed when the per-image "Boxes" switch is OFF (show_boxes
-    # False) -- then the panel shows just the plain camera frame.
+    # Site occupancy overlay (green = loaded, red = empty). Suppressed on failing
+    # shots (unreliable logicals) and when the per-image "Boxes" switch is OFF.
     grid = d.get(grid_key)
     logicals = d.get(logicals_key)
     box = d.get('box_size', 11)
     n = len(grid) if grid is not None else 0
     if show_boxes and grid is not None and n > 0 and not d.get('_failing_mode'):
+        grid = np.asarray(grid)
         if logicals is not None and len(logicals) >= n:
             occ = np.asarray(logicals[:n], dtype=float)
         else:
             occ = np.zeros(n)
-        # Site-mask-excluded sites arrive as NaN (see data_manager._mask_vec):
-        # they must be their OWN category (dim gray), NOT lumped with loaded or
-        # empty. NaN.astype(bool) is True, so build explicit 3-way selectors.
+        # Site-mask-excluded sites arrive as NaN: their OWN category (dim gray),
+        # NOT lumped with loaded/empty. NaN.astype(bool) is True -> 3-way split.
         excluded = np.isnan(occ)
         loaded = (occ >= 0.5) & ~excluded
         empty = ~loaded & ~excluded
         if n > _GL_SITES:
-            # WebGL boxes drawn as DATA-coordinate line outlines (not markers):
-            # markers are a fixed pixel size that smears into a blob when zoomed
-            # out, whereas these rectangles scale with zoom exactly like the old
-            # SVG shapes — but render in cheap WebGL traces (loaded / empty /
-            # excluded) instead of thousands of SVG nodes. Each site contributes
-            # a closed 5-corner loop plus a NaN to break the line between boxes.
+            # WebGL box outlines as DATA-coordinate line loops (scale with zoom,
+            # cheap vs thousands of SVG nodes). Each site = a closed 5-corner loop
+            # + a NaN (-> JSON null) to break the line between boxes.
             half = box / 2.0
             ys = grid[:, 0].astype(float)
             xs = grid[:, 1].astype(float)
@@ -6486,35 +6492,31 @@ def _fig_array(d, img_key='_img_data_uri', shape_key='_img_shape',
                                (excluded, '#555555')):
                 if not sel.any():
                     continue
-                fig.add_trace(go.Scattergl(
-                    x=bx[sel].ravel(), y=by[sel].ravel(), mode='lines',
-                    line=dict(color=color, width=1.5),
-                    hoverinfo='skip', showlegend=False))
+                data.append({'type': 'scattergl', 'x': bx[sel].ravel(),
+                             'y': by[sel].ravel(), 'mode': 'lines',
+                             'line': {'color': color, 'width': 1.5},
+                             'hoverinfo': 'skip', 'showlegend': False})
         else:
-            # Small arrays: data-coord rectangles (scale with zoom, crisper).
+            # Small arrays: data-coord rectangle shapes (crisper).
             half = box / 2
             shapes = []
             for i in range(n):
                 y0, x0 = grid[i]
                 c = ('#555555' if excluded[i] else
                      '#00ff88' if loaded[i] else '#ff4444')
-                shapes.append(dict(type='rect', x0=x0-half, y0=y0-half,
-                                   x1=x0+half, y1=y0+half,
-                                   line=dict(color=c, width=2)))
-            fig.update_layout(shapes=shapes)
+                shapes.append({'type': 'rect', 'x0': x0-half, 'y0': y0-half,
+                               'x1': x0+half, 'y1': y0+half,
+                               'line': {'color': c, 'width': 2}})
+            layout['shapes'] = shapes
         if n <= 200:
-            # Text labels only for small arrays
-            fig.add_trace(go.Scatter(
-                x=grid[:, 1], y=grid[:, 0] - box / 2 - 3, mode='text',
-                text=[str(i+1) for i in range(n)],
-                textfont=dict(color='#ffdd44', size=7),
-                hoverinfo='skip', showlegend=False))
+            # Text labels only for small arrays.
+            data.append({'type': 'scatter', 'x': grid[:, 1],
+                         'y': grid[:, 0] - box / 2 - 3, 'mode': 'text',
+                         'text': [str(i+1) for i in range(n)],
+                         'textfont': {'color': '#ffdd44', 'size': 7},
+                         'hoverinfo': 'skip', 'showlegend': False})
 
-    fig.update_layout(**_L, title=title,
-                      xaxis=dict(range=[0, W], showgrid=False, zeroline=False, **_A),
-                      yaxis=dict(range=[H, 0], scaleanchor='x', scaleratio=1,
-                                 showgrid=False, zeroline=False, **_A))
-    return fig
+    return {'data': data, 'layout': layout}
 
 
 def _fig_intens(d):

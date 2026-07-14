@@ -43,29 +43,30 @@ def _fake_frame(seq=5):
     }
 
 
+# _fig_array now returns a raw dict (Approach A); access via ['layout']/['data'].
 def test_url_mode_references_endpoint_not_base64():
     d = _fake_frame(seq=7)
     fig = dsh._fig_array(d, use_img_url=True)
-    src = fig.layout.images[0].source
+    src = fig["layout"]["images"][0]["source"]
     assert src == "/api/live/image1?t=7"
     # the heavy base64 must NOT be in the figure at all
-    assert "data:image" not in json.dumps(fig.to_plotly_json(), default=str)
+    assert "data:image" not in json.dumps(fig, default=str)
 
 
 def test_legacy_mode_still_bakes_base64():
-    """The legacy Dash-callback path (no use_img_url) is unchanged: it bakes the
-    data URI so the old page keeps working with no extra fetch."""
+    """No use_img_url (the legacy path): the image source stays the baked base64
+    data URI, so the old dcc page keeps working with no extra fetch."""
     d = _fake_frame()
     fig = dsh._fig_array(d)                       # default use_img_url=False
-    assert fig.layout.images[0].source.startswith("data:image")
+    assert fig["layout"]["images"][0]["source"].startswith("data:image")
 
 
 def test_url_mode_carries_frame_cache_buster():
     """The ?t=<_write_seq> cache-buster makes Plotly.js refetch each frame."""
     assert dsh._fig_array(_fake_frame(seq=1), use_img_url=True
-                          ).layout.images[0].source == "/api/live/image1?t=1"
+                          )["layout"]["images"][0]["source"] == "/api/live/image1?t=1"
     assert dsh._fig_array(_fake_frame(seq=2), use_img_url=True
-                          ).layout.images[0].source == "/api/live/image1?t=2"
+                          )["layout"]["images"][0]["source"] == "/api/live/image1?t=2"
 
 
 def test_url_mode_maps_each_panel_to_its_endpoint():
@@ -74,16 +75,16 @@ def test_url_mode_maps_each_panel_to_its_endpoint():
                          use_img_url=True)
     two = dsh._fig_array(d, img_key="_img2_data_uri", shape_key="_img2_shape",
                          use_img_url=True)
-    assert mid.layout.images[0].source.startswith("/api/live/image_mid?t=")
-    assert two.layout.images[0].source.startswith("/api/live/image2?t=")
+    assert mid["layout"]["images"][0]["source"].startswith("/api/live/image_mid?t=")
+    assert two["layout"]["images"][0]["source"].startswith("/api/live/image2?t=")
 
 
 def test_url_mode_preserves_box_overlay():
-    """Moving the image out-of-band must NOT drop the green/red site overlay."""
+    """Moving the image out-of-band must NOT drop the green/red site overlay
+    (colorbar anchor trace + the box overlay in data or layout.shapes)."""
     d = _fake_frame()
     fig = dsh._fig_array(d, use_img_url=True, show_boxes=True)
-    # colorbar anchor + at least one overlay trace
-    assert len(fig.data) >= 1
+    assert len(fig["data"]) >= 1
 
 
 def test_missing_image_falls_back_to_waiting_both_modes():
