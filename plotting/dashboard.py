@@ -83,14 +83,15 @@ _LIVE_FIG_NAMES = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
                    'load', 'infid', 'shift', 'scan', 'avghist',
                    'rep0', 'rep1', 'rep2')
 # The render-arg tuple the Live tab sends when NOTHING is customized (marker_size
-# 12, colorbar 0-1, site 1, all box overlays ON). The eager pre-builder targets
-# exactly this key so the common-case poll finds a ready fragment; any customized
-# request has a different arg_key and falls back to an inline build (unchanged).
-_LIVE_FIG_DEFAULT_ARGS = (12, '01', 0, ())
+# 12, colorbar 0-1, site 1, all box overlays ON, no scan-panel axis overrides).
+# The eager pre-builder targets exactly this key so the common-case poll finds a
+# ready fragment; any customized request has a different arg_key and falls back
+# to an inline build (unchanged).
+_LIVE_FIG_DEFAULT_ARGS = (12, '01', 0, (), None)
 
 
 def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
-                  use_img_url=False):
+                  use_img_url=False, scan_opts=None):
     """Build ONE live Plotly figure by name (the name->builder dispatch shared by
     the request handler and the eager pre-builder). ``boxes_on(name)`` -> bool
     selects the green/red per-site overlay for the array panels. ``use_img_url``
@@ -123,7 +124,8 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
     if name == 'load':     return _fig_loading(d, marker_size=marker_size)
     if name == 'infid':    return _fig_infid(d, marker_size=marker_size)
     if name == 'shift':    return _fig_shift(d)
-    if name == 'scan':     return _fig_scan_curve(d, cbar_scale=cbar_scale)
+    if name == 'scan':     return _fig_scan_curve(d, cbar_scale=cbar_scale,
+                                                  scan_opts=scan_opts)
     if name == 'avghist':  return _fig_avghist(d)
     if name in ('rep0', 'rep1', 'rep2', 'rep3'):
         figs = _reps_cached(d)          # built ONCE per frame, shared by rep0/1/2
@@ -136,7 +138,7 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
 
 
 def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
-                    boxes_off=(), use_img_url=True):
+                    boxes_off=(), use_img_url=True, scan_opts=None):
     """Serialized JSON string for one live figure -- a pure function of
     ``(d, render-args)`` so it can run on a request thread OR the eager
     pre-build worker. ``boxes_off`` is the set of array-panel names whose overlay
@@ -151,7 +153,7 @@ def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
         return nm not in boxes_off
     try:
         fig = _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, _boxes_on,
-                            use_img_url=use_img_url)
+                            use_img_url=use_img_url, scan_opts=scan_opts)
     except Exception as ex:
         logger.exception('_build_fig_json %s failed', name)
         fig = _waiting(name, message='render error: %s' % ex)
@@ -3332,6 +3334,24 @@ def _register_api_routes(server):
             marker_size = 12
         cbar_scale = request.args.get('cbar_scale', '01')
 
+        # Scan-panel axis overrides (both optional; None = default behavior):
+        #   ?scan_slice_dim=k  -- 3-D scans: which dim (0/1/2) the slice slider
+        #                         walks (the other two form the heatmap).
+        #   ?scan_x=j          -- coupled 1-D scans: which coupled param labels
+        #                         the x-axis.
+        def _int_arg(nm):
+            v = request.args.get(nm)
+            if v in (None, ''):
+                return None
+            try:
+                return int(v)
+            except ValueError:
+                return None
+        _slice_dim = _int_arg('scan_slice_dim')
+        _scan_x = _int_arg('scan_x')
+        scan_opts = ((_slice_dim, _scan_x)
+                     if (_slice_dim is not None or _scan_x is not None) else None)
+
         # Per-image green/red site-box overlay toggle (default ON). The Live tab
         # sends ?boxes_<name>=0 for any array panel whose "Boxes" switch is off,
         # so that panel renders just the plain camera frame.
@@ -3364,7 +3384,7 @@ def _register_api_routes(server):
         boxes_key = tuple(sorted(
             (k[len('boxes_'):], v) for k, v in request.args.items()
             if k.startswith('boxes_')))
-        arg_key = (seq, marker_size, cbar_scale, site_idx, boxes_key)
+        arg_key = (seq, marker_size, cbar_scale, site_idx, boxes_key, scan_opts)
 
         def _frag(name, frags):
             """Serialized JSON string for one figure, memoized in ``frags`` (the
@@ -3382,7 +3402,7 @@ def _register_api_routes(server):
             # request's `d` + render args, so a custom-arg fragment is correct.
             s = _build_fig_json(d, name, marker_size=marker_size,
                                 cbar_scale=cbar_scale, site_idx=site_idx,
-                                boxes_off=_boxes_off)
+                                boxes_off=_boxes_off, scan_opts=scan_opts)
             frags[name] = s
             return s
 
@@ -3780,6 +3800,13 @@ def _register_api_routes(server):
         if not rec:
             return jsonify({'error': f'unknown pattern {name!r}'}), 404
         body = request.get_json(silent=True) or {}
+        # Diagnostic: log exactly what the client asked for (clear vs how many
+        # indices) so a "save did nothing" report is traceable in the dash log.
+        _idx = body.get('indices')
+        logger.info('site_mask POST name=%s clear=%s n_indices=%s n_sites=%s',
+                    name, bool(body.get('clear')),
+                    (len(_idx) if isinstance(_idx, list) else _idx),
+                    body.get('n_sites'))
         if body.get('clear'):
             _pr.set_pattern_site_mask(name, None)
             return jsonify({'ok': True, 'cleared': True, 'name': name})
@@ -6798,7 +6825,7 @@ def _fig_shift(d):
     return fig
 
 
-def _fig_scan_curve(d, cbar_scale='01'):
+def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
     sc = d.get('scan_curve')
     if sc is None or sc.get('mode') == 'undefined':
         # 0d (no swept axis): fall back to a per-shot time series so the
@@ -6806,6 +6833,12 @@ def _fig_scan_curve(d, cbar_scale='01'):
         # `loading_history`, which the data manager already maintains
         # as a rolling window of fraction-loaded per shot.
         return _fig_scan_timeseries(d)
+
+    slice_dim, scan_x = (scan_opts if scan_opts else (None, None))
+
+    # --- >= 3-D: data cube, one heatmap slice at a time + slider ---
+    if sc.get('ndim', 1) >= 3:
+        return _fig_scan_3d(d, sc, cbar_scale=cbar_scale, slice_dim=slice_dim)
 
     # --- 2-D heatmap ---
     if sc.get('ndim', 1) >= 2:
@@ -6817,10 +6850,42 @@ def _fig_scan_curve(d, cbar_scale='01'):
     err = sc['y_sem']
     n_reps = sc['n_reps']
     mode = sc['mode']
+
+    scan_name = d.get('scan_name', 'Scan')
+    x_label = d.get('scan_param_path') or scan_name
+
+    # Coupled sweep: several params vary together along the one axis. Show every
+    # coupled value in the hover, and let ?scan_x=j pick which one labels the
+    # x-axis (default j=0 = the primary param). Switching x re-sorts all series
+    # by that param so the curve reads monotonically along it.
+    coupled = sc.get('coupled')
+    if coupled and len(coupled) > 1:
+        j = scan_x if (scan_x is not None and 0 <= scan_x < len(coupled)) else 0
+        xj = np.asarray(coupled[j]['values'], dtype=float)
+        if xj.size == x.size:
+            reorder = np.argsort(xj)
+            x = xj[reorder]
+            y = y[reorder]
+            err = err[reorder]
+            n_reps = n_reps[reorder]
+            x_label = coupled[j]['name'] or x_label
+            # Reorder the per-point coupled values to match (for the hover).
+            coupled_vals = []
+            for c in coupled:
+                cv = np.asarray(c['values'], dtype=float)
+                coupled_vals.append((c['name'], cv[reorder] if cv.size == x.size else None))
+        else:
+            coupled_vals = None
+    else:
+        coupled_vals = None
+
     mask = n_reps > 0
     if not np.any(mask):
         return _waiting('Scan Curve')
     x, y, err, n_reps = x[mask], y[mask], err[mask], n_reps[mask]
+    if coupled_vals:
+        coupled_vals = [(nm, (v[mask] if v is not None else None))
+                        for nm, v in coupled_vals]
 
     scale = d.get('plot_scale', 1)
     if scale and scale != 0 and scale != 1:
@@ -6828,8 +6893,6 @@ def _fig_scan_curve(d, cbar_scale='01'):
     else:
         x_disp = x
 
-    scan_name = d.get('scan_name', 'Scan')
-    x_label = d.get('scan_param_path') or scan_name
     if mode == 'survival':
         y_label = 'Survival — TP (target)' if sc.get('target_aware') else 'Survival'
     elif mode == 'rearrangement':
@@ -6837,17 +6900,28 @@ def _fig_scan_curve(d, cbar_scale='01'):
     else:
         y_label = 'Loading Rate'
 
+    # Hover: primary x + y ± err + n, plus every OTHER coupled param's value.
+    def _hover(i):
+        parts = [f'{x_label}={x_disp[i]:.4g}']
+        if coupled_vals:
+            for nm, v in coupled_vals:
+                if v is not None and nm != x_label:
+                    parts.append(f'{nm}={v[i]:.4g}')
+        parts.append(f'{y_label}={y[i]:.3f}+/-{err[i]:.3f} (n={n_reps[i]})')
+        return ', '.join(parts)
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=x_disp, y=y, error_y=dict(type='data', array=err, visible=True, thickness=1.5),
         mode='markers', marker=dict(size=6, color='#44aaff'),
-        hoverinfo='text', hovertext=[f'{x_label}={xi:.4g}, {y_label}={yi:.3f}+/-{ei:.3f} (n={ni})'
-                                      for xi, yi, ei, ni in zip(x_disp, y, err, n_reps)]))
-    title_text = _scan_title(f'{scan_name} ({int(n_reps.mean())} reps/pt)',
-                             d.get('scan_filename'))
-    fig.update_layout(**_L, title=title_text,
-                      xaxis=dict(title=x_label, **_A),
+        hoverinfo='text', hovertext=[_hover(i) for i in range(len(x_disp))]))
+    n_extra = (len(coupled) - 1) if (coupled and len(coupled) > 1) else 0
+    x_axis_title = f'{x_label}  (+{n_extra} coupled)' if n_extra else x_label
+    fig.update_layout(**_L,
+                      xaxis=dict(title=x_axis_title, **_A),
                       yaxis=dict(title=y_label, range=[-0.05, 1.05], **_A))
+    _scan_caption(fig, f'{scan_name} ({int(n_reps.mean())} reps/pt)',
+                  d.get('scan_filename'))
     if sc.get('target_aware'):
         fig.add_annotation(
             xref='paper', yref='paper', x=0.0, y=1.0, xanchor='left', yanchor='top',
@@ -6914,22 +6988,41 @@ def _fig_scan_timeseries(d):
             text='⌖ target-aware (diag)', showarrow=False,
             font=dict(size=10, color='#3fb950'),
             bgcolor='rgba(0,0,0,0.35)', borderpad=2)
-    title = _scan_title(d.get('scan_name') or 'Scan (0d)',
-                        d.get('scan_filename'))
-    fig.update_layout(**_L, title=title,
+    fig.update_layout(**_L,
                       xaxis=dict(title='Shot # (oldest → latest)', **_A),
                       yaxis=dict(title=y_label,
                                  tickformat='.0%', autorange=True, **_A))
+    _scan_caption(fig, d.get('scan_name') or 'Scan (0d)', d.get('scan_filename'))
     return fig
 
 
-def _scan_title(main, fname):
-    """Scan-panel title with the run/folder name shown inline and clearly
-    (bright, larger) next to the main title rather than as a faint subtitle."""
-    if not fname:
-        return main
-    run = fname[:-3] if fname.endswith('.h5') else fname  # strip .h5 → run folder
-    return f'{main}  <span style="font-size:14px;color:#7cc4ff">— {run}</span>'
+def _scan_caption(fig, main, fname, bottom=64):
+    """Scan-panel caption. The scan name + reps/pt + run/folder used to be the
+    big Plotly top title, which overflowed the narrow panel AND collided with
+    the control cluster pinned to the top-right corner. Instead drop the real
+    title and paint it small along the very BOTTOM of the panel, below the
+    x-axis label (the top corners stay clear for the expand button + controls).
+
+    ``bottom`` is the bottom margin reserved for (x-axis label + caption). The
+    x-axis title auto-centres in the UPPER part of that margin; the caption is
+    pinned to the panel's very bottom edge, so with enough margin the two don't
+    overlap."""
+    if fname:
+        run = fname[:-3] if fname.endswith('.h5') else fname  # strip .h5 → run folder
+        text = f'{main}  <span style="color:#7cc4ff">— {run}</span>'
+    else:
+        text = main
+    # No Plotly title; trim the top margin (was 35) since the top corners now
+    # only hold the overlay controls. Reserve `bottom` for x-axis label + caption.
+    fig.update_layout(title=None, margin=dict(l=40, r=15, t=14, b=bottom))
+    # Pin to the panel's very bottom edge (paper y=0 = plot-area floor, so shift
+    # down by the full bottom margin, +2px off the edge). The x-axis title sits
+    # higher in the margin, so the caption lands strictly beneath it.
+    fig.add_annotation(
+        xref='paper', yref='paper', x=0.5, y=0, xanchor='center', yanchor='bottom',
+        yshift=-bottom + 2, text=text, showarrow=False,
+        font=dict(size=9, color=TEXT))
+    return fig
 
 
 def _fmt_tick(v):
@@ -7041,12 +7134,167 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
 
     xtv, xtt = _tickset(xv)
     ytv, ytt = _tickset(yv)
-    title_text = _scan_title(f'{scan_name} ({avg_reps} reps/pt)', d.get('scan_filename'))
-    fig.update_layout(**_L, title=title_text,
+    fig.update_layout(**_L,
                       xaxis=dict(title=x_name, tickmode='array',
                                  tickvals=xtv, ticktext=xtt, **_A),
                       yaxis=dict(title=y_name, tickmode='array',
                                  tickvals=ytv, ticktext=ytt, **_A))
+    _scan_caption(fig, f'{scan_name} ({avg_reps} reps/pt)', d.get('scan_filename'))
+    return fig
+
+
+def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
+    """Render a >= 3-D scan as a heatmap of two axes + a slider over the third.
+
+    ``slice_dim`` (0/1/2) chooses which axis the slider walks; the other two
+    become the heatmap's x (lower index) and y (higher index). Default = 2
+    (the outermost / rarest axis, usually few points). Every slice is baked
+    into the figure as a Plotly frame with its own slider step, so the whole
+    cube is browsable client-side with no Dash callback. The slider defaults
+    to the slice holding the most-recently-scanned cell.
+    """
+    cube = sc.get('cube')            # (s2, s1, s0) = (dim2, dim1, dim0)
+    n_reps = sc.get('n_reps')
+    if cube is None or n_reps is None or not np.any(n_reps > 0):
+        return _waiting('Scan 3D')
+
+    cube = np.asarray(cube, dtype=float)
+    n_reps = np.asarray(n_reps)
+    dims = sc.get('dims') or []
+    if len(dims) < 3:
+        return _waiting('Scan 3D')
+    # dims[0]=dim0 (cube axis 2), dims[1]=dim1 (axis 1), dims[2]=dim2 (axis 0).
+    axis_of_dim = {0: 2, 1: 1, 2: 0}     # scan-dim -> numpy axis in the cube
+
+    sdim = slice_dim if (slice_dim is not None and 0 <= slice_dim < 3) else 2
+    plane_dims = [k for k in (0, 1, 2) if k != sdim]   # [x_dim, y_dim]
+    xd, yd = plane_dims[0], plane_dims[1]
+    x_ax, y_ax, s_ax = axis_of_dim[xd], axis_of_dim[yd], axis_of_dim[sdim]
+
+    x_name = dims[xd]['name']
+    y_name = dims[yd]['name']
+    s_name = dims[sdim]['name']
+    xv = np.asarray(dims[xd]['values'], dtype=float)
+    yv = np.asarray(dims[yd]['values'], dtype=float)
+    sv = np.asarray(dims[sdim]['values'], dtype=float)
+
+    scale = d.get('plot_scale', 1)
+    if scale and scale not in (0, 1):
+        xv = xv * scale
+
+    mode = sc.get('mode', 'survival')
+    if mode == 'survival':
+        y_label = 'TP (target)' if sc.get('target_aware') else 'Survival'
+    elif mode == 'rearrangement':
+        y_label = 'Rearrange'
+    else:
+        y_label = 'Loading'
+    zmin, zmax = (None, None) if cbar_scale == 'auto' else (0, 1)
+
+    nx, ny, ns = xv.size, yv.size, sv.size
+    x_idx = np.arange(nx)
+    y_idx = np.arange(ny)
+
+    def _slice(mat, s):
+        """2-D (ny, nx) slice at slider position ``s`` on the slice axis, with
+        the two plane axes ordered (y_ax, x_ax) for the heatmap."""
+        sl = np.take(mat, s, axis=s_ax)      # now 2-D over the two plane axes
+        # sl's remaining axes are the two plane cube-axes in ascending order.
+        rem = [a for a in (0, 1, 2) if a != s_ax]     # ascending
+        # We want (y_ax_pos, x_ax_pos). Map each plane cube-axis to sl's axis.
+        y_pos = rem.index(y_ax)
+        x_pos = rem.index(x_ax)
+        return np.transpose(sl, (y_pos, x_pos))
+
+    Xv = np.broadcast_to(xv.reshape(1, nx), (ny, nx))
+    Yv = np.broadcast_to(yv.reshape(ny, 1), (ny, nx))
+    sem = sc.get('sem')
+    sem = np.asarray(sem, dtype=float) if sem is not None else None
+
+    def _frame_data(s):
+        z2 = _slice(cube, s)
+        nr2 = _slice(n_reps, s)
+        z = np.where(nr2 > 0, z2, np.nan)
+        if sem is not None:
+            sm2 = _slice(sem, s)
+            cd = np.dstack([Xv, Yv, nr2, sm2])
+            ht = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
+                  f'{y_name}=%{{customdata[1]:.4g}}<br>'
+                  f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}<br>'
+                  f'reps=%{{customdata[2]:d}}<extra></extra>')
+        else:
+            cd = np.dstack([Xv, Yv, nr2])
+            ht = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
+                  f'{y_name}=%{{customdata[1]:.4g}}<br>'
+                  f'{y_label}=%{{z:.3f}}<br>reps=%{{customdata[2]:d}}<extra></extra>')
+        return z, cd, ht
+
+    # Current-scan cell: which slider position + (x_idx, y_idx) to outline.
+    cur = sc.get('current') or []
+    if isinstance(cur, dict):
+        cur = [cur]
+    idx_of_dim = {0: 'x_idx', 1: 'y_idx', 2: 'z_idx'}
+    cur_by_slice = {}
+    default_s = None
+    for cell in cur:
+        cs = cell.get(idx_of_dim[sdim])
+        cx = cell.get(idx_of_dim[xd])
+        cy = cell.get(idx_of_dim[yd])
+        if cs is None or not (0 <= cs < ns):
+            continue
+        cur_by_slice.setdefault(cs, []).append((cx, cy))
+        if default_s is None:
+            default_s = cs
+    if default_s is None:
+        default_s = 0
+
+    def _boxes(s):
+        shapes = []
+        for (cx, cy) in cur_by_slice.get(s, []):
+            if cx is None or cy is None or not (0 <= cx < nx) or not (0 <= cy < ny):
+                continue
+            shapes.append(dict(type='rect', xref='x', yref='y',
+                               x0=cx-0.5, x1=cx+0.5, y0=cy-0.5, y1=cy+0.5,
+                               line=dict(color='#ff0000', width=3),
+                               fillcolor='rgba(0,0,0,0)', layer='above'))
+        return shapes
+
+    # Base trace = the default slice; frames carry every slice.
+    z0, cd0, ht0 = _frame_data(default_s)
+    base = go.Heatmap(z=z0, x=x_idx, y=y_idx, colorscale='Viridis',
+                      zmin=zmin, zmax=zmax, colorbar=dict(title=y_label, len=0.9),
+                      customdata=cd0, hovertemplate=ht0)
+    frames = []
+    for s in range(ns):
+        z, cd, ht = _frame_data(s)
+        frames.append(go.Frame(
+            name=str(s),
+            data=[go.Heatmap(z=z, x=x_idx, y=y_idx, colorscale='Viridis',
+                             zmin=zmin, zmax=zmax, customdata=cd, hovertemplate=ht)],
+            layout=go.Layout(shapes=_boxes(s))))
+
+    steps = [dict(method='animate', label=f'{sv[s]:.4g}',
+                  args=[[str(s)], dict(mode='immediate',
+                                       frame=dict(duration=0, redraw=True),
+                                       transition=dict(duration=0))])
+             for s in range(ns)]
+    slider = dict(active=default_s, currentvalue=dict(prefix=f'{s_name} = '),
+                  pad=dict(t=30), steps=steps)
+
+    xtv, xtt = _tickset(xv)
+    ytv, ytt = _tickset(yv)
+    avg_reps = int(n_reps[n_reps > 0].mean()) if np.any(n_reps > 0) else 0
+    scan_name = d.get('scan_name', 'Scan')
+    fig = go.Figure(data=[base], frames=frames)
+    fig.update_layout(**_L,
+                      xaxis=dict(title=x_name, tickmode='array',
+                                 tickvals=xtv, ticktext=xtt, **_A),
+                      yaxis=dict(title=y_name, tickmode='array',
+                                 tickvals=ytv, ticktext=ytt, **_A),
+                      sliders=[slider], shapes=_boxes(default_s))
+    # Extra bottom room for the slice slider (caption is at the top now).
+    _scan_caption(fig, f'{scan_name} ({avg_reps} reps/pt, 3-D: slice {s_name})',
+                  d.get('scan_filename'), bottom=72)
     return fig
 
 

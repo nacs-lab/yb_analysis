@@ -1175,6 +1175,23 @@
     catch { return false; }
   })();
 
+  // Scan-panel axis pickers. scanSliceDim = which swept dim a >=3-D scan's
+  // slider walks (null = server default = outermost dim); scanXParam = which
+  // coupled param labels a coupled 1-D scan's x-axis (null = primary). Both
+  // ride the snapshot figures fetch as ?scan_slice_dim / ?scan_x. Persisted;
+  // reset to null when the running scan's axis signature changes (below).
+  let scanSliceDim = (() => {
+    const v = (() => { try { return localStorage.getItem("yb-dash-scan-slice-dim"); } catch { return null; } })();
+    return v == null || v === "" ? null : Number(v);
+  })();
+  let scanXParam = (() => {
+    const v = (() => { try { return localStorage.getItem("yb-dash-scan-x-param"); } catch { return null; } })();
+    return v == null || v === "" ? null : Number(v);
+  })();
+  // The scan-axes signature the dropdowns were last built for; a change means a
+  // new/different scan is running, so we rebuild + drop a now-invalid selection.
+  let _scanAxesSig = null;
+
   // Per-image green/red site-box overlay switches (img1 / middle / img2).
   // Persisted; default ON. OFF -> that panel renders the plain camera frame
   // (the figures endpoint gets ?boxes_<name>=0 and skips the overlay).
@@ -1214,6 +1231,73 @@
     // images; dim it so the operator knows it has no effect right now.
     const midSwitch = $("show-mid-switch");
     if (midSwitch) midSwitch.style.opacity = lastNumImages >= 3 ? "" : "0.45";
+  }
+
+  // Populate + show/hide the Scan-panel axis pickers from snapshot.scan_axes:
+  //   - >= 3-D scan: the "Slice" dropdown lists the swept dims (with sizes); the
+  //     chosen one is the slider axis in the 3-D heatmap figure.
+  //   - coupled 1-D scan: the "x-axis" dropdown lists the coupled params; the
+  //     chosen one labels the curve's x-axis.
+  // Each control hides when the running scan doesn't need it. A change in the
+  // axis signature (new scan) rebuilds the options and drops a stale selection.
+  function renderScanAxisControls(axes) {
+    const sliceCtl = $("scan-slice-dim-ctl");
+    const sliceSel = $("scan-slice-dim");
+    const xCtl = $("scan-x-ctl");
+    const xSel = $("scan-x");
+    if (!sliceCtl || !sliceSel || !xCtl || !xSel) return;
+
+    const dims = (axes && Array.isArray(axes.dims)) ? axes.dims : null;
+    const coupled = (axes && Array.isArray(axes.coupled)) ? axes.coupled : null;
+
+    // The axis-shape control set (Autoscale / Site mask / Slice / x-axis) only
+    // applies to a NON-LINEAR scan: a >= 3-D sweep (heatmap + slider) or a
+    // coupled 1-D sweep (several params per point). For a plain 1-D scan none
+    // of them do anything, so hide the whole set and keep the panel clean --
+    // leaving only the Cond. verify toggle, which is gated separately (below).
+    const shaped = $("scan-ctl-shaped");
+    if (shaped) {
+      const isShaped = (!!dims && dims.length >= 3)
+                    || (!!coupled && coupled.length > 1);
+      shaped.hidden = !isShaped;
+    }
+    // Signature = what the option lists depend on. Rebuild only when it changes.
+    const sig = JSON.stringify({
+      d: dims ? dims.map((x) => [x.name, x.size]) : null,
+      c: coupled ? coupled.map((x) => x.name) : null,
+    });
+    if (sig === _scanAxesSig) return;
+    _scanAxesSig = sig;
+    // New scan / different axes -> a persisted index may no longer be valid.
+    if (!dims || scanSliceDim == null || scanSliceDim >= dims.length) {
+      scanSliceDim = null;
+      try { localStorage.removeItem("yb-dash-scan-slice-dim"); } catch {}
+    }
+    if (!coupled || scanXParam == null || scanXParam >= coupled.length) {
+      scanXParam = null;
+      try { localStorage.removeItem("yb-dash-scan-x-param"); } catch {}
+    }
+
+    if (dims && dims.length >= 3) {
+      const def = dims.length - 1;   // server default = outermost dim
+      sliceSel.innerHTML = dims.map((dd, i) =>
+        `<option value="${i}">${escHtml(dd.name || ("dim" + i))}`
+        + ` (${dd.size})${i === def ? " — default" : ""}</option>`).join("");
+      sliceSel.value = String(scanSliceDim != null ? scanSliceDim : def);
+      sliceCtl.hidden = false;
+    } else {
+      sliceCtl.hidden = true;
+    }
+
+    if (coupled && coupled.length > 1) {
+      xSel.innerHTML = coupled.map((cc, i) =>
+        `<option value="${i}">${escHtml(cc.name || ("param" + i))}`
+        + `${i === 0 ? " — primary" : ""}</option>`).join("");
+      xSel.value = String(scanXParam != null ? scanXParam : 0);
+      xCtl.hidden = false;
+    } else {
+      xCtl.hidden = true;
+    }
   }
 
   // ---- Fast per-shot "shot #" tile (WS-driven, decoupled from pollLive) ----
@@ -1318,6 +1402,12 @@
       // owns the actual DOM/col-swap so the switch handler can reuse it.
       lastNumImages = snap.num_images != null ? Number(snap.num_images) : 0;
       applyMidVisibility();
+      // The "Cond. verify" toggle conditions survival on the MIDDLE frame, so
+      // it's meaningless unless the scan actually takes one (>= 3 images). Show
+      // it only then; hide it for 1-/2-image scans.
+      const svrSwitch = $("survival-ref-switch");
+      if (svrSwitch) svrSwitch.hidden = lastNumImages < 3;
+      renderScanAxisControls(snap.scan_axes);
       // Site picker bounds + info block.
       const ns = Math.max(1, Number(snap.num_sites || 1));
       const picker = $("site-pick");
@@ -2132,6 +2222,8 @@
     if (!showBoxes2)   boxParams.push("boxes_array2=0");
     let url = "/api/live/figures?group=snapshot";
     if (scanAutoscale) url += "&cbar_scale=auto";
+    if (scanSliceDim != null) url += "&scan_slice_dim=" + scanSliceDim;
+    if (scanXParam != null) url += "&scan_x=" + scanXParam;
     if (boxParams.length) url += "&" + boxParams.join("&");
     try { resp = await api(url); }
     catch (e) {
@@ -2175,6 +2267,33 @@
       // the annotation text -- so panels with no data still SHOW the
       // "Waiting for data..." label rather than going black.
       try {
+        if (Array.isArray(f.frames) && f.frames.length) {
+          // Figures with animation frames + a slider (the 3-D scan cube's slice
+          // browser). Plotly.react's positional form ignores `frames`; the
+          // object form applies them. Preserve the slider's active step across
+          // re-polls so a live 3-D scan doesn't snap back to the default slice
+          // on every refresh.
+          const prevActive = (el.layout && Array.isArray(el.layout.sliders)
+            && el.layout.sliders[0]) ? el.layout.sliders[0].active : null;
+          const layout = f.layout || {};
+          if (prevActive != null && Array.isArray(layout.sliders) && layout.sliders[0]) {
+            layout.sliders[0] = Object.assign({}, layout.sliders[0], { active: prevActive });
+          }
+          Plotly.react(el, {
+            data: f.data, layout: layout, frames: f.frames,
+            config: { displayModeBar: false, responsive: true },
+          });
+          // Re-show the frame matching the (preserved) active slider step so
+          // the heatmap + current-cell box match the slider on refresh.
+          if (prevActive != null && f.frames[prevActive]) {
+            Plotly.animate(el, [String(prevActive)], {
+              mode: "immediate",
+              frame: { duration: 0, redraw: true },
+              transition: { duration: 0 },
+            });
+          }
+          return;
+        }
         Plotly.react(el, f.data, f.layout || {}, {
           displayModeBar: false, responsive: true,
         });
@@ -4261,6 +4380,64 @@
     Plotly.react(el, [trace], layout, {displayModeBar: false, responsive: true});
   }
 
+  // A prominent, unmistakable banner stating whether a site mask is applied to
+  // THIS analysis and exactly what it does. Blank when no mask is active.
+  // Reads analyze_scan's site_mask_active / n_sites_used / site_mask_spec, plus
+  // per_site.site_mask_applied (which per-site maps actually got masked, so we
+  // can warn on a cross-grid run where survival/FP maps stay on the full array).
+  // The banner is rendered into a persistent SLOT in the run-meta, but its
+  // VISIBILITY is driven by the mask editor: it's shown only while the editor
+  // is open (maskEditEnter) and hidden when it closes (maskEditExit). So
+  // renderAnalysisDetail just emits the empty slot; refreshSiteMaskBanner()
+  // fills or clears it based on maskEdit.active + the current analysis.
+  function siteMaskBanner(r) {
+    return `<div id="site-mask-banner-slot"></div>`;
+  }
+
+  // Build the banner HTML for the active analysis (or "" if no mask / error-free
+  // full array). Called by refreshSiteMaskBanner while the editor is open.
+  function _siteMaskBannerHtml(r) {
+    if (r && r.site_mask_error) {
+      return `<div class="site-mask-banner bad" title="${escHtml(r.site_mask_error)}">`
+        + `⚠ site mask FAILED to apply — showing full array. `
+        + `<span class="mono">${escHtml(r.site_mask_error)}</span></div>`;
+    }
+    if (!r || !r.site_mask_active) {
+      // Editor open but no mask stored yet: tell the operator plainly.
+      return `<div class="site-mask-banner editing">`
+        + `✎ editing site mask — lasso a subset then Save (full array = no mask)</div>`;
+    }
+    const kept = r.n_sites_used, total = r.n_sites;
+    const spec = r.site_mask_spec || "";
+    const specShort = /[\\/]/.test(spec)
+      ? spec.replace(/^.*[\\/]patterns[\\/]/, "").replace(/[\\/]site_mask\.npy$/, "")
+      : spec;
+    const ps = r.per_site || {};
+    const applied = Array.isArray(ps.site_mask_applied) ? ps.site_mask_applied : null;
+    const sameGrid = ps.site_mask_same_grid;
+    let caveat = "";
+    if (applied && !sameGrid
+        && !applied.includes("survival_mean") && !applied.includes("tp_rate")) {
+      caveat = ` <span class="site-mask-caveat" title="This is a cross-grid rearrangement run: the survival/TP/FP maps are on the TARGET-site grid, a different site order than the mask (which is in the loading/init-grid order the mask editor uses). So the mask restricts the LOADING map + the site-averaged loading readout, but the target-grid survival/FP maps still show every site.">`
+        + `— applies to LOADING only (cross-grid; survival/FP maps are target-grid)</span>`;
+    }
+    const appliedTxt = applied && applied.length
+      ? ` · masks: <span class="mono">${escHtml(applied.join(", "))}</span>` : "";
+    return `<div class="site-mask-banner on" title="Analysis restricted to a site subset. `
+      + `The excluded traps still load atoms — they're just not counted. `
+      + `Stored per-pattern (site_mask.npy); edit via the per-site loading map's ✎ mask tool.">`
+      + `▣ SITE MASK ACTIVE — analyzing <b>${kept}</b> / ${total} sites`
+      + (specShort ? ` · <span class="mono">${escHtml(specShort)}</span>` : "")
+      + appliedTxt + caveat + `</div>`;
+  }
+
+  // Fill the run-meta banner slot iff the mask editor is open; else empty it.
+  function refreshSiteMaskBanner() {
+    const slot = $("site-mask-banner-slot");
+    if (!slot) return;
+    slot.innerHTML = maskEdit.active ? _siteMaskBannerHtml(activeAnalysis) : "";
+  }
+
   function renderAnalysisDetail(r) {
     const body = $("analysis-detail-body");
     const sweep = r.sweep || {};
@@ -4439,6 +4616,7 @@
         </div>` : ""}
       </div>
       <div class="run-meta">
+        ${siteMaskBanner(r)}
         <div>swept: <span class="mono">${(sweepG.cols || []).join(", ") || "(none)"}</span></div>
         ${ti ? `<div title="${escHtml(ti.source_note || "")}">thresholds: <span class="mono">${ti.source || "?"}</span>${
           (ti.patterns && ti.patterns.length) ? ` · pattern${ti.patterns.length === 1 ? "" : "s"}: <span class="mono">${escHtml(ti.patterns.join(", "))}</span>` : ""
@@ -4720,12 +4898,17 @@
     }
     let ax0 = realAxes[0], ax1 = realAxes[1];
     if (sweepPrefs.axisSwap) { const t = ax0; ax0 = ax1; ax1 = t; }
-    const xVals = (sweep.values || [])[ax0] || [];
-    const yVals = (sweep.values || [])[ax1] || [];
+    // useY (summary) is flat in scan-DESCRIPTOR order (column-major over the
+    // original axes). Label + index the grid with values_desc (same descriptor
+    // order) so cell (ix,jy) pairs with the value actually swept there. The
+    // sorted sweep.values would mislabel every cell for an out-of-order axis
+    // (e.g. step_size = [0, 1, .., -1, ..]); it stays the 1-D contract only.
+    const descVals = sweep.values_desc || sweep.values || [];
+    const xVals = descVals[ax0] || [];
+    const yVals = descVals[ax1] || [];
     const nx = xVals.length, ny = yVals.length;
     const xLabel = cols[ax0] || "x", yLabel2 = cols[ax1] || "y";
-    // useY is flattened in column-major over the original axes; map by
-    // (i over ax0, j over ax1) -> original linear index.
+    // map by (i over ax0, j over ax1) -> original linear index.
     const dim0orig = dims[realAxes[0]];
     const swap = sweepPrefs.axisSwap;
     const valAt = (ix, jy) => {
@@ -5169,6 +5352,13 @@
   }
 
   function renderPerSiteMaps(r) {
+    // While the mask editor is active, DON'T re-render the per-site maps: the
+    // loading map holds the live lasso selection + its select handler, and a
+    // Plotly.react here would wipe both mid-edit (the intermittent "lasso did
+    // nothing -> save cleared the mask" bug). A background growth-poll can fire
+    // renderAnalysisDetail while the operator is lassoing; skip it until the
+    // editor is closed (done/save/cancel all call maskEditExit first).
+    if (maskEdit.active) return;
     const ps = r.per_site;
     const infidCard = $("analysis-site-infid-card");
     if (!ps) {
@@ -5197,9 +5387,14 @@
     if (haveInfid) {
       // Infidelity may live on a different grid than the survival/FP maps
       // (cross-grid rearrangement: infidelity is on the init detection grid).
+      // Infidelity is on the init/detection grid — the SAME order as the site
+      // mask — so dim the excluded sites here regardless of same/cross grid.
+      const _smKeepInfid = Array.isArray(ps.site_mask_keep)
+        && ps.site_mask_keep.length === (ps.infid_x || ps.x || []).length
+        ? ps.site_mask_keep : null;
       plotSiteMap("plot-site-infid", "site-infid-info",
         ps.infid_x || ps.x, ps.infid_y || ps.y, ps.infidelity,
-        "Magma", "infidelity", {mode: "infid"});
+        "Magma", "infidelity", {mode: "infid", dimExcluded: _smKeepInfid});
     } else {
       const ie = $("plot-site-infid");
       if (ie) Plotly.purge(ie);
@@ -5212,7 +5407,8 @@
       });
       plotSiteMap("plot-site-loading", "site-loading-info",
         ps.loading_x || ps.x, ps.loading_y || ps.y,
-        ps.loading_init || ps.loading_rate, "Cividis", "loading", {});
+        ps.loading_init || ps.loading_rate, "Cividis", "loading",
+        {dimExcluded: Array.isArray(ps.site_mask_keep) ? ps.site_mask_keep : null});
       setupPathsOverlay(null);
       maskEditAfterRender(r);
       return;
@@ -5232,15 +5428,23 @@
     // pattern without losing the array context.
     const tgtMask = ps.is_target_site || null;
     const ntgtMask = ps.is_nontarget_site || null;
+    // Site-mask KEEP array (init/detection-grid order). The loading map is in
+    // this order (dim its excluded sites); the survival/FP maps are too ONLY on
+    // a same-grid run, else they're target-grid and the mask doesn't map to
+    // them (leave undimmed to avoid mislabeling). See siteMaskBanner's caveat.
+    const smKeep = Array.isArray(ps.site_mask_keep) ? ps.site_mask_keep : null;
+    const smSameGrid = ps.site_mask_same_grid;
     // Loading may live on a different grid than survival/FP (cross-grid run:
     // loading on the init grid, survival/FP on the target grid).
     plotSiteMap("plot-site-loading", "site-loading-info",
       ps.loading_x || ps.x, ps.loading_y || ps.y,
-      ps.loading_init || ps.loading_rate, "Cividis", "loading", {infoSuffix});
+      ps.loading_init || ps.loading_rate, "Cividis", "loading",
+      {infoSuffix, dimExcluded: smKeep});
     plotSiteMap("plot-site-survival", "site-survival-info",
       ps.x, ps.y, ps.survival_mean, "Viridis",
       tgtMask ? "TP (target survival)" : "survival",
       {mask: tgtMask, maskLabel: "target site", infoSuffix,
+       dimExcluded: smSameGrid ? smKeep : null,
        pathsOverlay: currentPathsOverlaySegments()});
     // No non-target sites at all (e.g. the target IS the whole final array)
     // => false positives are undefined everywhere. Hide the FP card rather
@@ -5254,7 +5458,8 @@
     } else {
       plotSiteMap("plot-site-fp", "site-fp-info",
         ps.x, ps.y, ps.fp_rate, "Plasma", "FP",
-        {mask: ntgtMask, maskLabel: "non-target site", infoSuffix});
+        {mask: ntgtMask, maskLabel: "non-target site", infoSuffix,
+         dimExcluded: smSameGrid ? smKeep : null});
     }
     maskEditAfterRender(r);
   }
@@ -5324,36 +5529,58 @@
     } catch { /* 404 / no mask -> keep all-selected */ }
     const bar = $("mask-edit-bar"); if (bar) bar.hidden = false;
     const btn = $("mask-edit-btn"); if (btn) btn.classList.add("active");
+    refreshSiteMaskBanner();   // banner shows ONLY while editing
     maskEditApplyPlot();
+  }
+
+  // The lasso-select handler. Kept as a named function so it can be RE-BOUND
+  // after every render: Plotly.react() (fired by re-analyze / the live poll
+  // re-rendering the loading map) wipes all .on() handlers. The old code
+  // guarded binding behind a one-shot `el._maskEditWired` flag, so after any
+  // re-render the handler was gone but the flag stayed true -> the lasso fired
+  // NOTHING, sel stayed all-selected, and save posted a clear. That was the
+  // intermittent "save didn't work / cleared instead" bug.
+  function _maskEditOnSelected(ev) {
+    // (fires with no points on an empty double-click clear -> ignore)
+    if (!maskEdit.active || !ev || !ev.points || !ev.points.length) return;
+    const picked = [];
+    ev.points.forEach((pt) => {
+      // Two customdata conventions reach this map, and the site-mask store is
+      // 0-BASED (server mask[idx]=True, rejects idx>=n_sites; Qt twin saves
+      // np.where(mask)[0]):
+      //   * The ANALYSIS-tab loading map is rendered by plotSiteMap (JS), whose
+      //     colored trace sets customdata = iIn = the 0-BASED canonical site
+      //     index (a plain scalar). Use it as-is -- NO -1.
+      //   * The Python _fig_loading (live tab) sets customdata = [site, value]
+      //     with a 1-BASED site number; subtract 1 there.
+      // Detect by shape: array => 1-based [site,val]; scalar => already 0-based.
+      // (An earlier version subtracted 1 unconditionally, which double-shifted
+      //  the analysis-tab indices -> the wrong sites lit up red / bottom-left.)
+      // Bg / dark-underlay / overlay traces carry no customdata and drop out.
+      const cd = pt.customdata;
+      let idx;
+      if (Array.isArray(cd)) idx = cd[0] - 1;      // [site(1-based), value]
+      else idx = cd;                                // 0-based scalar index
+      if (typeof idx === "number" && isFinite(idx) && idx >= 0) picked.push(idx);
+    });
+    if (!picked.length) return;
+    const modeSel = $("mask-edit-mode");
+    const mode = (modeSel && modeSel.value) || "replace";
+    if (mode === "replace") maskEdit.sel = new Set(picked);
+    else if (mode === "add") picked.forEach((i) => maskEdit.sel.add(i));
+    else picked.forEach((i) => maskEdit.sel.delete(i));
+    maskEditRefresh();
   }
 
   function maskEditApplyPlot() {
     const el = $("plot-site-loading");
     if (!el || !el.data || !maskEdit.active) return;
     Plotly.relayout(el, {dragmode: "lasso"});
-    if (!el._maskEditWired) {
-      el._maskEditWired = true;
-      el.on("plotly_selected", (ev) => {
-        // (fires with no points on an empty double-click clear -> ignore)
-        if (!maskEdit.active || !ev || !ev.points || !ev.points.length) return;
-        const picked = [];
-        ev.points.forEach((pt) => {
-          // customdata = canonical site index on the loading map (plain
-          // number; [idx, value] pairs only on the infid map). Bg/overlay
-          // traces carry no customdata and drop out here.
-          const cd = pt.customdata;
-          const idx = Array.isArray(cd) ? cd[0] : cd;
-          if (typeof idx === "number" && isFinite(idx)) picked.push(idx);
-        });
-        if (!picked.length) return;
-        const modeSel = $("mask-edit-mode");
-        const mode = (modeSel && modeSel.value) || "replace";
-        if (mode === "replace") maskEdit.sel = new Set(picked);
-        else if (mode === "add") picked.forEach((i) => maskEdit.sel.add(i));
-        else picked.forEach((i) => maskEdit.sel.delete(i));
-        maskEditRefresh();
-      });
-    }
+    // RE-BIND every call (Plotly.react wiped any prior binding). removeAllListeners
+    // first so we never stack duplicates across re-renders.
+    if (el.removeAllListeners) el.removeAllListeners("plotly_selected");
+    el.on("plotly_selected", _maskEditOnSelected);
+    el._maskEditWired = true;   // kept for back-compat; no longer gates binding
     maskEditRefresh();
   }
 
@@ -5391,6 +5618,7 @@
     const bar = $("mask-edit-bar"); if (bar) bar.hidden = true;
     const btn = $("mask-edit-btn"); if (btn) btn.classList.remove("active");
     setText("mask-edit-count", "");
+    refreshSiteMaskBanner();   // maskEdit.active is now false -> clears the banner
   }
 
   async function maskEditSave() {
@@ -5399,8 +5627,15 @@
       toast("empty selection — lasso at least one site", "warn");
       return;
     }
-    // Full array selected == no mask: store nothing, clear the record.
-    if (maskEdit.sel.size >= maskEdit.n) return maskEditClear();
+    // Full array selected == no mask: storing it would be a no-op, so this
+    // clears the record instead. Warn first -- reaching this by accident (a
+    // lasso that selected nothing, leaving the preloaded all-selected set)
+    // used to look like a successful save while actually clearing the mask.
+    if (maskEdit.sel.size >= maskEdit.n) {
+      toast("all sites selected = no mask; clearing the pattern's mask instead. "
+            + "Lasso a SUBSET (or use remove mode) to save a real mask.", "warn");
+      return maskEditClear();
+    }
     try {
       const res = await _maskApi(
         `/api/patterns/${encodeURIComponent(maskEdit.pattern)}/site_mask`, {
@@ -5409,8 +5644,12 @@
         });
       toast(`site mask saved: ${res.n_kept}/${res.n_sites} sites -> ${maskEdit.pattern}`, "ok");
       maskEditExit();
-      // Re-analyze so the new default mask shows up in every panel.
-      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+      // Re-analyze so the new mask shows up in every panel. MUST force a
+      // recache: the analysis is cached by n_shots, which does NOT change when
+      // the mask changes -- a plain reload returns the STALE (pre-mask) cached
+      // result, so the maps/banner wouldn't move and the save would look like a
+      // no-op. forceRecache re-runs analyze_scan with the mask applied.
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true, forceRecache: true});
     } catch (e) {
       toast(`mask save failed: ${(e.body && e.body.error) || e.message}`, "bad");
     }
@@ -5424,7 +5663,9 @@
         {clear: true});
       toast(`site mask cleared for ${maskEdit.pattern} (full array)`, "ok");
       maskEditExit();
-      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+      // forceRecache for the same reason as save: the cache is n_shots-keyed and
+      // wouldn't otherwise drop the now-removed mask.
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true, forceRecache: true});
     } catch (e) {
       toast(`mask clear failed: ${(e.body && e.body.error) || e.message}`, "bad");
     }
@@ -5451,6 +5692,12 @@
   (function wireMaskEditor() {
     const btn = $("mask-edit-btn");
     if (!btn) return;
+    // Start CLOSED on every fresh wire (page load / dash reconnect): reset the
+    // state + force the toolbar hidden. Guards against the toolbar appearing
+    // before the operator ever clicks the "mask" button.
+    maskEdit.active = false;
+    const bar0 = $("mask-edit-bar"); if (bar0) bar0.hidden = true;
+    btn.classList.remove("active");
     btn.addEventListener("click", () =>
       (maskEdit.active ? maskEditExit() : maskEditEnter()));
     const on = (id, fn) => {
@@ -5459,6 +5706,8 @@
     };
     on("mask-edit-save", maskEditSave);
     on("mask-edit-clear", maskEditClear);
+    // "done" (mask-edit-cancel) removed per request — re-click the "mask" button
+    // to exit without saving. Kept wiring guard-safe if the element is absent.
     on("mask-edit-cancel", maskEditExit);
     on("mask-edit-all", () => {
       if (!maskEdit.active) return;
@@ -5665,6 +5914,33 @@
         try { localStorage.setItem("yb-dash-scan-autoscale", scanAutoscale ? "1" : "0"); }
         catch {}
         pollSnapshot();   // the scan figure (cbar_scale) lives in the snapshot group now
+      });
+    }
+
+    // Scan-panel axis pickers (3-D slice dim + coupled-1-D x-axis). Both change
+    // the query params the next snapshot fetch sends -> re-poll immediately.
+    const sliceSel = document.getElementById("scan-slice-dim");
+    if (sliceSel) {
+      sliceSel.addEventListener("change", () => {
+        const v = sliceSel.value;
+        scanSliceDim = v === "" ? null : Number(v);
+        try {
+          if (scanSliceDim == null) localStorage.removeItem("yb-dash-scan-slice-dim");
+          else localStorage.setItem("yb-dash-scan-slice-dim", String(scanSliceDim));
+        } catch {}
+        pollSnapshot();
+      });
+    }
+    const xSel = document.getElementById("scan-x");
+    if (xSel) {
+      xSel.addEventListener("change", () => {
+        const v = xSel.value;
+        scanXParam = v === "" ? null : Number(v);
+        try {
+          if (scanXParam == null) localStorage.removeItem("yb-dash-scan-x-param");
+          else localStorage.setItem("yb-dash-scan-x-param", String(scanXParam));
+        } catch {}
+        pollSnapshot();
       });
     }
 
@@ -6012,6 +6288,28 @@
     el._sitemapBaseXSpan = baseXSpan;
     el._sitemapBaseSize = siteDotSize;
     const traces = [];
+    // SITE-MASK excluded sites: dark underlay so the operator SEES which sites
+    // are dropped from the analysis (distinct from the target/non-target
+    // opts.mask split above). `opts.dimExcluded` is a per-site KEEP bool array
+    // in the SAME index order as x/y; false => that site is analysis-excluded
+    // and draws as a dim dot. Drawn first so live/colored points sit on top.
+    const keep = opts && opts.dimExcluded;
+    if (keep && keep.length === n) {
+      const xEx = [], yEx = [];
+      for (let k = 0; k < n; k++) {
+        if (!keep[k]) { xEx.push(x[k]); yEx.push(y[k]); }
+      }
+      if (xEx.length) {
+        traces.push({
+          x: xEx, y: yEx, type: "scattergl", mode: "markers",
+          marker: {size: Math.max(1, siteDotSize),
+                   color: "#2a2a2a", line: {width: 0}, opacity: 0.85},
+          hoverinfo: "text",
+          hovertext: xEx.map(() => "excluded by site mask"),
+          showlegend: false, name: "site-mask-excluded",
+        });
+      }
+    }
     // Background (out-of-mask) trace first so colored points sit on top.
     if (xOut.length) {
       traces.push({

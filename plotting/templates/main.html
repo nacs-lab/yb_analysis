@@ -382,33 +382,62 @@
 
   <section class="card col-4" id="card-scan-curve" data-card-id="live-scan-curve">
     <h2>Scan curve<span class="grow"></span></h2>
-    <!-- Colorbar autoscale switch for 2-D scan heatmaps (mirrors the legacy
-         Dash "Autoscale" toggle). OFF = colorbar pinned 0–1; ON = autoscale
-         to the data range. No effect on 1-D scan curves. Default OFF. -->
-    <label class="switch card-switch" id="scan-autoscale-switch"
-           title="Autoscale the 2-D scan colorbar to the data range. OFF pins it to 0–1 (the survival/loading default). No effect on 1-D scans.">
-      <input type="checkbox" id="scan-autoscale-live">
-      <span class="track"></span>
-      <span>Autoscale</span>
-    </label>
-    <!-- Site-mask toggle: restrict the live scan curve to the current pattern's
-         configured "stable sites" subset (record.json site_mask). OFF = full
-         array (default). Applied in the main process's DataManager. -->
-    <label class="switch card-switch" id="site-mask-switch"
-           title="Average the live scan curve over only the current pattern's configured site subset (stable sites). OFF = full array.">
-      <input type="checkbox" id="site-mask-live">
-      <span class="track"></span>
-      <span>Site mask</span>
-    </label>
-    <!-- Survival conditioning-frame toggle (3-image scans): condition the live
-         survival on the MIDDLE (verify) frame instead of img1 (loading). No
-         effect on loading readouts or on scans without a middle frame. -->
-    <label class="switch card-switch" id="survival-ref-switch"
-           title="Condition the live survival on the MIDDLE (verify) frame — P(final | verify) — instead of img1 (loading), for 3-image (rearrange-verify) scans. Loading readouts unaffected; no effect when the scan has no middle frame.">
-      <input type="checkbox" id="survival-ref-live">
-      <span class="track"></span>
-      <span>Cond. verify</span>
-    </label>
+    <!-- All scan-curve controls live in ONE top-right cluster so they stop
+         stacking on the same corner and stop colliding with the plot title.
+         The scan name is now painted small along the plot's BOTTOM edge (see
+         _scan_caption in dashboard.py), leaving the top corners free.
+         `hidden` (attr) is the first-paint default; renderScanAxisControls()
+         reveals the axis-shape controls only for the scans that need them. -->
+    <div class="scan-ctl-group" id="scan-ctl-group">
+      <!-- Survival conditioning-frame toggle (3-image scans): condition the
+           live survival on the MIDDLE (verify) frame instead of img1 (loading).
+           No effect on loading readouts or on scans without a middle frame.
+           NOT axis-shape gated -- shown whenever the scan has a middle frame. -->
+      <label class="switch scan-ctl" id="survival-ref-switch"
+             title="Condition the live survival on the MIDDLE (verify) frame — P(final | verify) — instead of img1 (loading), for 3-image (rearrange-verify) scans. Loading readouts unaffected; no effect when the scan has no middle frame.">
+        <input type="checkbox" id="survival-ref-live">
+        <span class="track"></span>
+        <span>Cond. verify</span>
+      </label>
+      <!-- The controls below only make sense for a NON-LINEAR scan (>= 3-D, or a
+           coupled 1-D sweep): renderScanAxisControls() shows this whole
+           `.scan-ctl-shaped` set only then, and hides it for a plain 1-D scan. -->
+      <div class="scan-ctl-shaped" id="scan-ctl-shaped" hidden>
+        <!-- Colorbar autoscale switch for 2-D/3-D scan heatmaps. OFF = colorbar
+             pinned 0–1; ON = autoscale to the data range. Default OFF. -->
+        <label class="switch scan-ctl" id="scan-autoscale-switch"
+               title="Autoscale the 2-D/3-D scan colorbar to the data range. OFF pins it to 0–1 (the survival/loading default).">
+          <input type="checkbox" id="scan-autoscale-live">
+          <span class="track"></span>
+          <span>Autoscale</span>
+        </label>
+        <!-- Site-mask toggle: restrict the live scan curve to the current
+             pattern's configured "stable sites" subset (record.json site_mask).
+             OFF = full array (default). Applied in the main process's DataManager. -->
+        <label class="switch scan-ctl" id="site-mask-switch"
+               title="Average the live scan curve over only the current pattern's configured site subset (stable sites). OFF = full array.">
+          <input type="checkbox" id="site-mask-live">
+          <span class="track"></span>
+          <span>Site mask</span>
+        </label>
+        <!-- 3-D scan: which swept dimension the heatmap SLIDER walks (the other
+             two form the heatmap axes). Populated from snapshot.scan_axes.dims;
+             renderScanAxisControls() also flips its own `hidden` for < 3-D. -->
+        <label class="scan-axis-ctl scan-ctl" id="scan-slice-dim-ctl" hidden
+               title="For a 3-D scan: choose which swept parameter the slice slider steps through. The other two dimensions form the heatmap axes.">
+          <span>Slice</span>
+          <select id="scan-slice-dim"></select>
+        </label>
+        <!-- Coupled 1-D scan: which coupled parameter labels the x-axis (the
+             sweep sets several params per point). Populated from
+             snapshot.scan_axes.coupled; hidden unless the scan is coupled. -->
+        <label class="scan-axis-ctl scan-ctl" id="scan-x-ctl" hidden
+               title="This 1-D scan varies several parameters together. Choose which one labels the x-axis; the curve re-sorts along it and the rest show in the hover.">
+          <span>x-axis</span>
+          <select id="scan-x"></select>
+        </label>
+      </div>
+    </div>
     <span class="hint mono" id="site-mask-info"></span>
     <div class="plot-container" id="plot-scan" style="height: 320px;"></div>
   </section>
@@ -819,8 +848,7 @@
       <button id="mask-edit-all" title="Select all sites">all</button>
       <button id="mask-edit-invert" title="Invert selection">invert</button>
       <button id="mask-edit-save" title="Save selection as this pattern's site mask">save</button>
-      <button id="mask-edit-clear" title="Remove this pattern's configured site mask (analyze full array)">clear mask</button>
-      <button id="mask-edit-cancel" title="Exit editor without saving">done</button>
+      <button id="mask-edit-clear" title="Remove this pattern's configured site mask (analyze full array)">clear</button>
     </div>
     <div class="plot-container" id="plot-site-loading" style="height:360px;"></div>
   </section>

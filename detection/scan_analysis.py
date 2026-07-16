@@ -51,9 +51,12 @@ def extract_scan_dims(config):
     -------
     dims : list of dict  or  None
         Each dict has:
-            'name'   : str    — dotted param path (e.g. 'Pushout.Green.Freq')
-            'values' : ndarray (N,) — parameter values for that dimension
-            'size'   : int    — number of points
+            'name'    : str    — dotted param path (e.g. 'Pushout.Green.Freq')
+            'values'  : ndarray (N,) — parameter values for that dimension
+            'size'    : int    — number of points
+            'coupled' : list of {'name', 'values'} — EVERY parameter swept
+                        along this dimension (a coupled sweep sets several
+                        params per point). First entry == name/values above.
         Ordered dim-0 first (dim-0 varies fastest in MATLAB column-major indexing).
     """
     sg = config.get('ScanGroup')
@@ -75,19 +78,26 @@ def extract_scan_dims(config):
         # N-D scan: params = [dim0_struct, dim1_struct, ...]
         dims = []
         for i, p in enumerate(params):
-            val, path = _find_first_numeric(p, [])
-            sz = int(np.asarray(sizes[i]).ravel()[0]) if sizes is not None and i < len(sizes) else (len(val) if val is not None else 0)
-            if val is not None:
-                dims.append({'name': '.'.join(path), 'values': val, 'size': sz})
+            found = _find_all_numeric(p, [])
+            if not found:
+                continue
+            val, path = found[0]
+            sz = int(np.asarray(sizes[i]).ravel()[0]) if sizes is not None and i < len(sizes) else len(val)
+            dims.append({'name': '.'.join(path), 'values': val, 'size': sz,
+                         'coupled': [{'name': '.'.join(pth), 'values': v}
+                                     for v, pth in found]})
         return dims if dims else None
 
     # If params is a dict → 1-D scan (inline struct)
     if isinstance(params, dict):
-        val, path = _find_first_numeric(params, [])
-        if val is None:
+        found = _find_all_numeric(params, [])
+        if not found:
             return None
+        val, path = found[0]
         sz = int(np.asarray(sizes).ravel()[0]) if sizes is not None else len(val)
-        return [{'name': '.'.join(path), 'values': val, 'size': sz}]
+        return [{'name': '.'.join(path), 'values': val, 'size': sz,
+                 'coupled': [{'name': '.'.join(pth), 'values': v}
+                             for v, pth in found]}]
 
     return None
 
@@ -109,12 +119,13 @@ def extract_scan_dims_h5(mat_path):
 
             # 1-D scan: vars/params is an HDF5 Group (inline struct)
             if isinstance(vars_params, h5py.Group):
-                val = _find_first_dataset_h5(vars_params)
-                if val is None:
+                found = _find_all_datasets_h5(vars_params)
+                if not found:
                     return None
-                name = _find_first_dataset_path_h5(vars_params)
+                val, name = found[0]
                 sz = int(f['Scan/ScanGroup/base/vars/size'][()].ravel()[0]) if vars_size is not None else len(val)
-                return [{'name': name, 'values': val, 'size': sz}]
+                return [{'name': name, 'values': val, 'size': sz,
+                         'coupled': [{'name': n, 'values': v} for v, n in found]}]
 
             # N-D scan: vars/params is a Dataset of object references
             if isinstance(vars_params, h5py.Dataset) and vars_params.dtype == h5py.ref_dtype:
@@ -123,16 +134,22 @@ def extract_scan_dims_h5(mat_path):
                 dims = []
                 for i, ref in enumerate(refs):
                     grp = f[ref]
-                    val = _find_first_dataset_h5(grp) if isinstance(grp, h5py.Group) else grp[()].ravel().astype(np.float64)
-                    name = _find_first_dataset_path_h5(grp) if isinstance(grp, h5py.Group) else f'dim{i}'
+                    if isinstance(grp, h5py.Group):
+                        found = _find_all_datasets_h5(grp)
+                    else:
+                        found = [(grp[()].ravel().astype(np.float64), f'dim{i}')]
+                    if not found:
+                        continue
+                    val, name = found[0]
                     sz_ref = size_refs[i]
                     if sz_ref is not None:
                         sz_grp = f[sz_ref] if isinstance(sz_ref, h5py.Reference) else sz_ref
                         sz = int(np.asarray(sz_grp).ravel()[0]) if hasattr(sz_grp, '__array__') else int(sz_grp)
                     else:
                         sz = len(val) if val is not None else 0
-                    if val is not None:
-                        dims.append({'name': name, 'values': val, 'size': sz})
+                    dims.append({'name': name, 'values': val, 'size': sz,
+                                 'coupled': [{'name': n, 'values': v}
+                                             for v, n in found]})
                 return dims if dims else None
 
             return None
@@ -144,6 +161,30 @@ def extract_scan_dims_h5(mat_path):
 # ---------------------------------------------------------------------------
 #  Private tree-walk helpers
 # ---------------------------------------------------------------------------
+
+def _axis_scalars(arr):
+    """Reduce a numeric swept-axis array to one scalar PER SCAN POINT.
+
+    A scalar sweep (1-D, or 2-D with a singleton dim like ``(N,1)``/``(1,N)``)
+    ravels to its N values, unchanged from the historical behaviour. A
+    VECTOR-VALUED axis -- a nested list such as ``[[0, cx] for cx in ...]``,
+    which comes in as a genuine ``(N, K)`` array with ``K > 1`` -- must NOT be
+    ravelled: that would emit ``N*K`` scalars and desync ``len(values)`` from
+    the axis ``size`` (N), which breaks the 2-D heatmap's dstack. Instead pick
+    one representative scalar per point: the lone varying column if exactly one
+    column varies (so ``[0, cx]`` yields the ``cx`` values as tick labels),
+    else the 0-based point index.
+    """
+    if arr.ndim == 2 and min(arr.shape) > 1:
+        # Genuine vector-per-point axis (nested list). Rows = scan points.
+        af = arr.astype(np.float64)
+        varying = [c for c in range(af.shape[1])
+                   if not np.allclose(af[:, c], af[0, c])]
+        if len(varying) == 1:
+            return af[:, varying[0]]
+        return np.arange(af.shape[0], dtype=np.float64)
+    return arr.ravel().astype(np.float64)
+
 
 def _find_first_numeric(obj, path):
     """Recursively search a nested dict/array for the first numeric vector.
@@ -161,7 +202,7 @@ def _find_first_numeric(obj, path):
         except Exception:
             return None, []
         if arr.dtype.kind in ('b', 'i', 'u', 'f') and arr.ndim <= 2 and arr.size > 1:
-            return arr.ravel().astype(np.float64), path
+            return _axis_scalars(arr), path
         return None, []
     if isinstance(obj, np.ndarray):
         # Skip arrays of object references or non-numeric dtypes (bool 'b'
@@ -170,7 +211,7 @@ def _find_first_numeric(obj, path):
             return None, []
         if obj.ndim <= 2 and obj.size > 1:
             try:
-                return obj.ravel().astype(np.float64), path
+                return _axis_scalars(obj), path
             except (TypeError, ValueError):
                 return None, []
         return None, []
@@ -180,6 +221,22 @@ def _find_first_numeric(obj, path):
             if result is not None:
                 return result, rpath
     return None, []
+
+
+def _find_all_numeric(obj, path):
+    """Collect EVERY numeric vector in a nested dict, in dict order.
+
+    Returns a list of (values, path_list) — one entry per swept parameter of
+    the dimension. A coupled sweep (several params set together along one
+    axis) yields several entries; ``_find_first_numeric`` sees only the first.
+    """
+    if isinstance(obj, dict):
+        out = []
+        for k, v in obj.items():
+            out.extend(_find_all_numeric(v, path + [k]))
+        return out
+    val, p = _find_first_numeric(obj, path)
+    return [(val, p)] if val is not None else []
 
 
 def _find_first_dataset_h5(grp):
@@ -207,6 +264,23 @@ def _find_first_dataset_path_h5(grp, prefix=''):
             if result is not None:
                 return result
     return prefix or 'unknown'
+
+
+def _find_all_datasets_h5(grp, prefix=''):
+    """Collect EVERY >1-element dataset under an HDF5 group, in group order.
+
+    Returns a list of (values, dotted_path) — the HDF5 twin of
+    ``_find_all_numeric`` (coupled sweeps store one dataset per parameter).
+    """
+    out = []
+    for key in grp:
+        item = grp[key]
+        p = f'{prefix}.{key}' if prefix else key
+        if isinstance(item, h5py.Dataset) and item.size > 1:
+            out.append((item[:].ravel().astype(np.float64), p))
+        elif isinstance(item, h5py.Group):
+            out.extend(_find_all_datasets_h5(item, p))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +392,12 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     -------
     dict
     """
-    is_2d = scan_dims is not None and len(scan_dims) >= 2
+    if scan_dims is not None and len(scan_dims) >= 3:
+        return _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
+                           is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
+                           seq_targets=seq_targets, site_mask=site_mask)
 
-    if is_2d:
+    if scan_dims is not None and len(scan_dims) == 2:
         return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                            is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
                            seq_targets=seq_targets, site_mask=site_mask)
@@ -333,6 +410,21 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     n_sites_1 = len(scan_logicals[0][1])
     has_logic2 = scan_logicals[0][2] is not None
     n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
+
+    # Coupled sweep (several params set together along the one axis): expose
+    # every param's per-point values, sorted with the same point order as the
+    # curve, so the dashboard can list them all in the hover and offer any of
+    # them as the x-axis. None unless the dim really has > 1 coupled param.
+    def _coupled_sorted(order):
+        if not scan_dims:
+            return None
+        cl = scan_dims[0].get('coupled') or []
+        out = []
+        for c in cl:
+            v = np.asarray(c.get('values'), dtype=float).ravel()
+            if v.size == n_params:
+                out.append({'name': c.get('name'), 'values': v[order]})
+        return out if len(out) > 1 else None
 
     # Target-aware survival (matches the Analysis tab's TP): when the diag
     # supplied per-shot target sets, the live curve is per-shot TP, not
@@ -350,6 +442,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
                 'n_reps': cnt[order],
                 'mode': 'survival',
                 'target_aware': True,
+                'coupled': _coupled_sorted(order),
             }
     # In two-array mode with different-sized grids, the per-param metric is
     # the mean of logic2 over array-2 sites. With same-sized grids, treat as
@@ -405,6 +498,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
         'y_mean_sr': y_mean_sr[:, order],
         'n_reps': n_reps[order],
         'mode': mode,
+        'coupled': _coupled_sorted(order),
     }
 
 
@@ -540,6 +634,138 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         'x_size': s0,
         'y_size': s1,
         'current': current,  # list of {x_idx, y_idx} cells to highlight
+    }
+
+
+def _axis_vals(d):
+    """A dim's per-point values as float64, falling back to 0..size-1 when the
+    stored vector doesn't match the declared size (defensive)."""
+    v = np.asarray(d.get('values'), dtype=float).ravel()
+    s = int(d.get('size') or v.size)
+    if v.size != s:
+        return np.arange(s, dtype=float)
+    return v
+
+
+def _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
+                is_two_array=False, recent_seq_ids=None, seq_targets=None,
+                site_mask=None):
+    """Compute a full data CUBE for scans with >= 3 swept dimensions.
+
+    The flat param index decomposes column-major (dim-0 varies fastest):
+        i0 = p % s0;  i1 = (p // s0) % s1;  i2 = p // (s0*s1)
+    Dims beyond the third (rare) are folded into the slice axis (i2) as a
+    combined flat index so no shot is dropped.
+
+    Returns dict with ``ndim: 3``; ``cube``/``sem``/``n_reps`` shaped
+    ``(s2, s1, s0)``; ``dims`` = per-axis {name, values}; ``current`` = list
+    of {x_idx, y_idx, z_idx} cells updated in the latest batch. The dashboard
+    picks which axis to slice — the cube itself is axis-agnostic.
+    """
+    if not scan_logicals or param_indices is None:
+        return None
+
+    d0, d1 = scan_dims[0], scan_dims[1]
+    s0, s1 = int(d0['size']), int(d1['size'])
+    rest = scan_dims[2:]
+    s2 = int(np.prod([int(d['size']) for d in rest]))
+    if len(rest) == 1:
+        d2_name = rest[0]['name']
+        d2_vals = _axis_vals(rest[0])
+    else:
+        d2_name = ' × '.join(d['name'] for d in rest)
+        d2_vals = np.arange(s2, dtype=float)
+    if s0 <= 0 or s1 <= 0 or s2 <= 0:
+        return None
+    n_total = s0 * s1 * s2
+
+    n_sites_1 = len(scan_logicals[0][1])
+    has_logic2 = scan_logicals[0][2] is not None
+    n_sites_2 = len(scan_logicals[0][2]) if has_logic2 else 0
+    different_arrays = is_two_array and has_logic2 and n_sites_1 != n_sites_2
+    n_sites = n_sites_2 if different_arrays else n_sites_1
+
+    def _current_cells():
+        sids = list(recent_seq_ids) if recent_seq_ids else (
+            [int(scan_logicals[-1][0])] if scan_logicals else [])
+        cells, seen = [], set()
+        for sid in sids:
+            li = int(sid) - 1
+            if not (0 <= li < len(param_indices)):
+                continue
+            p = int(param_indices[li]) - 1
+            if not (0 <= p < n_total):
+                continue
+            cell = (p % s0, (p // s0) % s1, p // (s0 * s1))
+            if cell not in seen:
+                seen.add(cell)
+                cells.append({'x_idx': cell[0], 'y_idx': cell[1],
+                              'z_idx': cell[2]})
+        return cells
+
+    dims_meta = [
+        {'name': d0['name'], 'values': _axis_vals(d0)},
+        {'name': d1['name'], 'values': _axis_vals(d1)},
+        {'name': d2_name, 'values': d2_vals},
+    ]
+
+    # Target-aware survival (matches Analysis TP) when the diag gave targets.
+    if seq_targets and num_images >= 2 and has_logic2:
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets)
+        if ta is not None:
+            mean_flat, sem_flat, n_flat = ta
+            return {
+                'mode': 'survival', 'ndim': 3, 'target_aware': True,
+                'cube': mean_flat.reshape(s2, s1, s0),
+                'sem': sem_flat.reshape(s2, s1, s0),
+                'n_reps': n_flat.reshape(s2, s1, s0),
+                'dims': dims_meta,
+                'current': _current_cells(),
+            }
+
+    # Bucket by flat param index (0-based)
+    buckets = [[] for _ in range(n_total)]
+    for seq_id, logic1, logic2 in scan_logicals:
+        idx = int(seq_id) - 1
+        if idx < 0 or idx >= len(param_indices):
+            continue
+        p = int(param_indices[idx]) - 1
+        if p < 0 or p >= n_total:
+            continue
+        buckets[p].append((logic1, logic2))
+
+    if different_arrays and num_images >= 2:
+        mode = 'rearrangement'
+        y_mean_sr, y_sem_sr, n_reps = _rearrangement_buckets(
+            buckets, n_sites, n_total)
+    elif num_images >= 2:
+        mode = 'survival'
+        y_mean_sr, y_sem_sr, n_reps = _survival_buckets(buckets, n_sites, n_total)
+    else:
+        mode = 'loading'
+        y_mean_sr, y_sem_sr, n_reps = _loading_buckets(buckets, n_sites, n_total)
+
+    # Global "analyze only these sites" mask (NaN excluded rows, average the
+    # kept sites). No-op when site_mask is None.
+    y_mean_sr = _mask_sr(y_mean_sr, site_mask)
+    y_sem_sr = _mask_sr(y_sem_sr, site_mask)
+    n_avg = (int(np.asarray(site_mask, dtype=bool).sum())
+             if site_mask is not None
+             and np.asarray(site_mask).size == n_sites else n_sites)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)  # nanmean on empty slices
+        y_mean_flat = np.nanmean(y_mean_sr, axis=0)
+        sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
+
+    return {
+        'mode': mode,
+        'ndim': 3,
+        'cube': y_mean_flat.reshape(s2, s1, s0),
+        'sem': sem_flat.reshape(s2, s1, s0),
+        'n_reps': n_reps.reshape(s2, s1, s0),
+        'dims': dims_meta,
+        'current': _current_cells(),
     }
 
 
