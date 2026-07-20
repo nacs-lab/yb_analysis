@@ -182,6 +182,23 @@ def _build_fig_json(d, name, marker_size=12, cbar_scale='01', site_idx=0,
                       allow_nan=False, default=str)
 
 
+def _seed_live_png_ring(d, seq):
+    """Decode each array-panel image data URI in frame `d` and stash its raw PNG
+    bytes under `seq` in the per-key ring. Runs once per published frame (from the
+    prebuild watcher) so /api/live/imageN?t=<seq> can serve the EXACT frame its
+    baked boxes came from. Best-effort: a bad/absent URI for a key is skipped."""
+    import base64
+    for uri_key in _IMG_URL_FOR_KEY:      # only keys the URL path actually serves
+        uri = d.get(uri_key)
+        if not isinstance(uri, str) or not uri.startswith('data:image/png;base64,'):
+            continue
+        try:
+            png = base64.b64decode(uri[len('data:image/png;base64,'):])
+        except Exception:
+            continue
+        _live_png_ring_put(uri_key, seq, png)
+
+
 def _prebuild_default_fragments():
     """Eagerly build the DEFAULT-arg live-figure fragments for the CURRENT frame
     into _LIVE_FIG_CACHE, so request threads read a ready string instead of
@@ -197,6 +214,12 @@ def _prebuild_default_fragments():
     seq = d.get('_write_seq')
     if seq is None:
         return
+    # Seed the per-seq PNG ring for THIS frame the instant it publishes (~1/s on
+    # advance), so an /api/live/imageN?t=<seq> request that lands AFTER the pickle
+    # has moved on still finds frame <seq>'s exact bytes -> the baked boxes and the
+    # image never straddle. Done here (not lazily in the request) because the very
+    # first straddle would otherwise miss (the wanted frame was never recorded).
+    _seed_live_png_ring(d, seq)
     arg_key = (seq,) + _LIVE_FIG_DEFAULT_ARGS
     built = {}
     for name in _LIVE_FIG_NAMES:
@@ -4188,6 +4211,40 @@ def _decode_plotly_bdata(obj):
     return obj
 
 
+# --- Per-seq PNG ring: fixes the box/image off-by-one straddle -------------
+# The array-panel figure JSON bakes the green/red boxes from frame K's `d`, but
+# references the image out-of-band as /api/live/imageN?t=K (use_img_url). Those
+# are two separate HTTP round-trips: if the shared pickle advances to K+1 between
+# them, the server used to serve the CURRENT frame's PNG regardless of ?t=K, so
+# the client composited frame-K boxes over a frame-(K+/-1) image -- the off-by-one
+# `box_sync_monitor` measures (delta = +/-1, sign set by fetch order). Worse on
+# large arrays (bigger snapshot + PNG widen the window).
+#
+# Fix: keep a tiny per-key ring of the last few frames' PNG bytes keyed by
+# _write_seq. When the URL asks for ?t=K and we still have frame K, serve EXACTLY
+# frame K (stamped X-Frame-Seq: K) so it matches the baked boxes. If K was already
+# evicted (client far behind), fall back to the current frame -- i.e. today's
+# behavior, no worse. Bounded + best-effort; a miss can never raise.
+_LIVE_PNG_RING = {}          # uri_key -> OrderedDict(seq -> png_bytes)
+_LIVE_PNG_RING_MAX = 8       # frames retained per image key (~seconds of history)
+
+
+def _live_png_ring_put(uri_key, seq, png):
+    """Record frame `seq`'s decoded PNG bytes in the per-key ring (LRU-capped)."""
+    if seq is None or png is None:
+        return
+    ring = _LIVE_PNG_RING.get(uri_key)
+    if ring is None:
+        from collections import OrderedDict
+        ring = _LIVE_PNG_RING[uri_key] = OrderedDict()
+    if seq in ring:
+        ring.move_to_end(seq)
+    else:
+        ring[seq] = png
+        while len(ring) > _LIVE_PNG_RING_MAX:
+            ring.popitem(last=False)
+
+
 def _live_image_response(uri_key, shape_key, vlo_key, vhi_key):
     """Serve a cached PNG image from yb_dash_data.pkl.
 
@@ -4195,6 +4252,12 @@ def _live_image_response(uri_key, shape_key, vlo_key, vhi_key):
     ``Content-Type: image/png`` so the dashboard can just
     ``<img src=...>`` against this endpoint -- no JSON parsing, no
     multi-megabyte base64 on every poll.
+
+    The array-panel figure references this as ``?t=<_write_seq>`` (the frame its
+    baked boxes came from). We serve EXACTLY that frame when it is still in the
+    per-key ring, so the boxes and the image can never straddle a publish (the
+    box/image off-by-one). A far-behind / evicted seq falls back to the current
+    frame -- same as before the ring existed.
 
     Set ``?json=1`` for the legacy ``{data_uri, shape, vlo, vhi}`` JSON
     shape (still used by any caller that wants the percentile clip).
@@ -4223,9 +4286,35 @@ def _live_image_response(uri_key, shape_key, vlo_key, vhi_key):
         png = base64.b64decode(uri[len('data:image/png;base64,'):])
     else:
         return jsonify({'error': 'unexpected data URI format'}), 500
+
+    cur_seq = d.get('_write_seq')
+    # Record THIS (current) frame in the ring, then honor the requested seq.
+    _live_png_ring_put(uri_key, cur_seq, png)
+    served_seq = cur_seq
+    req_t = request.args.get('t')
+    if req_t not in (None, ''):
+        try:
+            want = int(req_t)
+        except ValueError:
+            want = None
+        if want is not None and want != cur_seq:
+            ring = _LIVE_PNG_RING.get(uri_key)
+            hit = ring.get(want) if ring else None
+            if hit is not None:
+                # Serve the exact frame the boxes were built from.
+                png = hit
+                served_seq = want
+            # else: evicted (client far behind) -> fall back to current frame,
+            # the pre-ring behavior. No worse than before.
     return Response(png, mimetype='image/png', headers={
         # No browser caching -- the URL doesn't change but the bytes do.
         'Cache-Control': 'no-store, no-cache, must-revalidate',
+        # Stamp the published-frame identity these PNG bytes came from. With the
+        # per-seq ring above this now equals the requested ?t= (the boxes' frame)
+        # on a ring hit, so a box_sync_monitor (or the browser) sees them agree.
+        # A mismatch here now means only "client asked for a frame we no longer
+        # have" (fell back to current), not a genuine box/image straddle.
+        'X-Frame-Seq': str(served_seq if served_seq is not None else ''),
     })
 
 
