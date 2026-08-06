@@ -12,7 +12,7 @@
      visible banner instead of silently showing black panels (the old
      failure mode: pollLiveFigures bailed at `if (!window.Plotly)
      return;` and divs stayed empty). -->
-<script src="{{ plotly_local_url }}?v={{ cache_bust }}"
+<script src="{{ plotly_local_url }}?v={{ plotly_cache_bust or cache_bust }}"
         onerror="this.onerror=null;
                  var s=document.createElement('script');
                  s.src='https://cdn.plot.ly/plotly-2.35.2.min.js';
@@ -67,12 +67,12 @@
        full-width thin strip and the Scan Curve takes the next row. -->
   <section class="card col-12 status-strip" data-card-id="status-overview">
     <div class="stat-tile stat-link-tile" id="tile-scan-id"
-         title="Open this run in the Analysis tab">
+         title="Click: open this run in the Analysis tab · Right-click: copy the scan_id">
       <span class="stat-label">scan_id</span>
       <span class="stat-value mono" id="kv-scan-id">—</span>
     </div>
     <div class="stat-tile stat-link-tile" id="tile-scan-name"
-         title="Open this run in the Analysis tab">
+         title="Click: open this run in the Analysis tab · Right-click: copy the scan_id">
       <span class="stat-label">scan_name</span>
       <span class="stat-value" id="kv-scan-name">—</span>
     </div>

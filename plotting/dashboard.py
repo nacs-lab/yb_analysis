@@ -4949,6 +4949,20 @@ def _register_main_html_routes(server):
     # because the ?v= token changes on restart (see above); 1 day is plenty.
     _STATIC_MAX_AGE = 86400
 
+    def _asset_bust():
+        """Cache-bust token for OUR static assets (dashboard.js/.css) = newest mtime.
+
+        Separate from ``_cache_bust`` (used for the 4.8 MB plotly bundle, which only changes
+        with the installed package): an EDIT to dashboard.js must ship on the next page
+        reload, without a dashboard restart. Two ``stat`` calls per page load. Falls back to
+        the per-process token if the files can't be stat'ed.
+        """
+        try:
+            return str(int(max(_os.path.getmtime(_os.path.join(static_dir, f))
+                               for f in ('dashboard.js', 'dashboard.css'))))
+        except OSError:
+            return _cache_bust
+
     def _cache_static(resp):
         resp.headers['Cache-Control'] = f'public, max-age={_STATIC_MAX_AGE}'
         return resp
@@ -5005,7 +5019,8 @@ def _register_main_html_routes(server):
             scope_url=yb_cfg.SCOPE_URL,
             monitor_url=yb_cfg.MONITOR_URL,
             molecube_web_url=yb_cfg.MOLECUBE_WEB_URL,
-            cache_bust=_cache_bust,
+            cache_bust=_asset_bust(),          # dashboard.js/.css -> mtime (edits ship on reload)
+            plotly_cache_bust=_cache_bust,     # 4.8 MB bundle -> per-process (never re-fetched)
             plotly_local_url='/vendor/plotly.min.js',
         )
 

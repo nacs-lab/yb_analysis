@@ -1754,9 +1754,11 @@ select.pattern-select option.popt-other { color: var(--text); }
   color: #d29922;
   border: 1px solid rgba(210, 153, 34, 0.4);
 }
-/* Click-to-copy scan_id tile: subtle hover, brief flash on copy. */
+/* Right-click-to-copy scan_id tile: subtle hover, brief flash on copy. `cursor: context-menu`
+   (not pointer) because LEFT-click here belongs to the floating card / normal selection --
+   only the right-click copies. */
 .scan-id-copy {
-  cursor: pointer;
+  cursor: context-menu;
   border-radius: 3px;
   padding: 0 2px;
   transition: background 120ms ease;
@@ -1766,6 +1768,11 @@ select.pattern-select option.popt-other { color: var(--text); }
 }
 .scan-id-copy.just-copied {
   background: rgba(46, 160, 67, 0.25);
+}
+/* Same brief copy flash on the live status tiles (right-click copies the scan_id). */
+.stat-tile.just-copied {
+  background: rgba(46, 160, 67, 0.22);
+  transition: background 120ms ease;
 }
 /* Paths overlay control row inside the per-site survival card. */
 .paths-overlay-ctl {

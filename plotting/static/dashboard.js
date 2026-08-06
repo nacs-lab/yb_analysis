@@ -1056,6 +1056,41 @@
     });
   }
 
+  // Copy a scan_id to the clipboard + flash the source element. Shared by the delegated
+  // .scan-id-copy click handler and the live status tiles' right-click (contextmenu).
+  // `function` (not const) so the earlier-in-file wiring can call it -- hoisted.
+  function copyScanId(sid, el) {
+    sid = String(sid || "").trim();
+    if (!sid || sid === "—") return;
+    const announce = () => {
+      toast(`Copied scan_id ${sid}`, "ok");
+      if (!el) return;
+      el.classList.add("just-copied");
+      setTimeout(() => el.classList.remove("just-copied"), 600);
+    };
+    // Modern path; falls back to a hidden textarea for browsers / iframes
+    // where clipboard.writeText is unavailable.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sid).then(announce, () => {
+        toast("Copy failed — clipboard permission denied", "warn");
+      });
+    } else {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = sid;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        announce();
+      } catch {
+        toast("Copy not supported in this browser", "warn");
+      }
+    }
+  }
+
   // Current run's scan_id (from /api/snapshot), so the scan_id / scan_name
   // status chips can open it in Analysis -- the same row-click behaviour the
   // Queue tab has. Set each live poll in pollLive.
@@ -1067,6 +1102,16 @@
       if (!_liveScanId) return;
       selectPrimary(_liveScanId);   // sets primary + loads analysis (background)
       setTab("analysis");           // then reveal it
+    });
+    // RIGHT-click copies the scan_id string instead of opening the browser menu (left-click
+    // is already taken by open-in-Analysis). Copies the live scan_id, falling back to the
+    // rendered kv-scan-id text so it still works before the first snapshot lands.
+    tile.addEventListener("contextmenu", (e) => {
+      const shown = (document.getElementById("kv-scan-id") || {}).textContent || "";
+      const sid = _liveScanId || shown.trim();
+      if (!sid || sid === "—") return;      // nothing to copy -> leave the native menu alone
+      e.preventDefault();
+      copyScanId(sid, tile);
     });
   });
 
@@ -4126,40 +4171,22 @@
     toast("Rescanning all runs…", "warn");
   });
 
-  // Click-to-copy on scan_id tiles (Analysis tab + anywhere else
-  // the .scan-id-copy class is dropped). Delegated so it picks up
-  // tiles rendered after page load.
-  document.addEventListener("click", (e) => {
-    const el = e.target.closest && e.target.closest(".scan-id-copy");
-    if (!el) return;
-    const sid = el.dataset.scanId || el.textContent.trim();
-    if (!sid) return;
-    const announce = () => {
-      toast(`Copied scan_id ${sid}`, "ok");
-      el.classList.add("just-copied");
-      setTimeout(() => el.classList.remove("just-copied"), 600);
-    };
-    // Modern path; falls back to a hidden textarea for browsers / iframes
-    // where clipboard.writeText is unavailable.
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(sid).then(announce, () => {
-        toast("Copy failed — clipboard permission denied", "warn");
-      });
-    } else {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = sid;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-        announce();
-      } catch {
-        toast("Copy not supported in this browser", "warn");
-      }
-    }
+  // Copy a scan_id: RIGHT-click only (delegated, so it picks up tiles rendered after page
+  // load). Left-click is deliberately NOT a copy gesture: the floating Scans/Channels cards
+  // overlay this area and own the left-click (peek -> expand), so a left-click copy either
+  // never fired or fought the card. Right-click is unclaimed -> one consistent copy gesture
+  // everywhere (here + the Live tab's status tiles). Delegated on the whole .stat-tile so
+  // right-clicking the "scan_id" label copies too.
+  document.addEventListener("contextmenu", (e) => {
+    if (!e.target.closest) return;
+    const el = e.target.closest(".scan-id-copy");
+    const tile = el || e.target.closest(".stat-tile");
+    const src = el || (tile && tile.querySelector(".scan-id-copy"));
+    if (!src) return;
+    const sid = (src.dataset.scanId || src.textContent || "").trim();
+    if (!sid || sid === "—") return;         // nothing to copy -> leave the native menu alone
+    e.preventDefault();
+    copyScanId(sid, src);
   });
 
   // Active analysis state lives module-level so the filter card and the
@@ -4583,7 +4610,7 @@
           <span class="stat-label">scan_id</span>
           <span class="stat-value mono scan-id-copy" style="font-size:14px;"
                 data-scan-id="${r.scan_id}"
-                title="Click to copy">${r.scan_id}</span>
+                title="Right-click to copy">${r.scan_id}</span>
         </div>
         <div class="stat-tile">
           <span class="stat-label">sweep</span>
@@ -9603,11 +9630,14 @@
     });
   }
 
-  // Click a step label -> zoom the time axis to that step's span + a side buffer.
+  // Click a step label -> zoom the time axis so the step FILLS 70% of the window (15% context
+  // on each side): window = span / 0.7, so pad = span * 0.15 / 0.7. An instantaneous step
+  // (t0 == t1, e.g. SLMStep) has no span to scale -> fall back to a fixed +-1 ms window.
+  const SEQ_STEP_ZOOM_FRAC = 0.70;
   function seqZoomToStep(el, t0, t1) {
     if (!el || !window.Plotly) return;
     const span = (t1 - t0) || 0;
-    const pad = Math.max(span * 0.12, 3);          // a bit of buffer on each side
+    const pad = span > 0 ? span * (1 - SEQ_STEP_ZOOM_FRAC) / (2 * SEQ_STEP_ZOOM_FRAC) : 1;
     let lo = t0 - pad, hi = t1 + pad;
     if (hi <= lo) hi = lo + 1;
     try { Plotly.relayout(el, { "xaxis.range": [lo, hi] }); } catch (e) {}
@@ -10011,8 +10041,11 @@
   // pyctrl/tools/provenance_scan.py (7 = + per-pulse source backtraces, read by the
   // /api/sequence/backtrace route's xref fallback; 8 = + pending_globals count;
   // 9 = + per-basic-sequence tagging of steps/time_regions so a multi-bseq scan shows only
-  // the displayed basic sequence's phase ruler / wait bands).
-  const SEQ_XREF_VERSION = 9;
+  // the displayed basic sequence's phase ruler / wait bands; 10 = the run's per-pattern config
+  // overlay (expConfig ByPattern) is re-applied during the rebuild, so step/wait bands land at
+  // the run's REAL absolute times -- v<=9 built against base consts and drifted by every
+  // pattern-overridden wait, mislabeling pulses on the ruler).
+  const SEQ_XREF_VERSION = 10;
   function seqXrefComplete(xr) {
     return !!(xr && xr.available && (xr.version || 0) >= SEQ_XREF_VERSION);
   }
