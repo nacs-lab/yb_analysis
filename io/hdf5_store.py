@@ -57,7 +57,8 @@ def _open_h5_append(path, retries=12, base_delay=0.1, max_delay=1.0):
 
 def create_scan_file(path, scan_config, frame_size, num_sites,
                      two_array=False, num_sites_img2=0,
-                     img2_logicals_source=None, save_mid=False):
+                     img2_logicals_source=None, save_mid=False,
+                     num_sites_mid=None):
     """Create a new HDF5 scan file with resizable datasets.
 
     Parameters
@@ -90,10 +91,15 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
     save_mid : bool
         If True (NumImages >= 3, two-round rearrangement), also create
         ``logicals_mid`` / ``intensities_mid`` datasets (shape ``(NSeqs,
-        num_sites)``) for the MIDDLE (verify) frame -- the post-rearrangement
+        num_sites_mid)``) for the MIDDLE (verify) frame -- the post-rearrangement
         occupancy that is detected + displayed live but was previously never
         persisted (only frame-0 -> img1 and the FINAL frame -> img2 were saved).
-        Uses ``num_sites`` (the middle frame detects on the same grid as img1).
+    num_sites_mid : int or None
+        Number of tweezer sites in the MIDDLE frame's grid. None -> ``num_sites``
+        (the middle frame detects on the img1 grid, the legacy behaviour). A
+        two-round rearrangement whose middle pattern is its own array (e.g. a
+        2198-site kagome between a 3013 tri load and a 2078 kagome target) MUST
+        pass its own count, else the middle bits are stored at the wrong width.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -143,19 +149,22 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
                 cert.attrs['source'] = src
                 cert.attrs['meaning'] = 'per-site P(loaded) posterior for logicals_img2'
             # Middle (verify) frame: post-rearrangement occupancy, detected on
-            # the img1 grid (num_sites). Only for NumImages >= 3.
+            # the MIDDLE pattern's own grid (num_sites_mid; defaults to the img1
+            # grid when the scan declared no distinct middle pattern). Only for
+            # NumImages >= 3.
             if save_mid:
+                n_mid = int(num_sites if num_sites_mid is None else num_sites_mid)
                 f.attrs['save_mid'] = True
                 lm = f.create_dataset(
-                    'logicals_mid', shape=(0, num_sites),
-                    maxshape=(None, num_sites), dtype='bool',
-                    chunks=(64, max(num_sites, 1)))
+                    'logicals_mid', shape=(0, n_mid),
+                    maxshape=(None, n_mid), dtype='bool',
+                    chunks=(64, max(n_mid, 1)))
                 lm.attrs['meaning'] = ('middle (verify) frame occupancy: '
                                        'post-rearrangement, pre-science')
                 f.create_dataset(
-                    'intensities_mid', shape=(0, num_sites),
-                    maxshape=(None, num_sites), dtype='float64',
-                    chunks=(64, max(num_sites, 1)))
+                    'intensities_mid', shape=(0, n_mid),
+                    maxshape=(None, n_mid), dtype='float64',
+                    chunks=(64, max(n_mid, 1)))
         else:
             # Legacy single-array layout: (nFrames, num_sites) interleaved.
             f.create_dataset(

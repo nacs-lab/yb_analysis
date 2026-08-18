@@ -264,6 +264,7 @@ def analyze_scan(scan_id: Optional[str] = None,
                  filters: Optional[dict] = None,
                  site_mask=None,
                  survival_ref: str = 'img1',
+                 target_only: bool = False,
                  recompute_infidelity: bool = False,
                  force_recache: bool = False,
                  sync_slm_diag: bool = True) -> dict:
@@ -295,6 +296,7 @@ def analyze_scan(scan_id: Optional[str] = None,
         filters=filters,
         site_mask=site_mask,
         survival_ref=survival_ref,
+        target_only=target_only,
         recompute_infidelity=recompute_infidelity,
         force_recache=force_recache,
         sync_slm_diag=sync_slm_diag)
@@ -308,6 +310,7 @@ def analyze_scan_dir(scan_dir,
                      filters: Optional[dict] = None,
                      site_mask=None,
                      survival_ref: str = 'img1',
+                     target_only: bool = False,
                      recompute_infidelity: bool = False,
                      force_recache: bool = False,
                      sync_slm_diag: bool = True,
@@ -433,8 +436,12 @@ def analyze_scan_dir(scan_dir,
     #    numbers. Net: refreshes of a live scan are instant (one-refresh lag on the
     #    numbers); the frontend's growth-poll also keeps updating in place.
     # Busted by force_recache (which already deleted the cache above).
+    # target_only is part of the view identity: the cached payload is the
+    # DEFAULT (all-sites) view, so a target-only request must never be served
+    # from it -- and must not overwrite it either (see the write guard below).
     _default_view = (filters is None and _site_mask_spec is None
                      and _survival_ref == 'img1'
+                     and not target_only
                      and not recompute_infidelity)
     if _default_view and not force_recache and not _skip_fastpath:
         _cached = _read_payload_cache(scan_dir)
@@ -512,6 +519,23 @@ def analyze_scan_dir(scan_dir,
                            'falling back to survival_ref=img1', ex)
             logic_mid = None
             _survival_ref = 'img1'
+        # Mid-conditioned survival is a MATCHED-INDEX comparison against the
+        # final frame, so it only means anything when the middle frame was
+        # detected on an array with the SAME site count/order. A multi-round
+        # rearrangement through a genuinely different middle array (3013 tri ->
+        # 2198 kagome -> 2078 kagome) has no such index correspondence: refuse
+        # rather than publish a silently-misaligned survival.
+        if logic_mid is not None and logic_mid.ndim == 3:
+            _n_ref = (logic2.shape[0] if (logic2 is not None and logic2.ndim == 3)
+                      else n_sites)
+            if logic_mid.shape[0] != _n_ref:
+                logger.warning('analyze_scan_dir: logicals_mid has %d sites but '
+                               'the final frame has %d -- middle array differs, '
+                               'mid-conditioned survival is not index-aligned; '
+                               'falling back to survival_ref=img1',
+                               logic_mid.shape[0], _n_ref)
+                logic_mid = None
+                _survival_ref = 'img1'
     out['survival_ref'] = _survival_ref
     out['survival_ref_available'] = bool(_mid_available)
     # NumImages (frames per shot) so the dashboard can show a DISABLED
@@ -549,6 +573,52 @@ def analyze_scan_dir(scan_dir,
             out['site_mask_error'] = f"{type(ex).__name__}: {ex}"
             logger.warning("analyze_scan_dir: site_mask %r failed: %s",
                            _site_mask_spec, out['site_mask_error'])
+
+    # ---- target-only restriction (COMPOUNDS with site_mask + survival_ref) ---
+    # The Analysis-tab twin of the live dashboard's "Targets only" toggle: keep
+    # only the sites the rearrangement moved atoms INTO (union of slm_diag
+    # target_paired over this run's shots). Untargeted leftovers excite/survive
+    # differently and contaminate an array average, so the STIRAP runbook's
+    # Rule 1 metric is target-only AND verify-conditioned -- the two are
+    # ORTHOGONAL and must be combinable, which is why this intersects the
+    # existing site mask rather than replacing it.
+    # 2026-08-06: added after the Analysis tab read 85.8% at a point where the
+    # target-restricted verify-conditioned value was 99.1% -- the gap was
+    # untargeted sites, not physics.
+    out['target_only'] = bool(target_only)
+    out['target_only_active'] = False
+    out['target_only_error'] = None
+    out['n_target_sites'] = None
+    # ALWAYS report the target-site count when this run has a diag, even in the
+    # all-sites view: the frontend needs it to know whether to OFFER the
+    # targets-only selector at all. Gating the count on target_only made the
+    # control un-selectable (it only appeared once already selected).
+    _tmask = None
+    if n_sites:
+        try:
+            from yb_analysis.scripts.select_subset_stirap import target_mask as _tm
+            _tmask = _tm(scan_dir, seq_ids, int(n_sites))
+            if _tmask is not None and _tmask.any():
+                out['n_target_sites'] = int(_tmask.sum())
+        except Exception as ex:
+            logger.debug('target-site probe failed: %s', ex)
+    if target_only and n_sites:
+        try:
+            if _tmask is None:
+                out['target_only_error'] = ('no slm_diag.h5 for this run -- '
+                                            'cannot restrict to target sites')
+            elif not _tmask.any():
+                out['target_only_error'] = 'target mask is empty'
+            else:
+                _site_mask = (_tmask if _site_mask is None
+                              else (np.asarray(_site_mask, bool) & _tmask))
+                out['target_only_active'] = True
+                out['site_mask_active'] = True
+                out['n_sites_used'] = int(np.asarray(_site_mask, bool).sum())
+        except Exception as ex:
+            out['target_only_error'] = f"{type(ex).__name__}: {ex}"
+            logger.warning("analyze_scan_dir: target_only failed: %s",
+                           out['target_only_error'])
 
     # Keep UNFILTERED references for the global (filter-independent)
     # headline block computed near the end of this function. The filter
@@ -929,6 +999,15 @@ def analyze_scan_dir(scan_dir,
         if ps_override is not None:
             if out.get('per_site') is not None:
                 out['per_site_lab_computed'] = out['per_site']
+            # The lab-paths per_site is built WITHOUT the site mask, so apply it
+            # here (it replaced the masked per_site from the block above). The
+            # mask lives in the DETECTION / init-grid site order (the per-site
+            # LOADING map is what the mask editor lasso'd). So mask the init-grid
+            # arrays unconditionally; the TARGET-grid arrays (survival/tp/fp)
+            # share that order only for a SAME-grid run (`loading_rate` present
+            # and full-width) -- mask those too then, but leave them untouched on
+            # a cross-grid run where target != init order.
+            _apply_mask_to_lab_paths_per_site(ps_override, _site_mask)
             out['per_site'] = ps_override
     elif slm_an is not None and not filter_active:
         ps_override = _per_site_from_slm_analysis(slm_an)
@@ -1308,7 +1387,18 @@ def _maybe_sync_slm_diag(scan_dir: Path, scan_name, *, enabled: bool = True,
             return
     name = (scan_name or '').lower()
     if 'rearrang' not in name and not (scan_dir / CODE_JSON).is_file():
-        return
+        # Name-convention miss (e.g. a rearrangement diagnostic not named
+        # '*Rearrange*'): a rearrangement run is still recognizable by its
+        # descriptor -- the pyctrl JSON sidecar embeds the scan params, which
+        # any rearrangement run fills with rearrange_kwargs.*. Cheap substring
+        # probe; on any miss/error keep the old behavior (skip the sync).
+        try:
+            sidecar = scan_dir / ('%s.json' % scan_dir.name)
+            if not (sidecar.is_file() and 'rearrange_kwargs'
+                    in sidecar.read_text(encoding='utf-8', errors='ignore')):
+                return
+        except OSError:
+            return
     scan_id = _scan_id_from_dir(scan_dir)
     if not scan_id:
         return
@@ -1504,15 +1594,25 @@ def _build_sweep(scan: dict, scan_params: np.ndarray,
             except Exception:
                 cols = []
 
+    # ``values`` is SORTED (np.unique) -- the historical contract the 1-D
+    # render + _reorder_summary_to_sweep depend on. ``values_desc`` carries
+    # the SAME uniques in FIRST-OCCURRENCE (scan-DESCRIPTOR) order, i.e. the
+    # order the axis was actually swept. The 2-D heatmap render keys its cell
+    # lookup off descriptor-order flat param indices, so it must label + index
+    # with values_desc; using the sorted ``values`` there mislabels every cell
+    # when the sweep wasn't defined ascending (e.g. step_size = [0, 1, .., -1, ..]).
+    values_desc: list = []
     if scan_params.size:
-        if scan_params.ndim == 1:
-            values = [np.unique(scan_params).tolist()]
-            dims = [len(values[0])]
-        else:
-            for axis in range(scan_params.shape[1]):
-                col_vals = np.unique(scan_params[:, axis]).tolist()
-                values.append(col_vals)
-                dims.append(len(col_vals))
+        cols_iter = ([scan_params] if scan_params.ndim == 1
+                     else [scan_params[:, a] for a in range(scan_params.shape[1])])
+        for col in cols_iter:
+            values.append(np.unique(col).tolist())
+            # First-occurrence unique (descriptor order), NaN-safe: np.unique
+            # with return_index gives sorted positions; sort those positions to
+            # recover first appearances in the original sweep order.
+            _, first_idx = np.unique(np.asarray(col), return_index=True)
+            values_desc.append(np.asarray(col)[np.sort(first_idx)].tolist())
+            dims.append(len(values[-1]))
 
     while len(cols) < len(dims):
         cols.append(f'axis{len(cols)}')
@@ -1520,7 +1620,8 @@ def _build_sweep(scan: dict, scan_params: np.ndarray,
     # reads as 0-D in the dashboard). cols may be padded beyond dims when
     # extract_scan_dims_h5 over-reports, so key off dims.
     n_dims = len([d for d in dims if d and d > 1])
-    return {'cols': cols, 'values': values, 'dims': dims, 'n_dims': n_dims}
+    return {'cols': cols, 'values': values, 'values_desc': values_desc,
+            'dims': dims, 'n_dims': n_dims}
 
 
 def _reorder_summary_to_sweep(summary, scan_params) -> None:
@@ -3530,8 +3631,13 @@ def _target_grid_camera_xy(scan: dict, n_target_sites: int):
     if not init_rec or not tgt_rec:
         return None
     try:
-        k_init = np.asarray(init_rec.get('knm') or [], dtype=float)
-        k_tgt  = np.asarray(tgt_rec.get('knm') or [], dtype=float)
+        # canonical_knm guards a transposed ([x,y]) record -> [y,x], so init + target agree
+        # even if only one pattern's record was written swapped.
+        from yb_analysis.analysis.affine_transform import canonical_knm as _canon_knm
+        k_init = _canon_knm(init_rec)
+        k_tgt  = _canon_knm(tgt_rec)
+        if k_init is None or k_tgt is None:
+            return None
     except (ValueError, TypeError):
         return None
     if (k_init.ndim != 2 or k_init.shape[1] != 2
@@ -3557,6 +3663,58 @@ def _target_grid_camera_xy(scan: dict, n_target_sites: int):
     if not np.isfinite(rms) or rms > 5.0:
         return None
     return np.column_stack([k_tgt, np.ones(len(k_tgt))]) @ A   # (n, 2) (y, x)
+
+
+def _apply_mask_to_lab_paths_per_site(ps: dict, site_mask) -> None:
+    """NaN the site-mask-excluded entries of a lab-paths per_site dict IN PLACE.
+
+    The site mask is in the DETECTION / init-grid site order (the per-site
+    loading map the editor lasso'd against). Two array families:
+      * INIT-grid arrays -- ``loading_rate`` / ``loading_init`` -- are in that
+        exact order, so mask them whenever their length matches the mask.
+      * TARGET-grid arrays -- ``survival_mean`` / ``tp_rate`` / ``fp_rate`` --
+        share the init order ONLY for a same-grid run (loading_rate present at
+        full width). On a cross-grid run they're a different site space; masking
+        by an init mask would mislabel sites, so leave them alone there.
+    Excluded entries become ``None`` (the dashboard's "excluded" render). No-op
+    when the mask is None. Sets ``ps['site_mask_applied']`` to the list of keys
+    actually masked so the UI can say precisely what was dropped.
+    """
+    if ps is None or site_mask is None:
+        return
+    import numpy as _np
+    m = _np.asarray(site_mask, dtype=bool)
+    nkeep = int(m.sum())
+
+    def _mask_list(key):
+        v = ps.get(key)
+        if not isinstance(v, list) or len(v) != m.size:
+            return False
+        ps[key] = [None if not keep else val for val, keep in zip(v, m)]
+        return True
+
+    masked = []
+    # Init-grid arrays: always in mask order.
+    for k in ('loading_rate', 'loading_init'):
+        if _mask_list(k):
+            masked.append(k)
+    # Target-grid arrays: same order only when this is a same-grid run
+    # (loading_rate on the main grid at full width). loading_x present ==
+    # cross-grid (loading carried on its own coords) -> DON'T mask target space.
+    same_grid = ('loading_x' not in ps) and (ps.get('loading_rate') is not None)
+    if same_grid:
+        for k in ('survival_mean', 'tp_rate', 'fp_rate'):
+            if _mask_list(k):
+                masked.append(k)
+    ps['site_mask_applied'] = masked
+    ps['site_mask_n_kept'] = nkeep
+    ps['site_mask_same_grid'] = bool(same_grid)
+    # Per-site KEEP booleans (mask order = init/detection grid = the loading
+    # map + the same-grid survival/FP maps). Lets the dashboard dim the
+    # excluded sites on the maps whose axes are in this order. On a cross-grid
+    # run this matches ONLY the loading map (survival/FP are target-grid), so
+    # the caller keys the overlay off site_mask_same_grid / which map.
+    ps['site_mask_keep'] = [bool(v) for v in m.tolist()]
 
 
 def _per_site_from_lab_paths(paths_per_shot: list,

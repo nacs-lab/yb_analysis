@@ -30,6 +30,7 @@ from yb_analysis.config import (
 )
 from yb_analysis.detection.detect_atom import detect_atom
 from yb_analysis.detection import spot_shape_model as ssm
+from yb_analysis.detection import common_mode as cmnorm
 from yb_analysis.detection.scan_analysis import (
     extract_scan_params, extract_scan_params_h5, extract_scan_name,
     extract_scan_dims, extract_scan_dims_h5, compute_scan_curve,
@@ -54,12 +55,26 @@ _AFFINE_UPDATE_LOCK = threading.Lock()
 DIAG_PULL_INTERVAL = 5
 DIAG_PULL_MAX_EMPTY = 4
 
-# Per-shot mean loading rate (img1), held at module scope so it survives
-# scan transitions — the DataManager (and its log_buffer) is recreated on
-# each new scan, but this deque persists for the camera-connection lifetime.
-# Also fed from dummy-mode frames in control_panel so the live trace keeps
-# updating while no real scan is running.
+# The camera frame that carries the MIDDLE (verify) image of a multi-round
+# rearrangement: frame 1 of a NumImages>=3 sequence (frame 0 = loading,
+# frame NumImages-1 = final). Only the FIRST middle frame is grid-resolved /
+# persisted, matching save_data's [1::pSeq] demux.
+MID_FRAME_IDX = 1
+
+# Per-shot FILL FRACTION history, held at module scope so it survives scan
+# transitions -- the DataManager (and its log_buffer) is recreated on each new
+# scan, but these deques persist for the camera-connection lifetime.
+# `_loading_history` is the frame-0 LOADING fraction (atoms / frame-0 pattern
+# sites); `_fill_history` holds the same quantity for the MIDDLE and FINAL
+# frames, each normalized by ITS OWN pattern's site count. Keeping them separate
+# matters: a 3013 -> 2198 -> 2078 rearrangement loads ~70% of 3013 and fills
+# ~96% of 2078, and quoting the loading number as "fraction loaded" while the
+# final image is visibly full reads as a bug (2026-07-27).
+# _loading_history is also fed from dummy-mode frames in control_panel so the
+# live trace keeps updating while no real scan is running.
 _loading_history = collections.deque(maxlen=100)
+_fill_history = {'mid': collections.deque(maxlen=100),
+                 'final': collections.deque(maxlen=100)}
 _loading_history_lock = threading.Lock()
 
 
@@ -74,10 +89,41 @@ def record_loading(logicals):
         _loading_history.append(float(arr.mean()))
 
 
+def record_fill(role, logicals):
+    """Append one frame's FILL fraction (occupied / that frame's own site count)
+    to the 'mid' / 'final' history. ``logicals`` is that frame's per-site
+    occupancy detected on ITS OWN pattern grid, so the denominator is implicitly
+    that pattern's site count."""
+    if logicals is None or role not in _fill_history:
+        return
+    arr = np.asarray(logicals)
+    if arr.size == 0:
+        return
+    with _loading_history_lock:
+        _fill_history[role].append(float(arr.mean()))
+
+
 def get_loading_history():
     """Snapshot of the persistent loading-rate history as a 1-D array."""
     with _loading_history_lock:
         return np.array(_loading_history, dtype=float) if _loading_history else None
+
+
+def get_fill_history(role):
+    """Snapshot of the 'mid' / 'final' per-frame fill history (1-D array or None)."""
+    with _loading_history_lock:
+        h = _fill_history.get(role)
+        return np.array(h, dtype=float) if h else None
+
+
+def reset_fill_history():
+    """Drop the mid/final fill histories at a scan boundary. Unlike the loading
+    trace (which is deliberately continuous across scans) these are normalized by
+    a specific pattern's site count, so carrying them into a scan with a
+    different array would silently mix denominators."""
+    with _loading_history_lock:
+        for h in _fill_history.values():
+            h.clear()
 
 
 # --- Cross-run threshold accumulation (in-memory, per loading pattern) ---------
@@ -128,6 +174,36 @@ def _prune_pattern_accum(pa, now):
         entries.popleft()
     while len(entries) > THRES_ACCUM_CROSS_RUN_MAX:
         entries.popleft()
+
+
+def peek_data_manager(scan_id):
+    """Return the CACHED DataManager for ``scan_id``, or None.
+
+    Unlike :func:`get_data_manager` this NEVER constructs a manager and never
+    evicts the others -- it is a pure lookup, safe to call from a live-view
+    toggle handler that must not disturb acquisition state or allocate a
+    hundreds-of-MB manager for a scan that may not be running.
+    (Added 2026-08-06 so dashboard view toggles reach the current scan's DM
+    even when no shots are arriving -- see ControlPanel._live_dm.)"""
+    try:
+        key = int(scan_id)
+    except (TypeError, ValueError):
+        return None
+    with _cache_lock:
+        return _cache.get(key)
+
+
+def latest_data_manager():
+    """The most recently cached DataManager, or None.
+
+    The cache holds at most the active scan (get_data_manager evicts the rest),
+    so this is normally "the current scan's manager". Used only as a last-resort
+    fallback for live-view toggles when the panel has not yet handled a shot;
+    like :func:`peek_data_manager` it never constructs or evicts."""
+    with _cache_lock:
+        if not _cache:
+            return None
+        return _cache[max(_cache)]
 
 
 def get_data_manager(scan_id):
@@ -256,6 +332,7 @@ class DataManager:
         self._pattern_grids = None      # {frame_idx: cropped grid [Y,X]}
         self._pattern_names = {}        # {frame_idx: pattern name}
         self._pattern_knm = {}          # {frame_idx: knm [y,x]} (for the live affine update)
+        self._pattern_zoff = {}         # {frame_idx: per-site v*z (N,2)} -- 3-D dz term, see load_dz
         self._roi = None                # [Xoff, Yoff, W, H] for this scan
         self._affine_grid0 = None       # frame-0 affine-predicted grid (pre-drift)
         # Loading-phase health (Live status strip "phase" tile). _build_pattern_grids
@@ -284,6 +361,25 @@ class DataManager:
         # survival series) -- loading readouts always stay on the loading frame.
         self.survival_ref = 'img1'
         self._scan_mid_logicals = {}
+
+        # Live "restrict the 0d per-shot survival series to TARGET sites" toggle
+        # (dashboard). Orthogonal to survival_ref: this picks the SITE SET
+        # (target sites from the SLM diag vs the whole array); survival_ref picks
+        # the CONDITIONING frame. Default True == the historical auto behavior
+        # (target-aware whenever the run's diag targets are known). A no-op for
+        # runs with no diag targets (falls back to whole-array survival).
+        self.target_restrict = True
+
+        # Per-shot COMMON-MODE brightness normalization of the DETECTION
+        # comparison (yb_analysis/detection/common_mode.py). One tracker per
+        # scan, one EWMA reference per camera frame (the 3013/2198/2078 frames
+        # of a two-round rearrangement sit at different absolute brightness and
+        # must not share one). Built before the isInit/isHC early return so
+        # get_plot_data can always read it. The accumulators/histograms/HDF5
+        # keep RAW intensities -- only the logicals comparison is normalized.
+        self._cm = cmnorm.CommonModeTracker()
+        self._cm_ref_cache = {}     # frame_idx -> (fits, n_sites, reference)
+        self._cm_logged = set()     # frames whose first application was logged
 
         # Paths
         date_stamp, time_stamp = scan_id_to_stamps(scan_id)
@@ -340,6 +436,16 @@ class DataManager:
         self._img2_logicals_source = None   # provenance tag stored in the HDF5
         self._display_proba2 = None         # last img2 per-site posterior (display)
         self._proba_img2_to_save = []       # per-(is_last)-frame posteriors, for HDF5
+        # MIDDLE (verify) frame own grid + thresholds (NumImages >= 3, the
+        # two-round rearrangement). Set by _build_pattern_grids when the scan
+        # declares a DISTINCT middle pattern (imagePatternsJson entry 1); None
+        # -> the middle frame keeps detecting on the frame-0 grid, which is only
+        # correct when the middle array IS the loading array.
+        self.grid_locations_mid = None
+        self.num_sites_mid = 0
+        self.loaded_thresholds_mid = None
+        self.loaded_infidelities_mid = None
+        self.loaded_gauss_fits_mid = None
         box_size = int(_scalar(self.config.get('boxSize', 11)))
         mask_sigma = float(_scalar(self.config.get('maskSigma', 2.0)))
         self.mask_mat = _gaussian_mask(box_size, mask_sigma)
@@ -358,6 +464,9 @@ class DataManager:
             return
 
         # --- LOADED state (from disk, read-only during scan) ---
+        # New scan -> new array(s): the per-frame fill histories are per-pattern
+        # normalized, so start them fresh (the loading trace stays continuous).
+        reset_fill_history()
         self.num_sites = 0
         self._load_from_disk()
 
@@ -585,6 +694,11 @@ class DataManager:
                     num_sites_img2=self.num_sites_img2,
                     img2_logicals_source=img2_src,
                     save_mid=self._save_mid,
+                    # The middle frame has its OWN width when the scan declared a
+                    # distinct MIDDLE pattern; None -> the img1 width (unchanged).
+                    num_sites_mid=(self.num_sites_mid
+                                   if self.grid_locations_mid is not None
+                                   else None),
                 )
                 self._file_created = True
             except Exception as e:
@@ -621,6 +735,11 @@ class DataManager:
         self._img2_logicals_source = None
         self._display_proba2 = None
         self._proba_img2_to_save = []
+        self.grid_locations_mid = None
+        self.num_sites_mid = 0
+        self.loaded_thresholds_mid = None
+        self.loaded_infidelities_mid = None
+        self.loaded_gauss_fits_mid = None
         self._save_two_array = False
         self._save_mid = False
         self._display_image = None
@@ -664,6 +783,7 @@ class DataManager:
         self._scan_logicals = []
         self.survival_ref = 'img1'
         self._scan_mid_logicals = {}
+        self.target_restrict = True
         self._last_batch_seq_ids = []
         self._seq_targets = {}
         self._diag_since = 0
@@ -966,6 +1086,7 @@ class DataManager:
         selection + live drift correction apply unchanged. No-ops (keeps the
         day grid) if no pattern/ROI/affine is available."""
         self._pattern_knm = {}   # (re)populated below; the live affine update reads it
+        self._pattern_zoff = {}  # (re)populated below; 3-D per-site dz offsets
         self._pattern_phase_status = {}  # name -> 'ok'|'missing'|'unreachable' (health chip)
         roi = self.config.get('roi')
         roi = _vector(roi) if roi is not None else None
@@ -1037,9 +1158,26 @@ class DataManager:
             # phase exists -- a transient fetch error that still found a cache
             # is not a "missing phase".
             self._pattern_phase_status[s['name']] = 'ok'
-            knm = np.asarray(rec['knm'], dtype=np.float64)
+            # Guard: correct a transposed ([x,y]) record to canonical [y,x] before it drives the grid
+            # (and, via _pattern_knm, every live affine update) -- see affine_transform.canonical_knm.
+            knm = aff.canonical_knm(rec)
+            if knm is None:
+                # Fallback must ALSO carry the per-pattern knm_offset, or this would be the one
+                # path where the live affine updater sees uncorrected coordinates and drags the
+                # GLOBAL affine to absorb a single pattern's registration offset (double-
+                # correcting it, since canonical_knm already applies it everywhere else).
+                knm = aff._apply_knm_offset(
+                    np.asarray(rec['knm'], dtype=np.float64), rec)
             self._pattern_knm[k] = knm
             grids[k] = aff.apply_affine_cropped(aff._knm_to_xy(knm), A, self._roi)
+            # 3-D linear-defocus correction (affine_transform.load_dz): a site away from the
+            # camera-focus plane walks laterally ~linearly in its TOTAL z4 defocus. ONLY for
+            # is_3d records with a configured dz block -- every flat-2-D pattern (any defocus)
+            # and any run without dz configured is byte-identical to the pre-dz behaviour.
+            zoff = self._pattern_dz_offsets(rec, len(knm))
+            if zoff is not None:
+                grids[k] = grids[k] + zoff
+                self._pattern_zoff[k] = zoff
         if not grids:
             return
         self._pattern_grids = grids
@@ -1060,9 +1198,54 @@ class DataManager:
             (self.loaded_thresholds_img2, self.loaded_infidelities_img2,
              self.loaded_gauss_fits_img2) = self._pattern_thresholds(
                 self._pattern_names[last], self.num_sites_img2)
+        # MIDDLE (verify) frame -- frame 1 of a pSeq>=3 scan (the round-1 image of
+        # the two-round rearrangement). It is its OWN array whenever the scan
+        # declares a distinct MIDDLE pattern, so it needs its own grid +
+        # thresholds: detecting it on the frame-0 (loading) grid scores a
+        # 2198-site kagome against 3013 tri positions and reads ~0.18 occupancy
+        # instead of ~0.95 (data_20260727_162059: logicals_mid was 3013 wide).
+        mid = MID_FRAME_IDX
+        if pSeq >= 3 and mid < last and mid in grids:
+            self.grid_locations_mid = np.ascontiguousarray(grids[mid])
+            self.num_sites_mid = len(grids[mid])
+            (self.loaded_thresholds_mid, self.loaded_infidelities_mid,
+             self.loaded_gauss_fits_mid) = self._pattern_thresholds(
+                self._pattern_names[mid], self.num_sites_mid)
         logger.info('Loading-pattern grids active: %s (sites %s); affine '
                     'mapped + ROI-cropped', self._pattern_names,
                     {k: len(v) for k, v in grids.items()})
+
+    def _pattern_dz_offsets(self, rec, n_sites):
+        """Per-site ``v * z_total`` camera-px offsets (N,2) for a 3-D pattern record, or None.
+
+        None (no correction) unless BOTH hold: the record is 3-D (``is_3d`` with a per-site
+        ``z_rad``) AND a ``dz`` block is configured (affine_transform.load_dz). z_total per
+        site = (loading_defocus - z_ref) + z_rad[i]; loading_defocus comes from the scan
+        descriptor (``config['descriptor']['runp']['loading_defocus']``, default z_ref so a
+        missing value only corrects the +-plane offsets)."""
+        try:
+            if not rec.get('is_3d') or rec.get('z_rad') is None:
+                return None
+            import yb_analysis.analysis.affine_transform as aff
+            dz = aff.load_dz()
+            if dz is None:
+                return None
+            z_rad = np.asarray(rec['z_rad'], dtype=np.float64).ravel()
+            if len(z_rad) != n_sites:
+                logger.warning('dz correction skipped: z_rad len %d != %d sites',
+                               len(z_rad), n_sites)
+                return None
+            desc = self.config.get('descriptor') if isinstance(self.config, dict) else None
+            runp = (desc or {}).get('runp') if isinstance(desc, dict) else None
+            loading_defocus = float((runp or {}).get('loading_defocus', dz['z_ref']))
+            z_tot = (loading_defocus - dz['z_ref']) + z_rad
+            logger.info('dz correction active: v=%s px/rad, carrier %g (z_ref %g), '
+                        'z span [%.2f, %.2f] rad', list(dz['v']), loading_defocus,
+                        dz['z_ref'], z_tot.min(), z_tot.max())
+            return z_tot[:, None] * dz['v'][None, :]
+        except Exception as e:  # noqa: BLE001 - the dz term must never break grid resolution
+            logger.warning('dz correction skipped (%s)', e)
+            return None
 
     # --- Loading-phase health chip ("phase" status tile) ---
 
@@ -1210,9 +1393,11 @@ class DataManager:
                 rec = reg.get_pattern(name)
                 if not rec or not rec.get('knm'):
                     return
+                knm = aff.canonical_knm(rec)     # guard transposed [x,y] record -> [y,x]
+                if knm is None:
+                    knm = np.asarray(rec['knm'], dtype=np.float64)
                 cand = aff.propose_scan_update(
-                    imgs, np.asarray(rec['knm'], dtype=np.float64), roi,
-                    self.mask_mat, str(self.scan_id))
+                    imgs, knm, roi, self.mask_mat, str(self.scan_id))
                 if cand.get('accept'):
                     aff.commit_update(cand, ema_weight=aff.SHIFT_EMA_WEIGHT)
                     logger.info('Affine drift-updated from scan %s: shift '
@@ -1230,18 +1415,41 @@ class DataManager:
 
     def _per_shot_survival_series(self, max_shots=400):
         """Per-shot SURVIVAL in time order, for the 0d Scan-Curve timeseries
-        (which otherwise shows loading). Target-aware (TP at this run's diag
-        targets) when targets are known for the shot, else per-site survival
-        (matched-index logic1&logic2 / loaded). None for 1-image scans (no
-        img2). Bounded to the last ``max_shots`` so the snapshot stays small."""
+        (which otherwise shows loading). None for 1-image scans (no img2).
+        Bounded to the last ``max_shots`` so the snapshot stays small.
+
+        TWO ORTHOGONAL dashboard toggles drive the per-shot value:
+
+          * ``target_restrict`` picks the SITE SET S -- the run's diag TARGET
+            sites (True, default) vs the whole array (False). A no-op for runs
+            with no diag targets (there is nothing to restrict to -> whole array).
+          * ``survival_ref`` picks the CONDITIONING frame -- 'img1' (loading,
+            default) vs 'mid' (the middle/verify frame). ``_effective_scan_logicals``
+            already substitutes the mid bits for logic1 when survival_ref='mid',
+            so ``a1`` below IS the conditioning frame.
+
+        The 2x2 (a2 = final frame):
+          targets + img1  -> raw TP:  a2[S].sum() / |S|   (fraction of target
+                              sites filled in the final image; a1 unused)
+          targets + mid   -> verify-conditioned survival at the target sites:
+                              (a1[S] & a2[S]).sum() / a1[S].sum()   (of the target
+                              sites occupied in the verify frame, fraction still
+                              occupied in the final frame -- the STIRAP metric)
+          all + img1/mid  -> matched-index survival: (a1&a2).sum() / a1.sum()
+        """
         # Survival only when there's a 2nd image (NumImages >= 2 AND logic2
         # present); 1-image scans keep the loading timeseries.
         if self.num_images_per_seq < 2:
             return None
-        sl = self._effective_scan_logicals()   # mid-conditioned when survival_ref='mid'
+        sl = self._effective_scan_logicals()   # a1 = mid-conditioned when survival_ref='mid'
         if not sl or sl[0][2] is None:
             return None
+        use_mid = getattr(self, 'survival_ref', 'img1') == 'mid'
+        # target_restrict is a no-op when the run has no diag targets at all
+        # (normal survival scans): fall back to whole-array survival so the plot
+        # is never blank. Individual target-known shots gap (None) mid-warmup.
         st = self._seq_targets
+        restrict = bool(getattr(self, 'target_restrict', True)) and bool(st)
         recent = sl[-max_shots:]
         vals = []
         target_aware = False
@@ -1251,26 +1459,44 @@ class DataManager:
                 continue
             a1 = np.asarray(l1, dtype=bool)
             a2 = np.asarray(l2, dtype=bool)
-            tgt = st.get(int(seq_id))
+            tgt = st.get(int(seq_id)) if restrict else None
             if tgt is not None and len(tgt):
                 t = np.asarray(tgt, dtype=int)
                 t = t[(t >= 0) & (t < a2.shape[0])]
-                vals.append(float(a2[t].sum()) / t.size if t.size else None)
-                if t.size:
-                    target_aware = True
+                if not t.size:
+                    vals.append(None)
+                    continue
+                target_aware = True
+                if use_mid:
+                    # verify-conditioned survival AT the target sites.
+                    if a1.shape[0] != a2.shape[0]:
+                        vals.append(None)
+                        continue
+                    mt = a1[t]
+                    den = int(mt.sum())
+                    vals.append(float((mt & a2[t]).sum()) / den if den else None)
+                else:
+                    # raw TP: fraction of target sites filled in the final image.
+                    vals.append(float(a2[t].sum()) / t.size)
+            elif restrict:
+                # Target-restricted run, but this shot's diag targets have not
+                # arrived yet -> gap it (don't silently swap in an all-sites
+                # metric that would read differently on the same curve).
+                vals.append(None)
             elif a1.shape[0] != a2.shape[0]:
                 # Cross-grid run (init pattern != target pattern): img1 and img2
                 # are detected on DIFFERENT grids, so matched-index per-site
-                # survival (a1 & a2) is undefined and would raise. Leave None
-                # until this shot's diag targets arrive (the target-aware branch
-                # above then fills it with per-shot TP).
+                # survival (a1 & a2) is undefined and would raise. Leave None.
                 vals.append(None)
             else:
                 loaded = int(a1.sum())
                 vals.append(float((a1 & a2).sum()) / loaded if loaded > 0 else None)
         if not any(v is not None for v in vals):
             return None
-        return {'values': vals, 'target_aware': target_aware}
+        # cond_mid distinguishes the verify-conditioned target survival (STIRAP
+        # metric) from raw TP so the figure can label them differently.
+        return {'values': vals, 'target_aware': target_aware,
+                'cond_mid': bool(use_mid and target_aware)}
 
     def _pull_live_targets(self):
         """Background: refresh ``self._seq_targets`` (seq_id → target lab-site
@@ -1400,13 +1626,26 @@ class DataManager:
         if 0 in self._pattern_knm:
             g0 = aff.apply_affine_cropped(
                 aff._knm_to_xy(self._pattern_knm[0]), A, roi)
+            if self._pattern_zoff.get(0) is not None:   # keep the 3-D dz term through refreshes
+                g0 = g0 + self._pattern_zoff[0]
             self.grid_locations = np.ascontiguousarray(g0)
             self._affine_grid0 = g0.copy()
         last = max(1, self.num_images_per_seq) - 1
         if self.is_two_array and last in self._pattern_knm:
             gl = aff.apply_affine_cropped(
                 aff._knm_to_xy(self._pattern_knm[last]), A, roi)
+            if self._pattern_zoff.get(last) is not None:
+                gl = gl + self._pattern_zoff[last]
             self.grid_locations_img2 = np.ascontiguousarray(gl)
+        # MIDDLE (verify) frame's own grid moves with the same affine.
+        mid = MID_FRAME_IDX
+        if (self.grid_locations_mid is not None and mid < last
+                and mid in self._pattern_knm):
+            gm = aff.apply_affine_cropped(
+                aff._knm_to_xy(self._pattern_knm[mid]), A, roi)
+            if self._pattern_zoff.get(mid) is not None:
+                gm = gm + self._pattern_zoff[mid]
+            self.grid_locations_mid = np.ascontiguousarray(gm)
 
     def _placement_ratio(self, fits, thres):
         """Per-site r = (thr - mu_empty)/(mu_atom - mu_empty) from a full Gaussian
@@ -1858,6 +2097,72 @@ class DataManager:
             return self.live_thresholds_img2
         return loaded
 
+    def _effective_gauss_fits(self, pattern_name, loaded):
+        """The per-site double-Gaussian fits that BELONG to the thresholds
+        :meth:`_effective_thresholds` returns for the same frame -- same
+        precedence (img1's live refit / img2's own live refit / the frame's
+        stored per-pattern fits). The common-mode corrector needs the fit that
+        produced the cut in use, so ``mu_empty`` and the cut share one scale."""
+        if (self.live_gauss_fits is not None and pattern_name is not None
+                and pattern_name == self._pattern_names.get(0)):
+            return self.live_gauss_fits
+        if (self.live_gauss_fits_img2 is not None and pattern_name is not None
+                and pattern_name == self._img2_pattern_name()
+                and (loaded is None
+                     or len(self.live_gauss_fits_img2) == len(loaded))):
+            return self.live_gauss_fits_img2
+        return loaded
+
+    # --- Per-shot common-mode brightness normalization (detection only) ---
+
+    def _cm_reference(self, frame_idx, fits, n_sites):
+        """Cached ``(mu_empty, atom_ref, good)`` for one frame. Keyed on the fit
+        OBJECT identity, so a live refit (which replaces the list) rebuilds it
+        and an unchanged fit costs nothing; the tuple keeps a strong reference
+        to ``fits`` so the identity check can never alias a freed object."""
+        ent = self._cm_ref_cache.get(frame_idx)
+        if ent is not None and ent[0] is fits and ent[1] == n_sites:
+            return ent[2]
+        ref = cmnorm.reference_from_fits(fits, n_sites)
+        self._cm_ref_cache[frame_idx] = (fits, n_sites, ref)
+        return ref
+
+    def _cm_detect(self, frame_idx, intensities, thresholds, fits, logicals,
+                   bypass=False):
+        """Re-decide one frame's occupancy after removing the shot's COMMON-MODE
+        brightness gain; returns the (possibly unchanged) logicals.
+
+        The gain is TRACKED on every frame -- including when the correction is
+        disabled or bypassed -- so the dashboard shows the wobble either way.
+        Never raises: any failure falls back to the raw logicals.
+        """
+        try:
+            n = int(np.size(intensities))
+            ref = self._cm_reference(frame_idx, fits, n)
+            if ref is None:
+                return logicals
+            mu_e, atom_ref, good = ref
+            thr = np.asarray(thresholds, dtype=np.float64).ravel()
+            if thr.size != n:
+                return logicals
+            gain = self._cm.observe(
+                frame_idx, intensities, thr, mu_e, atom_ref, good,
+                apply_correction=(bool(cmnorm.is_enabled()) and not bypass))
+            if gain == 1.0:
+                return logicals
+            if frame_idx not in self._cm_logged:
+                self._cm_logged.add(frame_idx)
+                logger.info('Common-mode normalization ACTIVE on frame %d '
+                            '(pattern %s, %d sites): first gain %.3f',
+                            frame_idx, self._pattern_names.get(frame_idx), n,
+                            gain)
+            norm = cmnorm.normalize(intensities, mu_e, good, gain)
+            return norm > thr
+        except Exception as e:  # noqa: BLE001
+            logger.debug('common-mode normalization skipped on frame %d: %s',
+                         frame_idx, e)
+            return logicals
+
     @property
     def infidelities(self):
         return self.live_infidelities if self.live_infidelities is not None else self.loaded_infidelities
@@ -1979,12 +2284,34 @@ class DataManager:
             is_first = frame_idx == 0
             is_last  = pSeq >= 2 and frame_idx == pSeq - 1
             is_mid   = (not is_first) and (not is_last)   # only when pSeq >= 3
-            # Two-array mode: the second array layout applies to the FINAL
-            # frame (post-rearrangement / post-pushout). Middle frames are
-            # still in the same configuration as the initial image, so they
-            # use grid_locations.
+            # Per-frame array layout: the FINAL frame uses the img2 grid
+            # (post-rearrangement / post-pushout); a MIDDLE frame uses its own
+            # declared pattern grid when the scan gave it one, else it falls back
+            # to the frame-0 (loading) grid -- correct only when the middle array
+            # IS the loading array.
             proba_vec = None   # img2 per-site posterior for this frame (model path)
-            if self.is_two_array and is_last:
+            cm_bypass = False  # True when the GMM (not a threshold) decided this frame
+            if is_mid and self.grid_locations_mid is not None:
+                # MIDDLE (verify) frame of a multi-round rearrangement with its
+                # OWN declared pattern: detect on THAT pattern's grid + per-site
+                # thresholds. Detecting it on the frame-0 (loading) grid is
+                # simply the wrong array whenever the middle pattern differs
+                # (3013 tri positions vs a 2198 kagome) -- it silently produced
+                # 3013-wide logicals_mid at ~0.18 occupancy, wrong boxes on the
+                # "Tweezer Array (middle)" pane, and a wrong mid-conditioned
+                # survival. (The bits the SLM server scores round 2 against come
+                # from pyctrl's own per-pattern detector, so the rearrangement
+                # itself was never affected -- see rearrange_runtime.detector_for.)
+                grid_i = self.grid_locations_mid
+                thr_i = self._effective_thresholds(
+                    self._pattern_names.get(frame_idx),
+                    self.loaded_thresholds_mid)
+                fits_i = self._effective_gauss_fits(
+                    self._pattern_names.get(frame_idx),
+                    self.loaded_gauss_fits_mid)
+                logicals, intensities = detect_atom(
+                    img.astype(np.float64), grid_i, thr_i, self.mask_mat)
+            elif self.is_two_array and is_last:
                 grid_i = self.grid_locations_img2
                 # Per-pattern, per-site thresholds. A frame detects with ITS
                 # pattern's thresholds. The live Gaussian refit only ever
@@ -1994,6 +2321,8 @@ class DataManager:
                 # loading pattern, otherwise its own stored per-site thresholds.
                 thr_i = self._effective_thresholds(
                     self._pattern_names.get(pSeq - 1), self.loaded_thresholds_img2)
+                fits_i = self._effective_gauss_fits(
+                    self._pattern_names.get(pSeq - 1), self.loaded_gauss_fits_img2)
                 fr = img.astype(np.float64)
                 if self._img2_model is not None:
                     # Spot-SHAPE GMM detector (distinct-pattern img2 only):
@@ -2010,6 +2339,13 @@ class DataManager:
                                      'falling back to threshold', e)
                     if res is not None:
                         logicals, proba_vec, intensities = res
+                        # The model classifies by spot SHAPE against a FIXED
+                        # trained per-pixel scaler, so it is not a threshold
+                        # comparison and must not be fed a rescaled patch --
+                        # bypass the common-mode correction here (the gain is
+                        # still tracked for the dashboard). The fallback branch
+                        # below IS a threshold comparison and is corrected.
+                        cm_bypass = True
                     else:
                         logicals, intensities = detect_atom(
                             fr, grid_i, thr_i, self.mask_mat)
@@ -2019,8 +2355,18 @@ class DataManager:
             else:
                 grid_i = self.grid_locations
                 thr_i = self.thresholds
+                fits_i = self.gauss_fits
                 logicals, intensities = detect_atom(
                     img.astype(np.float64), grid_i, thr_i, self.mask_mat)
+            # Per-shot COMMON-MODE brightness normalization: re-decide this
+            # frame's occupancy with the shot's global gain wobble divided out
+            # (the dominant imaging-fidelity limiter -- see common_mode.py).
+            # ONLY the logicals change: `intensities` stays RAW everywhere
+            # downstream (accumulators, histograms, HDF5), so the threshold
+            # refit and its degeneracy guards are untouched and an offline A/B
+            # of the same run is a pure recomputation.
+            logicals = self._cm_detect(frame_idx, intensities, thr_i, fits_i,
+                                       logicals, bypass=cm_bypass)
             self._logicals_to_save.append(logicals)
             self._intensities_to_save.append(intensities)
             self._imgs_to_save.append(img.astype(np.uint16))
@@ -2065,6 +2411,8 @@ class DataManager:
                 self._display_image_mid = img.astype(np.uint16)
                 self._display_intensities_mid = intensities.copy()
                 self._display_logicals_mid = logicals.copy()
+                if frame_idx == MID_FRAME_IDX:
+                    record_fill('mid', logicals)
             # Final image of each sequence: feeds the "image 2" display
             # slot and (for is_two_array) the second log buffer.
             if is_last:
@@ -2073,6 +2421,11 @@ class DataManager:
                 self._display_logicals2 = logicals.copy()
                 self._display_proba2 = (proba_vec.copy()
                                         if proba_vec is not None else None)
+                # FINAL-frame fill fraction, normalized by the FINAL pattern's own
+                # site count (2078 for the kagome target) -- NOT by the 3013-site
+                # loading array. This is the number the operator reads off the
+                # visibly-full final image; the loading trace stays frame-0.
+                record_fill('final', logicals)
                 if self.is_two_array and self.log_buffer_img2 is not None:
                     self.log_buffer_img2.push(logicals.astype(np.float64))
                 # When the shape model is the img2 detector, buffer its per-site
@@ -2608,9 +2961,10 @@ class DataManager:
                     proba2 = np.array(pr, dtype=np.float64)
 
             # Middle (verify) frame (NumImages >= 3): the round-1 post-
-            # rearrangement occupancy, detected on the img1 grid. Demux the
-            # frame-1 slot ([1::pSeq]) -- its bits are already in the same
-            # buffers as img1/img2, just never extracted before. (For pSeq > 3
+            # rearrangement occupancy, detected on the MIDDLE pattern's own grid
+            # (num_sites_mid; the img1 grid when no middle pattern was declared).
+            # Demux the frame-1 slot ([1::pSeq]) -- its bits are already in the
+            # same buffers as img1/img2, just never extracted before. (For pSeq > 3
             # only the FIRST middle frame is persisted.)
             logs_mid = ints_mid = None
             if self._save_mid and pSeq >= 3 and logs_all:
@@ -2782,6 +3136,41 @@ class DataManager:
         self.survival_ref = 'mid' if str(ref).lower() == 'mid' else 'img1'
         return self.survival_ref
 
+    def set_target_restrict(self, enabled):
+        """Dashboard toggle: restrict the 0d per-shot survival series to the
+        run's TARGET sites (from the SLM diag) vs the whole array. Orthogonal to
+        survival_ref (which frame conditions the survival). Default True == the
+        historical auto behavior; a no-op for runs with no diag targets."""
+        self.target_restrict = bool(enabled)
+        return self.target_restrict
+
+    def _scan_axes_summary(self):
+        """Compact axis metadata for the dashboard Scan-panel dropdowns.
+
+        Returns ``None`` for a 0/1-D single-param scan (no dropdown needed), or
+        a dict describing the swept dimensions:
+            {'ndim': int,
+             'dims': [{'name': str, 'size': int}, ...],        # for >= 3-D slice picker
+             'coupled': [{'name': str}, ...]}                  # for coupled 1-D x-axis picker
+        ``dims`` is present when ndim >= 3; ``coupled`` when the (1-D) dim sweeps
+        more than one parameter. Cheap -- names/sizes only, no value arrays."""
+        dims = self._scan_dims
+        if not dims:
+            return None
+        ndim = len(dims)
+        out = {'ndim': ndim}
+        if ndim >= 3:
+            out['dims'] = [{'name': d.get('name'), 'size': int(d.get('size') or 0)}
+                           for d in dims]
+        if ndim == 1:
+            coupled = dims[0].get('coupled') or []
+            if len(coupled) > 1:
+                out['coupled'] = [{'name': c.get('name')} for c in coupled]
+        # Nothing to configure -> no dropdown.
+        if ndim < 3 and 'coupled' not in out:
+            return None
+        return out
+
     def _effective_scan_logicals(self):
         """The (seq_id, cond, logic2) triples the live survival consumers use.
         survival_ref='mid': substitute each shot's middle (verify) bits for
@@ -2886,6 +3275,16 @@ class DataManager:
             'cur_image_mid': self._display_image_mid.astype(np.float64) if self._display_image_mid is not None else None,
             'cur_intensities_mid': self._display_intensities_mid,
             'logicals_mid': self._display_logicals_mid,
+            # MIDDLE (verify) frame's OWN detection grid / site count / pattern
+            # (None when the scan declared no distinct middle pattern -> the
+            # middle pane falls back to the frame-0 grid, as before).
+            'grid_locations_mid': self.grid_locations_mid.copy()
+                if self.grid_locations_mid is not None else None,
+            'num_sites_mid': self.num_sites_mid,
+            'active_pattern_mid': (self._pattern_names.get(MID_FRAME_IDX)
+                                   if self.grid_locations_mid is not None else None),
+            'thresholds_mid': (self.loaded_thresholds_mid
+                               if self.grid_locations_mid is not None else None),
             'num_images': self.num_images_per_seq,
             'is_two_array': self.is_two_array,
             'grid_locations_img2': self.grid_locations_img2.copy()
@@ -2921,6 +3320,13 @@ class DataManager:
             'infidelities': self.infidelities.copy(),
             'loading_rates': self.loading_rates.copy(),
             'loading_history': get_loading_history(),
+            # Per-frame FILL fractions, each over its OWN pattern's site count
+            # (mid -> num_sites_mid, final -> num_sites_img2). Deliberately
+            # separate series from loading_history (frame 0 / num_sites) so the
+            # Loading-Rate card can show "loaded 70% of 3013" and "final fill 96%
+            # of 2078" side by side instead of one ambiguous "fraction loaded".
+            'mid_fill_history': get_fill_history('mid'),
+            'final_fill_history': get_fill_history('final'),
             # Per-shot survival (TP) for the 0d Scan-Curve timeseries — shows
             # survival instead of loading, target-aware when diag targets known.
             'survival_history': self._per_shot_survival_series(),
@@ -2938,6 +3344,13 @@ class DataManager:
             'shots_this_run': int(self._seq_total),
             # Detection-threshold calibration health + cadence (threshold tab).
             'threshold_health': self._threshold_health,
+            # Per-shot COMMON-MODE brightness normalization: whether the live
+            # correction is on, plus per-frame gain stats (last gain, EWMA
+            # reference, and `cv` = the size of the wobble that frame is
+            # seeing). Tracked even with the correction OFF, so this is the
+            # before/after readout for the A/B.
+            'cm_norm': (self._cm.snapshot()
+                        if getattr(self, '_cm', None) is not None else None),
             # HDF5 save health (Live status strip): turns the save tile red when
             # an append_block ultimately failed and a block of shots was lost.
             'save_health': self._save_health,
@@ -2965,7 +3378,14 @@ class DataManager:
                 is_two_array=self.is_two_array,
                 recent_seq_ids=self._last_batch_seq_ids,
                 seq_targets=self._seq_targets,
-                site_mask=_live_mask),
+                site_mask=_live_mask,
+                # "Cond. verify": in the TARGET-AWARE branch, condition on the
+                # verify frame instead of reporting raw TP. Without this the
+                # plotted curve ignored the toggle entirely (2026-08-06) --
+                # _effective_scan_logicals already substitutes the mid bits into
+                # logic1, but that branch never read logic1.
+                cond_mid=(getattr(self, 'survival_ref', 'img1') == 'mid'
+                          and bool(getattr(self, 'target_restrict', True)))),
             'survival_ref': self.survival_ref,
             'survival_mid_available': bool(self._scan_mid_logicals),
             'site_mask_active': bool(_live_mask is not None),
@@ -2977,6 +3397,10 @@ class DataManager:
             'scan_param_path': self._scan_param_path,
             'plot_scale': self._plot_scale,
             'scan_filename': os.path.basename(self.fname) if self.fname else None,
+            # Compact axis summary for the dashboard's Scan-panel dropdowns
+            # (which dim to slice for a 3-D scan; which coupled param labels the
+            # x-axis for a coupled 1-D scan). Cheap metadata, no per-shot data.
+            'scan_axes': self._scan_axes_summary(),
         }
 
         # ---- Apply the live site mask to EVERY per-site readout ----
@@ -3029,6 +3453,9 @@ def _apply_live_site_mask(d, mask1, mask2):
     only the per-site VALUES/bits are NaN'd/blanked."""
     # img1 per-site vectors (intensities, logicals, thresholds, infidelities,
     # loading rates). Logicals become float w/ NaN -> the box renderer skips NaN.
+    # The mid entries are masked only when the MIDDLE frame shares the loading
+    # array (_mask_vec no-ops on a length mismatch) -- a distinct middle array's
+    # indices don't map through the frame-0 mask, same as a distinct img2 grid.
     for k in ('cur_intensities', 'logicals', 'cur_intensities_mid',
               'logicals_mid', 'thresholds', 'infidelities', 'loading_rates'):
         d[k] = _mask_vec(d.get(k), mask1)

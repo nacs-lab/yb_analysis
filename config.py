@@ -294,6 +294,38 @@ THRES_FIT_MAX_SHOTS = 400
 # doublet collapses into one bar. (lo, hi) in percent.
 HIST_DISPLAY_CLIP_PCT = (0.5, 99.5)
 
+# ---- Per-shot COMMON-MODE brightness normalization (detection only) ----
+# The 399 imaging fluorescence breathes shot-to-shot as a GLOBAL gain (whole
+# array together, CV ~22-24%, img1<->img2 same-shot corr 0.987, correlation time
+# ~2-3 shots) and is the DOMINANT per-site imaging-fidelity limiter -- removing
+# it offline lifted fidelity 0.993 -> 0.9996 and 2198 survival 0.979 -> 0.987
+# (problem-memory open-imaging-common-mode-shot-wobble). The live corrector
+# (yb_analysis/detection/common_mode.py) divides each frame's atom signal by a
+# robust per-shot gain BEFORE the threshold comparison; the accumulators /
+# histograms / stored intensities stay RAW, so the threshold refit and its
+# guards are untouched. Kill switch: YB_CM_NORM=0 (or common_mode.set_enabled).
+CM_NORM_ENABLED = os.environ.get('YB_CM_NORM', '1') != '0'
+# Minimum DETECTED-BRIGHT sites a frame needs before its gain is trusted. Below
+# this the shot is left alone (blank frame, fully pushed-out frame, tiny array).
+CM_NORM_MIN_SITES = 30
+# A site enters the reference only when its calibrated atom signal
+# (mu_atom - mu_empty) clears this, i.e. its fit is a real bimodal pair.
+CM_NORM_MIN_SEP = 1.0            # ADU
+# EWMA weight for the per-frame reference gain (memory ~ 1/EMA = 50 shots).
+# MUST stay much slower than the ~2-3 shot wobble correlation time, else the
+# reference absorbs the wobble and the correction nulls itself; slow drift is
+# already handled by the cheap threshold tracker, so the two never fight.
+CM_NORM_EMA = 0.02
+# Shots per frame before the correction starts (the reference needs to settle).
+CM_NORM_WARMUP = 10
+# Sanity rails on the APPLIED (relative) gain. Wide enough not to clip the
+# normal +-2 sigma of a 24%-CV wobble, tight enough to bound the damage from a
+# bad estimate (a gain g moves the effective cut to mu_e + g*(thr - mu_e)).
+CM_NORM_GAIN_MIN = 0.5
+CM_NORM_GAIN_MAX = 2.0
+# Recent RAW gains kept per frame for the dashboard wobble-CV readout.
+CM_NORM_HISTORY = 200
+
 # --- img2 spot-shape GMM detector (yb_analysis/detection/spot_shape_model.py) ---
 # img2 (the post-protocol frame) is detected by a spot-SHAPE GMM classifier
 # rather than an intensity threshold: when nearly every site is loaded the img2

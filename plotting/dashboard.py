@@ -90,6 +90,21 @@ _LIVE_FIG_NAMES = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
 _LIVE_FIG_DEFAULT_ARGS = (12, '01', 0, (), None)
 
 
+def _mid_grid_key(d):
+    """Which grid the "Tweezer Array (middle)" pane draws its boxes from.
+
+    A multi-round rearrangement's MIDDLE (verify) frame is its OWN array when the
+    scan declares a distinct middle pattern (imagePatternsJson entry 1) -- e.g. a
+    2198-site kagome between a 3013-site tri load and a 2078-site kagome target.
+    The DataManager then publishes ``grid_locations_mid`` and detects that frame
+    against it, so the pane MUST use it; hardcoding ``grid_locations`` drew the
+    full 3013-site loading grid over a kagome middle image (2026-07-27). Falls
+    back to the frame-0 grid when no middle pattern was declared (the middle
+    array then IS the loading array)."""
+    return ('grid_locations_mid' if d.get('grid_locations_mid') is not None
+            else 'grid_locations')
+
+
 def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
                   use_img_url=False, scan_opts=None):
     """Build ONE live Plotly figure by name (the name->builder dispatch shared by
@@ -105,7 +120,7 @@ def _dispatch_fig(d, name, marker_size, cbar_scale, site_idx, boxes_on,
                           shape_key='_img_mid_shape',
                           vlo_key='_img_mid_vlo', vhi_key='_img_mid_vhi',
                           logicals_key='logicals_mid',
-                          grid_key='grid_locations',
+                          grid_key=_mid_grid_key(d),
                           title='Tweezer Array (middle)',
                           show_boxes=boxes_on('array_mid'),
                           use_img_url=use_img_url)
@@ -1108,14 +1123,21 @@ def _fast_json_response(obj):
 # dashboard's plot-data dict; everything that's downsampled-image-only
 # is excluded (those live in _HEAVY_KEYS and are stripped from /snapshot).
 _API_KEYS_STATUS = ('scan_id', 'scan_name', 'scan_filename', 'scan_param_path',
-                    'num_sites', 'num_images', 'is_two_array', 'n_accum_shots',
+                    'num_sites', 'num_sites_mid', 'num_sites_img2',
+                    'num_images', 'is_two_array', 'n_accum_shots',
                     'hist_version', '_dummy_mode', '_failing_mode')
 _API_KEYS_GRID = ('grid_locations', 'thresholds', 'grid_locations_img2',
                   'thresholds_img2', 'num_sites', 'num_sites_img2', 'box_size',
-                  'is_two_array')
-_API_KEYS_LOADING = ('logicals', 'logicals2', 'cur_intensities',
-                     'cur_intensities2', 'loading_history', 'loading_rates',
-                     'loading_rates_img2', 'num_sites', 'n_accum_shots')
+                  'is_two_array',
+                  # MIDDLE (verify) frame's own grid (multi-round rearrangement);
+                  # None when the scan declared no distinct middle pattern.
+                  'grid_locations_mid', 'thresholds_mid', 'num_sites_mid',
+                  'active_pattern_mid')
+_API_KEYS_LOADING = ('logicals', 'logicals2', 'logicals_mid',
+                     'cur_intensities', 'cur_intensities2', 'loading_history',
+                     'mid_fill_history', 'final_fill_history', 'loading_rates',
+                     'loading_rates_img2', 'num_sites', 'num_sites_mid',
+                     'num_sites_img2', 'n_accum_shots')
 _API_KEYS_SCAN = ('scan_name', 'scan_filename', 'scan_param_path',
                   'scan_curve', 'plot_scale')
 _API_KEYS_INFID = ('infidelities', 'infidelities_img2', 'num_sites')
@@ -1906,8 +1928,8 @@ def _register_api_routes(server):
         '/api':             'this endpoint index',
         '/api/endpoints':   'list of available endpoints (with descriptions)',
         '/api/status':      'scan_id, scan_name, scan_filename, n_accum_shots, num_sites, ...',
-        '/api/grid':        'grid_locations, thresholds, box_size (+ *_img2 when two-array)',
-        '/api/loading':     'logicals, cur_intensities, loading_history, loading_rates',
+        '/api/grid':        'grid_locations, thresholds, box_size (+ *_img2 when two-array, *_mid when a middle pattern is declared)',
+        '/api/loading':     'logicals, cur_intensities, loading_history, per-frame mid/final fill history, loading_rates',
         '/api/scan':        'scan_curve (1-D or 2-D), scan_name, scan_filename',
         '/api/infidelities':'per-site discrimination infidelity',
         '/api/queue':       'runner queue {running, queued, history} (~1s stale)',
@@ -1936,7 +1958,7 @@ def _register_api_routes(server):
         '/api/sequence/pick_folder': 'POST: open a native folder picker on the lab PC desktop -> {path}',
         '/api/queue/submit':                              'POST: submit a scan descriptor (JSON body) to the SequenceRunner queue',
         '/api/queue/cancel/<int:entry_id>':               'POST: cancel a queued job or descriptor by id',
-        '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its kind',
+        '/api/queue/move/<int:entry_id>/<direction>':     'POST: move a queued entry up/down within its scheduling lane (foreground/background)',
         '/api/queue/requeue/<int:entry_id>':              'POST: re-submit an existing entry\'s original descriptor (same params) as a new descriptor',
         '/api/affine/current':       'current global SLM->camera affine (2x3 + rotation/scale/rms/coverage/last_scan_id)',
         '/api/affine/history':       'bounded history of past affines + current',
@@ -2477,12 +2499,18 @@ def _register_api_routes(server):
         survival_ref = (request.args.get('survival_ref') or 'img1').lower()
         if survival_ref not in ('img1', 'mid'):
             survival_ref = 'img1'
+        # Target-only restriction (ORTHOGONAL to survival_ref -- they compound):
+        # keep only the rearrangement-target sites. No-op for runs without an
+        # slm_diag.h5. Mirrors the live dashboard's "Targets only" toggle.
+        target_only = (request.args.get('target_only') or '').lower() in (
+            '1', 'true', 'yes', 'on', 'targets')
         try:
             result = analyze_scan(scan_id, filters=filters,
                                   recompute_infidelity=recompute,
                                   force_recache=force_recache,
                                   site_mask=site_mask,
-                                  survival_ref=survival_ref)
+                                  survival_ref=survival_ref,
+                                  target_only=target_only)
         except RunAnalysisError as ex:
             msg = str(ex).lower()
             if 'must be 14 digits' in msg or 'must pass scan_id' in msg:
@@ -3116,7 +3144,11 @@ def _register_api_routes(server):
     @server.route('/api/queue/move/<int:entry_id>/<direction>',
                   methods=['POST'])
     def _api_queue_move(entry_id, direction):
-        """Move a queued entry up or down (within its own kind)."""
+        """Move a queued entry up or down within its scheduling lane.
+
+        Jobs and descriptors share one ordering (dispatch inserts a built job at
+        its descriptor's slot), so displayed order == run order. Only the
+        foreground/background lanes are kept separate. 400 at a lane edge."""
         if direction not in ('up', 'down'):
             return jsonify({'error': "direction must be 'up' or 'down'"}), 400
         try:
@@ -3766,6 +3798,18 @@ def _register_api_routes(server):
             return jsonify({'error': "ref must be 'img1' or 'mid'"}), 400
         _wc.enqueue('survival_ref', ref=ref)
         return jsonify({'ok': True, 'ref': ref, 'via': 'run_monitor'})
+
+    @server.route('/api/control/target_restrict', methods=['POST'])
+    def _api_control_target_restrict():
+        # Live "restrict the 0d survival series to target sites" toggle: a
+        # view-only preference (no authority over the experiment -> no exposure
+        # gate). Orthogonal to survival_ref (conditioning frame). Spooled to the
+        # main process's ControlPanel, which applies it to the live DataManager.
+        from flask import jsonify, request
+        body = request.get_json(silent=True) or {}
+        enabled = bool(body.get('enabled', True))
+        _wc.enqueue('target_restrict', enabled=enabled)
+        return jsonify({'ok': True, 'enabled': enabled, 'via': 'run_monitor'})
 
     @server.route('/api/control/downsample', methods=['POST'])
     def _api_control_downsample():
@@ -5981,10 +6025,12 @@ new MutationObserver(function(mutations) {
                                 else 'Waiting for data...')
             img_mid_no_data_msg = ('No middle frame (NumImages < 3)'
                                    if num_images < 3 else 'Waiting for data...')
-            # Two-array grid only applies to the final frame; the middle
-            # frame is still in the initial array layout when pSeq >= 3.
+            # Two-array grid applies to the final frame; the middle frame uses
+            # its own declared pattern grid when the scan gave it one
+            # (_mid_grid_key), else the initial array layout.
             img2_grid_key = ('grid_locations_img2' if d.get('is_two_array')
                              else 'grid_locations')
+            img_mid_grid_key = _mid_grid_key(d)
             # Dummy mode: live panels (image, intensities, loading-rate trace)
             # still reflect the current frame, but cumulative panels carry
             # over stale values from the last real scan. Blank those out and
@@ -6006,7 +6052,7 @@ new MutationObserver(function(mutations) {
                            shape_key='_img_mid_shape',
                            vlo_key='_img_mid_vlo', vhi_key='_img_mid_vhi',
                            logicals_key='logicals_mid',
-                           grid_key='grid_locations',
+                           grid_key=img_mid_grid_key,
                            title='Tweezer Array (middle)')
                     if has_img_mid else _waiting('Tweezer Array (middle)',
                                                  img_mid_no_data_msg),
@@ -6750,19 +6796,25 @@ def _fig_intens(d):
     return fig
 
 
+def _cur_frac(logicals):
+    """Fraction occupied in one frame's per-site bits, nan-aware (site-mask
+    excluded sites arrive as NaN and must not count as empty), or None."""
+    if logicals is None or len(logicals) == 0:
+        return None
+    a = np.asarray(logicals, dtype=float)
+    if not np.isfinite(a).any():
+        return None
+    return float(np.nanmean(a))
+
+
 def _fig_loading_live(d):
     hist = d.get('loading_history')
     if hist is None or len(hist) == 0:
         return _waiting('Loading Rate')
     hist = np.asarray(hist, dtype=float)
-    logicals = d.get('logicals')
     # nan-aware: site-mask-excluded sites are NaN in `logicals`; the current
     # loading fraction is over the KEPT sites (else .mean() -> NaN -> "nan%").
-    cur = None
-    if logicals is not None and len(logicals) > 0:
-        _lg = np.asarray(logicals, dtype=float)
-        if np.isfinite(_lg).any():
-            cur = float(np.nanmean(_lg))
+    cur = _cur_frac(d.get('logicals'))
     # Average over the displayed history window (always populated, unlike
     # loading_rates which only refreshes every UPDATE_LOADING_INTERVAL shots).
     avg = float(hist.mean())
@@ -6770,25 +6822,61 @@ def _fig_loading_live(d):
     n = len(hist)
     x = list(range(1, n + 1))
     fig = go.Figure()
+    n_sites = d.get('num_sites') or 0
+    load_name = 'Loaded / %d' % n_sites if n_sites else 'Loaded'
     fig.add_trace(go.Scatter(x=x, y=hist.tolist(), mode='lines+markers',
                               line=dict(color='#0c6', width=1.5),
                               marker=dict(size=4, color='#0c6'),
-                              name='Per-shot', hoverinfo='y'))
+                              name=load_name, hoverinfo='y'))
+    # PER-FRAME FILL, each over ITS OWN pattern's site count. A multi-round
+    # rearrangement loads ~70% of a 3013-site tri array and ends up ~96% full on
+    # a 2078-site kagome target: reading the (correct) loading number as "how
+    # full is the final array" is the confusion this splits apart (2026-07-27).
+    # Series are right-anchored to the latest shot (they can be shorter than the
+    # loading history, e.g. right after a 2-image -> 3-image scan change).
+    num_images = int(d.get('num_images', 1) or 1)
+    extras = []
+    if num_images >= 3:
+        extras.append(('mid_fill_history', 'num_sites_mid', 'Mid fill', '#7aa2ff'))
+    if num_images >= 2:
+        extras.append(('final_fill_history', 'num_sites_img2', 'Final fill', '#ff9f43'))
+    cur_extra = []
+    for key, n_key, label, color in extras:
+        h = d.get(key)
+        if h is None or len(h) == 0:
+            continue
+        h = np.asarray(h, dtype=float)
+        m = min(len(h), n)
+        h = h[-m:]
+        nk = d.get(n_key) or 0
+        name = '%s / %d' % (label, nk) if nk else label
+        fig.add_trace(go.Scatter(x=list(range(n - m + 1, n + 1)), y=h.tolist(),
+                                 mode='lines+markers',
+                                 line=dict(color=color, width=1.5),
+                                 marker=dict(size=4, color=color),
+                                 name=name, hoverinfo='y'))
+        cur_extra.append('%s: %.1f%%' % (label, 100.0 * h[-1]))
     fig.add_shape(type='line', x0=0, x1=1, xref='paper', y0=avg, y1=avg,
                   line=dict(color='#ffdd44', width=1.5, dash='dash'))
-    fig.add_annotation(text=f'Avg: {avg:.1%}', xref='paper', y=avg,
+    fig.add_annotation(text=f'Avg load: {avg:.1%}', xref='paper', y=avg,
                        x=0.99, showarrow=False, xanchor='right', yanchor='bottom',
                        font=dict(color='#ffdd44', size=10))
     if cur is not None:
-        fig.add_annotation(text=f'Current: {cur:.1%}', xref='paper', yref='paper',
+        txt = 'Current load: %.1f%%' % (100.0 * cur)
+        if cur_extra:
+            txt += '   ' + '   '.join(cur_extra)
+        fig.add_annotation(text=txt, xref='paper', yref='paper',
                            x=0.5, y=1.0, showarrow=False,
-                           font=dict(size=18, color='#0c6', family='monospace'),
+                           font=dict(size=(18 if not cur_extra else 13),
+                                     color='#0c6', family='monospace'),
                            bgcolor='rgba(20,20,40,0.8)')
-    fig.update_layout(**_L, title='Loading Rate (last 100)',
+    fig.update_layout(**_L, title='Loading / fill per frame (last 100)',
                       xaxis=dict(title='Shot # (oldest → latest)', **_A),
-                      yaxis=dict(title='Fraction loaded', autorange=True,
-                                 tickformat='.0%', **_A),
-                      showlegend=False)
+                      yaxis=dict(title='Fraction of that frame\'s own array',
+                                 autorange=True, tickformat='.0%', **_A),
+                      showlegend=bool(cur_extra),
+                      legend=dict(x=0.01, y=0.01, bgcolor='rgba(0,0,0,0.35)',
+                                  font=dict(size=9)))
     return fig
 
 
@@ -6929,6 +7017,21 @@ def _fig_shift(d):
     return fig
 
 
+
+def _survival_y_label(sc, short=False):
+    """Y-axis label for a live scan curve, honest about BOTH axes of the 2x2.
+
+    Until 2026-08-06 these read "Survival - TP (target)" whenever the curve was
+    target-aware, no matter which frame it conditioned on -- so a raw-TP curve
+    and a verify-conditioned one were indistinguishable on screen while
+    differing by the whole rearrangement fill fraction (0.961 vs 0.992 on the
+    same shots). ``cond_mid`` now comes through from compute_scan_curve."""
+    if not (sc or {}).get('target_aware'):
+        return 'Survival' if not short else 'Survival'
+    if (sc or {}).get('cond_mid'):
+        return 'Survival | verify (target)'
+    return 'TP (target)' if short else 'Survival - TP (target)'
+
 def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
     sc = d.get('scan_curve')
     if sc is None or sc.get('mode') == 'undefined':
@@ -6998,7 +7101,7 @@ def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
         x_disp = x
 
     if mode == 'survival':
-        y_label = 'Survival — TP (target)' if sc.get('target_aware') else 'Survival'
+        y_label = _survival_y_label(sc)
     elif mode == 'rearrangement':
         y_label = 'Rearrangement Success (mean of logic2)'
     else:
@@ -7053,7 +7156,14 @@ def _fig_scan_timeseries(d):
     if is_surv:
         vals = sh.get('values') or []
         target_aware = bool(sh.get('target_aware'))
-        y_label = 'Survival — TP (target)' if target_aware else 'Survival'
+        cond_mid = bool(sh.get('cond_mid'))
+        if target_aware and cond_mid:
+            # verify-conditioned survival restricted to target sites (STIRAP).
+            y_label = 'Survival @ target (verify-cond.)'
+        elif target_aware:
+            y_label = _survival_y_label(sc)
+        else:
+            y_label = 'Survival'
         series_name = 'survival'
         color = '#3fb950'
     else:
@@ -7087,9 +7197,11 @@ def _fig_scan_timeseries(d):
         font=dict(color='#ffdd44', size=11),
         bgcolor='rgba(20,20,40,0.7)')
     if target_aware:
+        _ta_text = ('⌖ target survival (mid→final)' if cond_mid
+                    else '⌖ target-aware (diag)')
         fig.add_annotation(
             xref='paper', yref='paper', x=0.0, y=1.0, xanchor='left', yanchor='top',
-            text='⌖ target-aware (diag)', showarrow=False,
+            text=_ta_text, showarrow=False,
             font=dict(size=10, color='#3fb950'),
             bgcolor='rgba(0,0,0,0.35)', borderpad=2)
     fig.update_layout(**_L,
@@ -7100,32 +7212,96 @@ def _fig_scan_timeseries(d):
     return fig
 
 
-def _scan_caption(fig, main, fname, bottom=64):
-    """Scan-panel caption. The scan name + reps/pt + run/folder used to be the
-    big Plotly top title, which overflowed the narrow panel AND collided with
-    the control cluster pinned to the top-right corner. Instead drop the real
-    title and paint it small along the very BOTTOM of the panel, below the
-    x-axis label (the top corners stay clear for the expand button + controls).
+def _cbar(title):
+    """Colorbar dict with the title sitting on TOP of the bar (side='top'),
+    small, so it doesn't steal horizontal (side) space -- the user doesn't want
+    the title widening the panel. The full y-axis label ("Survival — TP
+    (target)") is too wide for a bar title, so shorten it to a compact token."""
+    short = title
+    if 'TP' in title:
+        short = 'TP'                     # target-aware survival -> just "TP"
+    elif title.startswith('Survival'):
+        short = 'Surv'
+    elif 'Loading' in title:
+        short = 'Load'
+    elif 'Rearrangement' in title:
+        short = 'Rearr'
+    return dict(len=0.9,
+                title=dict(text=short, side='top',
+                           font=dict(size=10, color='#e8e8e8')))
 
-    ``bottom`` is the bottom margin reserved for (x-axis label + caption). The
-    x-axis title auto-centres in the UPPER part of that margin; the caption is
-    pinned to the panel's very bottom edge, so with enough margin the two don't
-    overlap."""
+
+def _scan_margins(fig, *, caption_lines=2, has_slider=False):
+    """Compute the four Plotly margins for a scan-curve figure FROM ITS ACTUAL
+    CONTENT, instead of hand-guessing pixels per panel (the source of the
+    y-title-clipped / caption-overlaps-x-title / slider-collision whack-a-mole).
+
+    Reads the figure's own axis titles + tick labels:
+      * left   -- widest y-axis TICK label (drawn horizontally at the left) plus
+                  room for the rotated y-axis TITLE glyph line.
+      * bottom -- x-axis title line + the caption's line count, plus a slider
+                  band when one is present.
+      * top    -- small fixed band (no Plotly title; only overlay controls).
+      * right  -- small fixed band (a colorbar, if any, sits inside the plot).
+
+    Returns dict(l, r, t, b). Pixel coefficients are conservative -- a couple of
+    px too generous beats a clipped label. All four scan-fig builders funnel
+    through here via _scan_caption()."""
+    lay = fig.layout
+    # --- left: driven by the y-axis tick labels (widest string) + the title ---
+    yt = lay.yaxis.ticktext
+    y_tick_w = max((len(str(t)) for t in yt), default=6) if yt else 7
+    y_title = (lay.yaxis.title.text or '') if lay.yaxis.title else ''
+    # ~5.5 px per tick-label char + ~16 px for the rotated y-title + padding.
+    left = int(round(10 + y_tick_w * 5.5 + (16 if y_title else 0)))
+    left = max(44, min(left, 90))            # clamp to a sane band
+    # --- bottom: x-axis title band, then a gap, then the caption on the floor.
+    # The x-title auto-centres in the UPPER part of the margin and the caption
+    # is pinned to the bottom edge, so reserve enough that they don't share a
+    # row (the earlier tight margin let the folder caption overlap the x-title).
+    # NOTE: a 3-D slider does NOT add bottom room -- it overlays inside the plot
+    # (see _fig_scan_3d), so `has_slider` no longer inflates the margin.
+    x_title = (lay.xaxis.title.text or '') if lay.xaxis.title else ''
+    bottom = 8                               # floor padding under the caption
+    bottom += caption_lines * 13             # the bottom-pinned caption itself
+    if x_title:
+        bottom += 46                         # x-title band + gap above caption
+    return dict(l=left, r=15, t=14, b=bottom)
+
+
+def _scan_caption(fig, main, fname, *, has_slider=False):
+    """Scan-panel caption + auto-computed margins.
+
+    The scan name + reps/pt + run/folder used to be the big Plotly top title,
+    which overflowed the narrow panel AND collided with the control cluster
+    pinned to the top-right corner. Instead drop the real title and paint it
+    small along the very BOTTOM of the panel, below the x-axis label (the top
+    corners stay clear for the expand button + controls).
+
+    Margins come from _scan_margins() -- computed from the figure's own axis
+    titles / tick labels -- so long y-titles aren't clipped and the caption
+    always clears the x-axis label (and the slider, on a 3-D scan)."""
+    # Caption shows ONLY the data-folder name (blue). The scan name (`main`) is
+    # dropped from the visible caption -- it's redundant with the panel context
+    # -- but still accepted so callers don't change.
     if fname:
         run = fname[:-3] if fname.endswith('.h5') else fname  # strip .h5 → run folder
-        text = f'{main}  <span style="color:#7cc4ff">— {run}</span>'
+        text = f'<span style="color:#7cc4ff">{run}</span>'
     else:
-        text = main
-    # No Plotly title; trim the top margin (was 35) since the top corners now
-    # only hold the overlay controls. Reserve `bottom` for x-axis label + caption.
-    fig.update_layout(title=None, margin=dict(l=40, r=15, t=14, b=bottom))
-    # Pin to the panel's very bottom edge (paper y=0 = plot-area floor, so shift
-    # down by the full bottom margin, +2px off the edge). The x-axis title sits
-    # higher in the margin, so the caption lands strictly beneath it.
+        text = ''
+    caption_lines = 1
+    margin = _scan_margins(fig, caption_lines=caption_lines, has_slider=has_slider)
+    # No Plotly title; margins reserve exactly the room the caption + labels need.
+    fig.update_layout(title=None, margin=margin)
+    # Pin to the panel's very bottom-LEFT corner (paper 0,0 = plot-area
+    # bottom-left; shift left to the panel edge and down by the full bottom
+    # margin, +2px off the floor). Left-aligned so it starts at the left and
+    # never centres under -- and thus never collides with -- the 3-D slider's
+    # centred readout above it.
     fig.add_annotation(
-        xref='paper', yref='paper', x=0.5, y=0, xanchor='center', yanchor='bottom',
-        yshift=-bottom + 2, text=text, showarrow=False,
-        font=dict(size=9, color=TEXT))
+        xref='paper', yref='paper', x=0, y=0, xanchor='left', yanchor='bottom',
+        xshift=-margin['l'] + 4, yshift=-margin['b'] + 2, text=text,
+        align='left', showarrow=False, font=dict(size=9, color=TEXT))
     return fig
 
 
@@ -7177,7 +7353,7 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
 
     z = np.where(n_reps > 0, heatmap, np.nan)
     if mode == 'survival':
-        y_label = 'TP (target)' if sc.get('target_aware') else 'Survival'
+        y_label = _survival_y_label(sc, short=True)
     else:
         y_label = 'Loading'
     avg_reps = int(n_reps[n_reps > 0].mean()) if np.any(n_reps > 0) else 0
@@ -7216,7 +7392,7 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
     fig = go.Figure(go.Heatmap(
         z=z, x=x_idx, y=y_idx,
         colorscale='Viridis', zmin=zmin, zmax=zmax,
-        colorbar=dict(title=y_label, len=0.9),
+        colorbar=_cbar(y_label),
         customdata=customdata,
         hovertemplate=hovertemplate,
     ))
@@ -7288,7 +7464,7 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
 
     mode = sc.get('mode', 'survival')
     if mode == 'survival':
-        y_label = 'TP (target)' if sc.get('target_aware') else 'Survival'
+        y_label = _survival_y_label(sc, short=True)
     elif mode == 'rearrangement':
         y_label = 'Rearrange'
     else:
@@ -7366,7 +7542,7 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
     # Base trace = the default slice; frames carry every slice.
     z0, cd0, ht0 = _frame_data(default_s)
     base = go.Heatmap(z=z0, x=x_idx, y=y_idx, colorscale='Viridis',
-                      zmin=zmin, zmax=zmax, colorbar=dict(title=y_label, len=0.9),
+                      zmin=zmin, zmax=zmax, colorbar=_cbar(y_label),
                       customdata=cd0, hovertemplate=ht0)
     frames = []
     for s in range(ns):
@@ -7377,13 +7553,31 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
                              zmin=zmin, zmax=zmax, customdata=cd, hovertemplate=ht)],
             layout=go.Layout(shapes=_boxes(s))))
 
+    # Keep each step's real value as its label so the `currentvalue` readout
+    # ("<slice> = <value>") above the track shows it -- but HIDE the row of
+    # per-step numbers UNDER the track: the slider's own `font` (used for the
+    # tick labels) is made transparent, while `currentvalue.font` stays visible.
+    # Ticks themselves are zero-length. Net: readout yes, number axis no.
     steps = [dict(method='animate', label=f'{sv[s]:.4g}',
                   args=[[str(s)], dict(mode='immediate',
                                        frame=dict(duration=0, redraw=True),
                                        transition=dict(duration=0))])
              for s in range(ns)]
-    slider = dict(active=default_s, currentvalue=dict(prefix=f'{s_name} = '),
-                  pad=dict(t=30), steps=steps)
+    # The panel is a fixed 320px, too short to stack plot + x-title + slider +
+    # caption without squishing the plot (which spilled the rotated y-title off
+    # the top). So OVERLAY the slider INSIDE the plot's lower edge (y just above
+    # the x-axis, anchored from its bottom) instead of reserving a band below.
+    # It's rendered half-transparent at rest and made opaque on hover via CSS
+    # (`.js-plotly-plot .slider-container` in dashboard.css). Slim it down: thin
+    # track, no ticks, transparent tick-label font (readout only).
+    slider = dict(active=default_s,
+                  currentvalue=dict(prefix=f'{s_name} = ',
+                                    font=dict(size=10, color=TEXT)),
+                  font=dict(color='rgba(0,0,0,0)'),   # hide under-track labels
+                  y=0.02, yanchor='bottom', pad=dict(t=2, b=2),
+                  len=0.9, x=0.05,
+                  ticklen=0, minorticklen=0, tickwidth=0, borderwidth=0,
+                  bordercolor='rgba(0,0,0,0)', bgcolor='#3a3f52', steps=steps)
 
     xtv, xtt = _tickset(xv)
     ytv, ytt = _tickset(yv)
@@ -7396,9 +7590,10 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
                       yaxis=dict(title=y_name, tickmode='array',
                                  tickvals=ytv, ticktext=ytt, **_A),
                       sliders=[slider], shapes=_boxes(default_s))
-    # Extra bottom room for the slice slider (caption is at the top now).
+    # has_slider=True reserves the extra bottom band so the caption clears the
+    # slice slider (x-axis title -> slider -> caption, top to bottom).
     _scan_caption(fig, f'{scan_name} ({avg_reps} reps/pt, 3-D: slice {s_name})',
-                  d.get('scan_filename'), bottom=72)
+                  d.get('scan_filename'), has_slider=True)
     return fig
 
 
