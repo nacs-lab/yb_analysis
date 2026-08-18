@@ -50,6 +50,7 @@ from yb_analysis.analysis.probabilities import (
     per_shot_rate_stats, false_positive_rate,
 )
 from yb_analysis.analysis.unpack import unpack_scan_logicals
+from yb_analysis.io.scan_files import LAYOUT_SPLIT, resolve_scan_files
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,9 @@ ANALYSIS_PAYLOAD_JSON = 'analysis_payload.json'
 # v4: seq_specific now also carries the 556 push-out trap-depth panel
 # (type='trap_depth') for |mj|=1 survival scans; bump so already-cached mj=1 runs
 # recompute and surface it instead of their stale `seq_specific: None`.
-ANALYSIS_PAYLOAD_VERSION = 4
+# v5: payload now carries `images_layout` ('combined'|'split') so the dashboard
+# knows whether /imgs lives in the data file or the sibling image_<stamp>.h5.
+ANALYSIS_PAYLOAD_VERSION = 5
 
 
 def _analysis_cache_path(scan_dir: Path) -> Path:
@@ -545,6 +548,10 @@ def analyze_scan_dir(scan_dir,
         out['num_images'] = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
     except (TypeError, ValueError, IndexError):
         out['num_images'] = None
+    # Where the camera frames live: 'combined' (legacy, /imgs inside the data
+    # file) or 'split' (sibling image_<stamp>.h5). Additive/informational -- the
+    # analysis itself never opens the image file.
+    out['images_layout'] = bundle.get('layout')
 
     # ---- Global per-site mask ("analyze only these sites") ------------
     # Resolve the spec (arg or config.SITE_MASK) against this scan's n_sites.
@@ -829,7 +836,10 @@ def analyze_scan_dir(scan_dir,
     # an averaged-frame view in the Sequence-specific tab. The actual
     # PNG is computed lazily by the dashboard's /api/runs/<id>/avg_image
     # endpoint; here we just report whether it's available/computable.
-    out['avg_image'] = _avg_image_info(scan_dir, scan)
+    # Pass the bundle's already-known imgs_shape so this reports the frame
+    # dims WITHOUT opening the image file (the split-layout requirement).
+    out['avg_image'] = _avg_image_info(scan_dir, scan,
+                                       imgs_shape=bundle.get('imgs_shape'))
 
     # ---- Per-shot rearrangement PATHS (Phase 5a) ----------------------
     # Joins slm_diag.h5/{loaded_paired,target_paired} (per-shot bit
@@ -1856,18 +1866,51 @@ AVG_IMAGE_MAX_FRAMES = 250
 
 
 def _scan_data_h5(scan_dir: Path) -> Optional[Path]:
-    """Return the scan's data_*.h5 path (the one with /imgs, /logicals)."""
+    """Return the scan's data_*.h5 path (the one with /logicals, /seq_ids).
+
+    In the SPLIT layout this file no longer holds ``/imgs`` -- anything that
+    wants pixels must use ``_scan_imgs_h5``.
+    """
     cands = sorted(scan_dir.glob('data_*.h5'))
     return cands[0] if cands else None
 
 
-def _avg_image_info(scan_dir: Path, scan: dict) -> Optional[dict]:
+def _scan_imgs_h5(scan_dir: Path) -> Optional[Path]:
+    """Return the file that holds ``/imgs`` for this scan.
+
+    Combined (legacy) layout -> the data file itself; split layout -> the
+    sibling ``image_<stamp>.h5``. None when the directory holds no scan data
+    file at all, or when the image file is a OneDrive cloud-only placeholder
+    (opening it would block on a hydrate). Stat-only (``probe_attrs=False``):
+    no file is opened here.
+    """
+    p = resolve_scan_files(str(scan_dir), probe_attrs=False).image_path
+    if not p:
+        return None
+    try:
+        # Local function import: runs_list imports THIS module, so a top-level
+        # import back would be a cycle.
+        from yb_analysis.analysis.runs_list import _is_dehydrated
+        if _is_dehydrated(Path(p)):
+            return None
+    except Exception:
+        pass
+    return Path(p)
+
+
+def _avg_image_info(scan_dir: Path, scan: dict,
+                    imgs_shape=None) -> Optional[dict]:
     """Report whether an averaged camera image is available / computable.
 
     Shown for ANY scan with an ``/imgs`` dataset — the averaged frame is an
     informative "where did atoms appear / array health" view regardless of
     NumImages. For multi-image scans this averages ALL frames (e.g. img1+img2
     interleaved); ``num_images`` is reported so the dashboard can label it.
+
+    ``imgs_shape``: the already-known ``/imgs`` shape (from the loaded bundle).
+    Pass it and NO file is opened at all -- which is what the analysis flow
+    does, so it never touches the (multi-GB) image file in the split layout.
+    Omit it and the image file's header is read as before.
 
     Returns ``None`` only when there's no usable ``/imgs``. Otherwise::
 
@@ -1881,17 +1924,20 @@ def _avg_image_info(scan_dir: Path, scan: dict) -> Optional[dict]:
         }
     """
     num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
-    h5_path = _scan_data_h5(scan_dir)
-    if h5_path is None:
-        return None
-    try:
-        import h5py
-        with h5py.File(h5_path, 'r') as f:
-            if 'imgs' not in f:
-                return None
-            shape = tuple(int(s) for s in f['imgs'].shape)
-    except (OSError, KeyError):
-        return None
+    if imgs_shape is not None:
+        shape = tuple(int(s) for s in imgs_shape)
+    else:
+        h5_path = _scan_imgs_h5(scan_dir)
+        if h5_path is None:
+            return None
+        try:
+            import h5py
+            with h5py.File(h5_path, 'r') as f:
+                if 'imgs' not in f:
+                    return None
+                shape = tuple(int(s) for s in f['imgs'].shape)
+        except (OSError, KeyError):
+            return None
     if len(shape) != 3:
         return None
     n_frames, h, w = shape
@@ -1925,9 +1971,16 @@ def ensure_avg_image_png(scan_dir, *, batch_size: int = 16,
     png_path = scan_dir / AVG_IMAGE_PNG
     if png_path.is_file():
         return png_path
-    h5_path = _scan_data_h5(scan_dir)
+    h5_path = _scan_imgs_h5(scan_dir)      # None if absent / cloud-only
     if h5_path is None:
         return None
+    # Stat-only first; probe the attrs ONLY in the split layout (a legacy
+    # combined file never carries num_images_per_seq, so probing it would be a
+    # wasted open). The resolver's own cascade reads the data file then, when
+    # needed, the image header.
+    sf = resolve_scan_files(str(scan_dir), probe_attrs=False)
+    if sf.layout == LAYOUT_SPLIT:
+        sf = resolve_scan_files(str(scan_dir), probe_attrs=True)
     try:
         import h5py
         from PIL import Image
@@ -1935,15 +1988,19 @@ def ensure_avg_image_png(scan_dir, *, batch_size: int = 16,
         logger.warning('ensure_avg_image_png: missing dependency %s', ex)
         return None
     # NumImages → average only the FIRST image of each shot (frames
-    # 0, num_images, 2*num_images, ...). Read from the sibling config
-    # (.json for pyctrl, .mat for MATLAB).
-    num_images = 1
-    try:
-        from yb_analysis.io.mat_reader import load_scan_config
-        cfg = load_scan_config(str(scan_dir / (h5_path.stem + '.mat'))) or {}
-        num_images = int(np.asarray(cfg.get('NumImages', 1)).flat[0]) or 1
-    except Exception:
-        num_images = 1
+    # 0, num_images, 2*num_images, ...). Prefer the split-layout file attr
+    # (num_images_per_seq, stamped by the writer); fall back to the sibling
+    # config. NOTE the sidecar name comes from the DATA-file stem, never the
+    # image stem -- there is no image_<stamp>.mat/.json.
+    num_images = sf.num_images
+    if not num_images or num_images < 1:
+        try:
+            from yb_analysis.io.mat_reader import load_scan_config
+            data_stem = Path(sf.data_path).stem if sf.data_path else scan_dir.name
+            cfg = load_scan_config(str(scan_dir / (data_stem + '.mat'))) or {}
+            num_images = int(np.asarray(cfg.get('NumImages', 1)).flat[0]) or 1
+        except Exception:
+            num_images = 1
     try:
         with h5py.File(h5_path, 'r') as f:
             d = f.get('imgs')
@@ -4404,7 +4461,7 @@ def _focus_metrics_from_images(scan_dir, scan, scan_params_full, seq_ids,
     num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
     if num_images != 1 or seq_ids is None:
         return None
-    h5_path = _scan_data_h5(scan_dir)
+    h5_path = _scan_imgs_h5(scan_dir)
     if h5_path is None:
         return None
     seq_ids = np.asarray(seq_ids, dtype=np.int64).ravel()

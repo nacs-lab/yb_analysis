@@ -62,7 +62,10 @@ def load_scan_context(scan_dir):
     """
     scan_data = load_scan_from_path(scan_dir)
     config = scan_data['Scan']
-    data_path = scan_data['path']
+    # Every later step reads PIXELS through this path, so point it at the image
+    # file (== the data file for a legacy combined scan). Belt-and-braces: the
+    # load_images redirect would find the split file anyway.
+    data_path = scan_data.get('image_path') or scan_data['path']
     imgs_shape = scan_data.get('imgs_shape')
 
     if imgs_shape is None or imgs_shape[0] == 0:

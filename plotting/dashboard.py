@@ -3061,13 +3061,16 @@ def _register_api_routes(server):
         """
         from flask import request, jsonify, Response
         from pathlib import Path as _P
-        from yb_analysis.analysis.run_analysis import _scan_data_h5
+        from yb_analysis.analysis.run_analysis import _scan_imgs_h5
         sd = _resolve_scan_dir(scan_id)
         if sd is None or not _P(sd).is_dir():
             return jsonify({'error': f'scan_dir not found for {scan_id}'}), 404
-        h5 = _scan_data_h5(_P(sd))
+        # The image file: the data_*.h5 itself for a legacy combined scan, the
+        # sibling image_*.h5 in the split layout.
+        h5 = _scan_imgs_h5(_P(sd))
         if h5 is None:
-            return jsonify({'error': 'no data_*.h5 in scan_dir'}), 404
+            return jsonify({'error': 'no image file (data_*.h5 / image_*.h5) '
+                                     'in scan_dir'}), 404
         try:
             shot = int(request.args.get('shot', '1'))
             frame = int(request.args.get('frame', '0'))

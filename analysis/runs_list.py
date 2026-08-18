@@ -110,6 +110,21 @@ def _dehydrated_scan(scan_dir: Path) -> bool:
     return False
 
 
+def _dehydrated_images(scan_dir) -> bool:
+    """True if this scan's IMAGE file is a OneDrive cloud-only placeholder.
+
+    The image bytes are the bulk of a scan and the first thing OneDrive
+    dehydrates, so an image reader (avg-image build, shot-image popup, focus
+    metrics) must be able to bail out before it blocks on a hydrate -- even
+    when the small data file is still local and the enrich path (which never
+    reads pixels) is perfectly happy. Stat-only, never opens content; False
+    when there is no image file to check.
+    """
+    from yb_analysis.io.scan_files import resolve_scan_files
+    p = resolve_scan_files(str(scan_dir), probe_attrs=False).image_path
+    return _is_dehydrated(Path(p)) if p else False
+
+
 def _load_persisted_cache() -> None:
     """One-time load of the on-disk enrich cache into ``_ENRICH_CACHE``.
 

@@ -11,7 +11,9 @@ single seam that tells every reader which it is, so these tests pin:
 * probe_attrs=False opens nothing,
 * the naming helpers image_source / imgs_path_for.
 
-Writer + reader round-trip tests are added here in a later step.
+Step 2 appends the READ-path tests (see the second banner below): the legacy
+combined file unchanged through every new reader, and split mode where the
+ANALYSIS path must never open the image file. Writer tests come in a later step.
 
 Run: yb_analysis-env python -m pytest yb_analysis/tests/test_split_image_file.py -v
 """
@@ -233,3 +235,316 @@ def test_image_source_redirects_only_when_file_exists(tmp_path):
     mat = os.path.join(md, 'data_20260101_000000.mat')
     open(mat, 'wb').close()
     assert sf.image_source(mat) == mat
+
+
+# ==========================================================================
+# Step 2 -- the READ path (load_data / run_analysis / dashboard / hist_init).
+#
+# The governing requirement: in the SPLIT layout the ANALYSIS path must read
+# ONLY the small data file -- it must never open the multi-GB image file. The
+# imgs shape therefore comes from the data file's own attrs, and the image file
+# is opened solely on an explicit image request (load_images, avg-image build,
+# shot-image popup, focus metrics).
+# ==========================================================================
+
+import numpy as np
+
+from yb_analysis.analysis import load_data as ld
+from yb_analysis.analysis.run_analysis import _scan_data_h5, _scan_imgs_h5
+
+STAMP = '20260818_101500'
+
+
+def _track_h5_opens(monkeypatch):
+    """Record every path handed to h5py.File. Returns the growing list."""
+    opens = []
+    real_file = h5py.File
+
+    def _spy(*a, **k):
+        opens.append(str(a[0]) if a else str(k.get('name')))
+        return real_file(*a, **k)
+
+    monkeypatch.setattr(h5py, 'File', _spy)
+    return opens
+
+
+def _img_stack(n_frames, h=4, w=5):
+    """Deterministic distinguishable frames: frame k is filled with k+1."""
+    a = np.zeros((n_frames, h, w), dtype=np.uint16)
+    for k in range(n_frames):
+        a[k] = k + 1
+    return a
+
+
+def _write_combined_scan(scan_dir, n_seq=3, num_images=2, h=4, w=5):
+    """A LEGACY combined data_<stamp>.h5, as hdf5_store.create_scan_file
+    writes them today: /imgs + two-array logicals + seq_ids + scan_config
+    (and no split-layout attrs at all)."""
+    path = os.path.join(scan_dir, f'data_{STAMP}.h5')
+    imgs = _img_stack(n_seq * num_images, h, w)
+    with h5py.File(path, 'w') as f:
+        f.attrs['two_array'] = True
+        f.create_dataset('imgs', data=imgs, maxshape=(None, h, w),
+                         dtype='uint16', chunks=(1, h, w),
+                         compression='gzip', compression_opts=1)
+        f.create_dataset('logicals_img1', data=np.ones((n_seq, 2), dtype=bool),
+                         maxshape=(None, 2))
+        f.create_dataset('logicals_img2', data=np.ones((n_seq, 2), dtype=bool),
+                         maxshape=(None, 2))
+        f.create_dataset('seq_ids', data=np.arange(1, n_seq + 1, dtype='int64'),
+                         maxshape=(None,))
+        g = f.create_group('scan_config')
+        g.attrs['NumImages'] = num_images
+    return path, imgs
+
+
+def _write_split_scan(scan_dir, n_seq=3, num_images=2, h=4, w=5,
+                      data_attrs=True):
+    """A SPLIT pair: small data_<stamp>.h5 (NO /imgs) + bulk image_<stamp>.h5.
+
+    ``data_attrs=False`` omits num_images_per_seq/frame_size from the data file
+    so the attr-fallback path (header open of the image file) can be exercised.
+    """
+    data = os.path.join(scan_dir, f'data_{STAMP}.h5')
+    imgs_path = os.path.join(scan_dir, f'{sf.IMGS_PREFIX}_{STAMP}.h5')
+    n_frames = n_seq * num_images
+    imgs = _img_stack(n_frames, h, w)
+    seq_ids = np.arange(1, n_seq + 1, dtype='int64')
+
+    with h5py.File(data, 'w') as f:
+        f.attrs['two_array'] = True
+        f.attrs['schema_version'] = 1
+        f.attrs['images_external'] = True
+        f.attrs['images_file'] = os.path.basename(imgs_path)
+        if data_attrs:
+            f.attrs['num_images_per_seq'] = num_images
+            f.attrs['frame_size'] = (h, w)
+        f.create_dataset('logicals_img1', data=np.ones((n_seq, 2), dtype=bool),
+                         maxshape=(None, 2))
+        f.create_dataset('logicals_img2', data=np.ones((n_seq, 2), dtype=bool),
+                         maxshape=(None, 2))
+        f.create_dataset('seq_ids', data=seq_ids, maxshape=(None,))
+        g = f.create_group('scan_config')
+        g.attrs['NumImages'] = num_images
+
+    with h5py.File(imgs_path, 'w') as f:
+        f.attrs['schema_version'] = 1
+        f.attrs['layout'] = 'images'
+        f.attrs['num_images_per_seq'] = num_images
+        f.attrs['frame_size'] = (h, w)
+        f.attrs['data_file'] = os.path.basename(data)
+        f.attrs['committed_frames'] = n_frames
+        f.create_dataset('imgs', data=imgs, maxshape=(None, h, w),
+                         dtype='uint16', chunks=(1, h, w),
+                         compression='gzip', compression_opts=1)
+        f.create_dataset('seq_ids', data=seq_ids, maxshape=(None,))
+        f.create_dataset('frame_seq_ids',
+                         data=np.repeat(seq_ids, num_images), maxshape=(None,))
+    return data, imgs_path, imgs
+
+
+# --------------------------------------------------------------------------
+# old combined file -- behavior must be BIT-IDENTICAL to before the split
+# --------------------------------------------------------------------------
+
+def test_combined_file_readers_unchanged(tmp_path):
+    """The key backwards-compat test: a legacy combined scan through every
+    new reader behaves exactly as it did before the split existed."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs = _write_combined_scan(d, n_seq=3, num_images=2)
+
+    bundle = ld.load_scan_from_path(d)
+    assert bundle['path'] == data
+    assert bundle['image_path'] == data          # image path == data path
+    assert bundle['layout'] == sf.LAYOUT_COMBINED
+    assert tuple(bundle['imgs_shape']) == imgs.shape
+    assert bundle['logicals_img1'].shape == (3, 2)
+    np.testing.assert_array_equal(bundle['seq_ids'], [1, 2, 3])
+
+    # shape + pixels straight off the data path
+    assert tuple(ld.get_images_shape(data)) == imgs.shape
+    np.testing.assert_array_equal(ld.load_images(data, 3), imgs[3])
+    np.testing.assert_array_equal(ld.load_images(data), imgs)
+
+    # both resolvers point at the same (single) file
+    from pathlib import Path as _P
+    assert _scan_data_h5(_P(d)) == _P(data)
+    assert _scan_imgs_h5(_P(d)) == _P(data)
+
+
+def test_combined_no_imgs_dataset_gives_none_shape(tmp_path):
+    """A data file with no /imgs at all -> imgs_shape None (supported state)."""
+    d = _scan_dir(tmp_path, STAMP)
+    path = os.path.join(d, f'data_{STAMP}.h5')
+    with h5py.File(path, 'w') as f:
+        f.create_dataset('logicals', data=np.ones((2, 2), dtype=bool))
+        f.create_dataset('seq_ids', data=np.array([1, 2], dtype='int64'))
+
+    bundle = ld.load_scan_from_path(d)
+    assert bundle['imgs_shape'] is None
+    assert bundle['layout'] == sf.LAYOUT_COMBINED
+
+
+# --------------------------------------------------------------------------
+# split mode -- the analysis path must never open the image file
+# --------------------------------------------------------------------------
+
+def test_split_load_scan_never_opens_image_file(tmp_path, monkeypatch):
+    """load_scan_from_path derives imgs_shape from the DATA file's attrs."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=3, num_images=2,
+                                              h=4, w=5)
+
+    opens = _track_h5_opens(monkeypatch)
+    bundle = ld.load_scan_from_path(d)
+
+    # THE requirement: not one open of the image file.
+    assert all(os.path.basename(p) != os.path.basename(imgs_path)
+               for p in opens), opens
+    assert opens                                # (it did open the data file)
+
+    assert bundle['path'] == data               # scan identity = data file
+    assert bundle['image_path'] == imgs_path
+    assert bundle['layout'] == sf.LAYOUT_SPLIT
+    assert tuple(bundle['imgs_shape']) == (6, 4, 5) == imgs.shape
+    assert bundle['logicals_img1'].shape == (3, 2)
+
+
+def test_split_load_images_redirects_from_data_path(tmp_path):
+    """Every unedited caller keeps passing the DATA path and still gets the
+    split file's pixels (load_images / get_images_shape redirect)."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=3, num_images=2)
+
+    assert tuple(ld.get_images_shape(data)) == imgs.shape
+    np.testing.assert_array_equal(ld.load_images(data, 0), imgs[0])
+    np.testing.assert_array_equal(ld.load_images(data, 5), imgs[5])
+    np.testing.assert_array_equal(ld.load_images(data, slice(1, 4)), imgs[1:4])
+    np.testing.assert_array_equal(ld.load_images(data, [4, 1]), imgs[[4, 1]])
+    np.testing.assert_array_equal(ld.load_images(data), imgs)
+
+    # bundle['path'] is the data file -> the same redirect applies.
+    bundle = ld.load_scan_from_path(d)
+    np.testing.assert_array_equal(ld.load_images(bundle['path'], 2), imgs[2])
+
+
+def test_split_scan_imgs_h5_vs_scan_data_h5(tmp_path):
+    """_scan_data_h5 keeps returning the DATA file; _scan_imgs_h5 the image."""
+    from pathlib import Path as _P
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, _ = _write_split_scan(d)
+
+    assert _scan_data_h5(_P(d)) == _P(data)
+    assert _scan_imgs_h5(_P(d)) == _P(imgs_path)
+
+
+def test_split_hist_init_context_points_at_image_file(tmp_path):
+    """hist_init's ctx['data_path'] is the IMAGE file (belt and braces)."""
+    from yb_analysis.detection.hist_init import load_scan_context
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=3, num_images=2)
+
+    ctx = load_scan_context(d)
+    assert ctx['data_path'] == imgs_path
+    assert ctx['total_frames'] == imgs.shape[0]
+    assert ctx['num_images'] == 2
+    assert ctx['all_first_indices'] == [0, 2, 4]
+
+
+def test_split_pixel_read_still_opens_the_image_file(tmp_path, monkeypatch):
+    """The complement of the no-open rule: an EXPLICIT image request does
+    open the image file (and only it)."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d)
+
+    opens = _track_h5_opens(monkeypatch)
+    got = ld.load_images(data, 1)
+    np.testing.assert_array_equal(got, imgs[1])
+    assert [os.path.basename(p) for p in opens] == \
+        [os.path.basename(imgs_path)]
+
+
+# --------------------------------------------------------------------------
+# attr fallback -- data file lacking the attrs opens the image HEADER
+# --------------------------------------------------------------------------
+
+def test_split_imgs_shape_falls_back_to_image_header(tmp_path, monkeypatch):
+    """No num_images_per_seq/frame_size on the data file -> header-only open
+    of the image file yields the correct shape (never the pixels)."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=3, num_images=2,
+                                              h=4, w=5, data_attrs=False)
+
+    opens = _track_h5_opens(monkeypatch)
+    bundle = ld.load_scan_from_path(d)
+    assert tuple(bundle['imgs_shape']) == imgs.shape
+    assert bundle['layout'] == sf.LAYOUT_SPLIT
+    # It DID have to consult the image file here -- that is the documented
+    # fallback, and only in this (writer-impossible) case.
+    assert os.path.basename(imgs_path) in [os.path.basename(p) for p in opens]
+
+
+def test_split_imgs_shape_none_when_image_file_unreadable(tmp_path):
+    """Attrs missing AND the image file corrupt -> imgs_shape None, no raise."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, _ = _write_split_scan(d, data_attrs=False)
+    with open(imgs_path, 'wb') as f:
+        f.write(b'not an hdf5 file at all')
+
+    bundle = ld.load_scan_from_path(d)
+    assert bundle['imgs_shape'] is None
+    assert bundle['layout'] == sf.LAYOUT_SPLIT
+    assert bundle['image_path'] == imgs_path
+
+
+def test_split_pseq3_shape_from_attrs(tmp_path):
+    """pSeq=3 (rearrangement w/ middle frame): shape math is n_seq*pSeq."""
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=4, num_images=3,
+                                              h=3, w=6)
+    bundle = ld.load_scan_from_path(d)
+    assert tuple(bundle['imgs_shape']) == (12, 3, 6) == imgs.shape
+
+
+# --------------------------------------------------------------------------
+# the end-to-end guarantee: analyze_scan_dir opens the DATA file only
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('num_images', [2, 3])
+def test_analyze_scan_dir_never_opens_image_file(tmp_path, monkeypatch,
+                                                num_images):
+    """THE requirement, end to end: a full analysis of a split scan touches
+    the small data file and nothing else.
+
+    Parametrized over the multi-image cases (survival pSeq=2, rearrangement
+    with a middle frame pSeq=3) -- i.e. every scan whose image file is the
+    multi-GB one. NumImages==1 is excluded on purpose: for a single-image
+    multi-point SWEEP the analysis also builds the calibration-free focus
+    curve, which is an image measurement by definition (it is computed once
+    and cached to focus_metrics.json).
+    """
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    d = _scan_dir(tmp_path, STAMP)
+    data, imgs_path, imgs = _write_split_scan(d, n_seq=6,
+                                              num_images=num_images)
+
+    opens = _track_h5_opens(monkeypatch)
+    out = analyze_scan_dir(d)
+
+    img_base = os.path.basename(imgs_path)
+    assert [p for p in opens if os.path.basename(p) == img_base] == [], opens
+    assert out['images_layout'] == sf.LAYOUT_SPLIT
+    # avg_image still reports the frame dims -- from the bundle, not a file.
+    assert out['avg_image']['image_shape'] == [4, 5]
+    assert out['avg_image']['num_images'] == num_images
+
+
+def test_analyze_scan_dir_combined_reports_layout(tmp_path):
+    """A legacy combined scan reports images_layout='combined' (payload v5)."""
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    d = _scan_dir(tmp_path, STAMP)
+    _write_combined_scan(d, n_seq=6, num_images=2)
+
+    out = analyze_scan_dir(d)
+    assert out['images_layout'] == sf.LAYOUT_COMBINED
+    assert out['avg_image']['image_shape'] == [4, 5]
