@@ -338,6 +338,15 @@ CM_NORM_HISTORY = 200
 # posterior P(loaded) is stored as the "% certainty" alongside the logicals.
 IMG2_SHAPE_MODEL_VARIANT = os.environ.get('YB_IMG2_SHAPE_MODEL', 'A')
 
+# ---- Split image file: data_<stamp>.h5 (small) + image_<stamp>.h5 (bulk) ----
+# When ON the writer keeps /imgs out of the per-scan data file and puts it in a
+# sibling image_<stamp>.h5 (plus /seq_ids + /frame_seq_ids and a committed_frames
+# watermark), so the analysis path reads only a small file. Readers are already
+# split-aware via yb_analysis/io/scan_files.py and are unaffected either way;
+# existing combined files keep loading forever (no migration).
+# Default OFF until one real scan has been validated end to end.
+SPLIT_IMAGE_FILE = os.environ.get('YB_SPLIT_IMAGE_FILE', '0') != '0'
+
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
 

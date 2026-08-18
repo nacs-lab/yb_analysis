@@ -740,3 +740,654 @@ def test_lite_frames_per_seq_attr_ratio_default(tmp_path):
     assert lite.frames_per_seq(p_none, default=7) == 7
     # unreadable / missing file -> the default, never a raise
     assert lite.frames_per_seq(os.path.join(d3, 'nope.h5'), default=5) == 5
+
+
+# ==========================================================================
+# STEP 4: the WRITER (hdf5_store.create_scan_file / append_images_block /
+# append_block(write_imgs=), and DataManager.save_data driving them).
+#
+# The governing invariants, in the order the writer must uphold them:
+#   * the image file is created FIRST and completely -- a crash can leave an
+#     invisible orphan image file, never a data file promising absent images;
+#   * each block appends IMAGES first, then the data rows -- so seq_ids[k]
+#     visible implies its frames are durable, never the reverse;
+#   * committed_frames is stamped LAST inside the append handle, so the live
+#     count min(data seq rows, committed_frames // pSeq) never over-reports;
+#   * orphan image rows from a failed data append are TRIMMED by the next
+#     append_images_block -- prefer a hole in the images over a shift in them.
+# ==========================================================================
+
+import logging
+import threading
+import time
+
+from yb_analysis.io import hdf5_store as hs
+from yb_analysis.acquisition import data_manager as dm_mod
+
+W_STAMP = '20260818_120000'
+
+
+def _writer_dir(tmp_path, stamp=W_STAMP):
+    d = tmp_path / ('data_' + stamp)
+    d.mkdir()
+    return str(d)
+
+
+def _writer_paths(scan_dir, stamp=W_STAMP):
+    data = os.path.join(scan_dir, 'data_%s.h5' % stamp)
+    return data, sf.imgs_path_for(data)
+
+
+def _create(scan_dir, split, num_images=2, frame_size=(4, 5),
+            num_sites=3, stamp=W_STAMP):
+    """create_scan_file in either layout; returns (data_path, image_path)."""
+    data, imgs = _writer_paths(scan_dir, stamp)
+    hs.create_scan_file(
+        data, {'NumImages': num_images}, frame_size, num_sites,
+        two_array=True, num_sites_img2=num_sites,
+        image_path=imgs if split else None,
+        num_images_per_seq=num_images)
+    return data, imgs
+
+
+def _append(data, imgs_path, split, imgs_block, sids, num_images,
+            num_sites=3, expected_seq_rows=None):
+    """One block through the real writer, images first (as save_data does)."""
+    sids = np.asarray(sids, dtype='int64')
+    n = len(sids)
+    l1 = np.ones((n, num_sites), dtype=bool)
+    l2 = np.zeros((n, num_sites), dtype=bool)
+    i1 = np.arange(n * num_sites, dtype='float64').reshape(n, num_sites)
+    i2 = i1 + 0.5
+    if split:
+        hs.append_images_block(imgs_path, imgs_block, sids, num_images,
+                               expected_seq_rows=expected_seq_rows)
+    hs.append_block(data, imgs_block, l1, i1, sids,
+                    logicals_img2_block=l2, intensities_img2_block=i2,
+                    write_imgs=not split)
+
+
+def _tagged_frames(seq_tags, num_images, h=4, w=5):
+    """Frames for the given shot tags: every frame of shot t is filled with t."""
+    per_shot = np.array(seq_tags, dtype=np.uint16).reshape(-1, 1, 1)
+    return np.repeat(per_shot, num_images, axis=0) \
+             .repeat(h, axis=1).repeat(w, axis=2)
+
+
+# --------------------------------------------------------------------------
+# test 1: create_scan_file writes the split layout
+# --------------------------------------------------------------------------
+
+def test_create_split_writes_two_files_with_attrs(tmp_path):
+    d = _writer_dir(tmp_path)
+    data, imgs = _create(d, split=True, num_images=2, frame_size=(4, 5))
+
+    assert os.path.isfile(data) and os.path.isfile(imgs)
+    assert os.path.basename(imgs) == 'image_%s.h5' % W_STAMP
+    # no leftover .tmp from either atomic write
+    assert not os.path.exists(data + '.tmp')
+    assert not os.path.exists(imgs + '.tmp')
+
+    with h5py.File(data, 'r') as f:
+        assert 'imgs' not in f                    # absent, NOT a stub
+        assert f.attrs['schema_version'] == 1
+        assert bool(f.attrs['images_external']) is True
+        assert f.attrs['images_file'] == os.path.basename(imgs)
+        assert int(f.attrs['num_images_per_seq']) == 2
+        assert tuple(f.attrs['frame_size']) == (4, 5)
+        # everything else the data file always had
+        for k in ('logicals_img1', 'logicals_img2', 'intensities_img1',
+                  'intensities_img2', 'seq_ids', 'scan_config'):
+            assert k in f
+
+    with h5py.File(imgs, 'r') as f:
+        assert f.attrs['schema_version'] == 1
+        assert f.attrs['layout'] == 'images'
+        assert int(f.attrs['num_images_per_seq']) == 2
+        assert tuple(f.attrs['frame_size']) == (4, 5)
+        assert f.attrs['data_file'] == os.path.basename(data)
+        assert f.attrs['scan_id'] == W_STAMP
+        assert int(f.attrs['committed_frames']) == 0
+        assert f['imgs'].shape == (0, 4, 5)
+        assert f['seq_ids'].shape == (0,)
+        assert f['seq_ids'].maxshape == (None,)
+        assert f['seq_ids'].chunks == (64,)
+        assert f['frame_seq_ids'].shape == (0,)
+        assert f['frame_seq_ids'].maxshape == (None,)
+        assert f['frame_seq_ids'].chunks == (256,)
+
+    # and the resolver sees it as a split scan
+    r = sf.resolve_scan_files(d)
+    assert (r.data_path, r.image_path, r.layout) == (data, imgs,
+                                                     sf.LAYOUT_SPLIT)
+
+
+def test_split_imgs_tuning_identical_to_combined(tmp_path):
+    """The /imgs dataset tuning (dtype/chunks/gzip-1/maxshape) is UNCHANGED by
+    the split -- pinned so a read-speed experiment can't ride in on this PR."""
+    dc = _writer_dir(tmp_path, '20260818_120001')
+    ds = _writer_dir(tmp_path, '20260818_120002')
+    comb, _ = _create(dc, split=False, stamp='20260818_120001')
+    _, imgs = _create(ds, split=True, stamp='20260818_120002')
+
+    def _tuning(path):
+        with h5py.File(path, 'r') as f:
+            dset = f['imgs']
+            return (dset.shape, dset.maxshape, str(dset.dtype), dset.chunks,
+                    dset.compression, dset.compression_opts)
+
+    assert _tuning(comb) == _tuning(imgs)
+    assert _tuning(imgs)[2] == 'uint16'
+    assert _tuning(imgs)[4] == 'gzip' and _tuning(imgs)[5] == 1
+
+
+def test_create_combined_unchanged_no_split_attrs(tmp_path):
+    """image_path=None -> today's behaviour: /imgs present, NONE of the split
+    attrs stamped, and no image file created."""
+    d = _writer_dir(tmp_path)
+    data, imgs = _create(d, split=False)
+    assert not os.path.exists(imgs)
+    with h5py.File(data, 'r') as f:
+        assert 'imgs' in f
+        for k in ('schema_version', 'images_external', 'images_file',
+                  'num_images_per_seq', 'frame_size'):
+            assert k not in f.attrs
+
+
+def test_create_split_omits_num_images_attr_when_unknown(tmp_path):
+    """num_images_per_seq=None -> files still created, attr simply absent."""
+    d = _writer_dir(tmp_path)
+    data, imgs = _writer_paths(d)
+    hs.create_scan_file(data, {}, (4, 5), 3, image_path=imgs,
+                        num_images_per_seq=None)
+    for p in (data, imgs):
+        with h5py.File(p, 'r') as f:
+            assert 'num_images_per_seq' not in f.attrs
+    with h5py.File(imgs, 'r') as f:
+        assert f.attrs['layout'] == 'images'
+
+
+def test_create_image_file_exists_before_data_file(tmp_path, monkeypatch):
+    """ORDER: the data file must not appear while its image file does not."""
+    d = _writer_dir(tmp_path)
+    data, imgs = _writer_paths(d)
+
+    seen = {}
+    real_replace = os.replace
+
+    def _spy(src, dst):
+        # at the moment the DATA file is published, the image file must be there
+        if os.path.basename(dst) == os.path.basename(data):
+            seen['image_ready'] = os.path.isfile(imgs)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(hs.os, 'replace', _spy)
+    hs.create_scan_file(data, {}, (4, 5), 3, image_path=imgs,
+                        num_images_per_seq=2)
+    assert seen.get('image_ready') is True
+
+
+# --------------------------------------------------------------------------
+# tests 3 + 4: round trip -- both layouts produce identical bundles/pixels
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize('num_images', [1, 2, 3])
+def test_round_trip_split_equals_combined(tmp_path, num_images):
+    """The regression net for the whole refactor: the same synthetic blocks
+    through the real writer in both modes -> equal bundles (bar path /
+    image_path / layout) and identical pixels."""
+    n_seq_per_block, n_blocks = 3, 2
+    out = {}
+    for split in (False, True):
+        stamp = '2026081%d_120010' % int(split)
+        d = _writer_dir(tmp_path, stamp)
+        data, imgs_path = _create(d, split, num_images=num_images,
+                                  stamp=stamp)
+        all_frames = []
+        saved_rows = 0
+        for b in range(n_blocks):
+            tags = [b * n_seq_per_block + k + 1
+                    for k in range(n_seq_per_block)]
+            block = _tagged_frames(tags, num_images)
+            all_frames.append(block)
+            _append(data, imgs_path, split, block,
+                    np.array(tags, dtype='int64'), num_images,
+                    expected_seq_rows=saved_rows)
+            saved_rows += n_seq_per_block
+        out[split] = (d, data, imgs_path, np.concatenate(all_frames))
+
+    b_comb = ld.load_scan_from_path(out[False][0])
+    b_split = ld.load_scan_from_path(out[True][0])
+
+    ignore = {'path', 'image_path', 'layout'}
+    assert set(b_comb) == set(b_split)
+    for k in set(b_comb) - ignore:
+        a, b = b_comb[k], b_split[k]
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            np.testing.assert_array_equal(a, b, err_msg=k)
+        elif k == 'Scan':
+            assert dict(a) == dict(b)
+        else:
+            assert a == b, k
+    assert b_comb['layout'] == sf.LAYOUT_COMBINED
+    assert b_split['layout'] == sf.LAYOUT_SPLIT
+    assert tuple(b_split['imgs_shape']) == out[True][3].shape
+
+    # identical pixels, read via the DATA path in both modes (the redirect)
+    np.testing.assert_array_equal(ld.load_images(out[False][1]), out[False][3])
+    np.testing.assert_array_equal(ld.load_images(out[True][1]), out[True][3])
+    np.testing.assert_array_equal(ld.load_images(out[False][1]),
+                                  ld.load_images(out[True][1]))
+
+
+def test_frame_seq_ids_is_repeat_and_seq_ids_match_data(tmp_path):
+    """frame_seq_ids == repeat(seq_ids, pSeq), and the image file's /seq_ids is
+    the data file's /seq_ids -- values AND order."""
+    num_images = 3
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=num_images)
+
+    saved = 0
+    for tags in ([7, 8], [9, 10, 11]):
+        _append(data, imgs_path, True, _tagged_frames(tags, num_images),
+                np.array(tags, dtype='int64'), num_images,
+                expected_seq_rows=saved)
+        saved += len(tags)
+
+    with h5py.File(imgs_path, 'r') as fi, h5py.File(data, 'r') as fd:
+        img_sids = fi['seq_ids'][:]
+        frame_sids = fi['frame_seq_ids'][:]
+        data_sids = fd['seq_ids'][:]
+        n_frames = fi['imgs'].shape[0]
+    np.testing.assert_array_equal(img_sids, data_sids)
+    np.testing.assert_array_equal(img_sids, [7, 8, 9, 10, 11])
+    np.testing.assert_array_equal(frame_sids, np.repeat(img_sids, num_images))
+    assert n_frames == len(frame_sids) == 5 * num_images
+
+
+def test_append_images_block_lazily_creates_datasets(tmp_path):
+    """append_images_block on a file missing the datasets creates them (the
+    same lazy-create tolerance append_block has always had)."""
+    d = _writer_dir(tmp_path)
+    _, imgs_path = _writer_paths(d)
+    with h5py.File(imgs_path, 'w') as f:
+        f.attrs['layout'] = 'images'
+    block = _tagged_frames([1, 2], 2)
+    hs.append_images_block(imgs_path, block, np.array([1, 2], dtype='int64'), 2)
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape == (4, 4, 5)
+        np.testing.assert_array_equal(f['seq_ids'][:], [1, 2])
+        np.testing.assert_array_equal(f['frame_seq_ids'][:], [1, 1, 2, 2])
+        assert int(f.attrs['committed_frames']) == 4
+
+
+def test_append_images_block_logs_ragged_block(tmp_path, caplog):
+    """A frame count that is not pSeq*len(seq_ids) is LOGGED, not silent."""
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=2)
+    ragged = _tagged_frames([1, 2], 2)[:3]      # 3 frames for 2 shots at pSeq 2
+    with caplog.at_level(logging.WARNING, logger='yb_analysis.io.hdf5_store'):
+        hs.append_images_block(imgs_path, ragged,
+                               np.array([1, 2], dtype='int64'), 2)
+    assert any('frame(s) for' in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# test 7: committed_frames watermark + the live min() rule
+# --------------------------------------------------------------------------
+
+def _live_count(data, imgs_path, pSeq):
+    """The documented live-reader rule."""
+    with h5py.File(data, 'r') as f:
+        n_seq = f['seq_ids'].shape[0] if 'seq_ids' in f else 0
+    with h5py.File(imgs_path, 'r') as f:
+        cf = f.attrs.get('committed_frames')
+        if cf is None:
+            cf = f['imgs'].shape[0]
+    return min(int(n_seq), int(cf) // pSeq)
+
+
+def test_committed_frames_tracks_rows_and_min_rule_is_monotone(tmp_path):
+    num_images = 2
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=num_images)
+
+    counts = [_live_count(data, imgs_path, num_images)]
+    saved = 0
+    for b in range(4):
+        tags = [saved + k + 1 for k in range(2)]
+        _append(data, imgs_path, True, _tagged_frames(tags, num_images),
+                np.array(tags, dtype='int64'), num_images,
+                expected_seq_rows=saved)
+        saved += len(tags)
+        with h5py.File(imgs_path, 'r') as f:
+            assert int(f.attrs['committed_frames']) == f['imgs'].shape[0]
+            assert int(f.attrs['committed_frames']) == saved * num_images
+        counts.append(_live_count(data, imgs_path, num_images))
+
+    assert counts == [0, 2, 4, 6, 8]
+    assert all(b >= a for a, b in zip(counts, counts[1:]))
+
+
+def test_committed_frames_never_over_reports_mid_append(tmp_path, monkeypatch):
+    """The watermark is stamped LAST: interrupt the append after /imgs has been
+    resized and committed_frames must still show the PREVIOUS value."""
+    num_images = 2
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=num_images)
+    _append(data, imgs_path, True, _tagged_frames([1], num_images),
+            np.array([1], dtype='int64'), num_images, expected_seq_rows=0)
+
+    # Build the block BEFORE the patch (np.repeat is the real numpy function,
+    # shared with the helpers), then break the frame_seq_ids step -- which runs
+    # AFTER /imgs has been resized and written, but BEFORE the watermark.
+    block = _tagged_frames([2], num_images)
+
+    def _boom(*a, **k):
+        raise RuntimeError('interrupted')
+
+    monkeypatch.setattr(hs.np, 'repeat', _boom)
+    with pytest.raises(RuntimeError):
+        hs.append_images_block(imgs_path, block,
+                               np.array([2], dtype='int64'), num_images,
+                               expected_seq_rows=1)
+    monkeypatch.undo()
+
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 4                     # rows landed
+        assert int(f.attrs['committed_frames']) == 2       # watermark did not
+    assert _live_count(data, imgs_path, num_images) == 1    # min() rule holds
+
+
+# --------------------------------------------------------------------------
+# test 6: partial failure, both directions (+ the orphan self-heal amendment)
+# --------------------------------------------------------------------------
+
+def test_data_append_failure_leaves_orphans_that_next_block_trims(tmp_path,
+                                                                  caplog):
+    """images land, data append never happens -> orphan image rows; the NEXT
+    append_images_block trims them back to alignment (and says so)."""
+    num_images = 2
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=num_images)
+
+    # block 1 lands fully
+    _append(data, imgs_path, True, _tagged_frames([1], num_images),
+            np.array([1], dtype='int64'), num_images, expected_seq_rows=0)
+
+    # block 2: images land, then the data append blows up (simulated by not
+    # running it at all -- what _save_block's failure branch leaves behind)
+    hs.append_images_block(imgs_path, _tagged_frames([2], num_images),
+                           np.array([2], dtype='int64'), num_images,
+                           expected_seq_rows=1)
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 4                # orphans present
+        assert int(f.attrs['committed_frames']) == 4
+    with h5py.File(data, 'r') as f:
+        assert f['seq_ids'].shape[0] == 1             # data never advanced
+    # the min() rule already hides the orphans from a live reader
+    assert _live_count(data, imgs_path, num_images) == 1
+
+    # block 3 heals: expected_seq_rows is still 1, so the 2 orphan rows go
+    with caplog.at_level(logging.WARNING, logger='yb_analysis.io.hdf5_store'):
+        _append(data, imgs_path, True, _tagged_frames([3], num_images),
+                np.array([3], dtype='int64'), num_images,
+                expected_seq_rows=1)
+    assert any('orphan image row' in r.message for r in caplog.records)
+
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 4                # 1 kept + 1 new shot
+        np.testing.assert_array_equal(f['seq_ids'][:], [1, 3])
+        np.testing.assert_array_equal(f['frame_seq_ids'][:], [1, 1, 3, 3])
+        assert int(f.attrs['committed_frames']) == 4
+        # NO phase shift: the second shot's rows really are shot 3's frames
+        assert (f['imgs'][2] == 3).all()
+    with h5py.File(data, 'r') as f:
+        np.testing.assert_array_equal(f['seq_ids'][:], [1, 3])
+
+
+# --------------------------------------------------------------------------
+# DataManager-driven: save_data writes BOTH files when the toggle is on,
+# and the two partial-failure directions through the real save path.
+# --------------------------------------------------------------------------
+
+def _split_dm(tmp_path, monkeypatch, pSeq=2, num_sites=3, split=True):
+    """A bare DataManager wired for the save path only (mirrors
+    test_frame_drop_safety._save_dm) with the split toggle forced."""
+    monkeypatch.setattr(dm_mod._cfg, 'SPLIT_IMAGE_FILE', split, raising=False)
+    dm = dm_mod.DataManager.__new__(dm_mod.DataManager)
+    dm.num_images_per_seq = pSeq
+    dm.num_sites = num_sites
+    dm.num_sites_img2 = num_sites
+    dm.is_two_array = True
+    dm._save_two_array = True
+    dm._save_mid = pSeq >= 3
+    dm.frame_size = (4, 4)
+    dm.config = {}
+    dm.fname = os.path.join(str(tmp_path), 'data_%s.h5' % W_STAMP)
+    dm.iname = sf.imgs_path_for(dm.fname)
+    dm._split_images = bool(getattr(dm_mod._cfg, 'SPLIT_IMAGE_FILE', False))
+    dm._saved_seq_rows = 0
+    dm._file_created = True
+    dm._save_lock = threading.Lock()
+    dm._proba_img2_to_save = []
+    hs.create_scan_file(dm.fname, {}, dm.frame_size, num_sites,
+                        two_array=True, num_sites_img2=num_sites,
+                        save_mid=dm._save_mid,
+                        image_path=dm.iname if dm._split_images else None,
+                        num_images_per_seq=pSeq)
+    return dm, dm.fname, dm.iname
+
+
+def _dm_push(dm, tags, pSeq, num_sites=3):
+    """Fill the save buffers with pSeq frames per shot, frame value == tag."""
+    dm._imgs_to_save = [np.full((4, 4), t, dtype=np.uint16)
+                        for t in tags for _ in range(pSeq)]
+    dm._logicals_to_save = [np.ones(num_sites, dtype=bool)
+                            for _ in tags for _ in range(pSeq)]
+    dm._intensities_to_save = [np.full(num_sites, float(t))
+                               for t in tags for _ in range(pSeq)]
+    dm._seq_ids_to_save = list(tags)
+
+
+def _wait_save_done(dm, want_rows=None, want_state=None, timeout=5.0):
+    """Poll until the save thread has recorded the outcome we are waiting for.
+
+    ``want_rows`` -> ``_saved_seq_rows`` reached that value (a SUCCESS);
+    ``want_state`` -> ``_save_health['state']`` reached that value (a FAILURE).
+    Both are needed because save_health is sticky: a block that fails leaves
+    state='fail' behind, so the next block's success can only be recognised by
+    the row counter.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if want_rows is not None and \
+                getattr(dm, '_saved_seq_rows', 0) >= want_rows:
+            return
+        sh = getattr(dm, '_save_health', None)
+        if want_state is not None and sh is not None and \
+                sh.get('state') == want_state:
+            return
+        time.sleep(0.02)
+
+
+def _raise_oserror(*a, **k):
+    raise OSError('locked forever')
+
+
+def test_data_manager_split_save_writes_both_files(tmp_path, monkeypatch):
+    """The DataManager-driven proof: with config.SPLIT_IMAGE_FILE on, save_data
+    puts the frames in the image file and the shot rows in the data file, and
+    the data file gets no /imgs at all."""
+    pSeq = 2
+    dm, data, imgs_path = _split_dm(tmp_path, monkeypatch, pSeq=pSeq)
+    _dm_push(dm, tags=[11, 22, 33], pSeq=pSeq)
+    dm.save_data()
+    _wait_save_done(dm, 3)
+
+    with h5py.File(data, 'r') as f:
+        assert 'imgs' not in f
+        np.testing.assert_array_equal(f['seq_ids'][:], [11, 22, 33])
+        assert f['logicals_img1'].shape[0] == 3
+        assert f['logicals_img2'].shape[0] == 3
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape == (6, 4, 4)
+        assert int(f.attrs['committed_frames']) == 6
+        np.testing.assert_array_equal(f['seq_ids'][:], [11, 22, 33])
+        np.testing.assert_array_equal(f['frame_seq_ids'][:],
+                                      [11, 11, 22, 22, 33, 33])
+        for k, tag in enumerate([11, 22, 33]):
+            assert (f['imgs'][k * pSeq] == tag).all()
+    assert dm._saved_seq_rows == 3
+    assert dm._save_health['state'] == 'ok'
+
+    # and the reader sees a normal split scan through the DATA path
+    assert sf.image_source(data) == imgs_path
+    np.testing.assert_array_equal(ld.load_images(data, 4),
+                                  np.full((4, 4), 33, dtype=np.uint16))
+
+
+def test_data_manager_combined_save_unchanged(tmp_path, monkeypatch):
+    """Toggle OFF (the shipped default) -> exactly today's single file."""
+    pSeq = 2
+    dm, data, imgs_path = _split_dm(tmp_path, monkeypatch, pSeq=pSeq,
+                                    split=False)
+    assert dm._split_images is False
+    _dm_push(dm, tags=[11, 22], pSeq=pSeq)
+    dm.save_data()
+    _wait_save_done(dm, 2)
+
+    assert not os.path.exists(imgs_path)
+    with h5py.File(data, 'r') as f:
+        assert f['imgs'].shape == (4, 4, 4)
+        np.testing.assert_array_equal(f['seq_ids'][:], [11, 22])
+
+
+def test_dm_images_append_failure_skips_the_data_append(tmp_path, monkeypatch):
+    """append_images_block raises -> the data append is never attempted (the
+    block is lost WHOLE, never half)."""
+    dm, data, imgs_path = _split_dm(tmp_path, monkeypatch, pSeq=2)
+
+    calls = []
+    real_append_block = dm_mod.append_block
+    monkeypatch.setattr(dm_mod, 'append_images_block', _raise_oserror)
+    monkeypatch.setattr(
+        dm_mod, 'append_block',
+        lambda *a, **k: (calls.append(1), real_append_block(*a, **k))[1])
+
+    _dm_push(dm, tags=[1, 2], pSeq=2)
+    dm.save_data()
+    _wait_save_done(dm, want_state='fail')
+
+    assert calls == []                                  # data never attempted
+    with h5py.File(data, 'r') as f:
+        assert f['seq_ids'].shape[0] == 0
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 0
+    assert dm._save_health['state'] == 'fail'
+    assert 'images save failed' in dm._save_health['reason']
+    assert not dm._save_health.get('partial')
+    assert dm._saved_seq_rows == 0
+
+
+def test_dm_data_append_failure_marks_partial(tmp_path, monkeypatch):
+    """Images landed, data append raised -> save_health says fail + partial and
+    names the 'data' stage; _saved_seq_rows does NOT advance, so the next
+    block's append_images_block trims the orphans."""
+    dm, data, imgs_path = _split_dm(tmp_path, monkeypatch, pSeq=2)
+    monkeypatch.setattr(dm_mod, 'append_block', _raise_oserror)
+
+    _dm_push(dm, tags=[1, 2], pSeq=2)
+    dm.save_data()
+    _wait_save_done(dm, want_state='fail')
+
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 4                   # images landed
+    with h5py.File(data, 'r') as f:
+        assert f['seq_ids'].shape[0] == 0                # data did not
+    assert dm._save_health['state'] == 'fail'
+    assert dm._save_health.get('partial') is True
+    assert 'data save failed' in dm._save_health['reason']
+    assert dm._saved_seq_rows == 0                       # not counted
+
+    # the next (healthy) block self-heals the 4 orphan rows away
+    monkeypatch.undo()
+    dm._split_images = True
+    _dm_push(dm, tags=[3, 4], pSeq=2)
+    dm.save_data()
+    _wait_save_done(dm, 2)
+
+    with h5py.File(imgs_path, 'r') as f:
+        assert f['imgs'].shape[0] == 4
+        np.testing.assert_array_equal(f['seq_ids'][:], [3, 4])
+        assert (f['imgs'][0] == 3).all()                 # no phase shift
+    with h5py.File(data, 'r') as f:
+        np.testing.assert_array_equal(f['seq_ids'][:], [3, 4])
+
+
+# --------------------------------------------------------------------------
+# test 8: LIVE read while the writer appends (no phase shift, never decreasing)
+# --------------------------------------------------------------------------
+
+def test_live_read_during_split_append_never_shifts(tmp_path):
+    """A writer thread appends split blocks with small sleeps while a reader
+    loop applies the min() rule: the count never decreases, and every counted
+    shot's img1 pixels carry that shot's own tag (no positional phase shift).
+
+    Mirrors test_frame_drop_safety's polling idiom.
+    """
+    num_images, n_blocks, per_block = 2, 6, 2
+    d = _writer_dir(tmp_path)
+    data, imgs_path = _create(d, split=True, num_images=num_images)
+
+    stop = threading.Event()
+    errors = []
+
+    def _writer():
+        saved = 0
+        try:
+            for b in range(n_blocks):
+                tags = [saved + k + 1 for k in range(per_block)]
+                _append(data, imgs_path, True,
+                        _tagged_frames(tags, num_images),
+                        np.array(tags, dtype='int64'), num_images,
+                        expected_seq_rows=saved)
+                saved += per_block
+                time.sleep(0.02)
+        except Exception as e:              # noqa: BLE001
+            errors.append(e)
+        finally:
+            stop.set()
+
+    th = threading.Thread(target=_writer, daemon=True)
+    th.start()
+
+    counts = []
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            n = _live_count(data, imgs_path, num_images)
+        except (OSError, KeyError):
+            time.sleep(0.005)
+            continue
+        counts.append(n)
+        if n:
+            # shot k (1-based) -> its img1 frame row is (k-1)*pSeq; the frame
+            # must be filled with the shot's own tag, which IS its seq_id here.
+            try:
+                with h5py.File(data, 'r') as f:
+                    sids_now = f['seq_ids'][:n]
+                with h5py.File(imgs_path, 'r') as f:
+                    for k in (1, n):
+                        frame = f['imgs'][(k - 1) * num_images]
+                        assert (frame == sids_now[k - 1]).all(), (k, n)
+            except OSError:
+                pass
+        if stop.is_set() and n >= n_blocks * per_block:
+            break
+        time.sleep(0.005)
+    th.join(timeout=5.0)
+
+    assert not errors, errors
+    assert counts and all(b >= a for a, b in zip(counts, counts[1:])), counts
+    assert counts[-1] == n_blocks * per_block

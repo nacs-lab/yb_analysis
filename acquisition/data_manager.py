@@ -14,6 +14,7 @@ import collections
 import warnings
 import numpy as np
 
+from yb_analysis import config as _cfg
 from yb_analysis.config import (
     UPDATE_GRID_INTERVAL, UPDATE_GRID_BATCH_SIZE,
     UPDATE_THRES_INTERVAL, UPDATE_THRES_BATCH_SIZE,
@@ -38,7 +39,10 @@ from yb_analysis.detection.scan_analysis import (
 from yb_analysis.detection.locate_atom import locate_atom_update
 from yb_analysis.detection.buffers import RingBuffer
 from yb_analysis.io.scan_directory import make_scan_dir, make_scan_fname, scan_id_to_stamps
-from yb_analysis.io.hdf5_store import create_scan_file, append_block
+from yb_analysis.io.hdf5_store import (
+    create_scan_file, append_block, append_images_block,
+)
+from yb_analysis.io.scan_files import imgs_path_for
 from yb_analysis.io.mat_reader import load_scan_config
 
 logger = logging.getLogger(__name__)
@@ -386,6 +390,18 @@ class DataManager:
         self.dname, self.date, self.time = make_scan_dir(date_stamp, time_stamp)
         mat_fname, _, _ = make_scan_fname(date_stamp, time_stamp, self.dname)
         self.fname = os.path.splitext(mat_fname)[0] + '.h5'
+        # Split image layout (config.SPLIT_IMAGE_FILE / $YB_SPLIT_IMAGE_FILE):
+        # the bulk frames go to the sibling image_<stamp>.h5 instead of into
+        # self.fname, so the analysis path only ever opens the small file. The
+        # name is always computed (harmless, pure string); the flag decides
+        # whether it is used. Read off the module so a test can flip it.
+        self.iname = imgs_path_for(self.fname)
+        self._split_images = bool(getattr(_cfg, 'SPLIT_IMAGE_FILE', False))
+        # Sequence rows durable in the DATA file. Drives append_images_block's
+        # orphan self-heal (images are written first, so a failed data append
+        # leaves image rows this counter does NOT cover). A DataManager always
+        # starts a fresh scan file, hence 0.
+        self._saved_seq_rows = 0
         self._day_dir = os.path.dirname(self.dname)  # Data/YYYYMMDD/
 
         # Load scan config
@@ -457,7 +473,10 @@ class DataManager:
             # For isInit scans, still create the HDF5 so images get saved
             if self.is_init and self.frame_size[0] > 0:
                 try:
-                    create_scan_file(self.fname, self.config, self.frame_size, 1)
+                    create_scan_file(
+                        self.fname, self.config, self.frame_size, 1,
+                        image_path=self.iname if self._split_images else None,
+                        num_images_per_seq=self.num_images_per_seq)
                     self._file_created = True
                 except Exception as e:
                     logger.warning('Failed to create HDF5 for init scan: %s', e)
@@ -699,6 +718,9 @@ class DataManager:
                     num_sites_mid=(self.num_sites_mid
                                    if self.grid_locations_mid is not None
                                    else None),
+                    # Split layout -> /imgs lives in the sibling image file.
+                    image_path=self.iname if self._split_images else None,
+                    num_images_per_seq=self.num_images_per_seq,
                 )
                 self._file_created = True
             except Exception as e:
@@ -2194,7 +2216,10 @@ class DataManager:
                 # Retry HDF5 creation — initial attempt fails when config has frameSize=(0,0)
                 if not self._file_created and self.num_sites > 0:
                     try:
-                        create_scan_file(self.fname, self.config, self.frame_size, self.num_sites)
+                        create_scan_file(
+                            self.fname, self.config, self.frame_size, self.num_sites,
+                            image_path=self.iname if self._split_images else None,
+                            num_images_per_seq=self.num_images_per_seq)
                         self._file_created = True
                         logger.info('HDF5 file created after frame_size fix')
                     except Exception as e:
@@ -2851,7 +2876,8 @@ class DataManager:
 
     # --- Save ---
 
-    def _save_block(self, do_append, sids, n_frames, two_array=False):
+    def _save_block(self, do_append, sids, n_frames, two_array=False,
+                    stage='data'):
         """Run the HDF5 append (on the daemon save thread), recording
         ``save_health`` on failure instead of letting the thread die silently.
 
@@ -2859,6 +2885,13 @@ class DataManager:
         last-resort surface for when even the retries are exhausted — the block
         is lost, but the operator sees it (Live view turns red) rather than the
         old behaviour where the exception printed to the log and vanished.
+
+        ``stage`` names which of the split layout's two appends this is
+        ('images' | 'data'); it goes into the failure reason so the operator can
+        tell "the frames never landed" from "the frames landed but the shot rows
+        did not" (the latter also sets ``partial``). Returns True on success,
+        False on failure, so the caller can skip the DATA append when the IMAGES
+        append failed (a block is lost whole, never half).
         """
         # Fetch (lazily create) the health dict once — robust to any
         # construction path (e.g. tests that build a bare DM via __new__) and
@@ -2880,6 +2913,8 @@ class DataManager:
                 sh['reason'] = ('HDF5 saves resumed; %d sequence(s) lost earlier'
                                 % int(sh.get('lost_seqs', 0)))
                 sh['updated_iso'] = _now_iso()
+                sh.pop('partial', None)
+            return True
         except Exception as e:
             ids = [int(s) for s in list(sids)] if sids is not None else []
             n = len(ids)
@@ -2890,18 +2925,67 @@ class DataManager:
             if room:
                 kept.extend(ids[:room])
             sh['last_error'] = '%s: %s' % (type(e).__name__, e)
-            sh['reason'] = ('HDF5 save failed — %d sequence(s) lost so far (%s)'
-                            % (sh['lost_seqs'], sh['last_error']))
+            sh['reason'] = ('HDF5 %s save failed — %d sequence(s) lost so far (%s)'
+                            % (stage, sh['lost_seqs'], sh['last_error']))
+            # Split layout, images already durable: the block's frames are on
+            # disk but no shot rows point at them. Harmless (the next block's
+            # self-heal trims them) but the operator should see it.
+            if stage == 'data' and getattr(self, '_split_images', False):
+                sh['partial'] = True
             sh['updated_iso'] = _now_iso()
-            logger.error('HDF5 save FAILED for %d sequence(s) (seq_ids %s%s): %s '
-                         '— this block is LOST.', n, ids[:12],
+            logger.error('HDF5 %s save FAILED for %d sequence(s) (seq_ids %s%s): %s '
+                         '— this block is LOST.', stage, n, ids[:12],
                          '...' if n > 12 else '', e)
+            return False
+
+    def _block_lock(self):
+        """Serialise a WHOLE block's appends (split layout: images then data).
+
+        ``_save_lock`` guards one append; in the split layout a block is two of
+        them and they must not interleave with another block's pair, else the two
+        files' /seq_ids orders diverge. Created lazily on the CALLING thread
+        (``save_data``, before the save thread is spawned -- so no creation race)
+        so any construction path, including a bare ``__new__`` DataManager in a
+        test, gets one, and ``_save_lock``'s own semantics stay untouched.
+        """
+        lk = getattr(self, '_save_block_lock', None)
+        if lk is None:
+            lk = self._save_block_lock = threading.Lock()
+        return lk
+
+    def _save_images_block(self, imgs, sids):
+        """Split layout: append this block's FRAMES before its shot rows.
+
+        Returns True when the caller may go on to the data append -- always True
+        in the combined layout (nothing separate to write), True after a
+        successful image append, and False when the image append failed, in which
+        case the block is dropped WHOLE (as it always was) rather than writing
+        shot rows whose frames are missing behind them. ``_saved_seq_rows`` (the
+        data file's committed sequence-row count) is handed to
+        ``append_images_block`` so it can trim orphan image rows left by an
+        earlier failed data append before adding to them.
+        """
+        if not getattr(self, '_split_images', False):
+            return True
+        return self._save_block(
+            lambda: append_images_block(
+                self.iname, imgs, sids,
+                max(1, self.num_images_per_seq),
+                expected_seq_rows=self._saved_seq_rows),
+            sids, len(imgs), stage='images')
 
     def save_data(self):
         if not self._imgs_to_save or not self._file_created:
             return self.fname
         imgs = np.array(self._imgs_to_save, dtype=np.uint16)
         sids = np.array(self._seq_ids_to_save, dtype=np.int64)
+        # Grab (creating on first use) the whole-block lock here, on the calling
+        # thread, so the spawned save threads can never race to create it and
+        # two blocks in flight always append in submission order.
+        block_lock = self._block_lock()
+        split = bool(getattr(self, '_split_images', False))
+        if not isinstance(getattr(self, '_saved_seq_rows', None), int):
+            self._saved_seq_rows = 0        # bare-__new__ construction paths
 
         if self._save_two_array:
             # Demux the interleaved per-frame buffer into per-sequence rows:
@@ -2972,16 +3056,21 @@ class DataManager:
                 ints_mid = np.array(ints_all[1::pSeq], dtype=np.float64)
 
             def _do():
-                self._save_block(
-                    lambda: append_block(
-                        self.fname, imgs, logs1, ints1, sids,
-                        logicals_img2_block=logs2,
-                        intensities_img2_block=ints2,
-                        proba_img2_block=proba2,
-                        logicals_mid_block=logs_mid,
-                        intensities_mid_block=ints_mid,
-                    ),
-                    sids, len(imgs), two_array=True)
+                with block_lock:
+                    if not self._save_images_block(imgs, sids):
+                        return
+                    if self._save_block(
+                            lambda: append_block(
+                                self.fname, imgs, logs1, ints1, sids,
+                                logicals_img2_block=logs2,
+                                intensities_img2_block=ints2,
+                                proba_img2_block=proba2,
+                                logicals_mid_block=logs_mid,
+                                intensities_mid_block=ints_mid,
+                                write_imgs=not split,
+                            ),
+                            sids, len(imgs), two_array=True):
+                        self._saved_seq_rows += len(sids)
         else:
             logs = (np.array(self._logicals_to_save, dtype=bool)
                     if self._logicals_to_save
@@ -2992,9 +3081,15 @@ class DataManager:
                     else np.zeros_like(logs, dtype=np.float64))
 
             def _do():
-                self._save_block(
-                    lambda: append_block(self.fname, imgs, logs, ints, sids),
-                    sids, len(imgs))
+                with block_lock:
+                    if not self._save_images_block(imgs, sids):
+                        return
+                    if self._save_block(
+                            lambda: append_block(
+                                self.fname, imgs, logs, ints, sids,
+                                write_imgs=not split),
+                            sids, len(imgs)):
+                        self._saved_seq_rows += len(sids)
 
         threading.Thread(target=_do, daemon=True).start()
         self._imgs_to_save.clear()

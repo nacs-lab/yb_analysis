@@ -1,6 +1,38 @@
 """HDF5 storage for scan data — chunked, appendable, with atomic save.
 
 Replaces MATLAB matfile() incremental write pattern.
+
+Two on-disk layouts, both written by ``create_scan_file``:
+
+COMBINED (legacy, and what ``image_path=None`` still writes bit-identically) --
+one ``data_<stamp>.h5`` carrying everything::
+
+    /imgs                 uint16 (nFrames,H,W)  chunks (1,H,W), gzip-1
+    /logicals[_img1/_img2/_mid], /intensities[...], /certainties_img2
+    /seq_ids              int64  (nSeqs,)
+    /scan_config          group of scalar attrs
+
+SPLIT (``image_path=<...>``) -- the bulk frames move to a sibling
+``image_<stamp>.h5`` so the analysis path only ever opens the small file::
+
+    data_<stamp>.h5   everything above EXCEPT /imgs (absent, not a stub), plus
+                      attrs schema_version=1, images_external=True,
+                      images_file='image_<stamp>.h5', num_images_per_seq,
+                      frame_size
+    image_<stamp>.h5  /imgs           (identical dtype/chunks/compression)
+                      /seq_ids        int64 (nSeqs,)  same values+order as data
+                      /frame_seq_ids  int64 (nFrames,) = repeat(seq_ids, pSeq)
+                      attrs schema_version=1, layout='images',
+                      num_images_per_seq, frame_size, data_file, scan_id,
+                      committed_frames
+
+``committed_frames`` is a pessimistic watermark written LAST inside the append
+handle (h5py publishes a resize before the bytes land), so a live reader counts
+shots as ``min(data:/seq_ids rows, committed_frames // pSeq)``. The image file is
+created BEFORE the data file, and each block appends images BEFORE data, so a
+crash can only leave images with no data rows behind them -- never data rows
+promising images that are absent. ``append_images_block`` heals such orphan image
+rows on the next block (see its docstring).
 """
 
 import os
@@ -55,10 +87,58 @@ def _open_h5_append(path, retries=12, base_delay=0.1, max_delay=1.0):
     raise last
 
 
+def _create_image_file(image_path, data_path, frame_size, num_images_per_seq):
+    """Create the SPLIT layout's bulk ``image_<stamp>.h5`` (tmp + os.replace).
+
+    Holds ``/imgs`` (identical dtype/chunking/compression to the combined
+    layout's -- the tuning is deliberately unchanged by the split), plus the
+    per-sequence ``/seq_ids`` and the per-frame ``/frame_seq_ids`` that make a
+    frame row self-describing, and the ``committed_frames`` watermark.
+    """
+    H, W = frame_size
+    tmp = image_path + '.tmp'
+    with h5py.File(tmp, 'w') as f:
+        # Same tuning as the combined layout's /imgs -- see create_scan_file.
+        f.create_dataset(
+            'imgs', shape=(0, H, W), maxshape=(None, H, W),
+            dtype='uint16', chunks=(1, H, W), compression='gzip',
+            compression_opts=1,
+        )
+        f.create_dataset(
+            'seq_ids', shape=(0,), maxshape=(None,),
+            dtype='int64', chunks=(64,),
+        )
+        f.create_dataset(
+            'frame_seq_ids', shape=(0,), maxshape=(None,),
+            dtype='int64', chunks=(256,),
+        )
+        f.attrs['schema_version'] = 1
+        f.attrs['layout'] = 'images'
+        if num_images_per_seq is not None:
+            f.attrs['num_images_per_seq'] = int(num_images_per_seq)
+        f.attrs['frame_size'] = (int(H), int(W))
+        f.attrs['data_file'] = os.path.basename(data_path)
+        scan_id = _scan_id_of(data_path)
+        if scan_id:
+            f.attrs['scan_id'] = scan_id
+        # Pessimistic watermark: h5py publishes a resize before the data lands,
+        # so a live reader must trust this, not /imgs.shape[0].
+        f.attrs['committed_frames'] = 0
+    os.replace(tmp, image_path)
+
+
+def _scan_id_of(data_path):
+    """``.../data_20260818_101500.h5`` -> ``'20260818_101500'`` ('' if absent)."""
+    base = os.path.splitext(os.path.basename(str(data_path)))[0]
+    _, sep, stamp = base.partition('_')
+    return stamp if sep else ''
+
+
 def create_scan_file(path, scan_config, frame_size, num_sites,
                      two_array=False, num_sites_img2=0,
                      img2_logicals_source=None, save_mid=False,
-                     num_sites_mid=None):
+                     num_sites_mid=None, image_path=None,
+                     num_images_per_seq=None):
     """Create a new HDF5 scan file with resizable datasets.
 
     Parameters
@@ -100,6 +180,20 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
         two-round rearrangement whose middle pattern is its own array (e.g. a
         2198-site kagome between a 3013 tri load and a 2078 kagome target) MUST
         pass its own count, else the middle bits are stored at the wrong width.
+    image_path : str or None
+        None (default) -> the COMBINED layout: one file with ``/imgs`` inside,
+        byte-identical to what this function always wrote. When set -> the SPLIT
+        layout: ``/imgs`` moves to ``image_path`` (created FIRST, as its own
+        atomic tmp + os.replace) and ``path`` gets no ``/imgs`` dataset at all
+        (absent, not a stub -- a stub would turn a loud miss into a silent
+        "0 frames") plus the ``images_external`` / ``images_file`` attrs.
+        Image-file-first ordering means a crash between the two creates leaves an
+        invisible orphan image file, never a data file promising absent images.
+    num_images_per_seq : int or None
+        Frames per sequence (NumImages). Stored as the ``num_images_per_seq``
+        attr on both files of a split pair -- it is what lets a reader turn
+        frame rows into shots without dividing across the two files. None ->
+        the attr is simply omitted (the files are still created).
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -107,16 +201,29 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
     H, W = frame_size
     tmp = path + '.tmp'
 
+    # SPLIT layout: the bulk file goes down FIRST and completely, so the data
+    # file never exists while its images do not.
+    if image_path is not None:
+        _create_image_file(image_path, path, frame_size, num_images_per_seq)
+
     with h5py.File(tmp, 'w') as f:
-        # Resizable image dataset: (N, H, W), uint16, chunked. uint16 (not
-        # int16) so full 16-bit camera counts >= 32768 store without wrapping to
-        # negatives; readers cast to float and are dtype-agnostic (old int16
-        # files still load unchanged).
-        f.create_dataset(
-            'imgs', shape=(0, H, W), maxshape=(None, H, W),
-            dtype='uint16', chunks=(1, H, W), compression='gzip',
-            compression_opts=1,
-        )
+        if image_path is None:
+            # Resizable image dataset: (N, H, W), uint16, chunked. uint16 (not
+            # int16) so full 16-bit camera counts >= 32768 store without wrapping to
+            # negatives; readers cast to float and are dtype-agnostic (old int16
+            # files still load unchanged).
+            f.create_dataset(
+                'imgs', shape=(0, H, W), maxshape=(None, H, W),
+                dtype='uint16', chunks=(1, H, W), compression='gzip',
+                compression_opts=1,
+            )
+        else:
+            f.attrs['schema_version'] = 1
+            f.attrs['images_external'] = True
+            f.attrs['images_file'] = os.path.basename(image_path)
+            if num_images_per_seq is not None:
+                f.attrs['num_images_per_seq'] = int(num_images_per_seq)
+            f.attrs['frame_size'] = (int(H), int(W))
         if two_array:
             # Per-image datasets: one row per captured sequence, per image.
             f.attrs['two_array'] = True
@@ -196,10 +303,105 @@ def create_scan_file(path, scan_config, frame_size, num_sites,
     os.replace(tmp, path)
 
 
+def _append_rows(f, name, block, chunks):
+    """Append ``block`` to ``f[name]``, lazily creating the dataset."""
+    if name not in f:
+        shape = (0,) + block.shape[1:]
+        maxshape = (None,) + block.shape[1:]
+        f.create_dataset(name, shape=shape, maxshape=maxshape,
+                         dtype=block.dtype, chunks=chunks)
+    ds = f[name]
+    cur = ds.shape[0]
+    n_new = block.shape[0]
+    ds.resize(cur + n_new, axis=0)
+    ds[cur:cur + n_new] = block
+    return ds.shape[0]
+
+
+def append_images_block(image_path, imgs_block, seq_ids_block, num_images,
+                        expected_seq_rows=None):
+    """Append one block of frames to the SPLIT layout's ``image_<stamp>.h5``.
+
+    Writes ``/imgs`` (the frames), ``/seq_ids`` (one id per sequence, same values
+    and order as the data file's) and ``/frame_seq_ids``
+    (``repeat(seq_ids_block, num_images)``), then sets the ``committed_frames``
+    attr LAST -- all inside ONE ``_open_h5_append`` handle, so the OneDrive
+    lock-retry (bug-hdf5-append-lock-onedrive-silent-loss) covers this file too
+    and the watermark can never claim frames whose bytes have not landed.
+
+    ORPHAN SELF-HEAL (the reviewed amendment). Callers write images BEFORE the
+    data rows, so a failed data append -- or a crash between the two -- leaves
+    image rows with no shots behind them. Appending the NEXT block on top of
+    those orphans would shift every later shot's positional join
+    ``(shot-1)*pSeq + frame``, and the dashboard / avg-image would silently show
+    the WRONG shot. So when ``expected_seq_rows`` (the data file's committed
+    sequence-row count) is given and ``/imgs`` holds more than
+    ``num_images * expected_seq_rows`` rows, the three datasets are resized DOWN
+    to alignment first, with a WARNING naming the trimmed count. Rule of thumb:
+    prefer a hole in the images over a shift in the images.
+
+    Parameters
+    ----------
+    image_path : str
+    imgs_block : ndarray, shape (N, H, W), uint16
+    seq_ids_block : ndarray, shape (K,), int64
+        One seq_id per sequence. ``N`` must equal ``num_images * K``; a mismatch
+        is logged (the caller trimmed a partial sequence) rather than silently
+        written with a wrong per-frame id mapping.
+    num_images : int
+        Frames per sequence (pSeq).
+    expected_seq_rows : int or None
+        Sequence rows already durable in the DATA file. None -> no alignment
+        check (nothing to compare against).
+    """
+    if h5py is None:
+        raise ImportError("h5py is required for HDF5 storage")
+
+    imgs_block = np.asarray(imgs_block)
+    seq_ids_block = np.asarray(seq_ids_block, dtype='int64')
+    pSeq = max(1, int(num_images))
+    n_frames = int(imgs_block.shape[0])
+    n_seqs = int(seq_ids_block.shape[0])
+    if n_frames != pSeq * n_seqs:
+        logger.warning(
+            'append_images_block: %d frame(s) for %d sequence(s) at pSeq=%d '
+            '(expected %d) - per-frame ids follow the seq_ids block, so the '
+            'frame/seq counts will disagree by %d row(s).',
+            n_frames, n_seqs, pSeq, pSeq * n_seqs, n_frames - pSeq * n_seqs)
+
+    with _open_h5_append(image_path) as f:
+        # --- orphan self-heal, BEFORE anything is appended ---
+        if expected_seq_rows is not None and 'imgs' in f:
+            aligned = pSeq * int(expected_seq_rows)
+            have = int(f['imgs'].shape[0])
+            if have > aligned:
+                logger.warning(
+                    'append_images_block: trimming %d orphan image row(s) '
+                    '(%d present, %d aligned to %d saved sequence(s) at '
+                    'pSeq=%d) - a previous data append failed or crashed; '
+                    'realigning so positional shot joins cannot shift.',
+                    have - aligned, have, aligned, int(expected_seq_rows), pSeq)
+                f['imgs'].resize(aligned, axis=0)
+                for name, n_keep in (('seq_ids', int(expected_seq_rows)),
+                                     ('frame_seq_ids', aligned)):
+                    if name in f and f[name].shape[0] > n_keep:
+                        f[name].resize(n_keep, axis=0)
+                f.attrs['committed_frames'] = int(f['imgs'].shape[0])
+
+        _append_rows(f, 'imgs', imgs_block,
+                     chunks=(1,) + tuple(imgs_block.shape[1:]))
+        _append_rows(f, 'seq_ids', seq_ids_block, chunks=(64,))
+        _append_rows(f, 'frame_seq_ids',
+                     np.repeat(seq_ids_block, pSeq), chunks=(256,))
+        # LAST: publish the watermark only once every byte above is in.
+        f.attrs['committed_frames'] = int(f['imgs'].shape[0])
+
+
 def append_block(path, imgs_block, logicals_block, intensities_block,
                  seq_ids_block, logicals_img2_block=None,
                  intensities_img2_block=None, proba_img2_block=None,
-                 logicals_mid_block=None, intensities_mid_block=None):
+                 logicals_mid_block=None, intensities_mid_block=None,
+                 write_imgs=True):
     """Append a block of data to an existing HDF5 file.
 
     Parameters
@@ -228,6 +430,11 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
     intensities_mid_block : ndarray or None
         If non-None, two-array mode (NumImages >= 3): shape (NSeqs, M1), the
         middle-frame intensities, appended to ``intensities_mid``.
+    write_imgs : bool
+        True (default) -> the COMBINED layout: ``imgs_block`` is appended to this
+        file's ``/imgs``. False -> the SPLIT layout: skip ``/imgs`` entirely
+        (``append_images_block`` already put the frames in the image file);
+        everything else is identical.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
@@ -235,18 +442,20 @@ def append_block(path, imgs_block, logicals_block, intensities_block,
     two_array = logicals_img2_block is not None
 
     with _open_h5_append(path) as f:
-        # Always append the imgs block as-is (interleaved frames).
-        if 'imgs' not in f:
-            shape = (0,) + imgs_block.shape[1:]
-            maxshape = (None,) + imgs_block.shape[1:]
-            chunks = (1,) + imgs_block.shape[1:]
-            f.create_dataset('imgs', shape=shape, maxshape=maxshape,
-                             dtype=imgs_block.dtype, chunks=chunks)
-        ds = f['imgs']
-        cur = ds.shape[0]
-        n_new = imgs_block.shape[0]
-        ds.resize(cur + n_new, axis=0)
-        ds[cur:cur + n_new] = imgs_block
+        # Append the imgs block as-is (interleaved frames) -- unless the frames
+        # live in the sibling image file (split layout).
+        if write_imgs:
+            if 'imgs' not in f:
+                shape = (0,) + imgs_block.shape[1:]
+                maxshape = (None,) + imgs_block.shape[1:]
+                chunks = (1,) + imgs_block.shape[1:]
+                f.create_dataset('imgs', shape=shape, maxshape=maxshape,
+                                 dtype=imgs_block.dtype, chunks=chunks)
+            ds = f['imgs']
+            cur = ds.shape[0]
+            n_new = imgs_block.shape[0]
+            ds.resize(cur + n_new, axis=0)
+            ds[cur:cur + n_new] = imgs_block
 
         if two_array:
             pairs = [
@@ -299,6 +508,13 @@ def read_scan_file(path):
     Returns
     -------
     dict with keys: 'imgs', 'logicals', 'intensities', 'seq_ids', 'scan_config'
+
+    Notes
+    -----
+    Unused by the package (the live readers go through
+    ``yb_analysis.analysis.load_data``, which is split-aware). Left as-is:
+    combined-layout only -- it would KeyError on a split data file's absent
+    ``/imgs``, which is the intended loud failure.
     """
     if h5py is None:
         raise ImportError("h5py is required for HDF5 storage")
