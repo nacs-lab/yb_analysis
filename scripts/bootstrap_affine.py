@@ -116,37 +116,109 @@ def _num_images_per_seq(sdir, sid):
     return None
 
 
+def _frames_per_seq(fimg, n_frames, config_num_images=None):
+    """Frames per sequence (pSeq) for the image file handle ``fimg``.
+
+    ALWAYS average the img1 (loading) frames ONLY. A two-image scan (e.g. SLM
+    rearrangement: img1 = loading 33x33, img2 = rearranged every-other) interleaves
+    frames as [seq0_img1, seq0_img2, seq1_img1, ...]; averaging ALL frames would smear
+    the loading array with a DIFFERENT post-protocol pattern and wreck the fit -- a
+    corrupt global affine reads out as physics. The loading image is frame 0 of each
+    sequence -> indices 0, pSeq, 2*pSeq, ..., so pSeq had better be right.
+
+    Cascade, most to least authoritative:
+
+    1. ``num_images_per_seq`` attr on the image file (the split layout writes it;
+       authoritative whenever present).
+    2. ``len(frame_seq_ids) // len(seq_ids)`` from the image file -- self-contained,
+       no cross-file arithmetic.
+    3. the legacy division ``n_frames // n_rows(intensities_img1)``, ONLY when the
+       layout is combined (``/imgs`` and ``/intensities_img1`` in the SAME file).
+       Post-split that division would cross two files and silently yield 1.
+    4. ``NumImages`` from the scan config sidecar (last resort).
+
+    Returns ``(pSeq, source)`` where source is one of 'attr', 'frame_seq_ids',
+    'intensities', 'config', 'default'. Raises RuntimeError when the value comes
+    from the last-resort config fallback AND a file-derived hint disagrees with a
+    config ``NumImages > 1`` -- better to abort than to fit a smeared affine.
+    """
+    # (1) the image file's own attr.
+    attr_ni = None
+    try:
+        if 'num_images_per_seq' in fimg.attrs:
+            attr_ni = int(fimg.attrs['num_images_per_seq'])
+    except (TypeError, ValueError):
+        attr_ni = None
+    if attr_ni and attr_ni > 0 and n_frames % attr_ni == 0:
+        return max(1, attr_ni), 'attr'
+
+    # (2) per-frame -> per-seq id ratio, entirely inside the image file.
+    ratio_ni = None
+    if 'frame_seq_ids' in fimg and 'seq_ids' in fimg:
+        n_fs = int(fimg['frame_seq_ids'].shape[0])
+        n_sq = int(fimg['seq_ids'].shape[0])
+        if n_sq > 0 and n_fs % n_sq == 0:
+            ratio_ni = max(1, n_fs // n_sq)
+    if ratio_ni:
+        return ratio_ni, 'frame_seq_ids'
+
+    # (3) the legacy cross-dataset division -- combined layout only.
+    div_ni = None
+    if 'imgs' in fimg and 'intensities_img1' in fimg \
+            and fimg['intensities_img1'].shape[0] > 0:
+        nseq = int(fimg['intensities_img1'].shape[0])
+        if nseq > 0 and n_frames % nseq == 0:
+            div_ni = max(1, n_frames // nseq)
+    if div_ni and div_ni > 1:
+        return div_ni, 'intensities'
+
+    # (4) last resort: NumImages from the scan config. Refuse when a file-derived
+    # hint contradicts it -- a wrong pSeq here silently smears the affine.
+    if config_num_images and config_num_images > 1:
+        hints = {name: v for name, v in (('num_images_per_seq attr', attr_ni),
+                                         ('frame_seq_ids ratio', ratio_ni),
+                                         ('intensities division', div_ni))
+                 if v}
+        bad = {k: v for k, v in hints.items() if v != config_num_images}
+        if bad:
+            raise RuntimeError(
+                'refusing to fit the affine: config NumImages=%d disagrees with '
+                'the image file (%s). A wrong frames-per-sequence smears img1 with '
+                'img2 and corrupts the global affine.'
+                % (config_num_images, ', '.join(f'{k}={v}' for k, v in bad.items())))
+        if n_frames % config_num_images == 0:
+            return max(1, config_num_images), 'config'
+        raise RuntimeError(
+            'refusing to fit the affine: config NumImages=%d does not divide the '
+            '%d image frames and no file-derived frames-per-sequence is available.'
+            % (config_num_images, n_frames))
+
+    if div_ni:
+        return div_ni, 'intensities'
+    return 1, 'default'
+
+
 def _avg_image_and_roi(scan_id):
     import h5py
+    from yb_analysis.io.scan_files import resolve_scan_files
     os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
     sdir = _scan_dir(scan_id)
     sid = scan_id.replace('_', '')
-    h5p = os.path.join(sdir, f'data_{sid[:8]}_{sid[8:]}.h5')
+    # Resolve where /imgs actually lives: the data file (combined layout) or the
+    # sibling image_<stamp>.h5 (split layout).
+    files = resolve_scan_files(sdir, probe_attrs=False)
+    h5p = files.image_path or os.path.join(sdir, f'data_{sid[:8]}_{sid[8:]}.h5')
     with h5py.File(h5p, 'r', libver='latest', swmr=True) as f:
         imgs = f['imgs']
         n = imgs.shape[0]
-        # ALWAYS average the img1 (loading) frames ONLY. A two-image scan (e.g. SLM
-        # rearrangement: img1 = loading 33x33, img2 = rearranged every-other) interleaves
-        # frames as [seq0_img1, seq0_img2, seq1_img1, ...]; averaging ALL frames would smear
-        # the loading array with a DIFFERENT post-protocol pattern and wreck the fit. The
-        # loading image is frame 0 of each sequence -> indices 0, pSeq, 2*pSeq, ... . Infer
-        # pSeq from the per-sequence intensities the same data_manager wrote (most reliable);
-        # fall back to NumImages from the scan config, else assume single-image (pSeq=1).
-        pSeq = 1
-        if 'intensities_img1' in f and f['intensities_img1'].shape[0] > 0:
-            nseq = int(f['intensities_img1'].shape[0])
-            if nseq > 0 and n % nseq == 0:
-                pSeq = max(1, n // nseq)
-        if pSeq == 1:
-            ni = _num_images_per_seq(sdir, sid)
-            if ni and n % ni == 0:
-                pSeq = ni
+        pSeq, src = _frames_per_seq(f, n, _num_images_per_seq(sdir, sid))
         idx = list(range(0, n, pSeq))     # frame 0 of each sequence = loading image
         acc = np.zeros(imgs.shape[1:], np.float64)
         for i in idx:
             acc += imgs[i].astype(np.float64)
         avg = acc / max(len(idx), 1)
-        print(f'    averaged {len(idx)} img1 frames (pSeq={pSeq}, {n} total)')
+        print(f'    averaged {len(idx)} img1 frames '
+              f'(pSeq={pSeq} from {src}, {n} total)')
     # ROI from scan config, else expConfig default.
     roi = None
     try:

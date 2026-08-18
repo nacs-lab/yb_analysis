@@ -548,3 +548,195 @@ def test_analyze_scan_dir_combined_reports_layout(tmp_path):
     out = analyze_scan_dir(d)
     assert out['images_layout'] == sf.LAYOUT_COMBINED
     assert out['avg_image']['image_shape'] == [4, 5]
+
+
+# --------------------------------------------------------------------------
+# STEP 3: bootstrap_affine's frames-per-sequence cascade
+#
+# The highest-severity cross-file bug in the split refactor: the old code
+# inferred pSeq as ``len(imgs) // len(intensities_img1)`` -- a division across
+# two datasets that post-split live in two DIFFERENT files, silently yielding
+# pSeq=1 and averaging img1 together with img2 into the affine fit. A corrupt
+# global affine reads out as physics, so the cascade is pinned here.
+# --------------------------------------------------------------------------
+
+def _write_image_only_h5(scan_dir, n_seq=3, num_images=2, h=4, w=5,
+                         attr=True, frame_ids=True, stamp=STAMP):
+    """A bulk image_<stamp>.h5 with the attr and/or frame_seq_ids toggled off."""
+    path = os.path.join(scan_dir, f'{sf.IMGS_PREFIX}_{stamp}.h5')
+    seq_ids = np.arange(1, n_seq + 1, dtype='int64')
+    with h5py.File(path, 'w') as f:
+        f.attrs['layout'] = 'images'
+        if attr:
+            f.attrs['num_images_per_seq'] = num_images
+        f.create_dataset('imgs', data=_img_stack(n_seq * num_images, h, w),
+                         maxshape=(None, h, w), dtype='uint16')
+        f.create_dataset('seq_ids', data=seq_ids, maxshape=(None,))
+        if frame_ids:
+            f.create_dataset('frame_seq_ids',
+                             data=np.repeat(seq_ids, num_images),
+                             maxshape=(None,))
+    return path
+
+
+def _pseq(path, config_num_images=None):
+    """Run bootstrap_affine's cascade against one h5 file, return (pSeq, src)."""
+    from yb_analysis.scripts.bootstrap_affine import _frames_per_seq
+    with h5py.File(path, 'r') as f:
+        return _frames_per_seq(f, int(f['imgs'].shape[0]), config_num_images)
+
+
+def test_pseq_attr_wins_when_present(tmp_path):
+    """(1) num_images_per_seq on the image file is authoritative."""
+    d = _scan_dir(tmp_path, STAMP)
+    # frame_seq_ids deliberately absent, so only the attr can answer
+    p = _write_image_only_h5(d, n_seq=5, num_images=2, frame_ids=False)
+    assert _pseq(p) == (2, 'attr')
+
+
+def test_pseq_attr_wins_over_frame_ids(tmp_path):
+    """The attr is consulted before the frame_seq_ids ratio."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=3)
+    assert _pseq(p) == (3, 'attr')
+
+
+def test_pseq_from_frame_seq_ids_when_attr_stripped(tmp_path):
+    """(2) attr gone -> len(frame_seq_ids)//len(seq_ids), inside one file."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=3, attr=False)
+    assert _pseq(p) == (3, 'frame_seq_ids')
+
+
+def test_pseq_combined_file_still_uses_old_division(tmp_path):
+    """(3) a LEGACY combined file (no attrs, no frame_seq_ids) keeps working
+    via the /imgs vs /intensities_img1 division -- same answer as before."""
+    d = _scan_dir(tmp_path, STAMP)
+    path = os.path.join(d, f'data_{STAMP}.h5')
+    n_seq, num_images = 4, 2
+    with h5py.File(path, 'w') as f:
+        f.create_dataset('imgs', data=_img_stack(n_seq * num_images))
+        f.create_dataset('intensities_img1',
+                         data=np.ones((n_seq, 7), dtype='float64'))
+        f.create_dataset('seq_ids', data=np.arange(1, n_seq + 1, dtype='int64'))
+    assert _pseq(path) == (2, 'intensities')
+
+
+def test_pseq_split_image_file_never_cross_divides(tmp_path):
+    """The regression itself: with the split pair written by the real helper,
+    the answer is the true pSeq -- never 1 from a cross-file division."""
+    d = _scan_dir(tmp_path, STAMP)
+    _data, imgs_path, _imgs = _write_split_scan(d, n_seq=6, num_images=2)
+    pSeq, src = _pseq(imgs_path)
+    assert pSeq == 2 and src in ('attr', 'frame_seq_ids')
+
+
+def test_pseq_config_fallback_when_file_says_nothing(tmp_path):
+    """(4) no attr, no frame_seq_ids, no intensities -> the config NumImages."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=2, attr=False,
+                             frame_ids=False)
+    assert _pseq(p, config_num_images=2) == (2, 'config')
+
+
+def test_pseq_file_attr_beats_a_disagreeing_config(tmp_path):
+    """A usable file-derived value is authoritative even when the config
+    sidecar disagrees -- no abort, the FILE wins (the sidecar is the guess)."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=6, num_images=2)   # file says 2
+    assert _pseq(p, config_num_images=3) == (2, 'attr')  # config says 3
+
+
+def test_pseq_config_disagreement_aborts_loudly(tmp_path):
+    """The guard: falling through to the last-resort config NumImages>1 while a
+    file-derived HINT disagrees must abort, not fit a possibly-smeared affine.
+
+    Constructed with an internally inconsistent image file: the attr claims 4
+    frames per sequence but does not divide the 10 frames present, so no branch
+    of the cascade can use it -- exactly the "something is wrong here" state
+    where guessing from the sidecar would smear img1 with img2.
+    """
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=2, frame_ids=False)
+    with h5py.File(p, 'r+') as f:
+        f.attrs['num_images_per_seq'] = 4        # 4 does not divide 10 frames
+    with pytest.raises(RuntimeError) as ei:
+        _pseq(p, config_num_images=3)            # config says 3, attr says 4
+    assert 'NumImages=3' in str(ei.value)
+
+
+def test_pseq_config_not_dividing_frames_aborts(tmp_path):
+    """Config NumImages that does not divide the frame count, with no
+    file-derived hint at all -> abort, not a silent wrong stride."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=2, attr=False,
+                             frame_ids=False)           # 10 frames
+    with pytest.raises(RuntimeError):
+        _pseq(p, config_num_images=3)
+
+
+def test_pseq_single_image_scan_is_one(tmp_path):
+    """A genuine one-frame-per-shot scan: pSeq=1, no abort (NumImages==1 is
+    never treated as a disagreement)."""
+    d = _scan_dir(tmp_path, STAMP)
+    p = _write_image_only_h5(d, n_seq=5, num_images=1, attr=False,
+                             frame_ids=False)
+    assert _pseq(p, config_num_images=1) == (1, 'default')
+
+
+# --------------------------------------------------------------------------
+# STEP 3: pyctrl's dependency-light mirror (pyctrl/lib/scan_files_lite.py)
+# --------------------------------------------------------------------------
+
+def _scan_files_lite():
+    """Import pyctrl/lib/scan_files_lite.py by path (pyctrl is a separate repo
+    and its lib/ is flat on sys.path at runtime, not a package)."""
+    import importlib.util
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    path = os.path.join(repo, 'pyctrl', 'lib', 'scan_files_lite.py')
+    spec = importlib.util.spec_from_file_location('scan_files_lite', path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_lite_mirrors_resolver_naming(tmp_path):
+    """image_source / imgs_path_for must agree with yb_analysis's resolver."""
+    lite = _scan_files_lite()
+    assert lite.IMGS_PREFIX == sf.IMGS_PREFIX
+    d = _scan_dir(tmp_path, STAMP)
+    data = os.path.join(d, f'data_{STAMP}.h5')
+    assert lite.imgs_path_for(data) == sf.imgs_path_for(data)
+    # no image file yet -> identity, both implementations
+    assert lite.image_source(data) == data == sf.image_source(data)
+    _write_image_only_h5(d)
+    assert lite.image_source(data) == sf.image_source(data) \
+        == os.path.join(d, f'{sf.IMGS_PREFIX}_{STAMP}.h5')
+    # a legacy .mat scan (no image sibling anywhere) -> identity, both
+    d2 = _scan_dir(tmp_path, '20260818_101503')
+    mat = os.path.join(d2, 'data_20260818_101503.mat')
+    assert lite.image_source(mat) == mat == sf.image_source(mat)
+
+
+def test_lite_frames_per_seq_attr_ratio_default(tmp_path):
+    """attr -> ratio -> default, and it accepts a path or an open handle."""
+    lite = _scan_files_lite()
+    d = _scan_dir(tmp_path, STAMP)
+    p_attr = _write_image_only_h5(d, n_seq=4, num_images=3)
+    assert lite.frames_per_seq(p_attr) == 3
+    with h5py.File(p_attr, 'r') as f:
+        assert lite.frames_per_seq(f) == 3
+
+    d2 = _scan_dir(tmp_path, '20260818_101501')
+    p_ratio = _write_image_only_h5(d2, n_seq=4, num_images=2, attr=False,
+                                   stamp='20260818_101501')
+    assert lite.frames_per_seq(p_ratio) == 2
+
+    d3 = _scan_dir(tmp_path, '20260818_101502')
+    p_none = _write_image_only_h5(d3, n_seq=4, num_images=2, attr=False,
+                                  frame_ids=False, stamp='20260818_101502')
+    assert lite.frames_per_seq(p_none) is None
+    assert lite.frames_per_seq(p_none, default=7) == 7
+    # unreadable / missing file -> the default, never a raise
+    assert lite.frames_per_seq(os.path.join(d3, 'nope.h5'), default=5) == 5

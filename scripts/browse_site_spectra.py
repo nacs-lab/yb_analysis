@@ -63,11 +63,11 @@ def _read_two_array(scan_dir):
 
     # live fallback: read the h5 by hand
     import h5py
+    from yb_analysis.io.scan_files import resolve_scan_files
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
-    h5 = None
-    for fn in os.listdir(scan_dir):
-        if fn.endswith(".h5"):
-            h5 = os.path.join(scan_dir, fn); break
+    # the DATA file specifically -- a split scan's sibling image_<stamp>.h5 also
+    # ends in .h5 but carries no logicals (a first-.h5 pick would SystemExit).
+    h5 = resolve_scan_files(scan_dir, probe_attrs=False).data_path
     if h5 is None:
         raise SystemExit("no .h5 in %s" % scan_dir)
     last = None
