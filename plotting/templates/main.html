@@ -945,6 +945,14 @@
        chips (loading, survival, FP, swept param value, diag fields). -->
   <section class="card col-12" data-card-id="analysis-per-iter">
     <h2>Per-iteration metrics<span class="grow"></span>
+        <!-- Clicking a point in the plot below opens the shot-image viewer,
+             which reads the bulk image file -> shared hover warning. The plot
+             container carries the same data-warn so hovering the CLICK TARGET
+             itself shows it (see .img-read-warn in dashboard.css). -->
+        <span class="hint mono img-read-warn" id="per-iter-img-warn"
+              data-warn="Reads the bulk image file (image_&lt;stamp&gt;.h5) - slow on large scans and forces a OneDrive download if the file is cloud-only. Never runs automatically."
+              title="Reads the bulk image file (image_&lt;stamp&gt;.h5) - slow on large scans and forces a OneDrive download if the file is cloud-only. Never runs automatically."><span
+              class="img-read-sign">&#9888;</span>click a point &rarr; shot image</span>
         <span class="hint mono" id="per-iter-info"></span>
     </h2>
     <div id="per-iter-toggles" class="metric-toggles"
@@ -959,7 +967,13 @@
       overlay diag (right axis):
       <select id="per-iter-diag-select"><option value="">none</option></select>
     </label>
-    <div class="plot-container" id="plot-per-iter" style="height:380px;"></div>
+    <!-- The plot itself is the shot-image viewer's click target, so the
+         warning wraps it: hovering anywhere over the plot shows the tooltip
+         (the wrapper carries it, so Plotly's own div is untouched). -->
+    <div class="img-read-warn" id="per-iter-plot-wrap"
+         data-warn="Reads the bulk image file (image_&lt;stamp&gt;.h5) - slow on large scans and forces a OneDrive download if the file is cloud-only. Never runs automatically.">
+      <div class="plot-container" id="plot-per-iter" style="height:380px;"></div>
+    </div>
     <!-- Phase 5a: histogram of the same per-shot metric values
          (0.5% bins, frac axis 0..1). Same toggle chips drive both. -->
     <div class="plot-container" id="plot-per-iter-hist"
@@ -980,8 +994,13 @@
   <section class="card col-6" data-card-id="analysis-avg-image"
            id="analysis-avg-image-card" hidden>
     <h2>Averaged image<span class="grow"></span>
-        <button type="button" id="avg-image-gen-btn" class="ghost"
-                style="font-size:11px;padding:3px 10px;" hidden>Generate</button>
+        <!-- Reads the bulk image file -> carries the shared hover warning
+             (.img-read-warn + data-warn). Never fires automatically. -->
+        <button type="button" id="avg-image-gen-btn" class="ghost img-read-warn"
+                style="font-size:11px;padding:3px 10px;" hidden
+                data-warn="Reads the bulk image file (image_&lt;stamp&gt;.h5) - slow on large scans and forces a OneDrive download if the file is cloud-only. Never runs automatically."
+                title="Reads the bulk image file (image_&lt;stamp&gt;.h5) - slow on large scans and forces a OneDrive download if the file is cloud-only. Never runs automatically."><span
+                class="img-read-sign">&#9888;</span>Generate</button>
         <span class="hint mono" id="avg-image-info"></span>
     </h2>
     <div class="plot-container" id="plot-avg-image" style="height:360px;"></div>

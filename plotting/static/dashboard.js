@@ -7093,6 +7093,11 @@
     // the best SLM defocus by whichever metric they trust.
     const ss = r.seq_specific;
     const hasFocus = ss && ss.type === "focus_metrics" && ss.metrics;
+    // NOTE (payload v6): the focus curve is no longer computed automatically --
+    // it is the one panel measured from raw image PIXELS (post-split the bulk
+    // image_<stamp>.h5). `seq_specific` therefore arrives null for a qualifying
+    // scan whose curve was never generated, and this panel is simply absent --
+    // exactly as it already is for a NumImages>=2 scan. Nothing to render.
     if (hasFocus) {
       html += `
         <div style="padding:8px 0;">

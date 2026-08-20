@@ -3776,3 +3776,47 @@ textarea::-webkit-scrollbar-thumb:hover,
 .mc-ttl-lo-key { color: var(--err); }
 .mc-ttl-hi-key { color: var(--accent); }
 .mc-ovr-key    { color: var(--warn); }
+
+/* ==== Image-file read warning (bulk image_<stamp>.h5) ====================
+   Every control that reads the SPLIT layout's bulk image file -- multi-GB, and
+   an open can force a OneDrive hydration of a cloud-only file -- carries this
+   marker so the cost is visible BEFORE the click. Nothing here ever runs
+   automatically: the avg-image Generate button and the per-iteration ->
+   shot-image viewer are the only image readers left, and both are opt-in.
+
+   Usage: put .img-read-warn on the control itself (or a small sibling span);
+   the tooltip text lives in data-warn and appears on hover of the CONTROL,
+   with no extra icon to click. A title= attr is kept alongside as the
+   accessible/fallback text (native tooltip on touch + screen readers). */
+.img-read-warn { position: relative; }
+.img-read-warn::after {
+  content: attr(data-warn);
+  position: absolute; z-index: 1100; bottom: calc(100% + 7px); right: 0;
+  width: max-content; max-width: 340px; padding: 7px 9px;
+  background: rgba(15, 19, 28, 0.98); color: var(--text);
+  border: 1px solid var(--warn); border-radius: 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.6);
+  font: 11px/1.45 var(--mono); text-align: left; white-space: normal;
+  text-transform: none; letter-spacing: 0;
+  opacity: 0; visibility: hidden; pointer-events: none;
+  transition: opacity 90ms ease-in 120ms, visibility 0s linear 210ms;
+}
+.img-read-warn:hover::after, .img-read-warn:focus-visible::after {
+  opacity: 1; visibility: visible;
+  transition: opacity 90ms ease-out 120ms, visibility 0s linear 120ms;
+}
+/* The inline warning glyph itself: a small amber sign next to (or standing in
+   for) the control's label. Hover the whole control, not just this glyph. */
+.img-read-sign { color: var(--warn); font-weight: 700; margin-right: 3px; }
+
+/* The per-iteration PLOT is itself the shot-image viewer's click target, so the
+   warning wraps the whole 380px plot. That surface is hovered constantly just to
+   read data points, so this instance gets a long dwell delay and sits ABOVE the
+   plot's top-left corner -- it never covers the trace the operator is reading. */
+#per-iter-plot-wrap::after {
+  right: auto; left: 8px; bottom: auto; top: 4px;
+  transition: opacity 120ms ease-in 700ms, visibility 0s linear 820ms;
+}
+#per-iter-plot-wrap:hover::after {
+  transition: opacity 120ms ease-out 700ms, visibility 0s linear 700ms;
+}

@@ -1391,3 +1391,183 @@ def test_live_read_during_split_append_never_shifts(tmp_path):
     assert not errors, errors
     assert counts and all(b >= a for a, b in zip(counts, counts[1:])), counts
     assert counts[-1] == n_blocks * per_block
+
+
+# ==========================================================================
+# STEP 5: the focus-metric GATE -- the last automatic image read is gone.
+#
+# The calibration-free focus curve is the only analysis product measured from
+# raw /imgs PIXELS, and it used to be computed on EVERY default payload build
+# for a NumImages==1 multi-point sweep. Post-split that means opening the
+# multi-GB image_<stamp>.h5 (and possibly forcing a OneDrive hydration) just by
+# opening the Analysis tab. It is now gated behind compute_focus_metrics=True:
+#
+#   * default kwargs, no cache -> ZERO image-file opens, panel omitted
+#     (seq_specific is None, exactly as for a non-qualifying scan);
+#   * compute_focus_metrics=True -> the pixel read happens (image file only)
+#     and focus_metrics.json is written;
+#   * a later DEFAULT analyze serves that cache with zero image opens again.
+# ==========================================================================
+
+F_STAMP = STAMP
+
+
+def _spot_frame(sigma, h=64, w=64, spacing=16, amp=200.0, bg=10.0, seed=0):
+    """One frame of Gaussian spots of width ``sigma`` (mirrors the focus-metric
+    test's generator, small enough to keep the split fixture cheap)."""
+    rng = np.random.default_rng(seed)
+    img = np.full((h, w), bg, dtype=np.float64)
+    yy, xx = np.mgrid[0:h, 0:w]
+    for cy in range(spacing, h - spacing, spacing):
+        for cx in range(spacing, w - spacing, spacing):
+            img += amp * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2)
+                                / (2 * sigma ** 2))
+    return img + rng.normal(0, 1.0, img.shape)
+
+
+def _write_focus_split_scan(scan_dir, sigmas=(3.0, 1.4, 3.0), n_per=3,
+                            h=64, w=64):
+    """A SPLIT scan that QUALIFIES for focus metrics: NumImages==1, a multi-point
+    sweep, real spot frames in the bulk image file. Returns (data, image, imgs).
+
+    The middle sweep point is the tight focus, so a successful compute is
+    checkable (not just "it wrote something").
+    """
+    data = os.path.join(scan_dir, 'data_%s.h5' % F_STAMP)
+    imgs_path = os.path.join(scan_dir, '%s_%s.h5' % (sf.IMGS_PREFIX, F_STAMP))
+
+    frames, sids = [], []
+    for p, s in enumerate(sigmas):
+        for k in range(n_per):
+            frames.append(_spot_frame(s, h=h, w=w, seed=p * 10 + k))
+            sids.append(p + 1)
+    imgs = np.asarray(frames, dtype=np.uint16)
+    seq_ids = np.asarray(sids, dtype='int64')
+    n_seq = len(sids)
+
+    with h5py.File(data, 'w') as f:
+        f.attrs['schema_version'] = 1
+        f.attrs['images_external'] = True
+        f.attrs['images_file'] = os.path.basename(imgs_path)
+        f.attrs['num_images_per_seq'] = 1
+        f.attrs['frame_size'] = (h, w)
+        f.create_dataset('logicals', data=np.ones((n_seq, 2), dtype=bool),
+                         maxshape=(None, 2))
+        f.create_dataset('seq_ids', data=seq_ids, maxshape=(None,))
+        g = f.create_group('scan_config')
+        g.attrs['NumImages'] = 1
+        g.attrs['Params'] = np.array([1, 2, 3], dtype='int64')
+        g.attrs['ScanParams'] = np.array([-1.0, 0.0, 1.0])
+
+    with h5py.File(imgs_path, 'w') as f:
+        f.attrs['schema_version'] = 1
+        f.attrs['layout'] = 'images'
+        f.attrs['num_images_per_seq'] = 1
+        f.attrs['frame_size'] = (h, w)
+        f.attrs['data_file'] = os.path.basename(data)
+        f.attrs['committed_frames'] = imgs.shape[0]
+        f.create_dataset('imgs', data=imgs, maxshape=(None, h, w),
+                         dtype='uint16', chunks=(1, h, w),
+                         compression='gzip', compression_opts=1)
+        f.create_dataset('seq_ids', data=seq_ids, maxshape=(None,))
+        f.create_dataset('frame_seq_ids', data=seq_ids, maxshape=(None,))
+    return data, imgs_path, imgs
+
+
+def _img_opens(opens, imgs_path):
+    base = os.path.basename(imgs_path)
+    return [p for p in opens if os.path.basename(p) == base]
+
+
+def test_focus_scan_default_analyze_opens_no_image_file(tmp_path, monkeypatch):
+    """THE new requirement: the qualifying NumImages==1 sweep -- the ONE case
+    that used to read pixels automatically -- now opens the image file ZERO
+    times on a default analyze, and no focus panel is produced."""
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    d = _scan_dir(tmp_path, F_STAMP)
+    data, imgs_path, _imgs = _write_focus_split_scan(d)
+
+    opens = _track_h5_opens(monkeypatch)
+    out = analyze_scan_dir(d)
+
+    assert _img_opens(opens, imgs_path) == [], opens
+    assert opens                                   # (the data file was read)
+    assert out['seq_specific'] is None
+    # ...and the un-asked-for compute left no cache behind either.
+    assert not os.path.exists(os.path.join(d, 'focus_metrics.json'))
+
+
+def test_focus_explicit_compute_reads_only_image_file(tmp_path, monkeypatch):
+    """compute_focus_metrics=True does the pixel read -- of the IMAGE file --
+    and writes the focus_metrics.json cache with a real curve."""
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    d = _scan_dir(tmp_path, F_STAMP)
+    data, imgs_path, _imgs = _write_focus_split_scan(d)
+
+    opens = _track_h5_opens(monkeypatch)
+    out = analyze_scan_dir(d, compute_focus_metrics=True)
+
+    # It DID open the image file (that is the point of opting in).
+    assert _img_opens(opens, imgs_path), opens
+    ss = out['seq_specific']
+    assert ss['type'] == 'focus_metrics'
+    assert ss['calibration_free'] is True
+    vals = np.array(ss['metrics']['spot_width']['values'], dtype=float)
+    assert int(np.nanargmin(vals)) == 1            # tight focus = middle point
+    assert os.path.isfile(os.path.join(d, 'focus_metrics.json'))
+
+
+def test_focus_cached_metrics_served_with_zero_image_opens(tmp_path,
+                                                          monkeypatch):
+    """After an explicit compute, a DEFAULT analyze serves the cached curve --
+    still without opening the image file (a JSON read costs nothing)."""
+    from yb_analysis.analysis.run_analysis import analyze_scan_dir
+    d = _scan_dir(tmp_path, F_STAMP)
+    data, imgs_path, _imgs = _write_focus_split_scan(d)
+
+    analyze_scan_dir(d, compute_focus_metrics=True)      # explicit, warms cache
+    assert os.path.isfile(os.path.join(d, 'focus_metrics.json'))
+
+    # Bust the payload cache so the default call really rebuilds the payload
+    # (otherwise the fast path returns without consulting anything at all).
+    payload = os.path.join(d, 'analysis_payload.json')
+    if os.path.isfile(payload):
+        os.remove(payload)
+
+    opens = _track_h5_opens(monkeypatch)
+    out = analyze_scan_dir(d)
+
+    assert _img_opens(opens, imgs_path) == [], opens
+    ss = out['seq_specific']
+    assert ss['type'] == 'focus_metrics'
+    assert ss['metrics']['spot_width']['values']
+
+
+def test_focus_explicit_compute_refreshes_the_payload_cache(tmp_path):
+    """The empty panel must not get PINNED by the payload cache: after the
+    explicit compute the cached default payload carries the real curve, so a
+    plain re-fetch of the analysis shows it."""
+    from yb_analysis.analysis.run_analysis import (
+        analyze_scan_dir, ANALYSIS_PAYLOAD_VERSION)
+    import json as _json
+    d = _scan_dir(tmp_path, F_STAMP)
+    _write_focus_split_scan(d)
+
+    first = analyze_scan_dir(d)                     # caches the no-focus payload
+    assert first['seq_specific'] is None
+    cache_path = os.path.join(d, 'analysis_payload.json')
+    with open(cache_path) as f:
+        cached = _json.load(f)
+    assert cached['_version'] == ANALYSIS_PAYLOAD_VERSION == 6
+    assert cached['payload']['seq_specific'] is None
+
+    analyze_scan_dir(d, compute_focus_metrics=True)  # explicit compute
+
+    with open(cache_path) as f:
+        cached2 = _json.load(f)
+    ss = cached2['payload']['seq_specific']
+    assert ss['type'] == 'focus_metrics'
+    assert ss['metrics']['spot_width']['values']
+    # ...and the plain default call now returns the real curve off that cache.
+    again = analyze_scan_dir(d)
+    assert again['seq_specific']['metrics']['spot_width']['values']

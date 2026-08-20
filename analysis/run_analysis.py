@@ -92,7 +92,14 @@ ANALYSIS_PAYLOAD_JSON = 'analysis_payload.json'
 # recompute and surface it instead of their stale `seq_specific: None`.
 # v5: payload now carries `images_layout` ('combined'|'split') so the dashboard
 # knows whether /imgs lives in the data file or the sibling image_<stamp>.h5.
-ANALYSIS_PAYLOAD_VERSION = 5
+# v6: the seq-specific FOCUS metrics are no longer computed automatically -- they
+# read /imgs PIXELS, i.e. post-split the multi-GB image_<stamp>.h5, and an open
+# can force a OneDrive hydration. The default payload now serves a cached
+# focus_metrics.json if one exists and otherwise simply OMITS the panel
+# (seq_specific stays None), so `seq_specific` may legitimately be absent on a
+# scan that a v5 payload showed a curve for. Bump so v5 caches are rebuilt under
+# the new rule. The pixel path lives on behind compute_focus_metrics=True.
+ANALYSIS_PAYLOAD_VERSION = 6
 
 
 def _analysis_cache_path(scan_dir: Path) -> Path:
@@ -270,7 +277,8 @@ def analyze_scan(scan_id: Optional[str] = None,
                  target_only: bool = False,
                  recompute_infidelity: bool = False,
                  force_recache: bool = False,
-                 sync_slm_diag: bool = True) -> dict:
+                 sync_slm_diag: bool = True,
+                 compute_focus_metrics: bool = False) -> dict:
     """Run lab-side analysis on a completed scan.
 
     Either ``scan_id`` (14-digit YYYYMMDDHHMMSS) or ``scan_dir`` must
@@ -281,6 +289,12 @@ def analyze_scan(scan_id: Optional[str] = None,
     ``slm_diag.h5`` on demand from the SLM server (see
     ``_maybe_sync_slm_diag``) so rearrangement survival-vs-distance works
     even when the at-scan-end sync never fired.
+
+    ``compute_focus_metrics`` (default False) opts INTO the one analysis
+    product that reads image PIXELS (the calibration-free focus curve, from
+    the bulk ``image_<stamp>.h5``). Left False -- the automatic path -- the
+    curve is served from ``focus_metrics.json`` when an earlier explicit
+    compute left one, and otherwise omitted (``seq_specific`` is None).
 
     Returns a JSON-safe dict — see ``analyze_scan_dir`` below for shape.
     """
@@ -302,7 +316,8 @@ def analyze_scan(scan_id: Optional[str] = None,
         target_only=target_only,
         recompute_infidelity=recompute_infidelity,
         force_recache=force_recache,
-        sync_slm_diag=sync_slm_diag)
+        sync_slm_diag=sync_slm_diag,
+        compute_focus_metrics=compute_focus_metrics)
 
 
 def analyze_scan_dir(scan_dir,
@@ -317,6 +332,7 @@ def analyze_scan_dir(scan_dir,
                      recompute_infidelity: bool = False,
                      force_recache: bool = False,
                      sync_slm_diag: bool = True,
+                     compute_focus_metrics: bool = False,
                      _skip_fastpath: bool = False) -> dict:
     """Analyze a scan from its directory path. Same return shape as
     :func:`analyze_scan` — kept separate so callers that already
@@ -446,7 +462,11 @@ def analyze_scan_dir(scan_dir,
                      and _survival_ref == 'img1'
                      and not target_only
                      and not recompute_infidelity)
-    if _default_view and not force_recache and not _skip_fastpath:
+    # compute_focus_metrics also busts the fast path: a cached payload built on
+    # the default path has NO focus curve in it, and the whole point of the
+    # explicit request is to compute one (and rewrite the cache below with it).
+    if _default_view and not force_recache and not _skip_fastpath \
+            and not compute_focus_metrics:
         _cached = _read_payload_cache(scan_dir)
         if _cached is not None:
             _cur_shots = _probe_actual_shots(scan_dir)
@@ -723,10 +743,23 @@ def analyze_scan_dir(scan_dir,
     # no calibration), and average per-spot shape over the detected spots
     # (so spot count doesn't confound it). Cached to focus_metrics.json;
     # returns None for non-sweep / non-single-image scans.
+    #
+    # GATED (see compute_focus_metrics): this is the only analysis panel that
+    # reads /imgs PIXELS, i.e. post-split the multi-GB image_<stamp>.h5 -- which
+    # is slow and can force a OneDrive hydration of a cloud-only file. The
+    # default path therefore never reads pixels: it serves focus_metrics.json
+    # when an earlier explicit compute left one (a JSON read costs nothing), and
+    # otherwise simply OMITS the panel (seq_specific stays None -- exactly how a
+    # non-qualifying scan has always rendered). compute_focus_metrics=True
+    # restores the full old behaviour for an offline/CLI caller that wants the
+    # curve computed.
     try:
-        out['seq_specific'] = _focus_metrics_from_images(
-            scan_dir, scan, scan_params_full, seq_ids,
-            mat_path=bundle.get('mat_path'))
+        if compute_focus_metrics:
+            out['seq_specific'] = _focus_metrics_from_images(
+                scan_dir, scan, scan_params_full, seq_ids,
+                mat_path=bundle.get('mat_path'))
+        else:
+            out['seq_specific'] = _read_focus_metrics_cache(scan_dir)
     except Exception as ex:
         logger.warning('focus metrics failed: %s', ex)
         out['seq_specific'] = None
@@ -4425,6 +4458,22 @@ def _detect_spots_focus(img, *, half=6, min_dist=7, k_sigma=5.0, max_spots=500):
     return np.array(radii), np.array(peaksv), np.array(contrasts)
 
 
+def _read_focus_metrics_cache(scan_dir):
+    """The already-computed focus curve from ``focus_metrics.json``, or None.
+
+    A pure JSON read -- it never touches the image file, so the default
+    analysis path can serve a previously-computed curve for free."""
+    cache = Path(scan_dir) / FOCUS_METRICS_JSON
+    if not cache.is_file():
+        return None
+    try:
+        with open(cache) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _focus_metrics_from_images(scan_dir, scan, scan_params_full, seq_ids,
                                *, mat_path=None, max_shots_per_point=24):
     """Calibration-free seq-specific focus metrics vs the swept parameter
@@ -4449,15 +4498,20 @@ def _focus_metrics_from_images(scan_dir, scan, scan_params_full, seq_ids,
         Higher is better.
 
     Cached to ``<scan_dir>/focus_metrics.json``. Returns None for
-    non-sweep / non-single-image / no-image scans."""
+    non-sweep / non-single-image / no-image scans.
+
+    READS PIXELS from the image file (post-split: the bulk
+    ``image_<stamp>.h5``), so it is NEVER called on the default analysis path
+    -- only when a caller explicitly opts in with
+    ``analyze_scan_dir(..., compute_focus_metrics=True)`` (offline / CLI), or
+    calls this directly. The automatic path uses
+    :func:`_read_focus_metrics_cache` and omits the panel when there is no
+    cache."""
     scan_dir = Path(scan_dir)
     cache = scan_dir / FOCUS_METRICS_JSON
-    if cache.is_file():
-        try:
-            with open(cache) as f:
-                return json.load(f)
-        except Exception:
-            pass
+    cached = _read_focus_metrics_cache(scan_dir)
+    if cached is not None:
+        return cached
     num_images = int(np.asarray(scan.get('NumImages', 1)).flat[0]) or 1
     if num_images != 1 or seq_ids is None:
         return None
