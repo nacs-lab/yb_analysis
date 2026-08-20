@@ -326,56 +326,67 @@
        viewport without scrolling. -->
   <section class="card col-4 array-card" id="card-array1" data-card-id="live-array1">
     <h2>Tweezer array — img 1<span class="grow"></span></h2>
-    <!-- Switch overlaid on the plot's top-right corner (NOT inside h2),
-         so this card's header height matches its switch-less neighbours
-         and the top row of image plots stays vertically aligned. -->
-    <label class="switch card-switch" id="downsample-switch"
-           title="Downsample the live frame so the browser doesn't choke on full-sensor images. OFF = full resolution (heavier; momentary inspection only).">
-      <input type="checkbox" id="downsample-live" checked>
-      <span class="track"></span>
-      <span>Downsample</span>
-    </label>
-    <!-- Per-image green/red site-box overlay toggle (default ON). OFF = plain
-         camera frame, no boxes. Sits below the Downsample switch. -->
-    <label class="switch card-switch box-switch" id="boxes-switch-1"
-           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
-      <input type="checkbox" id="boxes-live-1" checked>
-      <span class="track"></span>
-      <span>Boxes</span>
-    </label>
+    <!-- All per-plot toggles live behind a ⚙ gear (below the ⤢ expand button):
+         click ⚙ to open/close the control cluster, click outside to close. The
+         cluster overlays the plot's top-right only while open, so it never
+         covers the image at rest. -->
+    <div class="ctl-menu">
+      <button type="button" class="ctl-gear" title="Plot controls" aria-label="plot controls">⚙</button>
+      <div class="ctl-cluster">
+        <label class="switch" id="downsample-switch"
+               title="Downsample the live frame so the browser doesn't choke on full-sensor images. OFF = full resolution (heavier; momentary inspection only).">
+          <input type="checkbox" id="downsample-live" checked>
+          <span class="track"></span>
+          <span>Downsample</span>
+        </label>
+        <label class="switch box-switch" id="boxes-switch-1"
+               title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+          <input type="checkbox" id="boxes-live-1" checked>
+          <span class="track"></span>
+          <span>Boxes</span>
+        </label>
+      </div>
+    </div>
     <div class="plot-container" id="plot-array1" style="height: 320px;"></div>
   </section>
 
   <section class="card col-3 array-card" id="card-array-mid" data-card-id="live-array-mid" hidden>
     <h2>Tweezer array — middle<span class="grow"></span></h2>
-    <!-- Per-image green/red site-box overlay toggle (default ON). -->
-    <label class="switch card-switch box-switch" id="boxes-switch-mid"
-           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
-      <input type="checkbox" id="boxes-live-mid" checked>
-      <span class="track"></span>
-      <span>Boxes</span>
-    </label>
+    <div class="ctl-menu">
+      <button type="button" class="ctl-gear" title="Plot controls" aria-label="plot controls">⚙</button>
+      <div class="ctl-cluster">
+        <label class="switch box-switch" id="boxes-switch-mid"
+               title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+          <input type="checkbox" id="boxes-live-mid" checked>
+          <span class="track"></span>
+          <span>Boxes</span>
+        </label>
+      </div>
+    </div>
     <div class="plot-container" id="plot-array-mid" style="height: 320px;"></div>
   </section>
 
   <section class="card col-4 array-card" id="card-array2" data-card-id="live-array2">
     <h2>Tweezer array — img 2<span class="grow"></span></h2>
-    <!-- Middle-frame show/hide switch (mirrors the legacy Dash toggle).
-         Only has an effect when NumImages >= 3; default ON. -->
-    <label class="switch card-switch" id="show-mid-switch"
-           title="Show / hide the middle-frame panel (only applies when NumImages ≥ 3). Hiding it expands img1 / img2 / scan to fill the row.">
-      <input type="checkbox" id="show-mid-live" checked>
-      <span class="track"></span>
-      <span>Middle frame</span>
-    </label>
-    <!-- Per-image green/red site-box overlay toggle (default ON). OFF = plain
-         camera frame, no boxes. Sits below the Middle-frame switch. -->
-    <label class="switch card-switch box-switch" id="boxes-switch-2"
-           title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
-      <input type="checkbox" id="boxes-live-2" checked>
-      <span class="track"></span>
-      <span>Boxes</span>
-    </label>
+    <div class="ctl-menu">
+      <button type="button" class="ctl-gear" title="Plot controls" aria-label="plot controls">⚙</button>
+      <div class="ctl-cluster">
+        <!-- Middle-frame show/hide switch (mirrors the legacy Dash toggle).
+             Only has an effect when NumImages >= 3; default ON. -->
+        <label class="switch" id="show-mid-switch"
+               title="Show / hide the middle-frame panel (only applies when NumImages ≥ 3). Hiding it expands img1 / img2 / scan to fill the row.">
+          <input type="checkbox" id="show-mid-live" checked>
+          <span class="track"></span>
+          <span>Middle frame</span>
+        </label>
+        <label class="switch box-switch" id="boxes-switch-2"
+               title="Show the green (loaded) / red (empty) site boxes. OFF = plain image, no overlay.">
+          <input type="checkbox" id="boxes-live-2" checked>
+          <span class="track"></span>
+          <span>Boxes</span>
+        </label>
+      </div>
+    </div>
     <span id="array2-info" class="hint"></span>
     <div class="plot-container" id="plot-array2" style="height: 320px;"></div>
   </section>
@@ -388,54 +399,69 @@
          _scan_caption in dashboard.py), leaving the top corners free.
          `hidden` (attr) is the first-paint default; renderScanAxisControls()
          reveals the axis-shape controls only for the scans that need them. -->
-    <div class="scan-ctl-group" id="scan-ctl-group">
-      <!-- Survival conditioning-frame toggle (3-image scans): condition the
-           live survival on the MIDDLE (verify) frame instead of img1 (loading).
-           No effect on loading readouts or on scans without a middle frame.
-           NOT axis-shape gated -- shown whenever the scan has a middle frame. -->
-      <label class="switch scan-ctl" id="survival-ref-switch"
-             title="Condition the live survival on the MIDDLE (verify) frame — P(final | verify) — instead of img1 (loading), for 3-image (rearrange-verify) scans. Loading readouts unaffected; no effect when the scan has no middle frame.">
-        <input type="checkbox" id="survival-ref-live">
-        <span class="track"></span>
-        <span>Cond. verify</span>
-      </label>
-      <!-- The controls below only make sense for a NON-LINEAR scan (>= 3-D, or a
-           coupled 1-D sweep): renderScanAxisControls() shows this whole
-           `.scan-ctl-shaped` set only then, and hides it for a plain 1-D scan. -->
-      <div class="scan-ctl-shaped" id="scan-ctl-shaped" hidden>
-        <!-- Colorbar autoscale switch for 2-D/3-D scan heatmaps. OFF = colorbar
-             pinned 0–1; ON = autoscale to the data range. Default OFF. -->
-        <label class="switch scan-ctl" id="scan-autoscale-switch"
-               title="Autoscale the 2-D/3-D scan colorbar to the data range. OFF pins it to 0–1 (the survival/loading default).">
-          <input type="checkbox" id="scan-autoscale-live">
+    <div class="ctl-menu" id="scan-ctl-group">
+      <button type="button" class="ctl-gear" title="Scan-curve controls" aria-label="scan-curve controls">⚙</button>
+      <div class="ctl-cluster">
+        <!-- Survival conditioning-frame toggle (3-image scans): condition the
+             live survival on the MIDDLE (verify) frame instead of img1 (loading).
+             No effect on loading readouts or on scans without a middle frame.
+             NOT axis-shape gated -- shown whenever the scan has a middle frame. -->
+        <label class="switch scan-ctl" id="survival-ref-switch"
+               title="Condition the live survival on the MIDDLE (verify) frame — P(final | verify) — instead of img1 (loading), for 3-image (rearrange-verify) scans. Loading readouts unaffected; no effect when the scan has no middle frame.">
+          <input type="checkbox" id="survival-ref-live">
           <span class="track"></span>
-          <span>Autoscale</span>
+          <span>Cond. verify</span>
         </label>
-        <!-- Site-mask toggle: restrict the live scan curve to the current
-             pattern's configured "stable sites" subset (record.json site_mask).
-             OFF = full array (default). Applied in the main process's DataManager. -->
-        <label class="switch scan-ctl" id="site-mask-switch"
-               title="Average the live scan curve over only the current pattern's configured site subset (stable sites). OFF = full array.">
-          <input type="checkbox" id="site-mask-live">
+        <!-- Target-restrict toggle (orthogonal to Cond. verify): average the 0d
+             per-shot survival series over only the run's diag TARGET sites vs
+             the whole array. ON (default) == the historical target-aware
+             behavior. Combined with Cond. verify ON it gives verify-conditioned
+             survival AT the target sites (the STIRAP metric). A no-op for runs
+             with no diag targets. -->
+        <label class="switch scan-ctl" id="target-restrict-switch"
+               title="Average the 0d per-shot survival over only the run's diag TARGET sites (vs the whole array). ON (default) matches the historical target-aware view. With Cond. verify ON it becomes verify-conditioned survival AT the target sites — the STIRAP metric. No effect on runs without diag targets.">
+          <input type="checkbox" id="target-restrict-live" checked>
           <span class="track"></span>
-          <span>Site mask</span>
+          <span>Targets only</span>
         </label>
-        <!-- 3-D scan: which swept dimension the heatmap SLIDER walks (the other
-             two form the heatmap axes). Populated from snapshot.scan_axes.dims;
-             renderScanAxisControls() also flips its own `hidden` for < 3-D. -->
-        <label class="scan-axis-ctl scan-ctl" id="scan-slice-dim-ctl" hidden
-               title="For a 3-D scan: choose which swept parameter the slice slider steps through. The other two dimensions form the heatmap axes.">
-          <span>Slice</span>
-          <select id="scan-slice-dim"></select>
-        </label>
-        <!-- Coupled 1-D scan: which coupled parameter labels the x-axis (the
-             sweep sets several params per point). Populated from
-             snapshot.scan_axes.coupled; hidden unless the scan is coupled. -->
-        <label class="scan-axis-ctl scan-ctl" id="scan-x-ctl" hidden
-               title="This 1-D scan varies several parameters together. Choose which one labels the x-axis; the curve re-sorts along it and the rest show in the hover.">
-          <span>x-axis</span>
-          <select id="scan-x"></select>
-        </label>
+        <!-- The controls below only make sense for a NON-LINEAR scan (>= 3-D, or a
+             coupled 1-D sweep): renderScanAxisControls() shows this whole
+             `.scan-ctl-shaped` set only then, and hides it for a plain 1-D scan. -->
+        <div class="scan-ctl-shaped" id="scan-ctl-shaped" hidden>
+          <!-- Colorbar autoscale switch for 2-D/3-D scan heatmaps. OFF = colorbar
+               pinned 0–1; ON = autoscale to the data range. Default OFF. -->
+          <label class="switch scan-ctl" id="scan-autoscale-switch"
+                 title="Autoscale the 2-D/3-D scan colorbar to the data range. OFF pins it to 0–1 (the survival/loading default).">
+            <input type="checkbox" id="scan-autoscale-live">
+            <span class="track"></span>
+            <span>Autoscale</span>
+          </label>
+          <!-- Site-mask toggle: restrict the live scan curve to the current
+               pattern's configured "stable sites" subset (record.json site_mask).
+               OFF = full array (default). Applied in the main process's DataManager. -->
+          <label class="switch scan-ctl" id="site-mask-switch"
+                 title="Average the live scan curve over only the current pattern's configured site subset (stable sites). OFF = full array.">
+            <input type="checkbox" id="site-mask-live">
+            <span class="track"></span>
+            <span>Site mask</span>
+          </label>
+          <!-- 3-D scan: which swept dimension the heatmap SLIDER walks (the other
+               two form the heatmap axes). Populated from snapshot.scan_axes.dims;
+               renderScanAxisControls() also flips its own `hidden` for < 3-D. -->
+          <label class="scan-axis-ctl scan-ctl" id="scan-slice-dim-ctl" hidden
+                 title="For a 3-D scan: choose which swept parameter the slice slider steps through. The other two dimensions form the heatmap axes.">
+            <span>Slice</span>
+            <select id="scan-slice-dim"></select>
+          </label>
+          <!-- Coupled 1-D scan: which coupled parameter labels the x-axis (the
+               sweep sets several params per point). Populated from
+               snapshot.scan_axes.coupled; hidden unless the scan is coupled. -->
+          <label class="scan-axis-ctl scan-ctl" id="scan-x-ctl" hidden
+                 title="This 1-D scan varies several parameters together. Choose which one labels the x-axis; the curve re-sorts along it and the rest show in the hover.">
+            <span>x-axis</span>
+            <select id="scan-x"></select>
+          </label>
+        </div>
       </div>
     </div>
     <span class="hint mono" id="site-mask-info"></span>
@@ -448,7 +474,7 @@
   </section>
 
   <section class="card col-4" data-card-id="live-loading">
-    <h2>Loading rate (live)<span class="grow"></span></h2>
+    <h2>Loading / fill per frame (live)<span class="grow"></span></h2>
     <div class="plot-container" id="plot-loading-live" style="height: 220px;"></div>
   </section>
 

@@ -155,6 +155,8 @@
   let recomputeInfid = false;       // refit discrimination from this run's data
   let svdMode = "total";            // survival-vs-distance x-axis: total|per_step
   let survivalRef = "img1";         // survival conditioning frame: img1 | mid (verify)
+  let targetOnly = false;           // site set: false = all array sites, true = rearrangement TARGET sites only.
+                                    // ORTHOGONAL to survivalRef -- the two compound (2026-08-06).
 
   // Shrink the font of each top-row status value until it fits its tile
   // (no ellipsis). Resets to the stylesheet base first so values that got
@@ -2313,30 +2315,7 @@
       // "Waiting for data..." label rather than going black.
       try {
         if (Array.isArray(f.frames) && f.frames.length) {
-          // Figures with animation frames + a slider (the 3-D scan cube's slice
-          // browser). Plotly.react's positional form ignores `frames`; the
-          // object form applies them. Preserve the slider's active step across
-          // re-polls so a live 3-D scan doesn't snap back to the default slice
-          // on every refresh.
-          const prevActive = (el.layout && Array.isArray(el.layout.sliders)
-            && el.layout.sliders[0]) ? el.layout.sliders[0].active : null;
-          const layout = f.layout || {};
-          if (prevActive != null && Array.isArray(layout.sliders) && layout.sliders[0]) {
-            layout.sliders[0] = Object.assign({}, layout.sliders[0], { active: prevActive });
-          }
-          Plotly.react(el, {
-            data: f.data, layout: layout, frames: f.frames,
-            config: { displayModeBar: false, responsive: true },
-          });
-          // Re-show the frame matching the (preserved) active slider step so
-          // the heatmap + current-cell box match the slider on refresh.
-          if (prevActive != null && f.frames[prevActive]) {
-            Plotly.animate(el, [String(prevActive)], {
-              mode: "immediate",
-              frame: { duration: 0, redraw: true },
-              transition: { duration: 0 },
-            });
-          }
+          renderFramesFigure(el, f);
           return;
         }
         Plotly.react(el, f.data, f.layout || {}, {
@@ -2356,6 +2335,88 @@
           'render error: ' + escHtml(err.message || String(err)) + '</div>';
       }
     });
+  }
+
+  // Render a frames-figure (the 3-D scan cube: heatmap of two axes + a slider
+  // over the third) WITHOUT flashing on every poll.
+  //
+  // The naive approach -- object-form Plotly.react({data,layout,frames}) each
+  // poll -- re-initializes Plotly's whole animation/frame stack, which visibly
+  // FLASHES the panel every shot on a live 3-D scan. Instead:
+  //   * FIRST draw (or when the slice geometry changes: frame count / grid
+  //     shape / slice-dim): do one full react to lay out the plot + slider.
+  //   * SUBSEQUENT polls: update IN PLACE -- restyle only the visible slice's
+  //     z/customdata and relayout only its current-cell boxes. No react, no
+  //     frame re-init, no flash. We also stash the raw frames on the element so
+  //     the slider's own onChange (wired once) can swap slices locally.
+  // The signature key is geometry-only (not data), so data updates never force
+  // a full react.
+  function _framesGeomKey(f) {
+    const nf = (f.frames || []).length;
+    const z0 = f.frames && f.frames[0] && f.frames[0].data
+      && f.frames[0].data[0] && f.frames[0].data[0].z;
+    const ny = Array.isArray(z0) ? z0.length : 0;
+    const nx = (ny && Array.isArray(z0[0])) ? z0[0].length : 0;
+    // slice-dim can flip via the dropdown -> axis titles change; fold them in.
+    const ax = (f.layout && f.layout.xaxis && f.layout.xaxis.title
+      && (f.layout.xaxis.title.text || f.layout.xaxis.title)) || "";
+    const ay = (f.layout && f.layout.yaxis && f.layout.yaxis.title
+      && (f.layout.yaxis.title.text || f.layout.yaxis.title)) || "";
+    return `${nf}x${ny}x${nx}|${ax}|${ay}`;
+  }
+
+  function _activeSlice(el) {
+    const s = el.layout && Array.isArray(el.layout.sliders) && el.layout.sliders[0];
+    return (s && Number.isInteger(s.active)) ? s.active : 0;
+  }
+
+  // Apply frame `s`'s data + boxes to the plot in place (no react).
+  function _showFrame(el, frames, s) {
+    const fr = frames[s];
+    if (!fr || !fr.data || !fr.data[0]) return;
+    const d0 = fr.data[0];
+    Plotly.restyle(el, {z: [d0.z], customdata: [d0.customdata]}, [0]);
+    const shapes = (fr.layout && fr.layout.shapes) || [];
+    Plotly.relayout(el, {shapes: shapes});
+  }
+
+  function renderFramesFigure(el, f) {
+    const geom = _framesGeomKey(f);
+    const firstOrGeomChange = !el._framesReady || el._framesGeom !== geom;
+
+    if (firstOrGeomChange) {
+      // Preserve the operator's current slider position across a full rebuild.
+      const prevActive = el._framesReady ? _activeSlice(el) : null;
+      const layout = f.layout || {};
+      if (prevActive != null && Array.isArray(layout.sliders) && layout.sliders[0]
+          && prevActive < f.frames.length) {
+        layout.sliders[0] = Object.assign({}, layout.sliders[0], {active: prevActive});
+      }
+      Plotly.react(el, {
+        data: f.data, layout: layout, frames: f.frames,
+        config: {displayModeBar: false, responsive: true},
+      });
+      el._framesReady = true;
+      el._framesGeom = geom;
+      el._frames = f.frames;
+      // Dragging the slider is handled NATIVELY: each step's method:'animate'
+      // args show that frame immediately (built-in, no flash). We only need
+      // in-place updates for LIVE data changes (below), not for slider drags.
+      const a = prevActive != null ? prevActive : _activeSlice(el);
+      _showFrame(el, f.frames, a);
+      return;
+    }
+
+    // Same geometry -> update in place, no react, no flash.
+    el._frames = f.frames;
+    // Refresh Plotly's STORED frames by name (so a later slider DRAG animates to
+    // the latest data, not the last full-react snapshot). addFrames replaces
+    // same-named frames in place -- cheap, no redraw of the current view.
+    if (Plotly.addFrames) {
+      try { Plotly.addFrames(el, f.frames); } catch (e) { /* non-fatal */ }
+    }
+    // Update the currently-shown slice's data + boxes.
+    _showFrame(el, f.frames, _activeSlice(el));
   }
 
   // Render a camera/array panel, guarding against a baked layout image that
@@ -4255,7 +4316,7 @@
     // Persist so refresh keeps you on the same scan.
     try { localStorage.setItem("yb_dashboard_selected_scan", scanId || ""); }
     catch { /* private mode */ }
-    if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; survivalRef = "img1"; }
+    if (!opts.keepFilters) { activeFilters = {}; recomputeInfid = false; survivalRef = "img1"; targetOnly = false; }
     const body = $("analysis-detail-body");
     if (!silent) {
       body.innerHTML = '<div class="hint">loading…</div>';
@@ -4273,6 +4334,7 @@
       if (recomputeInfid) qs.push('recompute_infidelity=1');
       if (opts.forceRecache) qs.push('force_recache=1');
       if (survivalRef === 'mid') qs.push('survival_ref=mid');
+      if (targetOnly) qs.push('target_only=1');
       if (qs.length) url += '?' + qs.join('&');
       const r = await api(url);
       if (!r || typeof r !== "object") {
@@ -4673,6 +4735,14 @@
               <select disabled class="ghost" style="margin-left:4px">
                 <option>img1 (no mid saved)</option>
               </select></label>` : "")}
+          ${(r.n_target_sites || r.target_only_active
+             || (r.summary && r.summary.survival_source)
+             || (r.summary_global && r.summary_global.survival_source)) ? `· <label class="mono" style="white-space:nowrap"
+              title="Which SITES the survival averages over. ORTHOGONAL to the conditioning frame — the two compound. targets only = just the sites the rearrangement moved atoms INTO (union of slm_diag target_paired); untargeted leftovers behave differently and contaminate an array average. all sites = the whole array (the historical view). Combine with 'middle (verify)' for the STIRAP runbook metric.">sites:
+              <select id="target-only-sel" class="ghost" style="margin-left:4px">
+                <option value="all"${!targetOnly ? " selected" : ""}>all sites</option>
+                <option value="targets"${targetOnly ? " selected" : ""}>targets only${r.n_target_sites ? ` (${r.n_target_sites})` : ""}</option>
+              </select></label>` : ""}
         </div>
         ${imf ? `<div title="${
           imf.source === "logged_throughout_run"
@@ -4748,6 +4818,14 @@
       survivalRef = srSel.value === "mid" ? "mid" : "img1";
       if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
     });
+    // Site set: all array sites vs the rearrangement TARGET sites only.
+    // Orthogonal to the conditioning frame above -- they compound, so the
+    // 2x2 (img1|mid) x (all|targets) is reachable. Re-fetches with target_only.
+    const toSel = document.getElementById("target-only-sel");
+    if (toSel) toSel.addEventListener("change", () => {
+      targetOnly = toSel.value === "targets";
+      if (selectedScanId) loadAnalysis(selectedScanId, {keepFilters: true});
+    });
     // The dedicated Survival / Loading cards were replaced by the
     // per-site maps + per-iteration chart further down the tab. Only
     // the sweep visualization needs to render here.
@@ -4799,9 +4877,17 @@
     const fpHasData = isSurv && fpm.some((v) => v != null && isFinite(v));
     const fpName = (summary.fp_source === "rearrange") ? "FP (target)" : "FP";
     const _num = (v) => (v == null || !isFinite(v)) ? null : v;
-    const _refTag = (r.survival_ref === "mid") ? " | verify" : "";
+    // Label the metric HONESTLY on BOTH axes of the 2x2 (conditioning frame x
+    // site set). The old label read "TP (target survival)" whenever the run was
+    // target-aware, regardless of the conditioning frame -- which is how a
+    // verify-conditioned curve and a raw-TP curve came to look identical on
+    // screen while differing by the whole rearrangement fill fraction
+    // (2026-08-06: 0.961 raw TP vs 0.992 verify-conditioned on the same shots).
+    const _condMid = (r.survival_ref === "mid");
+    const _sites = r.target_only_active ? "target" : (targetAware ? "target" : "all sites");
     const yLabel = isSurv
-        ? (targetAware ? "TP (target survival)" : ("survival" + _refTag))
+        ? (_condMid ? `survival | verify (${_sites})`
+                    : (targetAware ? `TP (${_sites})` : "survival"))
         : "loading rate";
     const baseMargin = {l: 70, r: 50, t: 14, b: 56};
     const nDimsReal = dims.filter((d) => d > 1).length;
@@ -5914,6 +6000,43 @@
           console.warn("survival_ref toggle failed", e);
           toast("Survival-ref toggle failed: " + (e.message || e), "bad");
           svr.checked = !svr.checked;   // revert on failure
+        }
+      });
+    }
+
+    // Target-restrict toggle -> POST to the server, which spools
+    // 'target_restrict' to the main process (ControlPanel) -> live DataManager.
+    // ON (default) restricts the 0d survival series to the run's diag TARGET
+    // sites; OFF averages over the whole array. Orthogonal to Cond. verify.
+    // View-only; persisted across reloads and re-asserted on load like the
+    // above (a fresh main process / DM defaults to ON).
+    const tgr = document.getElementById("target-restrict-live");
+    if (tgr) {
+      // Default ON: absent key => checked; explicit "0" => unchecked.
+      try { tgr.checked = localStorage.getItem("yb-dash-target-restrict") !== "0"; }
+      catch {}
+      // Only the OFF state differs from the backend default (ON), so re-assert
+      // only when restored OFF.
+      if (!tgr.checked) {
+        api("/api/control/target_restrict", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: false}),
+        }).catch(() => {});
+      }
+      tgr.addEventListener("change", async () => {
+        try {
+          await api("/api/control/target_restrict", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({enabled: tgr.checked}),
+          });
+          try { localStorage.setItem("yb-dash-target-restrict", tgr.checked ? "1" : "0"); }
+          catch {}
+        } catch (e) {
+          console.warn("target_restrict toggle failed", e);
+          toast("Targets-only toggle failed: " + (e.message || e), "bad");
+          tgr.checked = !tgr.checked;   // revert on failure
         }
       });
     }
@@ -7735,12 +7858,46 @@
     return lines.join("\n");
   };
 
+  // Reordering is LANE-scoped and kind-agnostic, mirroring ExptServer.queue_move:
+  // a queued descriptor and a queued job trade places freely (dispatch keeps the
+  // slot), but the background/calibration lane never interleaves with foreground.
+  // Returns {id: {first, last}} so the edge rows' arrows render disabled instead of
+  // firing a request that can only 400.
+  function queueLaneEdges(queued) {
+    const lanes = {};
+    (queued || []).forEach((r) => {
+      const k = r.priority === "background" ? "background" : "normal";
+      (lanes[k] = lanes[k] || []).push(r.id);
+    });
+    const edge = {};
+    Object.keys(lanes).forEach((k) => {
+      const ids = lanes[k];
+      ids.forEach((id, i) => {
+        edge[id] = {first: i === 0, last: i === ids.length - 1};
+      });
+    });
+    return edge;
+  }
+  // Arrow button markup shared by the queue table and the queue popup. `attr` is the
+  // data-attribute name the respective click handler listens on.
+  function queueMoveBtns(r, edge, upAttr, downAttr) {
+    const e = edge[r.id] || {};
+    const lane = r.priority === "background" ? "background lane" : "queue";
+    const btn = (attr, glyph, dead, dir) =>
+      `<button class="ghost" ${attr}="${r.id}"${dead ? " disabled" : ""}` +
+      ` title="${dead ? `already at the ${dir === "up" ? "top" : "bottom"} of the ${lane}`
+                      : `move ${dir} in the ${lane}`}"` +
+      ` style="font-size:10px;padding:2px 8px;${dead ? "opacity:.35;" : ""}">${glyph}</button>`;
+    return btn(upAttr, "↑", !!e.first, "up") + btn(downAttr, "↓", !!e.last, "down");
+  }
+
   function renderQueueTable(q) {
     const queued = q.queued || [];
     const running = q.running ? [q.running] : [];
     const history = q.history || [];
     setText("queue-counts",
       `${queued.length} queued · ${running.length} running · ${history.length} history`);
+    const edge = queueLaneEdges(queued);
     const rows = [...running, ...queued].map((r) => `
       <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
         <td class="mono">${r.id}</td>
@@ -7755,8 +7912,7 @@
         <td>
           ${r.state === "queued" ? `
             <button class="ghost" data-cancel="${r.id}" style="font-size:10px;padding:2px 8px;">cancel</button>
-            <button class="ghost" data-move-up="${r.id}" style="font-size:10px;padding:2px 8px;">↑</button>
-            <button class="ghost" data-move-down="${r.id}" style="font-size:10px;padding:2px 8px;">↓</button>
+            ${queueMoveBtns(r, edge, "data-move-up", "data-move-down")}
           ` : `
             <button class="ghost q-abort" data-abort-running="${r.id}"
               title="Abort the running scan — stops after the current shot (advances to the next queued scan, if any)"
@@ -7779,8 +7935,11 @@
       btn.addEventListener("click", async () => {
         const id = btn.dataset.moveUp || btn.dataset.moveDown;
         const dir = btn.dataset.moveUp ? "up" : "down";
-        try { await api(`/api/queue/move/${id}/${dir}`, {method: "POST"}); }
-        catch (e) { toast("Move failed", "bad"); }
+        // Re-poll immediately: /api/queue is fed by QueuePane's ~1 Hz snapshot, so
+        // without this the row visibly doesn't move for a beat and the click reads
+        // as a no-op (the popup already refreshed itself this way).
+        try { await api(`/api/queue/move/${id}/${dir}`, {method: "POST"}); pollQueue(); }
+        catch (e) { toast(e.message || "Move failed", "bad"); }
       });
     });
     // Abort the RUNNING scan (destructive → confirm-token then POST, same as
@@ -7897,6 +8056,7 @@
       }
     }
     const lbl = (r) => escHtml(r.label || r.seqName || "");
+    const edge = queueLaneEdges(queued);
     const qrows = [...running, ...queued].map((r) => `
       <tr ${r.scan_id ? `data-scan-id="${r.scan_id}" class="q-linked"` : ""}>
         <td class="mono">${r.id}</td>
@@ -7911,8 +8071,7 @@
         <td class="qp-actions">
           ${r.state === "queued" ? `
             <button class="ghost" data-pq-cancel="${r.id}" style="font-size:10px;padding:2px 8px;">cancel</button>
-            <button class="ghost" data-pq-up="${r.id}" style="font-size:10px;padding:2px 8px;">↑</button>
-            <button class="ghost" data-pq-down="${r.id}" style="font-size:10px;padding:2px 8px;">↓</button>
+            ${queueMoveBtns(r, edge, "data-pq-up", "data-pq-down")}
           ` : `
             <button class="ghost q-abort" data-pq-abort="${r.id}"
               title="Abort the running scan — stops after the current shot (advances to the next queued scan, if any)"
@@ -8033,7 +8192,7 @@
         const mv = up || down;
         const id = mv.dataset.pqUp || mv.dataset.pqDown;
         try { await api(`/api/queue/move/${id}/${up ? "up" : "down"}`, {method: "POST"}); refreshQueuePopup(); }
-        catch (err) { toast("Move failed", "bad"); }
+        catch (err) { toast(err.message || "Move failed", "bad"); }
         return;
       }
       const abort = t.closest("[data-pq-abort]");
@@ -10835,6 +10994,40 @@
     backdrop.addEventListener("click", contract);
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") contract();
+    });
+
+    // ---- Per-plot ⚙ control menus (click to open/close; outside-click closes) ----
+    // Every top-row plot card hides its toggles behind a ⚙ gear. Clicking the
+    // gear toggles `.open` on its `.ctl-menu`; clicking anywhere outside an open
+    // menu closes it. A single delegated document listener drives them all, and
+    // clicks INSIDE a cluster (on the switches/selects) don't close it. Escape
+    // closes any open menu too (before the expand-contract Escape above runs;
+    // both are harmless together).
+    const closeAllCtlMenus = (except) => {
+      document.querySelectorAll(".ctl-menu.open").forEach((m) => {
+        if (m !== except) m.classList.remove("open");
+      });
+    };
+    document.addEventListener("click", (e) => {
+      const gear = e.target.closest(".ctl-gear");
+      if (gear) {
+        // Toggle this menu; close others. Don't let it bubble to the header /
+        // expand-toggle handlers.
+        e.preventDefault();
+        e.stopPropagation();
+        const menu = gear.closest(".ctl-menu");
+        const willOpen = menu && !menu.classList.contains("open");
+        closeAllCtlMenus(menu);
+        if (menu) menu.classList.toggle("open", willOpen);
+        return;
+      }
+      // A click inside an OPEN cluster (a switch / select / label) must not
+      // close it. Everything else (plot, page, another card) closes all menus.
+      if (e.target.closest(".ctl-menu.open .ctl-cluster")) return;
+      closeAllCtlMenus(null);
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeAllCtlMenus(null);
     });
   }
 

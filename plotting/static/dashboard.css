@@ -202,65 +202,97 @@ header .status-pill .dot {
   margin: 0;
   overflow: hidden;
 }
-/* Switch overlaid on a card's top-right corner. Absolute => contributes no
-   layout height, so it can't push the plot down or misalign the row. A
-   translucent chip keeps the label legible over the image underneath. */
-.card-switch {
+/* ---- Per-plot control menu (⚙ gear) ----
+   Every top-row plot card (img1 / middle / img2 / scan curve) hides ALL its
+   toggles behind a ⚙ gear so nothing overlays the plot at rest. The gear sits
+   just BELOW the ⤢ expand button (which is top:6px, 22px tall) in the same
+   top-right corner, SAME 22x22 size. Click the gear to open the control
+   cluster; click it again -- or click anywhere outside the menu -- to close
+   (JS toggles `.open` on `.ctl-menu`). The cluster is absolutely positioned so
+   it never adds layout height / misaligns the image row. */
+.ctl-menu {
   position: absolute;
-  top: 6px;
-  right: 10px;
-  z-index: 6;
-  font-size: 11px;
-  background: rgba(13, 18, 32, 0.74);
-  padding: 2px 7px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
+  top: 32px;      /* directly below the expand button (top:6px + 22px + 4px) */
+  right: 6px;     /* same right edge as .card-expand-btn */
+  z-index: 7;     /* above the expand button's z-index 6 */
 }
-/* img1 / img2 cards already carry a top-right switch (Downsample / Middle
-   frame); their "Boxes" switch stacks just below it. The middle card has no
-   other switch, so its Boxes switch keeps the default top:6px. */
-#boxes-switch-1, #boxes-switch-2 { top: 32px; }
-
-/* Scan-curve control cluster. The three switches used to be `.card-switch`
-   overlays pinned to the SAME top-right corner (top:6px right:10px), so they
-   stacked on top of one another; the two axis pickers flowed at the top-left
-   over the Plotly title. Now every scan-curve control lives in ONE absolute
-   top-right column that flows its children downward (no overlap), and the scan
-   NAME moved to a small bottom caption inside the figure -- so the top corners
-   are clear. `.scan-ctl` resets the old `.card-switch` absolute positioning:
-   the children are in normal flow WITHIN this container. */
-#card-scan-curve .scan-ctl-group {
+.ctl-gear {
+  /* Match .card-expand-btn exactly (size / chrome) so the two stack cleanly. */
+  width: 22px; height: 22px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(14, 18, 28, 0.72); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 13px; line-height: 1; cursor: pointer; opacity: 0.3;
+}
+.card:hover > .ctl-menu > .ctl-gear { opacity: 0.8; }
+.ctl-gear:hover { color: var(--text); border-color: var(--accent); opacity: 1; }
+.ctl-menu.open > .ctl-gear { opacity: 1; border-color: var(--accent); color: var(--text); }
+/* The control cluster: a right-aligned column of chips, revealed on `.open`.
+   Anchored to the gear's right edge, dropping downward from just below it. */
+.ctl-cluster {
+  display: none;
   position: absolute;
-  top: 6px;
-  right: 10px;
-  z-index: 6;
-  display: flex;
+  top: 26px;      /* just under the 22px gear */
+  right: 0;
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
 }
-#card-scan-curve .scan-ctl {
-  position: static;   /* override .card-switch's absolute, if it applies */
+.ctl-menu.open > .ctl-cluster { display: flex; }
+/* Each toggle chip inside a cluster: translucent so labels stay legible, and
+   position:static (they used to be absolute `.card-switch` overlays). */
+.ctl-cluster .switch,
+.ctl-cluster .scan-axis-ctl {
+  position: static;
   font-size: 11px;
+  white-space: nowrap;
   background: rgba(13, 18, 32, 0.74);
   padding: 2px 7px;
   border-radius: 6px;
   border: 1px solid var(--border);
-  margin: 0;          /* override .scan-axis-ctl's margin-right */
+  margin: 0;                /* override .scan-axis-ctl's margin-right */
 }
-/* The axis-shape controls (Autoscale / Site mask / Slice / x-axis) also stack
-   as a column when the group reveals them for a non-linear scan. */
+/* The scan card's axis-shape sub-group (Autoscale / Site mask / Slice / x-axis)
+   stacks as its own column; renderScanAxisControls() flips its [hidden] for a
+   linear scan, and the individual Slice / x-axis pickers hide via their own
+   [hidden]. These must beat the cluster's `display:flex`. */
 #card-scan-curve .scan-ctl-shaped {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 4px;
 }
-#card-scan-curve .scan-ctl-shaped[hidden] { display: none; }
-/* `.scan-axis-ctl` sets display:inline-flex, which out-specifies the UA
-   [hidden]{display:none}; re-assert hidden for the Slice / x-axis pickers so
-   renderScanAxisControls() can actually hide the one the scan doesn't use. */
-#card-scan-curve .scan-ctl[hidden] { display: none; }
+#card-scan-curve .scan-ctl-shaped[hidden] { display: none !important; }
+.ctl-cluster .scan-ctl[hidden],
+.ctl-cluster .scan-axis-ctl[hidden] { display: none !important; }
+
+/* 3-D scan slice slider: it OVERLAYS the plot's lower edge (the 320px panel is
+   too short to give it its own band below the x-axis). Dim it at rest so it
+   doesn't obscure the heatmap data underneath; full opacity when the panel is
+   hovered. Plotly 2.35 renders the slider as an SVG `g.slider-group`, so the
+   opacity + the smaller handle/rail must target THOSE classes (an earlier
+   `.slider-container` guess matched nothing). */
+#plot-scan .slider-group {
+  opacity: 0.45;
+  transition: opacity 120ms ease;
+}
+#card-scan-curve:hover #plot-scan .slider-group,
+#plot-scan .slider-group:hover { opacity: 1; }
+/* Shrink the handle (default 20x20) and thin the rail. `width`/`height`/`rx`
+   are SVG geometry properties settable from CSS in modern browsers. */
+#plot-scan .slider-group .slider-grip-rect {
+  width: 12px; height: 12px; rx: 3px;
+}
+#plot-scan .slider-group .slider-rail-rect { height: 3px; }
+/* The slider overlays the heatmap, and Plotly's wide invisible touch zone
+   (`slider-rail-touch-rect`, ~374x37) would otherwise swallow pointer events
+   over the data cells beneath it -- blocking their hover tooltips. Make the
+   rail + its touch zone transparent to the pointer so hovers fall through to
+   the heatmap; keep the GRIP handle interactive so the slider is still
+   draggable (grab the handle directly). */
+#plot-scan .slider-group .slider-rail-touch-rect,
+#plot-scan .slider-group .slider-rail-rect { pointer-events: none !important; }
+#plot-scan .slider-group .slider-grip-rect { pointer-events: all !important; }
 /* Slide-in control sidebar: a position:fixed panel on the right edge
    of the viewport, below the sticky header. Default state is OPEN
    (visible). The ‹/› toggle on its LEFT edge collapses it to a thin
