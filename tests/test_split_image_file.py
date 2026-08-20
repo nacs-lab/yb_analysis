@@ -791,7 +791,7 @@ def _create(scan_dir, split, num_images=2, frame_size=(4, 5),
 
 
 def _append(data, imgs_path, split, imgs_block, sids, num_images,
-            num_sites=3, expected_seq_rows=None):
+            num_sites=3, expected_seq_rows=None, rotate_bytes=None):
     """One block through the real writer, images first (as save_data does)."""
     sids = np.asarray(sids, dtype='int64')
     n = len(sids)
@@ -801,7 +801,8 @@ def _append(data, imgs_path, split, imgs_block, sids, num_images,
     i2 = i1 + 0.5
     if split:
         hs.append_images_block(imgs_path, imgs_block, sids, num_images,
-                               expected_seq_rows=expected_seq_rows)
+                               expected_seq_rows=expected_seq_rows,
+                               rotate_bytes=rotate_bytes)
     hs.append_block(data, imgs_block, l1, i1, sids,
                     logicals_img2_block=l2, intensities_img2_block=i2,
                     write_imgs=not split)
@@ -1151,7 +1152,8 @@ def test_data_append_failure_leaves_orphans_that_next_block_trims(tmp_path,
 # and the two partial-failure directions through the real save path.
 # --------------------------------------------------------------------------
 
-def _split_dm(tmp_path, monkeypatch, pSeq=2, num_sites=3, split=True):
+def _split_dm(tmp_path, monkeypatch, pSeq=2, num_sites=3, split=True,
+              frame_size=(4, 4)):
     """A bare DataManager wired for the save path only (mirrors
     test_frame_drop_safety._save_dm) with the split toggle forced."""
     monkeypatch.setattr(dm_mod._cfg, 'SPLIT_IMAGE_FILE', split, raising=False)
@@ -1162,7 +1164,7 @@ def _split_dm(tmp_path, monkeypatch, pSeq=2, num_sites=3, split=True):
     dm.is_two_array = True
     dm._save_two_array = True
     dm._save_mid = pSeq >= 3
-    dm.frame_size = (4, 4)
+    dm.frame_size = tuple(frame_size)
     dm.config = {}
     dm.fname = os.path.join(str(tmp_path), 'data_%s.h5' % W_STAMP)
     dm.iname = sf.imgs_path_for(dm.fname)
@@ -1571,3 +1573,513 @@ def test_focus_explicit_compute_refreshes_the_payload_cache(tmp_path):
     # ...and the plain default call now returns the real curve off that cache.
     again = analyze_scan_dir(d)
     assert again['seq_specific']['metrics']['spot_width']['values']
+
+
+# ==========================================================================
+# STEP 6: image-file ROTATION -- image_<stamp>.h5 past
+# config.IMAGE_FILE_ROTATE_GB becomes frozen SEGMENTS behind a small
+# virtual-dataset MASTER kept at the same path.
+#
+# The point of the design is that readers change NOTHING, so that is what
+# these tests pin:
+#   * the master's /imgs is one contiguous stack whose pixels are right across
+#     every seam, read through the ordinary load_images(data_path) redirect;
+#   * /seq_ids, /frame_seq_ids and committed_frames on the master are GLOBAL,
+#     so min(data seq rows, committed_frames // pSeq) is still THE live rule and
+#     stays monotone straight through a rotation;
+#   * a segment holds only its own rows and its own LOCAL ids, plus the
+#     frame_offset that places them globally;
+#   * rotation happens BETWEEN blocks, never mid-handle, and a busy file (a
+#     reader blocking the Windows rename) postpones it instead of failing the
+#     block;
+#   * below the threshold NOTHING changes -- no segments, no master, same attrs.
+# ==========================================================================
+
+R_STAMP = '20260820_140000'
+
+# 64x64 uint16 = 8 KB of INCOMPRESSIBLE noise per frame, so a ~150 KB threshold
+# is crossed after a couple of blocks. (Uniform frames would gzip to nothing and
+# never trigger, which is exactly the trap a "tiny threshold" test can fall in.)
+R_H = R_W = 64
+R_ROT_BYTES = 150 * 1024
+
+
+def _rot_frames(tags, pSeq, seed=1, h=R_H, w=R_W):
+    """Noise frames, each shot's frames tagged in pixel [0, 0] with its tag."""
+    rng = np.random.default_rng(seed)
+    blk = rng.integers(0, 65535, size=(len(tags) * pSeq, h, w), dtype=np.uint16)
+    for i, t in enumerate(tags):
+        blk[i * pSeq:(i + 1) * pSeq, 0, 0] = t
+    return blk
+
+
+def _rot_scan(tmp_path, pSeq=2, stamp=R_STAMP):
+    """A split scan sized for rotation; returns (scan_dir, data, image_path)."""
+    d = _writer_dir(tmp_path, stamp)
+    data, imgs = _writer_paths(d, stamp)
+    hs.create_scan_file(data, {'NumImages': pSeq}, (R_H, R_W), 3,
+                        two_array=True, num_sites_img2=3, image_path=imgs,
+                        num_images_per_seq=pSeq)
+    return d, data, imgs
+
+
+def _rot_blocks(data, imgs, n_blocks, pSeq=2, per_block=3,
+                rotate_bytes=R_ROT_BYTES, start=0):
+    """Drive n_blocks blocks through the real writer; returns the tag list."""
+    tags_all = []
+    saved = start
+    for b in range(n_blocks):
+        tags = [saved + k + 1 for k in range(per_block)]
+        _append(data, imgs, True, _rot_frames(tags, pSeq, seed=saved + 1),
+                np.array(tags, dtype='int64'), pSeq,
+                expected_seq_rows=saved, rotate_bytes=rotate_bytes)
+        saved += per_block
+        tags_all += tags
+    return tags_all
+
+
+def _segments(imgs_path):
+    return [os.path.basename(p) for p in hs.existing_segments(imgs_path)]
+
+
+def _segment_frames(path):
+    with h5py.File(path, 'r') as f:
+        return int(f['imgs'].shape[0])
+
+
+# --------------------------------------------------------------------------
+# rotation fires, and what it leaves on disk
+# --------------------------------------------------------------------------
+
+def test_rotation_creates_segments_and_a_vds_master(tmp_path):
+    """Past the threshold: the old bulk file is renamed to .000, a .001 live
+    segment appears, and image_<stamp>.h5 is a small VIRTUAL-dataset master."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq)
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq)
+
+    assert _segments(imgs) == ['image_%s.000.h5' % R_STAMP,
+                               'image_%s.001.h5' % R_STAMP]
+    assert os.path.isfile(imgs)                     # master still at THE path
+    assert not os.path.exists(imgs + '.tmp')
+    # the master is tiny: no pixels in it, only the mapping + the global ids
+    assert os.path.getsize(imgs) < os.path.getsize(hs.segment_path(imgs, 0))
+
+    with h5py.File(imgs, 'r') as f:
+        assert f['imgs'].is_virtual
+        assert f.attrs['layout'] == 'images-master'
+        assert f.attrs['schema_version'] == 1
+        assert int(f.attrs['segments']) == 2
+        assert f.attrs['live_segment'] == 'image_%s.001.h5' % R_STAMP
+        assert int(f.attrs['num_images_per_seq']) == pSeq
+        assert tuple(f.attrs['frame_size']) == (R_H, R_W)
+        assert f.attrs['data_file'] == os.path.basename(data)
+        assert f.attrs['scan_id'] == R_STAMP
+        # /seq_ids + /frame_seq_ids are REAL datasets on the master
+        assert not f['seq_ids'].is_virtual
+        assert not f['frame_seq_ids'].is_virtual
+        assert f['imgs'].shape == (len(tags) * pSeq, R_H, R_W)
+        # relative source names -> the mapping does not hard-code this tmp path
+        srcs = [m.file_name for m in f['imgs'].virtual_sources()]
+    assert sorted(srcs) == ['image_%s.000.h5' % R_STAMP,
+                            'image_%s.001.h5' % R_STAMP]
+    assert not any(os.path.isabs(s) for s in srcs)
+
+    # the frozen segment stops growing; the live one carries the rest
+    n0 = _segment_frames(hs.segment_path(imgs, 0))
+    n1 = _segment_frames(hs.segment_path(imgs, 1))
+    assert n0 + n1 == len(tags) * pSeq
+    assert n0 > 0 and n1 > 0
+
+
+def test_rotated_segments_carry_local_ids_and_frame_offset(tmp_path):
+    """A segment describes only ITS rows: local /seq_ids + /frame_seq_ids, a
+    LOCAL committed_frames, and the frame_offset that places them globally."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq)
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq)
+
+    seg0, seg1 = hs.segment_path(imgs, 0), hs.segment_path(imgs, 1)
+    with h5py.File(seg0, 'r') as f:
+        n0 = int(f['imgs'].shape[0])
+        assert f.attrs['layout'] == 'images'
+        assert int(f.attrs['segment_index']) == 0
+        assert int(f.attrs['frame_offset']) == 0
+        assert int(f.attrs['committed_frames']) == n0
+        s0 = f['seq_ids'][:]
+        np.testing.assert_array_equal(f['frame_seq_ids'][:],
+                                      np.repeat(s0, pSeq))
+    with h5py.File(seg1, 'r') as f:
+        n1 = int(f['imgs'].shape[0])
+        assert int(f.attrs['segment_index']) == 1
+        assert int(f.attrs['frame_offset']) == n0       # global placement
+        assert int(f.attrs['committed_frames']) == n1   # LOCAL watermark
+        s1 = f['seq_ids'][:]
+    # local ids concatenate to the global list, in order
+    np.testing.assert_array_equal(np.concatenate([s0, s1]), tags)
+    assert len(s0) == n0 // pSeq and len(s1) == n1 // pSeq
+
+
+def test_rotated_master_pixels_are_contiguous_across_the_seam(tmp_path):
+    """THE reader guarantee: every frame reads back at its global row through
+    the ordinary load_images(data_path) redirect, seam included."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq)
+    tags = _rot_blocks(data, imgs, n_blocks=7, pSeq=pSeq)
+    assert len(_segments(imgs)) >= 2                  # rotation really happened
+
+    expect = np.repeat(np.array(tags, dtype=np.uint16), pSeq)
+    got = ld.load_images(data)                        # DATA path, as callers do
+    assert got.shape == (len(expect), R_H, R_W)
+    np.testing.assert_array_equal(got[:, 0, 0], expect)
+
+    # ... and single-frame / slice / fancy reads straddling the seam agree
+    n0 = _segment_frames(hs.segment_path(imgs, 0))
+    around = [n0 - 2, n0 - 1, n0, n0 + 1]
+    np.testing.assert_array_equal(ld.load_images(data, around)[:, 0, 0],
+                                  expect[around])
+    np.testing.assert_array_equal(
+        ld.load_images(data, slice(n0 - 2, n0 + 2))[:, 0, 0],
+        expect[n0 - 2:n0 + 2])
+    for i in around:
+        np.testing.assert_array_equal(ld.load_images(data, int(i)), got[i])
+    # the whole-scan reader path is untouched by rotation
+    bundle = ld.load_scan_from_path(d)
+    assert bundle['layout'] == sf.LAYOUT_SPLIT
+    assert tuple(bundle['imgs_shape']) == (len(expect), R_H, R_W)
+    np.testing.assert_array_equal(ld.load_images(bundle['path'])[:, 0, 0],
+                                  expect)
+    assert ld.get_images_shape(data) == (len(expect), R_H, R_W)
+
+
+def test_rotated_master_ids_and_watermark_are_global(tmp_path):
+    """The master's ids and committed_frames span ALL segments, and the data
+    file's /seq_ids still matches the master's row for row."""
+    pSeq = 3
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140001')
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq, per_block=2)
+    assert len(_segments(imgs)) >= 2
+
+    with h5py.File(imgs, 'r') as f:
+        np.testing.assert_array_equal(f['seq_ids'][:], tags)
+        np.testing.assert_array_equal(f['frame_seq_ids'][:],
+                                      np.repeat(tags, pSeq))
+        assert int(f.attrs['committed_frames']) == len(tags) * pSeq
+    with h5py.File(data, 'r') as f:
+        np.testing.assert_array_equal(f['seq_ids'][:], tags)
+    assert _live_count(data, imgs, pSeq) == len(tags)
+
+
+def test_second_rotation_adds_a_third_segment(tmp_path):
+    """Rotating again needs no rename: .001 freezes, .002 goes live, the master
+    is rewritten with two exact extents + one unlimited one."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140002')
+    tags = _rot_blocks(data, imgs, n_blocks=14, pSeq=pSeq)
+
+    segs = _segments(imgs)
+    assert len(segs) >= 3, segs
+    with h5py.File(imgs, 'r') as f:
+        assert int(f.attrs['segments']) == len(segs)
+        assert f.attrs['live_segment'] == segs[-1]
+        assert f['imgs'].shape[0] == len(tags) * pSeq
+        assert len(f['imgs'].virtual_sources()) == len(segs)
+    # pixels stay right across BOTH seams
+    expect = np.repeat(np.array(tags, dtype=np.uint16), pSeq)
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+    # every frozen segment keeps its own offset
+    off = 0
+    for i in range(len(segs) - 1):
+        with h5py.File(hs.segment_path(imgs, i), 'r') as f:
+            assert int(f.attrs['frame_offset']) == off
+            off += int(f['imgs'].shape[0])
+
+
+# --------------------------------------------------------------------------
+# the live-reader contract straight through a rotation
+# --------------------------------------------------------------------------
+
+def test_min_rule_is_monotone_across_a_rotation_with_a_live_reader(tmp_path):
+    """A reader thread polls the documented min() rule while the writer rotates
+    underneath it: the count never goes backwards and every counted shot's img1
+    row still carries that shot's own tag (no phase shift across the seam)."""
+    pSeq, per_block, n_blocks = 2, 2, 10
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140003')
+
+    stop = threading.Event()
+    errors = []
+
+    def _writer():
+        try:
+            _rot_blocks(data, imgs, n_blocks=n_blocks, pSeq=pSeq,
+                        per_block=per_block)
+        except Exception as e:                      # noqa: BLE001
+            errors.append(e)
+        finally:
+            stop.set()
+
+    th = threading.Thread(target=_writer, daemon=True)
+    th.start()
+
+    counts, seen_rotation = [], False
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        try:
+            n = _live_count(data, imgs, pSeq)
+        except (OSError, KeyError):
+            time.sleep(0.005)               # the ms-wide rotation window
+            continue
+        counts.append(n)
+        if hs.existing_segments(imgs):
+            seen_rotation = True
+        if n:
+            try:
+                with h5py.File(data, 'r') as f:
+                    sids_now = f['seq_ids'][:n]
+                with h5py.File(imgs, 'r') as f:
+                    for k in (1, max(1, n // 2), n):
+                        row = int(f['imgs'][(k - 1) * pSeq, 0, 0])
+                        assert row == sids_now[k - 1], (k, n, row)
+            except OSError:
+                pass
+        if stop.is_set() and n >= n_blocks * per_block:
+            break
+        time.sleep(0.004)
+    th.join(timeout=10.0)
+
+    assert not errors, errors
+    assert seen_rotation, 'the writer never crossed the threshold'
+    assert counts and all(b >= a for a, b in zip(counts, counts[1:])), counts
+    assert counts[-1] == n_blocks * per_block
+
+
+# --------------------------------------------------------------------------
+# failure / recovery paths
+# --------------------------------------------------------------------------
+
+def test_rotation_postponed_when_the_rename_is_blocked(tmp_path, monkeypatch,
+                                                       caplog):
+    """A concurrent reader can block the Windows rename. Then rotation is simply
+    POSTPONED: a warning, no segment on disk, and the block still lands in the
+    (slightly oversized) file -- retried on the next block."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140004')
+    tags = _rot_blocks(data, imgs, n_blocks=3, pSeq=pSeq)     # under threshold
+    assert _segments(imgs) == []
+
+    seg0 = hs.segment_path(imgs, 0)
+    real_replace = os.replace
+
+    def _blocked(src, dst):
+        if str(dst) == seg0:
+            raise PermissionError(32, 'used by another process')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(hs.os, 'replace', _blocked)
+    with caplog.at_level(logging.WARNING, logger='yb_analysis.io.hdf5_store'):
+        more = _rot_blocks(data, imgs, n_blocks=3, pSeq=pSeq, start=len(tags))
+    monkeypatch.undo()
+
+    assert any('rotation postponed' in r.message for r in caplog.records)
+    assert not os.path.exists(seg0)
+    assert _segments(imgs) == []
+    # nothing leaked: no stray segment, no leftover master tmp
+    assert not os.path.exists(hs.segment_path(imgs, 1))
+    assert not os.path.exists(imgs + '.tmp')
+    # ...and every frame is still there, in the plain (unrotated) file
+    all_tags = tags + more
+    expect = np.repeat(np.array(all_tags, dtype=np.uint16), pSeq)
+    with h5py.File(imgs, 'r') as f:
+        assert f.attrs['layout'] == 'images'          # never became a master
+        assert not f['imgs'].is_virtual
+        assert int(f.attrs['committed_frames']) == len(expect)
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+
+    # the NEXT block (unblocked) rotates as normal
+    _rot_blocks(data, imgs, n_blocks=1, pSeq=pSeq, start=len(all_tags))
+    assert _segments(imgs) == ['image_20260820_140004.000.h5',
+                              'image_20260820_140004.001.h5']
+
+
+def test_self_heal_after_rotation_trims_only_the_live_segment(tmp_path, caplog):
+    """A data append that fails right after a rotation leaves orphan rows in the
+    LIVE segment; the next block trims exactly those, never a frozen extent, and
+    the master's global ids/watermark follow."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140005')
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq)
+    assert len(_segments(imgs)) == 2
+    seg0, seg1 = hs.segment_path(imgs, 0), hs.segment_path(imgs, 1)
+    n0 = _segment_frames(seg0)
+    n1_before = _segment_frames(seg1)
+    saved = len(tags)
+
+    # images land, data append never happens (what _save_block leaves behind).
+    # A huge threshold from here on keeps .001 the live segment, so the trim is
+    # observed in isolation from another rotation.
+    no_rotate = 1 << 30
+    orphan_tags = [saved + 1, saved + 2]
+    hs.append_images_block(imgs, _rot_frames(orphan_tags, pSeq, seed=99),
+                           np.array(orphan_tags, dtype='int64'), pSeq,
+                           expected_seq_rows=saved,
+                           rotate_bytes=no_rotate)
+    assert _segment_frames(seg1) == n1_before + len(orphan_tags) * pSeq
+    assert _live_count(data, imgs, pSeq) == saved      # min() hides them
+
+    # the next healthy block heals the live segment only
+    with caplog.at_level(logging.WARNING, logger='yb_analysis.io.hdf5_store'):
+        good = _rot_blocks(data, imgs, n_blocks=1, pSeq=pSeq, per_block=2,
+                           start=saved, rotate_bytes=no_rotate)
+    assert any('live segment' in r.message for r in caplog.records)
+
+    assert _segment_frames(seg0) == n0                 # frozen: untouched
+    assert _segment_frames(seg1) == n1_before + len(good) * pSeq
+    expect = np.repeat(np.array(tags + good, dtype=np.uint16), pSeq)
+    with h5py.File(imgs, 'r') as f:
+        assert f['imgs'].shape[0] == len(expect)
+        np.testing.assert_array_equal(f['seq_ids'][:], tags + good)
+        np.testing.assert_array_equal(f['frame_seq_ids'][:],
+                                      np.repeat(tags + good, pSeq))
+        assert int(f.attrs['committed_frames']) == len(expect)
+    # no phase shift: the healed rows really are the good block's frames
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+
+
+def test_self_heal_with_an_empty_live_segment(tmp_path):
+    """A trim demand that arrives when the live segment is EMPTY (rotation just
+    happened) must be a no-op, not a raid on the frozen segment."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140006')
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq)
+    seg0, seg1 = hs.segment_path(imgs, 0), hs.segment_path(imgs, 1)
+    n0, n1 = _segment_frames(seg0), _segment_frames(seg1)
+
+    # Rotate again so the live segment is brand new and empty...
+    segs_before = len(_segments(imgs))
+    hs._rotate_image_file(imgs, pSeq)
+    assert len(_segments(imgs)) == segs_before + 1
+    live = hs.segment_path(imgs, segs_before)
+    assert _segment_frames(live) == 0
+
+    # ...then heal against the shots that are already saved: nothing to trim.
+    hs._heal_orphans_rotated(imgs, hs.existing_segments(imgs), pSeq, len(tags))
+    assert _segment_frames(live) == 0
+    assert _segment_frames(seg0) == n0 and _segment_frames(seg1) == n1
+    with h5py.File(imgs, 'r') as f:
+        assert int(f.attrs['committed_frames']) == len(tags) * pSeq
+        np.testing.assert_array_equal(f['seq_ids'][:], tags)
+        assert f['imgs'].shape[0] == len(tags) * pSeq
+
+
+def test_master_is_rebuilt_when_it_goes_missing(tmp_path):
+    """A crash between the rename and the master publish leaves segments with no
+    master. The next append rebuilds it from the segments themselves."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140007')
+    tags = _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq)
+    assert len(_segments(imgs)) == 2
+
+    os.remove(imgs)                       # simulate the crash window
+    more = _rot_blocks(data, imgs, n_blocks=1, pSeq=pSeq, start=len(tags))
+
+    with h5py.File(imgs, 'r') as f:
+        assert f['imgs'].is_virtual
+        assert f.attrs['layout'] == 'images-master'
+        np.testing.assert_array_equal(f['seq_ids'][:], tags + more)
+        assert int(f.attrs['committed_frames']) == \
+            (len(tags) + len(more)) * pSeq
+    expect = np.repeat(np.array(tags + more, dtype=np.uint16), pSeq)
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+
+
+# --------------------------------------------------------------------------
+# below the threshold: nothing whatsoever changes
+# --------------------------------------------------------------------------
+
+def test_below_threshold_never_rotates(tmp_path):
+    """The 99% case: same single bulk file, real (non-virtual) /imgs, the plain
+    'images' layout attr, no segment, no master, no rotation attrs."""
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140008')
+    tags = _rot_blocks(data, imgs, n_blocks=8, pSeq=pSeq,
+                       rotate_bytes=64 * 1024 * 1024)      # 64 MB: never hit
+
+    assert _segments(imgs) == []
+    assert sorted(os.listdir(d)) == ['data_20260820_140008.h5',
+                                     'image_20260820_140008.h5']
+    with h5py.File(imgs, 'r') as f:
+        assert not f['imgs'].is_virtual
+        assert f.attrs['layout'] == 'images'
+        assert f['imgs'].chunks == (1, R_H, R_W)
+        assert f['imgs'].compression == 'gzip'
+        assert f['imgs'].compression_opts == 1
+        for k in ('segments', 'live_segment', 'segment_index', 'frame_offset'):
+            assert k not in f.attrs
+        assert int(f.attrs['committed_frames']) == len(tags) * pSeq
+    expect = np.repeat(np.array(tags, dtype=np.uint16), pSeq)
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+
+
+def test_rotation_disabled_by_a_zero_threshold(tmp_path, monkeypatch):
+    """IMAGE_FILE_ROTATE_GB <= 0 switches rotation off entirely."""
+    from yb_analysis import config as _cfg
+    monkeypatch.setattr(_cfg, 'IMAGE_FILE_ROTATE_GB', 0.0, raising=False)
+    pSeq = 2
+    d, data, imgs = _rot_scan(tmp_path, pSeq, stamp='20260820_140009')
+    _rot_blocks(data, imgs, n_blocks=6, pSeq=pSeq, rotate_bytes=None)
+    assert _segments(imgs) == []
+    assert hs._rotate_limit_bytes(None) is None
+
+
+def test_config_threshold_default_is_50_gb():
+    """The configured default, in bytes, is what an unset override resolves to."""
+    from yb_analysis import config as _cfg
+    assert _cfg.IMAGE_FILE_ROTATE_GB == 50.0
+    assert hs._rotate_limit_bytes(None) == 50.0 * 1024 ** 3
+    assert hs._rotate_limit_bytes(2 * 1024 ** 2) == 2 * 1024 ** 2
+
+
+# --------------------------------------------------------------------------
+# ...and the same through a real DataManager save loop
+# --------------------------------------------------------------------------
+
+def test_data_manager_save_loop_rotates(tmp_path, monkeypatch):
+    """End to end: the DataManager save path (config threshold, no explicit
+    rotate_bytes) rotates mid-scan and the scan still reads back as one stack."""
+    pSeq = 2
+    monkeypatch.setattr(dm_mod._cfg, 'IMAGE_FILE_ROTATE_GB',
+                        150 * 1024.0 / 1024 ** 3, raising=False)   # ~150 KB
+    # the DataManager default of _split_dm is (4, 4) frames; rotation needs
+    # bulk, so build this one around the noise frame size.
+    dm, data, imgs = _split_dm(tmp_path, monkeypatch, pSeq=pSeq,
+                               frame_size=(R_H, R_W))
+
+    tags_all = []
+    for b in range(8):
+        tags = [b * 2 + 1, b * 2 + 2]
+        blk = _rot_frames(tags, pSeq, seed=b + 1)
+        dm._imgs_to_save = [blk[i] for i in range(blk.shape[0])]
+        dm._logicals_to_save = [np.ones(3, dtype=bool)
+                                for _ in tags for _ in range(pSeq)]
+        dm._intensities_to_save = [np.full(3, float(t))
+                                   for t in tags for _ in range(pSeq)]
+        dm._seq_ids_to_save = list(tags)
+        dm.save_data()
+        _wait_save_done(dm, len(tags_all) + len(tags))
+        tags_all += tags
+
+    assert dm._saved_seq_rows == len(tags_all)
+    assert dm._save_health['state'] == 'ok'
+    assert len(hs.existing_segments(imgs)) >= 2, \
+        sorted(os.listdir(os.path.dirname(imgs)))
+
+    expect = np.repeat(np.array(tags_all, dtype=np.uint16), pSeq)
+    with h5py.File(imgs, 'r') as f:
+        assert f['imgs'].is_virtual
+        assert int(f.attrs['committed_frames']) == len(expect)
+        np.testing.assert_array_equal(f['seq_ids'][:], tags_all)
+    with h5py.File(data, 'r') as f:
+        assert 'imgs' not in f
+        np.testing.assert_array_equal(f['seq_ids'][:], tags_all)
+    np.testing.assert_array_equal(ld.load_images(data)[:, 0, 0], expect)
+    assert _live_count(data, imgs, pSeq) == len(tags_all)

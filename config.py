@@ -348,6 +348,19 @@ IMG2_SHAPE_MODEL_VARIANT = os.environ.get('YB_IMG2_SHAPE_MODEL', 'A')
 # YB_SPLIT_IMAGE_FILE=0 to fall back to the combined layout.
 SPLIT_IMAGE_FILE = os.environ.get('YB_SPLIT_IMAGE_FILE', '1') != '0'
 
+# Image-file ROTATION threshold, in GiB (env YB_IMAGE_FILE_ROTATE_GB).
+# When the bulk image_<stamp>.h5 grows past this, the writer rotates it between
+# blocks: the oversized file becomes a frozen segment image_<stamp>.000.h5, a new
+# live segment .001 takes the following frames, and image_<stamp>.h5 is rewritten
+# as a small MASTER whose /imgs is a virtual dataset stitching the segments into
+# one contiguous stack (global /seq_ids + /frame_seq_ids + committed_frames stay
+# real datasets/attrs on it). Readers keep opening the same path and need no
+# change. 0 (or negative) disables rotation. See yb_analysis/io/hdf5_store.py.
+try:
+    IMAGE_FILE_ROTATE_GB = float(os.environ.get('YB_IMAGE_FILE_ROTATE_GB', '50'))
+except ValueError:
+    IMAGE_FILE_ROTATE_GB = 50.0
+
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
 
