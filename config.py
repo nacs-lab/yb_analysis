@@ -344,8 +344,9 @@ IMG2_SHAPE_MODEL_VARIANT = os.environ.get('YB_IMG2_SHAPE_MODEL', 'A')
 # watermark), so the analysis path reads only a small file. Readers are already
 # split-aware via yb_analysis/io/scan_files.py and are unaffected either way;
 # existing combined files keep loading forever (no migration).
-# Default OFF until one real scan has been validated end to end.
-SPLIT_IMAGE_FILE = os.environ.get('YB_SPLIT_IMAGE_FILE', '0') != '0'
+# Default ON since 2026-08-20 (validated by the full-scale shadow run); set
+# YB_SPLIT_IMAGE_FILE=0 to fall back to the combined layout.
+SPLIT_IMAGE_FILE = os.environ.get('YB_SPLIT_IMAGE_FILE', '1') != '0'
 
 # Number of completed scans shown in the queue history panel
 QUEUE_HISTORY_DISPLAY = 30
