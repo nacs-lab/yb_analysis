@@ -42,6 +42,14 @@ def _hist_dm(M=5, box=9, H=80, W=90):
     # its value is irrelevant to the histogram content this test pins.
     dm.live_thresholds = None
     dm.loaded_thresholds = np.full(M, 1e9)
+    # No Gaussian fits -> the per-shot common-mode normalization is a no-op
+    # (it needs a per-site mu_empty / atom reference), which is what this
+    # histogram-cadence test wants: raw intensities, unchanged logicals.
+    dm.live_gauss_fits = None
+    dm.loaded_gauss_fits = None
+    dm._cm = None
+    dm._cm_ref_cache = {}
+    dm._cm_logged = set()
     dm.mask_mat = _mask(box)
     dm._accum_pattern_name = None
     dm._logicals_to_save = []
