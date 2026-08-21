@@ -287,22 +287,63 @@ def test_queue_list_kind_discriminator(fresh_expt_server):
     assert kinds == ['descriptor', 'job']
 
 
-def test_queue_move_kind_aware(fresh_expt_server):
-    """queue_move moves an entry only relative to other same-kind
-    queued entries -- jobs and descriptors don't compete for ordering."""
+def test_queue_move_kind_agnostic(fresh_expt_server):
+    """queue_move orders the whole queued FOREGROUND lane, jobs and descriptors
+    alike: dispatch inserts a built job at its descriptor's slot, so displayed
+    order == run order and the two kinds do compete for ordering."""
     srv = fresh_expt_server
     j1 = srv.submit_job(b'job1')
     j2 = srv.submit_job(b'job2')
     d1 = srv.submit_scan_descriptor(json.dumps({'seq': 'CoolingSeq'}))
     d2 = srv.submit_scan_descriptor(json.dumps({'seq': 'RamseySeq'}))
-    # Move d2 up -> d2, d1
+    ids = lambda: [r['id'] for r in srv.queue_list()['queued']]
+    assert ids() == [j1, j2, d1, d2]
+    # A descriptor can be walked up PAST the queued jobs...
     assert srv.queue_move(d2, 'up')
+    assert ids() == [j1, j2, d2, d1]
+    assert srv.queue_move(d2, 'up') and srv.queue_move(d2, 'up')
+    assert ids() == [d2, j1, j2, d1]
+    # ...and a job back down past a descriptor.
+    assert srv.queue_move(j1, 'down')
+    assert ids() == [d2, j2, j1, d1]
+    # Head/tail of the lane are still hard edges.
+    assert srv.queue_move(d2, 'up') is False
+    assert srv.queue_move(d1, 'down') is False
+
+
+def test_queue_move_lanes_are_separate(fresh_expt_server):
+    """Background (calibration) entries never trade places with foreground ones:
+    the lanes are scheduled independently, so cross-lane ordering is meaningless."""
+    srv = fresh_expt_server
+    b1 = srv.submit_job(b'bg1', priority='background')
+    f1 = srv.submit_job(b'fg1')
+    b2 = srv.submit_job(b'bg2', priority='background')
+    ids = lambda: [r['id'] for r in srv.queue_list()['queued']]
+    # f1 is alone in the foreground lane -> both directions are edges.
+    assert srv.queue_move(f1, 'up') is False
+    assert srv.queue_move(f1, 'down') is False
+    # b2 moves up past f1 to swap with b1 (its only same-lane neighbour).
+    assert srv.queue_move(b2, 'up')
+    assert ids() == [b2, f1, b1]
+
+
+def test_dispatched_job_takes_descriptor_slot(fresh_expt_server):
+    """The built job lands at the descriptor's queue index (submit_job's
+    place_at_descriptor), so dispatch can't silently undo a reorder."""
+    srv = fresh_expt_server
+    j1 = srv.submit_job(b'job1')
+    d1 = srv.submit_scan_descriptor(json.dumps({'seq': 'CoolingSeq'}))
+    assert srv.queue_move(d1, 'up')                 # operator pulls d1 in front of j1
+    # Dispatch it the way the run loop does (pop -> submit_job -> link).
+    popped = srv.pop_next_descriptor()
+    assert popped['id'] == d1
+    srv.submit_job(b'built', job_id=d1, place_at_descriptor=d1)
+    srv.link_descriptor_to_job(d1, d1)
     snap = srv.queue_list()
-    desc_ids = [r['id'] for r in snap['queued'] if r['kind'] == 'descriptor']
-    assert desc_ids == [d2, d1]
-    # Jobs unaffected
-    job_ids = [r['id'] for r in snap['queued'] if r['kind'] == 'job']
-    assert job_ids == [j1, j2]
+    assert [r['id'] for r in snap['queued']] == [d1, j1]
+    assert [r['kind'] for r in snap['queued']] == ['job', 'job']
+    # ...and it is the one that actually runs next.
+    assert srv.pop_next_job()['id'] == d1
 
 
 def test_pop_next_job_explicit_kind_for_existing_entries(fresh_expt_server):

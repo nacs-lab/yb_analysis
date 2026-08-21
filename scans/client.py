@@ -168,7 +168,12 @@ def cancel(entry_id: int, kind: str = 'auto', *, url: Optional[str] = None,
 
 def move(entry_id: int, direction: str, *, url: Optional[str] = None,
          client=None) -> bool:
-    """Move a queued entry up or down within its own kind."""
+    """Move a queued entry up or down within its scheduling lane.
+
+    Jobs and descriptors compete for the same ordering (the run loop dispatches a
+    descriptor into a job AT the descriptor's queue slot); only the foreground and
+    background lanes are ordered independently. False at a lane edge.
+    """
     if direction not in ('up', 'down'):
         raise ValueError(f"move: direction must be up|down, got {direction!r}")
     if client is None:

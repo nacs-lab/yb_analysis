@@ -598,9 +598,15 @@ class QueuePane(ttk.LabelFrame):
             self._status.config(text='select a queued job')
             return
         try:
-            self._client.queue_move(jid, direction)
+            rep = self._client.queue_move(jid, direction)
         except Exception as e:
             self._status.config(text=f'move failed: {e}')
+            return
+        # The server refuses a move at a lane edge ('error: cannot move'); say so
+        # instead of leaving the row silently unmoved.
+        if not (isinstance(rep, str) and rep.lower().startswith('ok')):
+            edge = 'top' if direction == 'up' else 'bottom'
+            self._status.config(text=f'already at the {edge} of its lane')
 
     def _remove(self):
         jid, _ = self._selected_queued()
