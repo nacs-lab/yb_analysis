@@ -200,6 +200,10 @@ class ControlPanel(tk.Tk):
         # Live survival conditioning frame ('img1' | 'mid'), panel-level like
         # the site mask so it survives DM churn; re-applied to each new DM.
         self._survival_ref = 'img1'
+        # Live "restrict the 0d survival series to target sites" toggle, panel-
+        # level like the above; default True == the DM default (historical
+        # target-aware auto behavior). Orthogonal to _survival_ref.
+        self._target_restrict = True
 
         style = ttk.Style(self)
         style.configure('Abort.TButton', foreground='red',
@@ -212,6 +216,77 @@ class ControlPanel(tk.Tk):
         self._poll_status()
         self._poll_web_control_loop()
         self._tick_alive()
+
+    def _live_dm(self):
+        """The DataManager the live view is currently rendering, or None.
+
+        ``_last_real_dm`` is only assigned on a REAL SHOT SAVE (_process_once),
+        so between scans it is None (fresh process) or points at the previous
+        scan's DM. Toggle handlers must not gate on it alone: with no scan
+        running the dashboard still renders the CURRENT scan's DM out of the
+        module cache, so a toggle flipped between scans was silently dropped
+        while every layer (REST 200, spool file drained) reported success.
+        Prefer the cached DM for the scan the dashboard is showing, and fall
+        back to _last_real_dm. (2026-08-06 bug: survival_ref/target_restrict
+        flipped between scans never reached the DM.)"""
+        from yb_analysis.acquisition.data_manager import (peek_data_manager,
+                                                          latest_data_manager)
+        dm = None
+        try:
+            cur = getattr(self, '_cur_scan_id', None)
+            if cur is not None and int(cur) > 0:
+                dm = peek_data_manager(int(cur))
+        except Exception:
+            dm = None
+        if dm is None:
+            dm = self._last_real_dm
+        if dm is None:
+            # Nothing seen this session yet (fresh process, or the panel has not
+            # handled a shot): fall back to whatever manager the cache holds, so
+            # a toggle flipped before the first save still lands.
+            try:
+                dm = latest_data_manager()
+            except Exception:
+                dm = None
+        return dm
+
+    def _apply_view_toggles(self, dm):
+        """Push every panel-level live-view toggle onto ``dm``.
+
+        Single place so the command handlers and the new-scan path cannot drift
+        apart. Each is individually guarded: a DM that predates a setter must
+        not block the others."""
+        if dm is None:
+            return
+        if self._site_mask_enabled:
+            try:
+                dm.set_site_mask_enabled(True, spec=self._site_mask_spec)
+            except Exception:
+                pass
+        try:
+            dm.set_survival_ref(self._survival_ref)
+        except Exception:
+            pass
+        try:
+            dm.set_target_restrict(self._target_restrict)
+        except Exception:
+            pass
+
+    def _repaint_dashboard(self, dm):
+        """Re-render the dashboard from ``dm`` RIGHT NOW, without waiting for the
+        next shot.
+
+        These view toggles only change how the ALREADY-ACCUMULATED shots are
+        reduced, so the new curve is computable immediately. Without this the
+        toggle looked dead between shots -- and completely dead once a scan
+        finished, since _process_once (the only other caller of
+        ``_dashboard.update``) never runs again. (2026-08-06.)"""
+        if dm is None or not self._dashboard:
+            return
+        try:
+            self._dashboard.update(dm.get_plot_data())
+        except Exception as e:
+            logger.error('dashboard repaint after view-toggle failed: %s', e)
 
     def _tick_alive(self):
         self.after(200, self._tick_alive)
@@ -1007,20 +1082,41 @@ class ControlPanel(tk.Tk):
                     self._site_mask_enabled = bool(rec.get('enabled'))
                     if rec.get('spec') is not None:
                         self._site_mask_spec = rec.get('spec')
-                    if self._last_real_dm is not None:
-                        self._last_real_dm.set_site_mask_enabled(
+                    _dm = self._live_dm()
+                    if _dm is not None:
+                        _dm.set_site_mask_enabled(
                             self._site_mask_enabled, spec=self._site_mask_spec)
-                    logger.info('Web site_mask -> enabled=%s spec=%r',
-                                self._site_mask_enabled, self._site_mask_spec)
+                        self._repaint_dashboard(_dm)
+                    logger.info('Web site_mask -> enabled=%s spec=%r (dm=%s)',
+                                self._site_mask_enabled, self._site_mask_spec,
+                                'yes' if _dm is not None else 'NONE')
                 elif cmd == 'survival_ref':
                     # Live survival conditioning-frame toggle (view-only).
                     # Persist on the panel (survives new-scan DM churn) and
-                    # apply to the current DM now.
+                    # apply to the CURRENT DM now -- via _live_dm(), not
+                    # _last_real_dm, which is only set on a real shot save and
+                    # so silently dropped toggles flipped between scans.
                     ref = str(rec.get('ref', 'img1')).lower()
                     self._survival_ref = 'mid' if ref == 'mid' else 'img1'
-                    if self._last_real_dm is not None:
-                        self._last_real_dm.set_survival_ref(self._survival_ref)
-                    logger.info('Web survival_ref -> %s', self._survival_ref)
+                    _dm = self._live_dm()
+                    if _dm is not None:
+                        _dm.set_survival_ref(self._survival_ref)
+                        self._repaint_dashboard(_dm)
+                    logger.info('Web survival_ref -> %s (dm=%s)',
+                                self._survival_ref,
+                                'yes' if _dm is not None else 'NONE')
+                elif cmd == 'target_restrict':
+                    # Live "restrict the 0d survival series to target sites"
+                    # toggle (view-only). Persist on the panel (survives new-scan
+                    # DM churn) and apply to the current DM now.
+                    self._target_restrict = bool(rec.get('enabled', True))
+                    _dm = self._live_dm()
+                    if _dm is not None:
+                        _dm.set_target_restrict(self._target_restrict)
+                        self._repaint_dashboard(_dm)
+                    logger.info('Web target_restrict -> %s (dm=%s)',
+                                self._target_restrict,
+                                'yes' if _dm is not None else 'NONE')
                 elif cmd in ('camera_connect', 'camera_apply',
                              'camera_disconnect'):
                     # Dispatch to CameraPane, which owns the ZMQ client and
@@ -1097,18 +1193,13 @@ class ControlPanel(tk.Tk):
                 # Track this DM so dummy frames (cur_scan < 0) can borrow its
                 # plot context. Updated only on real saves.
                 self._last_real_dm = dm
-                # Carry the live site-mask toggle onto each new-scan DM.
-                if self._site_mask_enabled:
-                    try:
-                        dm.set_site_mask_enabled(True, spec=self._site_mask_spec)
-                    except Exception:
-                        pass
-                # Carry the survival conditioning-frame toggle likewise.
-                if self._survival_ref != 'img1':
-                    try:
-                        dm.set_survival_ref(self._survival_ref)
-                    except Exception:
-                        pass
+                # Carry every panel-level live-view toggle onto each new-scan DM.
+                # Shared with the command handlers via _apply_view_toggles so the
+                # two paths cannot drift. NOTE this now pushes each setting
+                # UNCONDITIONALLY (the old code skipped values equal to the DM
+                # default, which left a DM that had been set the other way by a
+                # previous scan carrying a stale value).
+                self._apply_view_toggles(dm)
                 self.after(0, self._update_labels, fname, save_err)
             elif cur_scan == FAILING_DISPLAY_SCAN_ID:
                 # Failing-shot frames published for DISPLAY ONLY (backend's

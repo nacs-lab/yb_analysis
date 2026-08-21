@@ -299,15 +299,36 @@ def extract_scan_params_h5(mat_path):
 #  Compute scan curves (1-D and 2-D)
 # ---------------------------------------------------------------------------
 
-def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets):
-    """Per-shot target-aware TP averaged per flat param index.
+def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
+                        cond_mid=False):
+    """Per-shot target-aware survival averaged per flat param index.
 
-    Mirrors the offline ``_target_aware_from_lab_paths``: for each shot with a
-    known target set (``seq_targets[seq_id]`` = lab-site indices from the diag),
-    TP = (# target sites occupied in the final image) / (# target sites). Index
-    into the logicals directly (no grid needed). Returns
-    ``(mean, sem, n_reps)`` each length ``n_total``, or ``None`` when no shot
-    had usable targets (→ caller falls back to per-site survival)."""
+    Two metrics, selected by ``cond_mid`` -- the SAME 2x2 the per-shot series
+    uses (see ``DataManager._per_shot_survival_series``), so the plotted curve
+    and the 0d series finally agree:
+
+    * ``cond_mid=False`` (Cond. verify OFF) -- **raw TP**:
+      ``logic2[t].sum() / t.size``, the fraction of TARGET sites filled in the
+      final image. Mirrors the offline ``_target_aware_from_lab_paths``.
+      NOTE this is FLOORED BY THE REARRANGEMENT FILL FRACTION: a target site the
+      rearrangement never filled counts as a miss, so raw TP can never exceed
+      the fill rate however good the survival is.
+    * ``cond_mid=True`` (Cond. verify ON) -- **verify-conditioned survival**:
+      ``(logic1[t] & logic2[t]).sum() / logic1[t].sum()``, i.e. of the target
+      sites occupied in the CONDITIONING frame, the fraction still occupied in
+      the final one. ``logic1`` is already the mid/verify frame here because
+      ``_effective_scan_logicals`` substitutes it when survival_ref='mid'.
+      This divides out rearrangement fill and is the loss/thermometry metric.
+
+    2026-08-06: this branch previously computed raw TP UNCONDITIONALLY and never
+    read ``logic1``, so the live scan curve silently ignored the Cond. verify
+    toggle -- on a dark-control run it read 0.961 where the correct
+    verify-conditioned value was 0.992 (the ~3.9% gap was rearrangement fill,
+    not loss). The axis label said "TP (target)" throughout, which is how it was
+    finally caught.
+
+    Returns ``(mean, sem, n_reps)`` each length ``n_total``, or ``None`` when no
+    shot had usable targets (→ caller falls back to per-site survival)."""
     sum_tp = np.zeros(n_total)
     sumsq = np.zeros(n_total)
     cnt = np.zeros(n_total, dtype=int)
@@ -329,7 +350,22 @@ def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets):
         t = t[(t >= 0) & (t < l2.shape[0])]
         if t.size == 0:
             continue
-        tp = float(l2[t].sum()) / t.size
+        if cond_mid:
+            if logic1 is None:
+                continue
+            l1 = np.asarray(logic1)
+            # Cross-grid run: the conditioning and final frames are detected on
+            # DIFFERENT grids, so a matched-index AND is meaningless. Skip the
+            # shot rather than report a bogus number.
+            if l1.shape[0] != l2.shape[0]:
+                continue
+            m1 = l1[t].astype(bool)
+            den = int(m1.sum())
+            if den == 0:
+                continue          # no atoms to condition on in this shot
+            tp = float((m1 & l2[t].astype(bool)).sum()) / den
+        else:
+            tp = float(l2[t].sum()) / t.size
         sum_tp[p] += tp
         sumsq[p] += tp * tp
         cnt[p] += 1
@@ -361,7 +397,7 @@ def _mask_sr(y_sr, site_mask):
 
 def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
                        scan_dims=None, is_two_array=False, recent_seq_ids=None,
-                       seq_targets=None, site_mask=None):
+                       seq_targets=None, site_mask=None, cond_mid=False):
     """Compute survival, loading, or rearrangement curve from accumulated
     logicals.
 
@@ -387,6 +423,12 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
         and fall back to the standard conditioned-survival calc. When
         False, behaves exactly as before (survival when NumImages=2,
         loading when NumImages=1).
+    cond_mid : bool
+        The dashboard's "Cond. verify" toggle, for the TARGET-AWARE branch only
+        (it is a no-op without ``seq_targets``). False = raw TP (fraction of
+        target sites filled in the final frame, floored by the rearrangement
+        fill fraction); True = verify-conditioned survival at the target sites.
+        See :func:`_target_tp_per_flat`. Pass ``survival_ref == 'mid'``.
 
     Returns
     -------
@@ -395,12 +437,14 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     if scan_dims is not None and len(scan_dims) >= 3:
         return _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
                            is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
-                           seq_targets=seq_targets, site_mask=site_mask)
+                           seq_targets=seq_targets, site_mask=site_mask,
+                           cond_mid=cond_mid)
 
     if scan_dims is not None and len(scan_dims) == 2:
         return _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                            is_two_array=is_two_array, recent_seq_ids=recent_seq_ids,
-                           seq_targets=seq_targets, site_mask=site_mask)
+                           seq_targets=seq_targets, site_mask=site_mask,
+                           cond_mid=cond_mid)
 
     # --- 1-D path ---
     if not scan_logicals or scan_params is None or param_indices is None:
@@ -430,7 +474,8 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
     # supplied per-shot target sets, the live curve is per-shot TP, not
     # per-site survival. Falls through to per-site when no targets apply.
     if seq_targets and num_images >= 2 and has_logic2:
-        ta = _target_tp_per_flat(scan_logicals, param_indices, n_params, seq_targets)
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_params, seq_targets,
+                                 cond_mid=cond_mid)
         if ta is not None:
             mean, sem, cnt = ta
             order = np.argsort(scan_params)
@@ -442,6 +487,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
                 'n_reps': cnt[order],
                 'mode': 'survival',
                 'target_aware': True,
+                'cond_mid': bool(cond_mid),
                 'coupled': _coupled_sorted(order),
             }
     # In two-array mode with different-sized grids, the per-param metric is
@@ -504,7 +550,7 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
 
 def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                 is_two_array=False, recent_seq_ids=None, seq_targets=None,
-                site_mask=None):
+                site_mask=None, cond_mid=False):
     """Compute 2-D heatmap for multi-dimensional scans.
 
     The flat param_index decomposes column-major (dim-0 varies fastest):
@@ -525,7 +571,8 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
 
     # Target-aware survival (matches Analysis TP) when the diag gave targets.
     if seq_targets and num_images >= 2 and has_logic2:
-        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets)
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
+                                 cond_mid=cond_mid)
         if ta is not None:
             mean_flat, sem_flat, n_flat = ta
             sids = list(recent_seq_ids) if recent_seq_ids else (
@@ -545,6 +592,7 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                     current.append({'x_idx': cell[0], 'y_idx': cell[1]})
             return {
                 'mode': 'survival', 'ndim': 2, 'target_aware': True,
+                'cond_mid': bool(cond_mid),
                 'heatmap': mean_flat.reshape(s1, s0),
                 'sem': sem_flat.reshape(s1, s0),
                 'n_reps': n_flat.reshape(s1, s0),
@@ -649,7 +697,7 @@ def _axis_vals(d):
 
 def _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
                 is_two_array=False, recent_seq_ids=None, seq_targets=None,
-                site_mask=None):
+                site_mask=None, cond_mid=False):
     """Compute a full data CUBE for scans with >= 3 swept dimensions.
 
     The flat param index decomposes column-major (dim-0 varies fastest):
@@ -711,11 +759,13 @@ def _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
 
     # Target-aware survival (matches Analysis TP) when the diag gave targets.
     if seq_targets and num_images >= 2 and has_logic2:
-        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets)
+        ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
+                                 cond_mid=cond_mid)
         if ta is not None:
             mean_flat, sem_flat, n_flat = ta
             return {
                 'mode': 'survival', 'ndim': 3, 'target_aware': True,
+                'cond_mid': bool(cond_mid),
                 'cube': mean_flat.reshape(s2, s1, s0),
                 'sem': sem_flat.reshape(s2, s1, s0),
                 'n_reps': n_flat.reshape(s2, s1, s0),
