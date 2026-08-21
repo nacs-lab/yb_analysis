@@ -8,6 +8,7 @@ computation on the site-sliced logicals.
 import numpy as np
 import pytest
 
+from yb_analysis.tests.conftest import fig_json
 from yb_analysis.analysis import probabilities as P
 from yb_analysis.analysis.site_mask import (
     resolve_site_mask, mask_site_resolved, effective_spec)
@@ -233,11 +234,11 @@ def _masked_fig_dict(n):
 def test_fig_array_excluded_sites_are_gray(n, gl, monkeypatch):
     from yb_analysis.plotting import dashboard as D
     monkeypatch.setattr(D, "_GL_SITES", gl)
-    fa = D._fig_array(_masked_fig_dict(n))
-    trace_colors = [tr.line.color for tr in fa.data
-                    if getattr(tr, 'line', None)
-                    and getattr(tr.line, 'color', None)]
-    shape_colors = [s['line']['color'] for s in (fa.layout.shapes or [])]
+    fa = fig_json(D._fig_array(_masked_fig_dict(n)))
+    trace_colors = [tr['line']['color'] for tr in fa['data']
+                    if isinstance(tr.get('line'), dict)
+                    and tr['line'].get('color')]
+    shape_colors = [s['line']['color'] for s in (fa['layout'].get('shapes') or [])]
     all_colors = trace_colors + shape_colors
     assert '#555555' in all_colors, "excluded sites must be gray, not green/red"
     assert '#00ff88' in all_colors  # some loaded sites still green
@@ -298,7 +299,7 @@ def test_fig_loading_and_infid_maps_no_nan_labels():
     fl = D._fig_loading({"grid_locations": grid, "loading_rates": rates})
     fi = D._fig_infid({"grid_locations": grid, "infidelities": inf})
     for fig in (fl, fi):
-        txt = list(getattr(fig.data[0], "text", []) or [])
+        txt = list(fig_json(fig)['data'][0].get("text") or [])
         assert not any("nan" in str(t).lower() for t in txt)
 
 

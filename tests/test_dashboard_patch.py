@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 from dash import Patch, no_update
 
 from yb_analysis.plotting import dashboard as dsh
+from yb_analysis.tests.conftest import fig_json
 
 
 @pytest.fixture(autouse=True)
@@ -223,8 +224,8 @@ def test_large_array_uses_webgl_scattergl():
     rates = rng.random(n)
     inf = rng.random(n) * 0.01
     d = {'grid_locations': grid, 'loading_rates': rates, 'infidelities': inf}
-    load_types = {tr['type'] for tr in dsh._fig_loading(d).to_plotly_json()['data']}
-    infid_types = {tr['type'] for tr in dsh._fig_infid(d).to_plotly_json()['data']}
+    load_types = {tr['type'] for tr in fig_json(dsh._fig_loading(d))['data']}
+    infid_types = {tr['type'] for tr in fig_json(dsh._fig_infid(d))['data']}
     assert load_types == {'scattergl'}
     assert infid_types == {'scattergl'}
 
@@ -239,6 +240,6 @@ def test_large_array_has_no_per_site_shapes():
     d = {'_img_data_uri': uri, '_img_shape': (200, 200), '_img_vlo': vlo,
          '_img_vhi': vhi, 'grid_locations': grid,
          'logicals': (rng.random(n) > 0.5), 'box_size': 11}
-    fig = dsh._fig_array(d).to_plotly_json()
+    fig = fig_json(dsh._fig_array(d))
     assert not fig['layout'].get('shapes')          # no per-site SVG rects
     assert any(tr['type'] == 'scattergl' for tr in fig['data'])

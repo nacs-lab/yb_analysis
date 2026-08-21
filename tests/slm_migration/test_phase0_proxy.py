@@ -9,14 +9,14 @@ Tests are self-contained: the FakeSlmServer fixture spins up a Flask server on
 an OS-assigned port, the proxy is constructed with short poll intervals (50 ms),
 and assertions run against the on-disk pickle / Flask test client.
 
-NOTE (environmental): test_proxy_polls_fake_slm and test_passthrough_routes
-assert on a *shared* pickle at ``<tempdir>/yb_dash_slm.pkl``. If a LIVE dashboard
-proxy is running on the same machine it owns that file, so the test proxy gets a
-WinError 5 on write and reads the live proxy's payload instead (e.g. the real SLM
-url rather than the FakeSlmServer url) — these two tests then fail. This is a
-test-isolation limitation, not a product bug: they pass on a clean machine / CI
-where no live dashboard is running. (A proper fix would give the proxy a
-per-test temp pickle path.)
+ISOLATION: the proxy pickle is a machine-wide rendezvous at
+``<tempdir>/yb_dash_slm.pkl``. These tests USED to assert on that shared path,
+which meant they both (a) failed whenever a LIVE dashboard proxy owned the file
+(WinError 5 on write, then reading the live payload -- the real SLM url instead
+of the FakeSlmServer one) and (b) deleted the operator's live pickle on the way
+in and out. The autouse fixture below now redirects the whole dashboard IPC
+pickle set to a per-test tmp dir via YB_DASH_TMPDIR, so a running dashboard is
+neither read nor touched.
 """
 
 import math
@@ -39,19 +39,16 @@ from yb_analysis.tests.slm_migration.fake_slm_server import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_slm_pickle():
-    """Remove the SLM pickle before and after each test for isolation."""
-    for p in (SLM_DATA_FILE, SLM_DATA_FILE + '.tmp'):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+def _isolated_slm_pickle(tmp_path, monkeypatch):
+    """Give each test its own dashboard IPC pickle dir.
+
+    YB_DASH_TMPDIR is read at call time by both the proxy's writer and the
+    dashboard's reader, so the test proxy and the Flask routes agree on a
+    private path and a LIVE dashboard on this machine is never read or
+    clobbered. monkeypatch auto-reverts.
+    """
+    monkeypatch.setenv('YB_DASH_TMPDIR', str(tmp_path))
     yield
-    for p in (SLM_DATA_FILE, SLM_DATA_FILE + '.tmp'):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
 
 
 # Fast poll intervals so tests don't have to wait — 50 ms across the board.

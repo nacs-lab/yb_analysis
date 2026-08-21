@@ -454,3 +454,27 @@ MOLECUBE_MAX_TTL_CHN = _read_molecube_max_ttl_chn()
 # tab's Molecube sub-view links its "open source" (↗) action here, mirroring how
 # the iframe sub-views link to their standalone dashboards. Override per host.
 MOLECUBE_WEB_URL = os.environ.get('YB_MOLECUBE_WEB_URL', 'https://yb.nigrp.org/s/zynq/1/dds')
+
+# --------------------------------------------------------------------------- #
+# Dashboard IPC pickles (yb_dash_*.pkl)
+# --------------------------------------------------------------------------- #
+# The dashboard, the SLM proxy and the queue pane exchange snapshots through a
+# handful of small pickles in the system tempdir. They are a machine-wide
+# rendezvous by design: the Dash subprocess and the main run_monitor process
+# find each other by path alone.
+#
+# That makes them hostile to tests, which would otherwise read (and clobber) the
+# LIVE dashboard's files on this lab machine. YB_DASH_TMPDIR redirects the whole
+# set to a private directory so a test can run a proxy of its own without
+# touching the operator's running dashboard. Unset in production -- the default
+# is the shared tempdir the processes already agree on.
+DASH_TMPDIR = os.environ.get('YB_DASH_TMPDIR') or tempfile.gettempdir()
+
+
+def dash_pickle_path(name):
+    """Absolute path of a dashboard IPC pickle, honoring YB_DASH_TMPDIR.
+
+    Read at call time (not import time) so a test that sets the env var after
+    import still gets the redirected path.
+    """
+    return os.path.join(os.environ.get('YB_DASH_TMPDIR') or tempfile.gettempdir(), name)

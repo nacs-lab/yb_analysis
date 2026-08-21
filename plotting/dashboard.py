@@ -56,6 +56,7 @@ _DATA_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_data.pkl')
 _QUEUE_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_queue.pkl')
 # SLM-proxy snapshot — written by yb_analysis.slm_proxy.SlmProxy on the main
 # process, read here by the dashboard subprocess + the /api/slm/* routes.
+# Redirectable via YB_DASH_TMPDIR (see _slm_file()).
 _SLM_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_slm.pkl')
 # Reverse-channel control file: written by the Dash subprocess (browser
 # toggles) and read by the MAIN process. Carries the live-image downsample
@@ -81,7 +82,7 @@ _LIVE_FIG_LOCK = threading.Lock()
 # by the request handler AND the eager pre-builder so both stay in sync.
 _LIVE_FIG_NAMES = ('array', 'array_mid', 'array2', 'intens', 'loadlive',
                    'load', 'infid', 'shift', 'scan', 'avghist',
-                   'rep0', 'rep1', 'rep2')
+                   'rep0', 'rep1', 'rep2', 'rep3')
 # The render-arg tuple the Live tab sends when NOTHING is customized (marker_size
 # 12, colorbar 0-1, site 1, all box overlays ON, no scan-panel axis overrides).
 # The eager pre-builder targets exactly this key so the common-case poll finds a
@@ -727,6 +728,14 @@ class EventHub:
 _EVENT_HUB = None
 
 
+def _slm_file():
+    """The SLM pickle path, resolved at CALL time so YB_DASH_TMPDIR applies even
+    when it is set after this module is imported (which is what a test fixture
+    does). Keeps this reader and slm_proxy's writer on the same file."""
+    from yb_analysis import config
+    return config.dash_pickle_path('yb_dash_slm.pkl')
+
+
 def _read_slm_data():
     """Read the latest SLM-proxy snapshot written by yb_analysis.slm_proxy.
 
@@ -735,7 +744,7 @@ def _read_slm_data():
     badge.
     """
     try:
-        with open(_SLM_FILE, 'rb') as f:
+        with open(_slm_file(), 'rb') as f:
             return pickle.load(f)
     except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
         return None
@@ -3481,7 +3490,7 @@ def _register_api_routes(server):
 
         names = ['array', 'array_mid', 'array2', 'intens', 'loadlive',
                  'load', 'infid', 'shift', 'scan', 'avghist',
-                 'rep0', 'rep1', 'rep2']
+                 'rep0', 'rep1', 'rep2', 'rep3']
         # Two live fetch groups, both built from the SAME _read_data() snapshot ('d'
         # above) -- so a single request's figures are mutually consistent (one shot).
         #   ?group=snapshot -> the coherent SINGLE-SHOT view: both camera frames
@@ -7695,9 +7704,9 @@ def _figs_reps(d):
 
 
 # Per-frame memo for the rep-histogram set. _dispatch_fig is called once PER rep
-# name (rep0/rep1/rep2), and each call rebuilt ALL 4 histograms -> 12 builds/frame
-# to display 3. The reps depend only on the frame `d`, so build the set ONCE per
-# frame (keyed on _write_seq) and reuse it across rep0/1/2. Keyed on the same
+# name (rep0..rep3), and each call rebuilt ALL 4 histograms -> 16 builds/frame
+# to display 4. The reps depend only on the frame `d`, so build the set ONCE per
+# frame (keyed on _write_seq) and reuse it across rep0..rep3. Keyed on the same
 # monotonic stamp the live-figure cache uses; a benign race (two threads building
 # the same frame's reps) just wastes one build, last write wins.
 _REPS_CACHE = {'seq': object(), 'figs': None}

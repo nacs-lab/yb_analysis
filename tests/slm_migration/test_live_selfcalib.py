@@ -186,6 +186,14 @@ def test_affine_live_ewma_translation_and_log(state):
     dm.grid_shift_history = collections.deque(maxlen=50)
     dm.mask_mat = _gaussian_mask(7, 2.0)
     dm._affine_update_running = False
+    # _refresh_grids_from_affine also reads these; DataManager.__new__ skips
+    # __init__, so anything the refresh path touches has to be set by hand here.
+    # _affine_live_worker catches Exception, so a MISSING attribute does not
+    # raise -- it silently skips the grid refresh and the affine still commits
+    # (which is exactly how the _pattern_zoff 3-D dz term slipped past this
+    # test: only the final grid_locations assertion noticed).
+    dm._pattern_zoff = {}           # 3-D per-site dz offsets (none in this 2-D case)
+    dm.grid_locations_mid = None    # no verify frame in this single-image setup
 
     t0 = aff.load_matrix()[:, 2].copy()
     imgs = np.array([render(2, 3) for _ in range(8)])

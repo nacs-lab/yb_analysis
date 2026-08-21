@@ -37,3 +37,42 @@ def _isolated_queue_file(tmp_path, monkeypatch):
     if hasattr(mod, '_LEGACY_QUEUE_PATH'):
         monkeypatch.setattr(mod, '_LEGACY_QUEUE_PATH', qp, raising=False)
     yield
+
+
+# --------------------------------------------------------------------------- #
+# Figure normalization for the dashboard panel tests.
+#
+# The dashboard's panel builders are being migrated to "Approach A": they return
+# a raw figure-JSON dict ({"data": [...], "layout": {...}}) instead of a
+# go.Figure, so the hot live-update path skips plotly object construction and
+# serializes straight through orjson. The migration is per-panel and ongoing --
+# _fig_array / _fig_loading / _fig_infid already return dicts, while _fig_intens
+# / _fig_loading_live / _waiting still return go.Figure (and _fig_array itself
+# still returns a go.Figure on its _waiting placeholder branch).
+#
+# Tests should assert on the FIGURE CONTENT, not on which of the two
+# representations a given panel happens to use today. fig_json() normalizes
+# either into the plain dict form so a later Approach-A conversion does not
+# break a test that never cared.
+# --------------------------------------------------------------------------- #
+def fig_json(fig):
+    """Normalize a panel builder's return value to a plain figure-JSON dict.
+
+    Accepts either a go.Figure (legacy panels, and the _waiting placeholder) or
+    the raw {"data": [...], "layout": {...}} dict (Approach A) and always
+    returns the dict form, with 'data' and 'layout' keys present.
+    """
+    if hasattr(fig, "to_plotly_json"):
+        fig = fig.to_plotly_json()
+    if not isinstance(fig, dict):
+        raise TypeError("not a figure: %r" % (type(fig),))
+    fig = dict(fig)
+    fig.setdefault("data", [])
+    fig.setdefault("layout", {})
+    return fig
+
+
+@pytest.fixture
+def figjson():
+    """Fixture form of :func:`fig_json` (import the function directly if easier)."""
+    return fig_json

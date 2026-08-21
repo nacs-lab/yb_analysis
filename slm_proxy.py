@@ -32,8 +32,18 @@ logger = logging.getLogger(__name__)
 
 # Shared pickle file path. Sits next to the existing dashboard data and
 # queue pickles in tempdir so the dashboard subprocess can read all three
-# the same way.
+# the same way. Redirectable per-process via YB_DASH_TMPDIR (see
+# yb_analysis.config.dash_pickle_path) -- the tests point it at a private dir so
+# they can never read or clobber a LIVE dashboard's pickle on the lab machine.
 SLM_DATA_FILE = os.path.join(tempfile.gettempdir(), 'yb_dash_slm.pkl')
+
+
+def _slm_data_file():
+    """The SLM pickle path, resolved at CALL time so YB_DASH_TMPDIR applies even
+    when it is set after this module is imported (which is what a test fixture
+    does). Falls back to the module-level default."""
+    from yb_analysis import config
+    return config.dash_pickle_path('yb_dash_slm.pkl')
 
 
 class SlmProxy:
@@ -183,7 +193,8 @@ class SlmProxy:
             snapshot['last_poll_ts'] = dict(self._state['last_poll_ts'])
             snapshot['last_error_ts'] = dict(self._state['last_error_ts'])
             snapshot['last_error_msg'] = dict(self._state['last_error_msg'])
-        tmp = SLM_DATA_FILE + '.tmp'
+        dest = _slm_data_file()
+        tmp = dest + '.tmp'
         import time as _t
         with self._write_lock:
             try:
@@ -199,7 +210,7 @@ class SlmProxy:
             last = None
             for _attempt in range(5):
                 try:
-                    os.replace(tmp, SLM_DATA_FILE)
+                    os.replace(tmp, dest)
                     return
                 except OSError as e:
                     last = e
@@ -213,7 +224,7 @@ def _read_slm_data():
     Returns the unpickled dict, or None if the file is missing / unreadable.
     """
     try:
-        with open(SLM_DATA_FILE, 'rb') as f:
+        with open(_slm_data_file(), 'rb') as f:
             return pickle.load(f)
     except (FileNotFoundError, EOFError, pickle.UnpicklingError, OSError):
         return None
