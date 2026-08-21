@@ -2031,11 +2031,11 @@ def test_rotation_disabled_by_a_zero_threshold(tmp_path, monkeypatch):
     assert hs._rotate_limit_bytes(None) is None
 
 
-def test_config_threshold_default_is_50_gb():
+def test_config_threshold_default_is_10_gb():
     """The configured default, in bytes, is what an unset override resolves to."""
     from yb_analysis import config as _cfg
-    assert _cfg.IMAGE_FILE_ROTATE_GB == 50.0
-    assert hs._rotate_limit_bytes(None) == 50.0 * 1024 ** 3
+    assert _cfg.IMAGE_FILE_ROTATE_GB == 10.0
+    assert hs._rotate_limit_bytes(None) == 10.0 * 1024 ** 3
     assert hs._rotate_limit_bytes(2 * 1024 ** 2) == 2 * 1024 ** 2
 
 

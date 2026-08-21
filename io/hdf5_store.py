@@ -38,7 +38,7 @@ ROTATION (huge scans) -- lazy virtual-dataset segments
 ------------------------------------------------------
 A multi-day scan can drive the bulk file past any sane single-file size, so when
 ``image_<stamp>.h5`` grows beyond ``config.IMAGE_FILE_ROTATE_GB`` (env
-``YB_IMAGE_FILE_ROTATE_GB``, default 50 GB) the next ``append_images_block``
+``YB_IMAGE_FILE_ROTATE_GB``, default 10 GB) the next ``append_images_block``
 ROTATES -- between blocks, never mid-handle::
 
     image_<stamp>.000.h5   frozen segment (the old bulk file, renamed)
@@ -385,7 +385,7 @@ SEGMENT_LAYOUT = 'images'           # a segment carries the plain images layout 
 
 # Fallback when config cannot be read (import problem, exotic value): the
 # documented default of config.IMAGE_FILE_ROTATE_GB.
-_ROTATE_GB_FALLBACK = 50.0
+_ROTATE_GB_FALLBACK = 10.0
 
 # The rename / master-publish retries are SHORT on purpose: a concurrent reader
 # holding the file open on Windows blocks the rename, and postponing rotation to
