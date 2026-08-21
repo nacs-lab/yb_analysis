@@ -54,6 +54,55 @@ def test_knm_to_xy_swaps_once():
     np.testing.assert_array_equal(xy, [[9.0, 5.0], [2.0, 1.0]])
 
 
+# --- canonical_knm: guard a transposed ([x,y]) record ---------------------------
+# Regression for 2x11x11_5um_back2um (2026-07-14): the server returned positions_knm
+# as [x,y] for this pattern, transposing knm while positions_knm3d stayed [y,x,z].
+# A swapped knm here would poison the GLOBAL affine, not just the grid.
+
+def test_canonical_knm_corrects_transpose_via_pos3d():
+    yx = [[454.5, 636.5], [500.5, 632.0], [512.0, 640.0]]     # canonical [y, x]
+    p3 = [[y, x, -2.7778] for (y, x) in yx]
+    bad = [[x, y] for (y, x) in yx]                           # stored swapped [x, y]
+    out = aff.canonical_knm({'knm': bad, 'positions_knm3d': p3})
+    np.testing.assert_allclose(out, yx)
+
+
+def test_canonical_knm_passthrough_when_canonical():
+    yx = [[454.5, 636.5], [500.5, 632.0]]
+    p3 = [[y, x, 1.0] for (y, x) in yx]
+    np.testing.assert_allclose(aff.canonical_knm({'knm': yx, 'positions_knm3d': p3}), yx)
+
+
+def test_canonical_knm_tolerates_drift():
+    """~1 px drift between knm and positions_knm3d (as the real record had) still detected as the
+    transpose by RELATIVE fit."""
+    rng = np.random.RandomState(1)
+    ys = np.linspace(454, 570, 11); xs = np.linspace(632, 752, 11)
+    yx = np.array([[y, x] for y in ys for x in xs], float)
+    p3 = np.column_stack([yx, np.full(len(yx), -2.7778)])
+    bad = yx[:, ::-1] + rng.uniform(-0.8, 0.8, yx.shape)     # swapped [x,y] + drift
+    np.testing.assert_allclose(aff.canonical_knm({'knm': bad.tolist(),
+                                                  'positions_knm3d': p3.tolist()}), yx)
+
+
+def test_canonical_knm_trusts_unrelated_and_no_pos3d():
+    # unrelated to pos3d -> don't guess, return knm
+    p3 = [[10.0, 20.0, 0.0], [30.0, 40.0, 0.0]]
+    knm = [[1.0, 2.0], [3.0, 4.0]]
+    np.testing.assert_allclose(aff.canonical_knm({'knm': knm, 'positions_knm3d': p3}), knm)
+    # no pos3d -> return knm as-is (no heuristic)
+    np.testing.assert_allclose(aff.canonical_knm({'knm': knm}), knm)
+
+
+def test_canonical_knm_resilient_to_garbage():
+    assert aff.canonical_knm({}) is None
+    assert aff.canonical_knm({'knm': []}) is None
+    assert aff.canonical_knm(None) is None
+    knm = [[1.0, 2.0], [3.0, 4.0]]
+    np.testing.assert_allclose(aff.canonical_knm({'knm': knm, 'positions_knm3d': 'nope'}), knm)
+    np.testing.assert_allclose(aff.canonical_knm({'knm': knm, 'positions_knm3d': [[1.0]]}), knm)
+
+
 def test_crop_separation_offset_only():
     knm_xy = _grid_xy(4)
     abs_yx = aff.apply_affine(knm_xy, A_TRUE)

@@ -115,6 +115,34 @@ def load_matrix() -> Optional[np.ndarray]:
     return np.asarray(cur['A'], dtype=np.float64).reshape(2, 3)
 
 
+def load_dz() -> Optional[dict]:
+    """The optional LINEAR DEFOCUS (3-D) correction, or None when not configured.
+
+    A site imaged away from the camera-focus plane walks laterally on the camera
+    (defocus-PSF centroid pull + any tilt/non-telecentricity), measured LINEAR in the
+    site's TOTAL ANSI-z4 defocus (2026-07-15, per-plane registration of the
+    2x11x11_5um_back2um bifocal across a 13-rad carrier sweep: translation ~0.25 px/rad
+    in row, scale flat <0.1%/rad -> translation-only term).
+
+    Stored as an ADDITIVE top-level ``dz`` block in affine_transform.json (old readers
+    ignore it): ``{"v": [v_col0, v_col1] px/rad in apply_affine_cropped's output column
+    order, "z_ref": <carrier defocus the base affine is calibrated at, default -5.0>}``.
+
+    Applied ONLY to 3-D (``is_3d``) pattern records, per site:
+    ``grid[i] += v * ((loading_defocus - z_ref) + z_rad[i])`` -- so every flat-2-D
+    pattern, at ANY defocus, is byte-identical to the pre-dz behaviour, and a 3-D
+    pattern at the reference carrier only corrects the +-plane offsets."""
+    with _LOCK:
+        dz = _read().get('dz')
+    if not isinstance(dz, dict) or dz.get('v') is None:
+        return None
+    try:
+        v = np.asarray(dz['v'], dtype=np.float64).reshape(2)
+    except Exception:  # noqa: BLE001 - malformed block -> behave as unconfigured
+        return None
+    return {'v': v, 'z_ref': float(dz.get('z_ref', -5.0))}
+
+
 # ---------------------------------------------------------------------------
 # Core math (axis-order discipline lives here)
 # ---------------------------------------------------------------------------
@@ -123,6 +151,89 @@ def _knm_to_xy(knm) -> np.ndarray:
     """Registry knm is ``[y, x]``; affine math wants ``[x, y]``. Swap ONCE."""
     knm = np.asarray(knm, dtype=np.float64).reshape(-1, 2)
     return knm[:, [1, 0]]
+
+
+def _apply_knm_offset(knm, record) -> np.ndarray:
+    """Add the record's optional per-pattern ``knm_offset`` (knm-px, ``[y, x]``).
+
+    No-op when unset/malformed, so every pre-existing record behaves exactly as before.
+    Kept local (no hard import of pattern_registry) so this module stays importable on its
+    own, and so a registry problem can never break affine math.
+    """
+    off = (record or {}).get('knm_offset') if isinstance(record, dict) else None
+    if off is None:
+        return knm
+    try:
+        off = np.asarray(off, dtype=np.float64).reshape(2)
+    except (ValueError, TypeError):
+        logger.warning('pattern %r: malformed knm_offset %r; ignoring',
+                       (record or {}).get('name'), (record or {}).get('knm_offset'))
+        return knm
+    if not np.isfinite(off).all() or not off.any():
+        return knm
+    return np.asarray(knm, dtype=np.float64) + off[None, :]
+
+
+def canonical_knm(record) -> Optional[np.ndarray]:
+    """A pattern record's trap positions as canonical registry ``[y, x]`` (N,2), guarding against a
+    record whose ``knm`` was written TRANSPOSED as ``[x, y]``.
+
+    The registry convention is ``knm = [y, x]`` (see :mod:`pattern_registry` docs) and every consumer
+    -- this affine fit, the live grid build, run_analysis -- assumes it. A server derivation once
+    returned ``positions_knm`` as ``[x, y]`` for one pattern (``2x11x11_5um_back2um``, 2026-07-14),
+    which silently swapped ``knm`` while ``positions_knm3d`` stayed ``[y, x, z]``. That transposed the
+    detection grid (boxes on the wrong side of the frame -> loading/survival ~0) AND would have
+    poisoned the GLOBAL affine had that pattern been used to fit it. This guard uses the 3-D source as
+    ground truth and only corrects a provable, well-separated transpose (never guesses):
+
+      * ``knm`` matches ``positions_knm3d[:, :2]``            -> already canonical, use it.
+      * ``knm`` matches ``positions_knm3d[:, [1,0]]`` far better (relative fit, robust to the ~1 px
+        drift between the two stored copies) -> transposed; use the 3-D ``[y, x]``.
+      * no ``positions_knm3d`` / no clear winner / any error  -> return ``knm`` unchanged.
+
+    THEN adds the record's optional per-pattern ``knm_offset`` (knm-px, ``[y, x]``; see
+    :mod:`pattern_registry`). This is the ONLY place the offset enters on this side, and it is
+    deliberately upstream of everything -- grid build, affine fit, bootstrap, run_analysis -- so the
+    GLOBAL affine is fit BLIND to it: a pattern carrying ``knm_offset`` is fit exactly as if its
+    sites had genuinely been extracted that far away, leaving the affine a pure global-drift fit
+    instead of a tug-of-war between patterns that need different translations. Applied AFTER the
+    transpose guard, since the offset is stored in canonical ``[y, x]``.
+
+    Mirrors ``pyctrl/lib/pattern_grid._canonical_knm`` (the engine-side reader) so both agree.
+    Returns None only when the record has no usable ``knm``.
+    """
+    raw = record.get('knm') if isinstance(record, dict) else None
+    if raw is None or (hasattr(raw, '__len__') and len(raw) == 0):
+        return None
+    try:
+        knm = np.asarray(raw, dtype=np.float64).reshape(-1, 2)
+    except (ValueError, TypeError):
+        return None
+    p3 = record.get('positions_knm3d') if isinstance(record, dict) else None
+    if not p3:
+        return _apply_knm_offset(knm, record)
+    try:
+        p3 = np.asarray(p3, dtype=np.float64)
+        if p3.ndim != 2 or p3.shape[0] != knm.shape[0] or p3.shape[1] < 2:
+            return _apply_knm_offset(knm, record)
+        yx = p3[:, :2]
+        finite = np.isfinite(knm).all(1) & np.isfinite(yx).all(1)
+        if not finite.any():
+            return _apply_knm_offset(knm, record)
+        k, g = knm[finite], yx[finite]
+        d_same = float(np.max(np.abs(k - g)))
+        d_swap = float(np.max(np.abs(k - g[:, ::-1])))
+        span = float(np.max(g.max(axis=0) - g.min(axis=0))) if len(g) > 1 else 0.0
+        # Transposed only when the swapped orientation fits DRAMATICALLY better (<= 1/8 of the
+        # as-stored residual) AND sub-lattice in absolute terms -- an unrelated/edited knm (both
+        # large, no clear winner) is left untouched.
+        if d_swap <= max(1.0, span / 20.0) and d_swap <= d_same / 8.0:
+            logger.warning('pattern knm looks transposed ([x,y]); using positions_knm3d [y,x] '
+                           '(d_same=%.1f d_swap=%.1f)', d_same, d_swap)
+            return _apply_knm_offset(yx, record)
+        return _apply_knm_offset(knm, record)
+    except Exception:  # noqa: BLE001 - the guard must never break grid/affine resolution
+        return _apply_knm_offset(knm, record)
 
 
 def fit_affine(knm_xy, cam_abs_yx):
@@ -520,7 +631,15 @@ def bootstrap_from_scan(avg_image, pattern_record, roi, *,
 
     Returns the candidate dict (NOT committed — caller commits if accepted).
     """
-    knm_yx = np.asarray(pattern_record['knm'], dtype=np.float64)
+    # Guard against a transposed record ([x,y]) so the affine is fit against canonical [y,x]
+    # (a swapped knm here would poison the GLOBAL affine, not just this pattern's grid).
+    knm_yx = canonical_knm(pattern_record)
+    if knm_yx is None:
+        # Fallback path: still apply the per-pattern offset, or a bootstrap fit would
+        # be the one place that sees UNCORRECTED coordinates and would bake this
+        # pattern's registration error straight into the global affine.
+        knm_yx = _apply_knm_offset(
+            np.asarray(pattern_record['knm'], dtype=np.float64), pattern_record)
     n_sites = knm_yx.shape[0]
     if detected_yx is None:
         n_det = int(round(n_det_factor * n_sites))

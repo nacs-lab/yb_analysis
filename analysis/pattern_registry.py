@@ -22,6 +22,9 @@ the base dir via ``$YB_PATTERNS_DIR``). Persistence mirrors
      "threshold": 0.30, "min_dist": null,
      "n_sites": 1068,
      "knm": [[y, x], ...],            # (N,2) knm-1024-space, (y,x)
+     "knm_offset": [dy, dx] | null,   # OPTIONAL per-pattern registration offset,
+                                      # knm-px, (y,x). See below.
+     "knm_offset_note": "..." | null, # provenance: who measured it, from which scan
      "phases": [...],                 # (N,) per-site phase (rad)
      "lattice": {rows, cols, n_rows, n_cols, pitch_x, pitch_y,
                  row_basis, col_basis, tilt_deg, n_missing, x0, y0},
@@ -40,6 +43,39 @@ only that, so a 3-D record is a strict superset and 2-D detection is
 unchanged. Site order for a 3-D record is LAYER-MAJOR (declared plane order,
 then within-layer ``order``).
 
+``knm_offset`` -- the per-pattern registration offset
+----------------------------------------------------
+The GLOBAL affine maps knm -> camera for EVERY pattern, so it can only ever
+carry effects that are common to all of them (camera/optics drift). A residual
+that belongs to ONE pattern -- its extracted coordinate origin sitting a couple
+of knm-px away from where the physical array actually lands -- has nowhere to
+live in that model, and dragging the shared affine to absorb it makes every
+OTHER pattern wrong by the same amount. Measured 2026-08-11: with one affine
+fitting both ``17x17_20um`` (0.35 px rms) and ``33x33_feedback11`` (0.47 px rms
+over 903 sites) at the SAME scale (0.06 %) and rotation (0.0013 deg), the two
+still needed translations 4.94 cam-px apart in Y -- a per-pattern translation
+and nothing else.
+
+``knm_offset`` is that translation, in knm-px, registry ``(y, x)`` order, and
+it is **added to the stored ``knm`` at read time**::
+
+    knm_effective = knm + knm_offset
+
+Applied by :func:`affine_transform.canonical_knm` and its engine-side mirror
+``pyctrl.lib.pattern_grid._canonical_knm``, i.e. BEFORE anything -- grid build,
+affine fit, bootstrap, run_analysis -- ever sees the coordinates. So the affine
+is fit **blind to it**: a pattern carrying offset ``(10, 0)`` is fit exactly as
+if its sites had genuinely been extracted 10 knm-px away, and the affine stays a
+pure global-drift fit. Nothing downstream needs to know the offset exists.
+
+Null/absent means ``(0, 0)`` -- every existing record is unchanged. The offset
+is PRESERVED across a server refresh (the server derives positions from the
+phase and knows nothing about it) and is deliberately NOT part of the refresh
+cache key.
+
+Set it with :func:`set_knm_offset`, which is additive-aware and records
+provenance in ``knm_offset_note``.
+
 Public API::
 
     list_patterns()            -> {name: <compact metadata>}
@@ -47,6 +83,8 @@ Public API::
     write_pattern(record)      -> None
     delete_pattern(name)       -> bool
     fetch_or_refresh_pattern(name, *, base_phase_path, ...) -> record | None
+    get_knm_offset(record)     -> (2,) float ndarray, (dy, dx); zeros if unset
+    set_knm_offset(name, dy, dx, *, note=None, add=False) -> record
 """
 
 from __future__ import annotations
@@ -178,6 +216,64 @@ def write_pattern(record: dict) -> None:
         raise ValueError('record must have a name')
     with _LOCK:
         _write(record)
+
+
+def get_knm_offset(record) -> 'np.ndarray':
+    """This pattern's registration offset as ``(dy, dx)`` knm-px; zeros if unset.
+
+    Accepts a record dict or a pattern NAME. Never raises on a malformed value --
+    a bad offset must degrade to "no offset", not break grid resolution for the
+    whole run (the same discipline :func:`affine_transform.canonical_knm` uses).
+    """
+    import numpy as np
+    if isinstance(record, str):
+        record = get_pattern(record) or {}
+    raw = record.get('knm_offset') if isinstance(record, dict) else None
+    if raw is None:
+        return np.zeros(2, dtype=np.float64)
+    try:
+        off = np.asarray(raw, dtype=np.float64).reshape(2)
+    except (ValueError, TypeError):
+        logger.warning('pattern_registry: malformed knm_offset %r on %r; ignoring',
+                       raw, (record or {}).get('name'))
+        return np.zeros(2, dtype=np.float64)
+    if not np.isfinite(off).all():
+        logger.warning('pattern_registry: non-finite knm_offset %r on %r; ignoring',
+                       raw, (record or {}).get('name'))
+        return np.zeros(2, dtype=np.float64)
+    return off
+
+
+def set_knm_offset(name: str, dy: float, dx: float, *, note=None,
+                   add: bool = False) -> dict:
+    """Set (or accumulate) a pattern's registration offset, in knm-px ``(y, x)``.
+
+    ``add=True`` ADDS to the existing offset, which is what you want after
+    measuring a residual on top of an already-offset pattern -- measuring again
+    and calling with ``add=False`` would double-count whatever the first offset
+    already removed.
+
+    ``note`` should say who measured it and from which scan; it is stored in
+    ``knm_offset_note`` so the number is never a bare magic constant.
+    """
+    import numpy as np
+    with _LOCK:
+        rec = _read(name)
+        if rec is None:
+            raise KeyError('pattern %r not in the registry' % (name,))
+        base = np.zeros(2, dtype=np.float64)
+        if add:
+            base = get_knm_offset(rec)
+        off = base + np.asarray([float(dy), float(dx)], dtype=np.float64)
+        if not np.isfinite(off).all():
+            raise ValueError('knm_offset must be finite; got %r' % (off.tolist(),))
+        rec['knm_offset'] = [float(off[0]), float(off[1])]
+        rec['knm_offset_note'] = note
+        rec['updated_iso'] = _now_iso()
+        _write(rec)
+    logger.info('pattern_registry: %s knm_offset -> (%.4f, %.4f) knm-px%s',
+                name, off[0], off[1], (' [%s]' % note) if note else '')
+    return rec
 
 
 def delete_pattern(name: str) -> bool:
@@ -407,6 +503,13 @@ def fetch_or_refresh_pattern(name, *, base_phase_path,
         'min_dist': min_dist,
         'n_sites': resp.get('n_sites'),
         'knm': resp.get('positions_knm'),
+        # PRESERVED across the refresh: the server derives positions from the phase
+        # and knows nothing about this pattern's registration offset, so a refresh
+        # must not silently drop it (that would re-open the misregistration the
+        # offset was measured to close). It is also NOT part of the cache key --
+        # changing it must not force a re-extraction.
+        'knm_offset': (existing or {}).get('knm_offset'),
+        'knm_offset_note': (existing or {}).get('knm_offset_note'),
         'phases': resp.get('phases'),
         'lattice': resp.get('lattice'),
         # 3-D fields: echo what the server returned. For a 2-D request the
