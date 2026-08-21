@@ -30,7 +30,7 @@ import numpy as np
 _ROOT = r"c:\msys64\home\Ybtweezer-PC2\projects\experiment-control"
 MASK_REGISTRY = {
     # 744 sites whose relative trap depth changed <5% between the 06-22 post-feedback
-    # map and the 07-05 measurement (regenerate: _daily/_stable_mask.py).
+    # map and the 07-05 measurement (regenerate: campaigns/daily/scratch/_stable_mask.py).
     "stable": os.path.join(_ROOT, "_daily", "stable_sites_lt5pct.npy"),
 }
 

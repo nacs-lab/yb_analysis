@@ -4620,7 +4620,7 @@ _TRAP_DEPTH_F0_MARGIN_HZ = 0.15e6
 def _trap_depth_from_lightshift(delta_nu):
     """556 |mj|=1-vs-mj=0 excited-state light-shift difference (Hz) -> ground-
     state trap depth (uK). ``delta_nu = 2*(f0 - f_site)``. Ported verbatim from
-    the trap-depth-feedback campaign (``_feedback47x47/fit_trap_depths.py``): a
+    the trap-depth-feedback campaign (``campaigns/feedback/47x47/fit_trap_depths.py``): a
     532 nm tweezer, mj1=1, mj0=0, theta=0. Depth is LINEAR in ``delta_nu``, so the
     overall scale cancels in the CV; the absolute uK only sets the histogram axis.
     Vectorised over sites."""
@@ -4650,7 +4650,7 @@ def _trap_depth_from_pushout(scan_dir, scan, scan_params_full, logic1_full,
     the scan being named ``Spectrum556Scan``.
 
     Mirrors the trap-depth-feedback campaign
-    (``_feedback47x47/fit_trap_depths.py``): a per-site Lorentzian PEAK on
+    (``campaigns/feedback/47x47/fit_trap_depths.py``): a per-site Lorentzian PEAK on
     ``1 - survival`` vs the push-out green frequency gives each site's |mj|=1
     center ``f_i``; the differential light shift converts it to a trap depth
     ``d_i`` (``delta_nu = 2*(f0 - f_i)``), with ``f0`` = the mj=0 resonance from
