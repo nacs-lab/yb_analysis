@@ -7173,7 +7173,7 @@ def _fig_scan_timeseries(d):
             # verify-conditioned survival restricted to target sites (STIRAP).
             y_label = 'Survival @ target (verify-cond.)'
         elif target_aware:
-            y_label = _survival_y_label(sc)
+            y_label = _survival_y_label(sh)
         else:
             y_label = 'Survival'
         series_name = 'survival'

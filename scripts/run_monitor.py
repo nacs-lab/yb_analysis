@@ -19,6 +19,7 @@ import os
 import signal
 
 from yb_analysis.acquisition.port_utils import kill_port
+from yb_analysis.acquisition import single_instance
 from yb_analysis.config import (
     MATLAB_URL, DASHBOARD_PORT, MATLAB_EXE, MATLAB_ROOT,
     SLM_URL, SLM_VERIFY_TLS, SLM_PASSWORD_PATH, SLM_POLL_INTERVALS_MS,
@@ -84,6 +85,11 @@ def main():
                         help=f'MATLAB framework directory (default: {MATLAB_ROOT})')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable debug logging')
+    parser.add_argument('--allow-duplicate', action='store_true',
+                        help='Bypass the single-instance guard. Two monitors '
+                             'SPLIT the camera ZMQ frames and each records only '
+                             '~half the shots -- only use this with --no-runner '
+                             'for offline replay/analysis.')
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -117,6 +123,18 @@ def main():
                     'proceeding anyway (kill_port will scrub).', old_pid)
         except Exception as _ex:
             logging.warning('YB_WAIT_FOR_PID wait failed: %s', _ex)
+
+    # Refuse to start alongside a live monitor. This MUST precede kill_port():
+    # the dashboard listener is a child process, so a duplicate would otherwise
+    # scrub the running dashboard off port 8050 while the first monitor stayed
+    # alive and kept consuming camera frames -- ZMQ then round-robins the frames
+    # and EACH monitor records only ~half the shots (2026-08-28: 51% of a scan
+    # lost this way, and the interleaved loss mimicked a physics anomaly).
+    try:
+        single_instance.acquire(force=args.allow_duplicate)
+    except RuntimeError as ex:
+        parser.error(str(ex))
+    atexit.register(single_instance.release)
 
     # Clear any stale listener on the dashboard port + the sibling analysis-API
     # port (dashboard port + 1; see DashboardRenderer._api_port).
