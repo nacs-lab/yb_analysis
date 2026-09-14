@@ -419,6 +419,16 @@ SLM_HTTP_TIMEOUT_S = (2.0, 5.0)
 #     gate is opened. Point YB_MOLECUBE_URL at the local mock for development.
 MOLECUBE_URL = os.environ.get('YB_MOLECUBE_URL', 'tcp://192.168.0.174:7777')
 MOLECUBE_TIMEOUT_MS = int(os.environ.get('YB_MOLECUBE_TIMEOUT_MS', '2000'))
+# Channels-page live refresh (labctrl-node polling model, see dashboard.py
+# _molecube_snapshot_cached): every browser poll costs the daemon only the two
+# cheap `state_id`/`name_id` requests; the full DDS/TTL re-read happens when
+# those ids change, when a sequence is RUNNING (state_id sign bit) at most once
+# per MOLECUBE_RUN_REFRESH_S, or when the cache is older than
+# MOLECUBE_SNAPSHOT_MAX_AGE_S. All viewers share ONE cache, so N open tabs never
+# multiply the daemon traffic. YB_MOLECUBE_LIVE_RUNNING=0 disables mid-sequence
+# re-reads entirely (values then refresh only at sequence start/end).
+MOLECUBE_RUN_REFRESH_S = float(os.environ.get('YB_MOLECUBE_RUN_REFRESH_S', '1.0'))
+MOLECUBE_SNAPSHOT_MAX_AGE_S = float(os.environ.get('YB_MOLECUBE_SNAPSHOT_MAX_AGE_S', '60'))
 
 
 def _read_molecube_max_ttl_chn():

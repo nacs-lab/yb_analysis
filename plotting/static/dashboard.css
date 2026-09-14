@@ -3681,6 +3681,12 @@ textarea::-webkit-scrollbar-thumb:hover,
 }
 .mc-name-save { flex: 0 0 auto; border-color: var(--accent-dim); }
 .mc-cell { white-space: nowrap; }
+/* A DDS value the user typed but has not Set yet: protected from live refresh
+   until submitted (Set / Enter) or reverted (Escape). */
+.mc-cell-wrap .mc-in.mc-dirty {
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
 .mc-cell.mc-ovr { background: color-mix(in srgb, var(--warn) 14%, transparent); }
 /* Each editable cell lays its input + Set/ovr buttons out in a no-wrap flex row
    with a gap, so they never overlap even on narrow columns. */

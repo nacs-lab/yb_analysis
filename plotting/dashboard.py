@@ -4455,7 +4455,13 @@ _molecube_client_box = {}
 # lives only in the engine venv. Shape mirrors the molecube reads: gated +
 # cached. See _register_nidaq_routes below.
 _NIDAQ_CACHE = {'data': None, 'ts': 0.0}        # last good driver result + monotonic time
-_NIDAQ_CACHE_TTL_S = 5.0                          # serve cache within this window (spawn is ~1-2 s)
+# Serve the cache within this window instead of re-spawning the driver. Every spawn is a
+# fresh DAQmx client session against the NI Configuration Manager (nimxs.exe / mxssvr);
+# at the old 5 s TTL the ~6 s browser poll spawned 13k-30k/day and nimxs leaked
+# threads/handles/sockets until it threw (2026-09-11, mxsRpcServerGetReferences) and every
+# NI read failed with DAQmx -229771. 60 s cuts spawns ~10x; a successful /api/nidaq/set
+# invalidates the cache so the new value shows on the next poll.
+_NIDAQ_CACHE_TTL_S = 60.0
 _NIDAQ_LOCK = threading.Lock()                    # serialize spawns (one reader at a time)
 
 
@@ -4530,7 +4536,13 @@ def _molecube_gated_write(fn):
             return jsonify({'ok': False, 'gated': True, 'kind': 'write',
                             'error': 'Molecube writes are disabled (read-only mode). '
                                      'Enable with YB_MOLECUBE_WRITES=1.'}), 403
-        return fn(*args, **kwargs)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # Any write (even a failed one) may have moved device state: drop the
+            # shared snapshot cache so the next poll re-reads instead of trusting
+            # the daemon's state_id bump alone.
+            _molecube_snapshot_invalidate()
     return _wrapped
 
 
@@ -4545,6 +4557,110 @@ def _molecube_client():
         cli = MolecubeClient(_cfg.MOLECUBE_URL, timeout_ms=_cfg.MOLECUBE_TIMEOUT_MS)
         _molecube_client_box['cli'] = cli
     return cli
+
+
+# ---------------------------------------------------------------------------
+# Shared molecube snapshot cache -- the labctrl-node polling model.
+#
+# molecube2's `state_id` is a 64-bit word: the TOP bit is set while a sequence is
+# running ("values constantly changing"), the low 63 bits count state changes seen
+# while idle (bumped at every sequence start/stop and on any idle-time change since
+# the id was last observed). labctrl-node polls state_id/name_id at 0.5 s and
+# re-reads the full DDS/TTL state only when the ids changed, on EVERY poll while
+# the run bit is set, and at least once a minute. We do the same here, on the
+# server, so that (a) each browser poll costs the daemon two tiny requests, (b) the
+# ~10-request full read happens only when something changed, at most once per
+# MOLECUBE_RUN_REFRESH_S during a sequence, and (c) every open dashboard tab shares
+# ONE read stream instead of each hitting the daemon. Reads during a sequence are
+# the same get_dds / zero-mask TTL frames labctrl-node issues; molecube2 documents
+# them as legal concurrent with a running sequence (they are appended behind the
+# sequence's pulses, never interleaved into its timing).
+_MOLECUBE_RUN_BIT = 1 << 63
+_MC_SNAP = {'data': None, 'ts': 0.0, 'key': None}   # last full snapshot + monotonic ts
+_MC_SNAP_LOCK = threading.Lock()
+
+
+def _molecube_live_running_open():
+    """Whether the cache re-reads DDS/TTL while a sequence is RUNNING. OPEN by default
+    (labctrl-node parity). YB_MOLECUBE_LIVE_RUNNING=0 -> values refresh only at
+    sequence start/end (zero mid-sequence daemon reads from the channels page)."""
+    return os.environ.get('YB_MOLECUBE_LIVE_RUNNING', '1').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _molecube_snapshot_invalidate():
+    """Drop the shared cache so the next /api/molecube/snapshot re-reads the daemon."""
+    _MC_SNAP['ts'] = 0.0
+    _MC_SNAP['key'] = None
+
+
+def _molecube_snapshot_cached(force=False):
+    """Return the dashboard snapshot, re-reading the daemon only when needed.
+
+    Always issues `state_id` + `name_id` (cheap). Performs the full
+    ``MolecubeClient.snapshot()`` only on: first call, ``force``, id change (server
+    restart, idle-time change, sequence start/stop, rename), run bit set AND the cache
+    older than MOLECUBE_RUN_REFRESH_S (if live-running is open), or cache older than
+    MOLECUBE_SNAPSHOT_MAX_AGE_S. Adds ``running`` (bool), ``state_cnt`` (the 63-bit
+    counter, JSON-safe), ``cached`` / ``age_s`` / ``refresh`` (why it re-read) so the
+    page can show live status without touching the raw 64-bit id.
+    """
+    from yb_analysis import config as _cfg
+    from yb_analysis.control import molecube_client as _mcm
+    cli = _molecube_client()
+    ttl_on = _molecube_ttl_reads_open()
+    max_chn = getattr(_cfg, 'MOLECUBE_MAX_TTL_CHN', None)
+    run_refresh = float(getattr(_cfg, 'MOLECUBE_RUN_REFRESH_S', 1.0))
+    max_age = float(getattr(_cfg, 'MOLECUBE_SNAPSHOT_MAX_AGE_S', 60.0))
+    live_running = _molecube_live_running_open()
+
+    try:
+        sid, server_id = cli.state_id()
+    except _mcm.MolecubeError as e:
+        return {'url': cli.url, 'connected': False, 'errors': {'state_id': str(e)},
+                'writes_enabled': _molecube_writes_open(), 'ttl_reads_enabled': ttl_on,
+                'live_running': live_running}
+    try:
+        nid = cli.name_id()[0]
+    except _mcm.MolecubeError:
+        nid = None
+    running = bool(sid & _MOLECUBE_RUN_BIT)
+    state_cnt = sid & (_MOLECUBE_RUN_BIT - 1)
+    key = (server_id, state_cnt, nid, ttl_on, max_chn)
+
+    with _MC_SNAP_LOCK:
+        now = time.monotonic()
+        cached = _MC_SNAP['data']
+        age = now - _MC_SNAP['ts']
+        if force:
+            reason = 'force'
+        elif cached is None:
+            reason = 'first'
+        elif _MC_SNAP['key'] != key:
+            reason = 'changed'
+        elif age >= max_age:
+            reason = 'stale'
+        elif running and live_running and age >= run_refresh:
+            reason = 'running'
+        else:
+            reason = None
+        if reason is None:
+            snap = dict(cached)
+            snap.update(cached=True, age_s=age, refresh=None)
+        else:
+            fresh = cli.snapshot(include_ttl=ttl_on, ttl_max_chn=max_chn)
+            if fresh.get('connected'):
+                _MC_SNAP['data'] = fresh
+                _MC_SNAP['ts'] = now
+                _MC_SNAP['key'] = key
+            snap = dict(fresh)
+            snap.update(cached=False, age_s=0.0, refresh=reason)
+
+    snap.update(state_id=sid, state_cnt=state_cnt, running=running, name_id=nid,
+                server_id=server_id, writes_enabled=_molecube_writes_open(),
+                ttl_reads_enabled=ttl_on, live_running=live_running,
+                run_refresh_s=run_refresh)
+    return snap
 
 
 def _molecube_encode_value(typ, value, raw):
@@ -4617,16 +4733,12 @@ def _register_molecube_routes(server):
     @server.route('/api/molecube/snapshot')
     @_molecube_gated_read
     def _mc_snapshot():
-        # snapshot() performs several reads and folds per-read failures into
-        # result['errors'] rather than aborting -- ideal for the live poller.
-        # TTL reads are sub-gated off (they'd issue zero-mask set_ttl frames).
-        ttl_on = _molecube_ttl_reads_open()
-        from yb_analysis import config as _cfg
-        snap = _molecube_client().snapshot(
-            include_ttl=ttl_on, ttl_max_chn=getattr(_cfg, 'MOLECUBE_MAX_TTL_CHN', None))
-        snap['writes_enabled'] = _molecube_writes_open()
-        snap['ttl_reads_enabled'] = ttl_on
-        return jsonify(snap)
+        # Cached + id-gated (see _molecube_snapshot_cached): the poller pays two
+        # cheap id requests per call; the full DDS/TTL read runs only on change,
+        # at a bounded rate while a sequence runs, or on ?force=1 (Refresh button).
+        # Per-read failures inside the full read are folded into result['errors'].
+        force = request.args.get('force', '').strip().lower() in ('1', 'true', 'yes')
+        return jsonify(_molecube_snapshot_cached(force=force))
 
     @server.route('/api/molecube/startup')
     @_molecube_gated_read

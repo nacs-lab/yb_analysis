@@ -37,7 +37,7 @@
     // refresh so it self-updates as scans complete. List-only (analysis re-run
     // is gated to shot growth), and the rebuild is skipped when unchanged.
     scans:    3000,
-    molecube: 1500,
+    molecube: 1000,   // channels page; server-side cache keeps daemon reads bounded
     // NI DAC monitor (Hardware/Molecube sub-view). Slower than molecube: each
     // poll spawns an engine-python subprocess to read the card, server-cached
     // ~5 s, so a tight loop would just re-serve the cache.
@@ -330,6 +330,7 @@
         m._mcWired = true;
         m.addEventListener("click", mcControlClick);
         m.addEventListener("keydown", mcControlKeydown);
+        m.addEventListener("input", mcControlInput);
         m.addEventListener("mousedown", mcControlMousedown);
         m.addEventListener("focusout", mcNameFocusOut);
       }
@@ -886,9 +887,12 @@
     // Molecube is a Hardware sub-view now: poll only when it's the active one.
     // Molecube polls when its sub-view is open OR the Overview has molecube
     // tile(s) to keep live; mirror the cards into those tiles after each poll.
+    // Cadence: POLL.molecube once the server answers in its id-gated/cached shape
+    // (each poll = two cheap daemon requests); 1.5 s against an older server that
+    // still does a full daemon read per call.
     loop("molecube",
          async () => { await pollMolecube(); mirrorMolecubeTiles(); },
-         POLL.molecube,
+         () => (_mcServerCached ? POLL.molecube : 1500),
          () => activeTab === "hardware" &&
                (hwSubview === "molecube" ||
                 (hwSubview === "overview" && hwTiles.some((t) => t.source === "molecube"))));
@@ -8399,8 +8403,20 @@
   // gate is closed every call returns 403 and we render a clear "disabled"
   // banner -- so this tab is harmless until the gate is opened. These helpers
   // only ever talk to OUR server's proxy routes, never the daemon directly.
-  let _mcLastStateId = null;
-  let _mcLastNameId = null;   // names bump name_id (NOT state_id) -> rebuild on either
+  // Live-refresh bookkeeping (labctrl-node model; the server does the id-gated
+  // caching, see dashboard.py _molecube_snapshot_cached):
+  //  _mcLastSig      -- JSON signature of the last DDS/TTL content painted. Panels are
+  //                     patched whenever the CONTENT changes, not only when state_id
+  //                     moves (during a sequence molecube2 holds the id and sets its
+  //                     run bit instead, so values must be compared directly).
+  //  _mcLastIdKey    -- state_cnt/name_id of the last startup-script fetch (that one
+  //                     only changes with idle edits -> never refetch it per second).
+  //  _mcServerCached -- the server answered with the cached/id-gated shape; poll at
+  //                     POLL.molecube then, else stay at the older 1.5 s (a pre-restart
+  //                     server does a full daemon read per call).
+  let _mcLastSig = null;
+  let _mcLastIdKey = null;
+  let _mcServerCached = false;
 
   function _mcFmt(v, d) {
     return (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(d);
@@ -8421,7 +8437,7 @@
         body: JSON.stringify(body || {}),
       });
       if (r && r.ok === false) toast("molecube: " + (r.error || "failed"), "err");
-      _mcLastStateId = null; _mcLastNameId = null;   // force a re-render on the next poll
+      _mcLastSig = null;   // force a re-render on the next poll
       await pollMolecube();
       return r;
     } catch (e) {
@@ -8448,13 +8464,14 @@
     const dds = $("mc-dds-body"); if (dds) dds.innerHTML = "<div class='hint'>—</div>";
     const ttl = $("mc-ttl-grid"); if (ttl) ttl.innerHTML = "<div class='hint'>—</div>";
     setText("mc-dds-count", ""); setText("mc-ttl-count", "");
-    _mcLastStateId = null; _mcLastNameId = null;
+    _mcLastSig = null;
   }
 
-  async function pollMolecube() {
+  async function pollMolecube(force) {
     let snap;
     try {
-      snap = await api("/api/molecube/snapshot");
+      // ?force=1 (Refresh button) bypasses the server's snapshot cache.
+      snap = await api("/api/molecube/snapshot" + (force ? "?force=1" : ""));
     } catch (e) {
       if (e.status === 403) { renderMolecubeGated(e.body); return; }
       mcSetPill("err", "error");
@@ -8472,7 +8489,7 @@
         ((snap.errors && snap.errors.state_id) || ""));
       return;
     }
-    mcSetPill("ok", "connected");
+    mcSetPill("ok", snap.running ? "connected · running ▶" : "connected");
     // Read-only banner + dimming when the write gate is closed (the default).
     const readOnly = snap.writes_enabled === false;
     const pane = $("tab-molecube");
@@ -8493,30 +8510,44 @@
     }
     const errs = (snap.errors && Object.keys(snap.errors).length)
       ? "  ⚠ " + Object.keys(snap.errors).join(",") : "";
+    // state_cnt = the 63-bit change counter (JSON-safe); the raw 64-bit state_id
+    // carries the run bit and is unreadable as a number. Old servers send only state_id.
+    _mcServerCached = (snap.state_cnt != null);
+    const stateTxt = snap.state_cnt != null ? snap.state_cnt
+                   : (snap.state_id != null ? snap.state_id : "?");
+    const runTxt = snap.running
+      ? (snap.live_running === false
+           ? " · ▶ sequence running (mid-run refresh off: YB_MOLECUBE_LIVE_RUNNING=0)"
+           : " · ▶ sequence running · values live (" +
+             (snap.run_refresh_s != null ? snap.run_refresh_s : 1) + " s)")
+      : "";
     setText("mc-status-line",
       "server " + (snap.server_id != null ? snap.server_id : "?") +
-      " · state " + (snap.state_id != null ? snap.state_id : "?") +
+      " · state " + stateTxt +
       " · clock " + (snap.clock != null ? snap.clock : "?") +
-      " · max_ttl " + (snap.max_ttl != null ? snap.max_ttl : "?") + errs);
+      " · max_ttl " + (snap.max_ttl != null ? snap.max_ttl : "?") + runTxt + errs);
 
     setText("mc-clock-cur", snap.clock != null ? ("current " + snap.clock) : "");
     const ci = $("mc-clock-input");
     if (ci && document.activeElement !== ci && snap.clock != null && ci.value === "")
       ci.value = snap.clock;
 
-    // Rebuild the DDS/TTL panels only when device state OR names changed (names
-    // bump name_id, not state_id) AND no DDS value / channel-name field is being
-    // edited (so we never stomp a value or a name mid-type).
-    const ae = document.activeElement;
-    const editing = ae && ae.classList &&
-      (ae.classList.contains("mc-in") || ae.classList.contains("mc-name-in"));
-    if (!editing &&
-        (snap.state_id !== _mcLastStateId || snap.name_id !== _mcLastNameId)) {
-      _mcLastStateId = snap.state_id;
-      _mcLastNameId = snap.name_id;
-      renderMcDds(snap.dds || []);
+    // Refresh the DDS/TTL panels whenever their CONTENT changed. Rows are patched
+    // IN PLACE (mcApplyDds / mcApplyTtl): focus, half-typed "dirty" values and open
+    // name editors survive a refresh -- only the field being edited is left alone,
+    // everything else keeps tracking the FPGA (labctrl-node's "changed" semantics).
+    const sig = JSON.stringify([snap.dds || null, snap.ttl || null, snap.ttl_reads_enabled]);
+    if (sig !== _mcLastSig) {
+      _mcLastSig = sig;
+      mcApplyDds(snap.dds || []);
       if (snap.ttl_reads_enabled === false) renderMcTtlDisabled();
-      else renderMcTtl(snap.ttl || []);
+      else mcApplyTtl(snap.ttl || []);
+    }
+    // The startup script only changes with idle-time edits -> refetch it when the
+    // change counter / name id move, never on the per-second value refresh of a run.
+    const idKey = String(stateTxt) + "/" + String(snap.name_id);
+    if (idKey !== _mcLastIdKey) {
+      _mcLastIdKey = idKey;
       api("/api/molecube/startup").then((r) => {
         if (r && r.startup != null) setText("mc-startup-view", r.startup || "(empty)");
       }).catch(() => {});
@@ -8530,8 +8561,8 @@
       : "";
     return "<td class='mc-cell" + (ovr ? " mc-ovr" : "") + "'><div class='mc-cell-wrap'>" +
       "<input class='mc-in' type='number' step='any' value='" +
-        (shown === "—" ? "" : shown) + "' data-mc-chn='" + chn +
-        "' data-mc-type='" + type + "'>" +
+        (shown === "—" ? "" : shown) + "' data-mc-live='" + (shown === "—" ? "" : shown) +
+        "' data-mc-chn='" + chn + "' data-mc-type='" + type + "'>" +
       "<button class='mc-mini mc-set' data-mc-chn='" + chn + "' data-mc-type='" + type +
         "'>Set</button>" +
       "<button class='mc-mini mc-ovr-btn" + (ovr ? " on" : "") + "' data-mc-chn='" + chn +
@@ -8575,10 +8606,123 @@
     return "<td class='mc-name mc-name-cell'>" + mcNameField(chn, 'dds', name) + "</td>";
   }
 
+  // ----- in-place live refresh (labctrl-node "changed" semantics) -----
+  // A DDS input turns "dirty" once the user types into it and stays so until it is
+  // submitted (Set / Enter) or reverted (Escape). Live updates skip ONLY dirty or
+  // focused inputs and open name editors; every other cell keeps tracking the FPGA.
+  function mcMarkDirty(inp) {
+    if (!inp) return;
+    const dirty = inp.value !== (inp.dataset.mcLive || "");
+    inp.classList.toggle("mc-dirty", dirty);
+    if (dirty) inp.dataset.mcDirty = "1"; else delete inp.dataset.mcDirty;
+  }
+  function mcClearDirty(inp) {
+    if (!inp) return;
+    inp.classList.remove("mc-dirty");
+    delete inp.dataset.mcDirty;
+  }
+  function mcRevertInput(inp) {                 // Escape -> back to the live value
+    if (!inp) return;
+    inp.value = inp.dataset.mcLive || "";
+    mcClearDirty(inp);
+  }
+  function mcHostBusy(host) {                   // an edit in flight inside host?
+    const ae = document.activeElement;
+    return !!(host.querySelector(".mc-in.mc-dirty") ||
+              host.querySelector(".mc-name-field.editing") ||
+              (ae && host.contains(ae) && ae.matches && ae.matches(".mc-in, .mc-name-in")));
+  }
+  function mcPatchName(host, chn, kind, name) {
+    const field = host.querySelector(
+      ".mc-name-field[data-mc-name-chn='" + chn + "'][data-mc-name-kind='" + kind + "']");
+    if (!field || field.classList.contains("editing")) return;
+    const full = String(name == null ? "" : name);
+    const txt = field.querySelector(".mc-name-text");
+    if (txt) {
+      txt.textContent = full === "" ? "name" : full;
+      txt.classList.toggle("mc-name-empty", full === "");
+      txt.title = full === "" ? "Click to name this channel" : full;
+    }
+    const inp = field.querySelector(".mc-name-in");
+    if (inp) { inp.value = full; inp.dataset.mcNameOrig = full; }
+  }
+  function mcPatchCell(host, chn, type, val, dec, ovrVal) {
+    const inp = host.querySelector(
+      ".mc-in[data-mc-chn='" + chn + "'][data-mc-type='" + type + "']");
+    if (!inp) return;
+    const shown = _mcFmt(val, dec);
+    const live = shown === "—" ? "" : shown;
+    inp.dataset.mcLive = live;
+    if (!inp.dataset.mcDirty && document.activeElement !== inp && inp.value !== live)
+      inp.value = live;
+    const ovr = ovrVal != null;
+    const cell = inp.closest(".mc-cell");
+    if (cell) cell.classList.toggle("mc-ovr", ovr);
+    const btn = cell && cell.querySelector(".mc-ovr-btn");
+    if (btn) btn.classList.toggle("on", ovr);
+    const wrap = inp.closest(".mc-cell-wrap");
+    if (wrap) {
+      let tag = wrap.querySelector(".mc-ovr-tag");
+      if (ovr) {
+        if (!tag) {
+          tag = document.createElement("span");
+          tag.className = "mc-ovr-tag"; tag.textContent = "▲";
+          wrap.appendChild(tag);
+        }
+        tag.title = "override = " + _mcFmt(ovrVal, dec);
+      } else if (tag) {
+        tag.remove();
+      }
+    }
+  }
+  // Apply a fresh DDS row set: patch in place when the channel set is unchanged;
+  // rebuild the table only when channels appeared/vanished (and never over an
+  // in-flight edit -- the rebuild is retried on the next poll instead).
+  function mcApplyDds(rows) {
+    const host = $("mc-dds-body");
+    if (!host) return;
+    const chns = rows.map((r) => r.chn).join(",");
+    if (host.dataset.mcChns !== chns || !host.querySelector("table")) {
+      if (host.querySelector("table") && mcHostBusy(host)) { _mcLastSig = null; return; }
+      renderMcDds(rows);
+      return;
+    }
+    setText("mc-dds-count", rows.length + " active");
+    for (const r of rows) {
+      mcPatchName(host, r.chn, "dds", r.name);
+      mcPatchCell(host, r.chn, "freq", r.freq_hz != null ? (r.freq_hz / 1e6) : null, 6,
+                  r.ovr_freq != null ? (r.ovr_freq / 1e6) : null);
+      mcPatchCell(host, r.chn, "amp",   r.amp,       4, r.ovr_amp);
+      mcPatchCell(host, r.chn, "phase", r.phase_deg, 2, r.ovr_phase);
+    }
+  }
+  function mcApplyTtl(rows) {
+    const host = $("mc-ttl-grid");
+    if (!host) return;
+    const chns = rows.map((r) => r.chn).join(",");
+    if (host.dataset.mcChns !== chns || !host.querySelector("[data-mc-ttl]")) {
+      if (host.querySelector("[data-mc-ttl]") && mcHostBusy(host)) { _mcLastSig = null; return; }
+      renderMcTtl(rows);
+      return;
+    }
+    setText("mc-ttl-count", rows.length + " channels");
+    for (const r of rows) {
+      const chip = host.querySelector("[data-mc-ttl='" + r.chn + "']");
+      if (!chip) continue;
+      chip.classList.toggle("on", !!r.value);
+      chip.classList.toggle("ovr-lo", !!r.ovr_lo);
+      chip.classList.toggle("ovr-hi", !!r.ovr_hi);
+      chip.title = "ch " + r.chn + (r.name ? (" · " + r.name) : "") +
+        (r.ovr_lo ? " · forced LOW" : r.ovr_hi ? " · forced HIGH" : "");
+      mcPatchName(host, r.chn, "ttl", r.name);
+    }
+  }
+
   function renderMcDds(rows) {
     setText("mc-dds-count", rows.length + " active");
     const host = $("mc-dds-body");
     if (!host) return;
+    host.dataset.mcChns = rows.map((r) => r.chn).join(",");
     if (!rows.length) { host.innerHTML = "<div class='hint'>no active DDS channels</div>"; return; }
     let h = "<table class='mc-dds-table mono'><thead><tr><th>Ch</th><th>Name</th>" +
       "<th>Freq (MHz)</th><th>Amp (0–1)</th><th>Phase (°)</th><th></th></tr></thead><tbody>";
@@ -8607,6 +8751,7 @@
     setText("mc-ttl-count", rows.length + " channels");
     const host = $("mc-ttl-grid");
     if (!host) return;
+    host.dataset.mcChns = rows.map((r) => r.chn).join(",");
     if (!rows.length) { host.innerHTML = "<div class='hint'>no TTL channels</div>"; return; }
     let h = "";
     for (const r of rows) {
@@ -8696,6 +8841,7 @@
       const inp = container.querySelector(
         ".mc-in[data-mc-chn='" + chn + "'][data-mc-type='" + type + "']");
       if (!inp || inp.value === "") return;
+      mcClearDirty(inp);                        // submitted -> live updates may resume
       mcPost("/api/molecube/dds/set", {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
     } else if (ovr) {
       const chn = +ovr.dataset.mcChn, type = ovr.dataset.mcType;
@@ -8705,6 +8851,7 @@
         const inp = container.querySelector(
           ".mc-in[data-mc-chn='" + chn + "'][data-mc-type='" + type + "']");
         if (!inp || inp.value === "") { toast("enter a value first", "warn"); return; }
+        mcClearDirty(inp);
         mcPost("/api/molecube/dds/override",
                {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
       }
@@ -8721,11 +8868,21 @@
       else if (e.key === "Escape") { e.preventDefault(); mcCloseNameEditor(field); nameInp.blur(); }
       return;
     }
-    if (e.key !== "Enter") return;
     const inp = e.target.closest(".mc-in");
-    if (!inp || inp.value === "") return;
+    if (!inp) return;
+    if (e.key === "Escape") {                   // discard the edit, back to live value
+      e.preventDefault(); mcRevertInput(inp); inp.blur(); return;
+    }
+    if (e.key !== "Enter" || inp.value === "") return;
+    mcClearDirty(inp);
     const chn = +inp.dataset.mcChn, type = inp.dataset.mcType;
     mcPost("/api/molecube/dds/set", {chn, type, value: _mcValOf(type, parseFloat(inp.value))});
+  }
+  // Typing into a DDS value field marks it dirty (highlighted, protected from live
+  // updates) until Set / Enter submits it or Escape reverts it.
+  function mcControlInput(e) {
+    const inp = e.target.closest(".mc-in");
+    if (inp) mcMarkDirty(inp);
   }
   // Keep the field focused when the ✓ is pressed (so the focusout-cancel never beats
   // the ✓ click-commit), and cancel an editor that loses focus to anything else.
@@ -8749,6 +8906,7 @@
     if (ddsBody) {
       ddsBody.addEventListener("click", mcControlClick);
       ddsBody.addEventListener("keydown", mcControlKeydown);
+      ddsBody.addEventListener("input", mcControlInput);
       ddsBody.addEventListener("mousedown", mcControlMousedown);
       ddsBody.addEventListener("focusout", mcNameFocusOut);
     }
@@ -8760,7 +8918,7 @@
       ttlGrid.addEventListener("focusout", mcNameFocusOut);
     }
     if ($("mc-refresh-btn"))
-      $("mc-refresh-btn").addEventListener("click", () => { _mcLastStateId = null; pollMolecube(); });
+      $("mc-refresh-btn").addEventListener("click", () => { _mcLastSig = null; pollMolecube(true); });
     if ($("mc-clock-set"))
       $("mc-clock-set").addEventListener("click", () => {
         const v = $("mc-clock-input").value;
