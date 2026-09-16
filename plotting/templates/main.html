@@ -424,6 +424,19 @@
           <span class="track"></span>
           <span>Targets only</span>
         </label>
+        <!-- Error family for the live scan curve. ON (default) = shot-to-shot:
+             each SHOT's array-averaged rate is one sample, so the bar shows the
+             scatter between shots. OFF = array-average: the per-site binomial
+             errors propagated into the array mean (the pre-2026-09-15
+             behaviour), which shrinks with the SITE count and says nothing
+             about shot-to-shot stability. Applies to every scan shape, so it
+             sits OUTSIDE the axis-shape group below. -->
+        <label class="switch scan-ctl" id="scan-err-switch"
+               title="Error bars on the live scan curve (and the ± in a 2-D/3-D heatmap hover). ON = shot-to-shot: std of the per-shot array-averaged rate / sqrt(N shots) — includes loading and drift scatter, and matches the Analysis tab's default. OFF = array-average: the per-site binomial SEMs propagated into the array mean — shrinks with the site count, so it reads tight on a big array even when the shots scatter.">
+          <input type="checkbox" id="scan-err-pershot" checked>
+          <span class="track"></span>
+          <span>Shot-to-shot</span>
+        </label>
         <!-- The controls below only make sense for a NON-LINEAR scan (>= 3-D, or a
              coupled 1-D sweep): renderScanAxisControls() shows this whole
              `.scan-ctl-shaped` set only then, and hides it for a plain 1-D scan. -->

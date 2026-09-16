@@ -327,8 +327,10 @@ def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
     not loss). The axis label said "TP (target)" throughout, which is how it was
     finally caught.
 
-    Returns ``(mean, sem, n_reps)`` each length ``n_total``, or ``None`` when no
-    shot had usable targets (→ caller falls back to per-site survival)."""
+    Returns ``(mean, sem, n_reps, std)`` each length ``n_total``, or ``None``
+    when no shot had usable targets (→ caller falls back to per-site survival).
+    ``sem``/``std`` are already the SHOT-TO-SHOT family -- this branch has one
+    sample per shot by construction, so there is no per-site alternative."""
     sum_tp = np.zeros(n_total)
     sumsq = np.zeros(n_total)
     cnt = np.zeros(n_total, dtype=int)
@@ -374,9 +376,14 @@ def _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
         return None
     with np.errstate(invalid='ignore', divide='ignore'):
         mean = np.where(cnt > 0, sum_tp / np.maximum(cnt, 1), np.nan)
-        var = np.where(cnt > 0, sumsq / np.maximum(cnt, 1) - mean ** 2, np.nan)
-        sem = np.sqrt(np.maximum(var, 0.0) / np.maximum(cnt, 1))
-    return mean, sem, cnt
+        # SAMPLE variance (ddof=1). Until 2026-09-15 this was the POPULATION
+        # variance, which reads low by sqrt(n/(n-1)) and so disagreed with the
+        # Analysis tab's per_shot_rate_stats on the same shots.
+        var = np.where(cnt > 1,
+                       (sumsq - cnt * mean ** 2) / np.maximum(cnt - 1, 1), 0.0)
+        std = np.where(cnt > 0, np.sqrt(np.maximum(var, 0.0)), np.nan)
+        sem = np.where(cnt > 0, std / np.sqrt(np.maximum(cnt, 1)), np.nan)
+    return mean, sem, cnt, std
 
 
 def _mask_sr(y_sr, site_mask):
@@ -477,12 +484,18 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
         ta = _target_tp_per_flat(scan_logicals, param_indices, n_params, seq_targets,
                                  cond_mid=cond_mid)
         if ta is not None:
-            mean, sem, cnt = ta
+            mean, sem, cnt, sd = ta
             order = np.argsort(scan_params)
             return {
                 'scan_x': scan_params[order],
                 'y_mean': mean[order],
                 'y_sem': sem[order],
+                # Already per-shot here (one TP sample per shot) -- published
+                # under the per-shot names too so the figure's error-family
+                # picker finds them on this branch as well.
+                'y_sem_pershot': sem[order],
+                'y_std_pershot': sd[order],
+                'n_shots_pershot': cnt[order],
                 'y_mean_sr': mean[order][None, :],
                 'n_reps': cnt[order],
                 'mode': 'survival',
@@ -536,11 +549,20 @@ def compute_scan_curve(scan_logicals, param_indices, scan_params, num_images,
         y_mean = np.nanmean(y_mean_sr, axis=0)
     y_sem = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
 
+    # Shot-to-shot error family alongside the per-site one (the figure picks
+    # which to draw; per-shot is the default because it also carries the
+    # shot-to-shot scatter the per-site binomial cannot see).
+    ps_std, ps_sem, ps_n = _per_shot_bucket_stats(
+        buckets, n_params, mode, site_mask=site_mask, n_sites=n_sites)
+
     order = np.argsort(scan_params)
     return {
         'scan_x': scan_params[order],
         'y_mean': y_mean[order],
         'y_sem': y_sem[order],
+        'y_sem_pershot': ps_sem[order],
+        'y_std_pershot': ps_std[order],
+        'n_shots_pershot': ps_n[order],
         'y_mean_sr': y_mean_sr[:, order],
         'n_reps': n_reps[order],
         'mode': mode,
@@ -574,7 +596,7 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
                                  cond_mid=cond_mid)
         if ta is not None:
-            mean_flat, sem_flat, n_flat = ta
+            mean_flat, sem_flat, n_flat, std_flat = ta
             sids = list(recent_seq_ids) if recent_seq_ids else (
                 [int(scan_logicals[-1][0])] if scan_logicals else [])
             current = []
@@ -595,6 +617,9 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
                 'cond_mid': bool(cond_mid),
                 'heatmap': mean_flat.reshape(s1, s0),
                 'sem': sem_flat.reshape(s1, s0),
+                # Already per-shot on this branch (see _target_tp_per_flat).
+                'sem_pershot': sem_flat.reshape(s1, s0),
+                'std_pershot': std_flat.reshape(s1, s0),
                 'n_reps': n_flat.reshape(s1, s0),
                 'x_values': d0['values'], 'y_values': d1['values'],
                 'x_name': d0['name'], 'y_name': d1['name'],
@@ -643,6 +668,10 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         warnings.simplefilter('ignore', RuntimeWarning)
         sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
 
+    # Shot-to-shot error family alongside the per-site one (the hover picks).
+    ps_std, ps_sem, _ps_n = _per_shot_bucket_stats(
+        buckets, n_total, mode, site_mask=site_mask, n_sites=n_sites)
+
     # Reshape into (s1, s0) grid → heatmap[dim1_idx, dim0_idx]
     # Column-major: dim0 varies fastest in the flat array
     heatmap = y_mean_flat.reshape(s1, s0)
@@ -674,6 +703,8 @@ def _compute_2d(scan_logicals, param_indices, scan_dims, num_images,
         'ndim': 2,
         'heatmap': heatmap,
         'sem': sem_grid,  # per-cell standard error of the site-averaged value
+        'sem_pershot': ps_sem.reshape(s1, s0),
+        'std_pershot': ps_std.reshape(s1, s0),
         'n_reps': n_grid,
         'x_values': d0['values'],  # dim0 → x-axis
         'y_values': d1['values'],  # dim1 → y-axis
@@ -762,12 +793,15 @@ def _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
         ta = _target_tp_per_flat(scan_logicals, param_indices, n_total, seq_targets,
                                  cond_mid=cond_mid)
         if ta is not None:
-            mean_flat, sem_flat, n_flat = ta
+            mean_flat, sem_flat, n_flat, std_flat = ta
             return {
                 'mode': 'survival', 'ndim': 3, 'target_aware': True,
                 'cond_mid': bool(cond_mid),
                 'cube': mean_flat.reshape(s2, s1, s0),
                 'sem': sem_flat.reshape(s2, s1, s0),
+                # Already per-shot on this branch (see _target_tp_per_flat).
+                'sem_pershot': sem_flat.reshape(s2, s1, s0),
+                'std_pershot': std_flat.reshape(s2, s1, s0),
                 'n_reps': n_flat.reshape(s2, s1, s0),
                 'dims': dims_meta,
                 'current': _current_cells(),
@@ -808,11 +842,17 @@ def _compute_3d(scan_logicals, param_indices, scan_dims, num_images,
         y_mean_flat = np.nanmean(y_mean_sr, axis=0)
         sem_flat = np.sqrt(np.nansum(y_sem_sr**2, axis=0)) / max(n_avg, 1)
 
+    # Shot-to-shot error family alongside the per-site one (the hover picks).
+    ps_std, ps_sem, _ps_n = _per_shot_bucket_stats(
+        buckets, n_total, mode, site_mask=site_mask, n_sites=n_sites)
+
     return {
         'mode': mode,
         'ndim': 3,
         'cube': y_mean_flat.reshape(s2, s1, s0),
         'sem': sem_flat.reshape(s2, s1, s0),
+        'sem_pershot': ps_sem.reshape(s2, s1, s0),
+        'std_pershot': ps_std.reshape(s2, s1, s0),
         'n_reps': n_reps.reshape(s2, s1, s0),
         'dims': dims_meta,
         'current': _current_cells(),
@@ -893,3 +933,77 @@ def _rearrangement_buckets(buckets, n_sites, n_params):
         y_sem_sr[:, p] = se
 
     return y_mean_sr, y_sem_sr, n_reps
+
+
+def _per_shot_bucket_stats(buckets, n_params, mode, site_mask=None, n_sites=None):
+    """SHOT-TO-SHOT spread of the array-averaged rate, per param bucket.
+
+    Each SHOT contributes ONE sample -- its rate averaged over that shot's
+    sites -- so the returned std/sem carry the shot-to-shot scatter (loading
+    fluctuations, slow drift, a bad frame) that the per-site binomial errors
+    from ``_survival_buckets`` & co. cannot see: those describe how well each
+    SITE's rate is pinned down and shrink with the site count alone.
+
+    Same convention as ``probabilities.per_shot_rate_stats`` (the Analysis
+    tab's default error family), so the live curve and the offline one agree:
+    ``survival`` counts only the ELIGIBLE shots (>= 1 site loaded in the
+    conditioning frame); ``loading`` / ``rearrangement`` count every shot.
+
+    Returns ``(std, sem, n_shots)``, each length ``n_params``. A point with a
+    single usable shot gets 0.0 (its spread is undefined, not large -- and a
+    NaN in the error array blanks the Plotly trace); an empty one stays NaN.
+    """
+    std = np.full(n_params, np.nan)
+    sem = np.full(n_params, np.nan)
+    n_out = np.zeros(n_params, dtype=int)
+    m = np.asarray(site_mask, dtype=bool) if site_mask is not None else None
+    if m is not None and n_sites is not None and m.size != n_sites:
+        m = None                      # shape mismatch -> no-op, as in _mask_sr
+
+    def _stack(frames):
+        """(nShots, nSites) bool array, site-masked. None if unusable."""
+        if not frames:
+            return None
+        try:
+            a = np.asarray(frames, dtype=bool)
+        except ValueError:            # ragged bucket (grid changed mid-scan)
+            return None
+        if a.ndim != 2 or a.shape[1] == 0:
+            return None
+        if m is not None and m.size == a.shape[1]:
+            a = a[:, m]
+        return a if a.shape[1] else None
+
+    for p in range(n_params):
+        bucket = buckets[p]
+        if not bucket:
+            continue
+        if mode == 'survival':
+            # Pair the frames first so the AND stays shot-aligned.
+            pairs = [b for b in bucket if b[1] is not None]
+            a = _stack([b[0] for b in pairs])
+            b2 = _stack([b[1] for b in pairs])
+            if a is None or b2 is None or a.shape != b2.shape:
+                continue              # incl. cross-grid: a matched AND is meaningless
+            loaded = a.sum(axis=1)
+            elig = loaded > 0         # no atoms to condition on -> not a sample
+            if not elig.any():
+                continue
+            rates = ((a & b2).sum(axis=1)[elig] / loaded[elig]).astype(float)
+        else:
+            a = _stack([b[1] for b in bucket if b[1] is not None]
+                       if mode == 'rearrangement' else [b[0] for b in bucket])
+            if a is None:
+                continue
+            rates = a.mean(axis=1)
+
+        n = rates.size
+        n_out[p] = n
+        if n >= 2:
+            sd = float(rates.std(ddof=1))
+            std[p] = sd
+            sem[p] = sd / np.sqrt(n)
+        elif n == 1:
+            std[p] = 0.0
+            sem[p] = 0.0
+    return std, sem, n_out

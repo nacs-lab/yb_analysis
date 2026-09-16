@@ -3406,6 +3406,8 @@ def _register_api_routes(server):
         #                         walks (the other two form the heatmap).
         #   ?scan_x=j          -- coupled 1-D scans: which coupled param labels
         #                         the x-axis.
+        #   ?scan_err=mode     -- which error family the curve draws / the
+        #                         heatmap hover quotes (see _SCAN_ERR_MODES).
         def _int_arg(nm):
             v = request.args.get(nm)
             if v in (None, ''):
@@ -3416,8 +3418,12 @@ def _register_api_routes(server):
                 return None
         _slice_dim = _int_arg('scan_slice_dim')
         _scan_x = _int_arg('scan_x')
-        scan_opts = ((_slice_dim, _scan_x)
-                     if (_slice_dim is not None or _scan_x is not None) else None)
+        _scan_err = request.args.get('scan_err')
+        if _scan_err not in _SCAN_ERR_MODES:
+            _scan_err = None
+        scan_opts = ((_slice_dim, _scan_x, _scan_err)
+                     if (_slice_dim is not None or _scan_x is not None
+                         or _scan_err is not None) else None)
 
         # Per-image green/red site-box overlay toggle (default ON). The Live tab
         # sends ?boxes_<name>=0 for any array panel whose "Boxes" switch is off,
@@ -7156,6 +7162,47 @@ def _survival_y_label(sc, short=False):
         return 'Survival | verify (target)'
     return 'TP (target)' if short else 'Survival - TP (target)'
 
+# Error family for the live scan panel -- the two sides of the Scan card's
+# "Shot-to-shot" switch:
+#   sem_pershot (ON, the default) -- each SHOT's array-averaged rate is one
+#     sample; std/sqrt(N shots). Carries the shot-to-shot scatter (loading
+#     fluctuations, slow drift, one bad frame) and matches the Analysis tab.
+#   sem_site (OFF) -- the pre-2026-09-15 behavior: the per-site binomial SEMs
+#     propagated into the array average. Describes how well each SITE is pinned
+#     down, shrinks with the SITE count alone, and so reads implausibly tight on
+#     a big array while saying nothing about shot-to-shot stability.
+# Chosen per request via ?scan_err= (see scan_opts).
+_SCAN_ERR_MODES = ('sem_pershot', 'sem_site')
+_SCAN_ERR_LABEL = {'sem_pershot': 'SEM shot-to-shot',
+                   'sem_site':    'SEM array-average'}
+
+
+def _unpack_scan_opts(scan_opts):
+    """``(slice_dim, scan_x, err_mode)`` from the request's scan_opts tuple.
+
+    Accepts the legacy 2-tuple (no err mode) so a cached/older caller still
+    works; an unknown mode falls back to the default.
+    """
+    opts = tuple(scan_opts) if scan_opts else ()
+    slice_dim = opts[0] if len(opts) > 0 else None
+    scan_x = opts[1] if len(opts) > 1 else None
+    err_mode = opts[2] if len(opts) > 2 else None
+    if err_mode not in _SCAN_ERR_MODES:
+        err_mode = _SCAN_ERR_MODES[0]
+    return slice_dim, scan_x, err_mode
+
+
+def _scan_err(sc, mode, *, pershot, site):
+    """Per-point error array for the requested family.
+
+    Falls back to the array-average one whenever the per-shot array is missing
+    -- a snapshot written by an older DataManager has no *_pershot keys, and
+    the panel must still draw rather than go blank.
+    """
+    e = sc.get(site) if mode == 'sem_site' else sc.get(pershot)
+    return sc.get(site) if e is None else e
+
+
 def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
     sc = d.get('scan_curve')
     if sc is None or sc.get('mode') == 'undefined':
@@ -7165,20 +7212,25 @@ def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
         # as a rolling window of fraction-loaded per shot.
         return _fig_scan_timeseries(d)
 
-    slice_dim, scan_x = (scan_opts if scan_opts else (None, None))
+    slice_dim, scan_x, err_mode = _unpack_scan_opts(scan_opts)
 
     # --- >= 3-D: data cube, one heatmap slice at a time + slider ---
     if sc.get('ndim', 1) >= 3:
-        return _fig_scan_3d(d, sc, cbar_scale=cbar_scale, slice_dim=slice_dim)
+        return _fig_scan_3d(d, sc, cbar_scale=cbar_scale, slice_dim=slice_dim,
+                            err_mode=err_mode)
 
     # --- 2-D heatmap ---
     if sc.get('ndim', 1) >= 2:
-        return _fig_scan_2d(d, sc, cbar_scale=cbar_scale)
+        return _fig_scan_2d(d, sc, cbar_scale=cbar_scale, err_mode=err_mode)
 
     # --- 1-D scatter with error bars ---
     x = sc['scan_x']
     y = sc['y_mean']
-    err = sc['y_sem']
+    err = _scan_err(sc, err_mode, pershot='y_sem_pershot', site='y_sem')
+    # Both families absent (a malformed/partial scan_curve) -> plot the points
+    # with no bars rather than raising and blanking the whole panel.
+    show_err = err is not None
+    err = np.asarray(err if show_err else np.zeros_like(y), dtype=float)
     n_reps = sc['n_reps']
     mode = sc['mode']
 
@@ -7238,12 +7290,17 @@ def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
             for nm, v in coupled_vals:
                 if v is not None and nm != x_label:
                     parts.append(f'{nm}={v[i]:.4g}')
-        parts.append(f'{y_label}={y[i]:.3f}+/-{err[i]:.3f} (n={n_reps[i]})')
+        if show_err:
+            parts.append(f'{y_label}={y[i]:.3f}+/-{err[i]:.3f}'
+                         f' [{_SCAN_ERR_LABEL[err_mode]}] (n={n_reps[i]})')
+        else:
+            parts.append(f'{y_label}={y[i]:.3f} (n={n_reps[i]})')
         return ', '.join(parts)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=x_disp, y=y, error_y=dict(type='data', array=err, visible=True, thickness=1.5),
+        x=x_disp, y=y,
+        error_y=dict(type='data', array=err, visible=show_err, thickness=1.5),
         mode='markers', marker=dict(size=6, color='#44aaff'),
         hoverinfo='text', hovertext=[_hover(i) for i in range(len(x_disp))]))
     n_extra = (len(coupled) - 1) if (coupled and len(coupled) > 1) else 0
@@ -7259,6 +7316,16 @@ def _fig_scan_curve(d, cbar_scale='01', scan_opts=None):
             text='⌖ target-aware (diag)', showarrow=False,
             font=dict(size=10, color='#3fb950'),
             bgcolor='rgba(0,0,0,0.35)', borderpad=2)
+    # Name the error family ON the plot -- a bar whose meaning you have to open
+    # the gear menu to learn is a bar you will misread. Top-LEFT, under the
+    # target-aware badge when there is one: the top-RIGHT corner belongs to the
+    # card's expand button + control gear, which overlay the panel.
+    fig.add_annotation(
+        xref='paper', yref='paper', x=0.0, y=1.0, xanchor='left', yanchor='top',
+        yshift=(-16 if sc.get('target_aware') else 0),
+        text=f'± {_SCAN_ERR_LABEL[err_mode]}', showarrow=False,
+        font=dict(size=9, color='#8b98a5'),
+        bgcolor='rgba(0,0,0,0.35)', borderpad=2)
     return fig
 
 
@@ -7450,7 +7517,7 @@ def _tickset(vals):
     return idx, [_fmt_tick(vals[i]) for i in idx]
 
 
-def _fig_scan_2d(d, sc, cbar_scale='01'):
+def _fig_scan_2d(d, sc, cbar_scale='01', err_mode='sem_pershot'):
     """Render a 2-D scan as a survival/loading heatmap."""
     heatmap = sc.get('heatmap')
     n_reps = sc.get('n_reps')
@@ -7499,13 +7566,14 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
     Xv = np.broadcast_to(xv.reshape(1, nx), (ny, nx))   # actual x per cell
     Yv = np.broadcast_to(yv.reshape(ny, 1), (ny, nx))   # actual y per cell
 
-    sem = sc.get('sem')
+    sem = _scan_err(sc, err_mode, pershot='sem_pershot', site='sem')
     if sem is not None:
         # customdata: [x_val, y_val, reps, error] per cell
         customdata = np.dstack([Xv, Yv, n_reps, sem])
         hovertemplate = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
                          f'{y_name}=%{{customdata[1]:.4g}}<br>'
-                         f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}<br>'
+                         f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}'
+                         f' ({_SCAN_ERR_LABEL[err_mode]})<br>'
                          f'reps=%{{customdata[2]:d}}<extra></extra>')
     else:
         customdata = np.dstack([Xv, Yv, n_reps])
@@ -7547,7 +7615,8 @@ def _fig_scan_2d(d, sc, cbar_scale='01'):
     return fig
 
 
-def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
+def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None,
+                 err_mode='sem_pershot'):
     """Render a >= 3-D scan as a heatmap of two axes + a slider over the third.
 
     ``slice_dim`` (0/1/2) chooses which axis the slider walks; the other two
@@ -7612,7 +7681,7 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
 
     Xv = np.broadcast_to(xv.reshape(1, nx), (ny, nx))
     Yv = np.broadcast_to(yv.reshape(ny, 1), (ny, nx))
-    sem = sc.get('sem')
+    sem = _scan_err(sc, err_mode, pershot='sem_pershot', site='sem')
     sem = np.asarray(sem, dtype=float) if sem is not None else None
 
     def _frame_data(s):
@@ -7624,7 +7693,8 @@ def _fig_scan_3d(d, sc, cbar_scale='01', slice_dim=None):
             cd = np.dstack([Xv, Yv, nr2, sm2])
             ht = (f'{x_name}=%{{customdata[0]:.4g}}<br>'
                   f'{y_name}=%{{customdata[1]:.4g}}<br>'
-                  f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}<br>'
+                  f'{y_label}=%{{z:.3f}} ± %{{customdata[3]:.3f}}'
+                  f' ({_SCAN_ERR_LABEL[err_mode]})<br>'
                   f'reps=%{{customdata[2]:d}}<extra></extra>')
         else:
             cd = np.dstack([Xv, Yv, nr2])

@@ -1226,6 +1226,18 @@
     catch { return false; }
   })();
 
+  // Live scan-curve error family ("Shot-to-shot" switch): which error the panel
+  // draws (1-D bars) or quotes in a 2-D/3-D heatmap hover. ON (default) = std
+  // of the per-shot array-averaged rate / sqrt(N shots), the SHOT-TO-SHOT
+  // scatter and the family the Analysis tab defaults to; OFF = the legacy
+  // per-site binomial propagated into the array average. Rides the snapshot
+  // figures fetch as ?scan_err=, sent only when OFF so the eager pre-builder
+  // (which builds with default args) still hits. Persisted; default ON.
+  let scanErrPerShot = (() => {
+    try { return localStorage.getItem("yb-dash-scan-err-pershot") !== "0"; }
+    catch { return true; }
+  })();
+
   // Scan-panel axis pickers. scanSliceDim = which swept dim a >=3-D scan's
   // slider walks (null = server default = outermost dim); scanXParam = which
   // coupled param labels a coupled 1-D scan's x-axis (null = primary). Both
@@ -2275,6 +2287,7 @@
     if (scanAutoscale) url += "&cbar_scale=auto";
     if (scanSliceDim != null) url += "&scan_slice_dim=" + scanSliceDim;
     if (scanXParam != null) url += "&scan_x=" + scanXParam;
+    if (!scanErrPerShot) url += "&scan_err=sem_site";
     if (boxParams.length) url += "&" + boxParams.join("&");
     try { resp = await api(url); }
     catch (e) {
@@ -6068,6 +6081,22 @@
         try { localStorage.setItem("yb-dash-scan-autoscale", scanAutoscale ? "1" : "0"); }
         catch {}
         pollSnapshot();   // the scan figure (cbar_scale) lives in the snapshot group now
+      });
+    }
+
+    // Scan-curve error family (shot-to-shot vs array-average) -> changes the
+    // ?scan_err the next snapshot fetch sends; re-poll immediately so the bars
+    // redraw without waiting a tick.
+    const errSw = document.getElementById("scan-err-pershot");
+    if (errSw) {
+      errSw.checked = scanErrPerShot;
+      errSw.addEventListener("change", () => {
+        scanErrPerShot = errSw.checked;
+        try {
+          localStorage.setItem("yb-dash-scan-err-pershot",
+                               scanErrPerShot ? "1" : "0");
+        } catch {}
+        pollSnapshot();
       });
     }
 
